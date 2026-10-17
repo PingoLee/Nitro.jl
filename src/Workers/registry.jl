@@ -100,7 +100,7 @@ still owes for this capability, and `missing_store_methods` does not include the
 | [`claim_next!`](@ref)`(store, queue_name, consumer_id; lease_seconds, now)` | Atomically claim the oldest external `PENDING` submission of a queue as a new run, or `nothing` |
 | [`renew_leases!`](@ref)`(store, consumer_id, runs; lease_seconds, now)` | Extend the leases a consumer holds, returns the run ids that are still its own |
 | [`release_claim!`](@ref)`(store, task_id, run_id; policy, now)` | Hand a claim back to `PENDING` as a new run, or record it `FAILED` at its queue's attempt bound, returns `Bool` |
-| [`requeue_expired!`](@ref)`(store, now; policies)` | Adjudicate every expired lease by its queue's [`LeasePolicy`](@ref), returns counts |
+| [`requeue_expired!`](@ref)`(store, now; policies, on_unknown_queue)` | Adjudicate every expired lease by its queue's [`LeasePolicy`](@ref), failing or skipping one on a queue `policies` does not name, returns counts |
 | [`count_external_runs`](@ref)`(store, statuses; queue_name, submitter)` | Count external submissions, for the submit-time bounds of an external queue |
 
 The first four are each one atomic intent operation in the store, like `try_transition!`: a
@@ -498,7 +498,8 @@ approximate under concurrent submits.
 function count_external_runs end
 
 """
-    requeue_expired!(store, now::DateTime; policies::AbstractDict{String, LeasePolicy})
+    requeue_expired!(store, now::DateTime; policies::AbstractDict{String, LeasePolicy},
+                     on_unknown_queue::Symbol = :fail)
         -> @NamedTuple{requeued::Int, failed::Int, unknown_queue::Int, lost_race::Int}
 
 Adjudicate every `RUNNING` run whose lease expired before `now`, by its queue's
@@ -506,12 +507,19 @@ Adjudicate every `RUNNING` run whose lease expired before `now`, by its queue's
 
 | The run's queue | Outcome |
 |---|---|
-| not in `policies` | `FAILED`, counted in `unknown_queue`: **fail-closed**, never stranded |
+| not in `policies`, `on_unknown_queue = :fail` | `FAILED`, counted in `unknown_queue`: **fail-closed**, never stranded |
+| not in `policies`, `on_unknown_queue = :skip` | not read, and left `RUNNING` for a process that declares the queue |
 | `:fail` | `FAILED` |
 | `:requeue`, `attempt < max_attempts` | back to `PENDING` as a new run (fresh `run_id`, claim and `started_at` cleared, progress reset, `created_at` kept) |
 | `:requeue`, `attempt >= max_attempts` | `FAILED`, with an error naming the attempts |
 
 `failed` counts every run recorded `FAILED`; `unknown_queue` is how many of those had no policy.
+
+A consumer passes `:fail`, the default: it holds the app's whole set of external queues, so an
+expired run on a queue none of them names belongs to a queue no longer declared anywhere. The web
+process's retention tick passes `:skip`: it adjudicates only the queues its own runtime declares,
+so two apps sharing one store, or an old web process in a rolling deploy that adds a queue, never
+fail each other's runs.
 
 Only leased runs are looked at: a `RUNNING` row with no lease belongs to a process running it as
 its own, and is the zombie sweep's to judge. Each outcome is one write fenced on the run it read
@@ -575,6 +583,13 @@ end
 
 _lease_policy(policies::AbstractDict, queue::Union{Nothing, String}) =
     queue === nothing ? nothing : get(policies, queue, nothing)
+
+# `requeue_expired!`'s `on_unknown_queue`, validated once for every backend.
+function _check_on_unknown_queue(on_unknown_queue::Symbol)
+    on_unknown_queue in (:fail, :skip) || throw(ArgumentError(
+        "`on_unknown_queue` must be :fail or :skip, got $(repr(on_unknown_queue))"))
+    return on_unknown_queue
+end
 
 const _ExpiryTally = @NamedTuple{requeued::Int, failed::Int, unknown_queue::Int, lost_race::Int}
 
@@ -1116,13 +1131,15 @@ end
 _visible_across_processes(::InMemoryWorkerStore) = false
 
 function requeue_expired!(store::InMemoryWorkerStore, now::DateTime;
-                          policies::AbstractDict{String, LeasePolicy})
+                          policies::AbstractDict{String, LeasePolicy}, on_unknown_queue::Symbol = :fail)
+    skip_unknown = _check_on_unknown_queue(on_unknown_queue) === :skip
     # The counts live inside the closure and come back as its value: assigned from inside it, they
     # would be captured in a `Core.Box` (#364).
     return lock(store.task_lock) do
         requeued = failed = unknown = 0
         expired = [t for t in values(store.task_registry)
-                   if t.status == RUNNING && t.lease_expires_at !== nothing && t.lease_expires_at < now]
+                   if t.status == RUNNING && t.lease_expires_at !== nothing && t.lease_expires_at < now &&
+                      !(skip_unknown && _lease_policy(policies, t.queue_name) === nothing)]
         for t in expired
             policy = _lease_policy(policies, t.queue_name)
             err = _lease_expiry_error(t.queue_name, policy, t.attempt)

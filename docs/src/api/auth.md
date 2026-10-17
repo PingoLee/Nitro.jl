@@ -31,6 +31,8 @@ Nitro.Auth.extract_auth_token
 ```@docs
 Nitro.Auth.make_password
 Nitro.Auth.check_password
+Nitro.Auth.password_concurrency
+Nitro.Auth.set_password_concurrency!
 Nitro.Auth.parse_argon2_phc
 ```
 

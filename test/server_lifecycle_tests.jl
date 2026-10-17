@@ -1562,3 +1562,89 @@ if Sys.islinux()
 end
 
 end
+
+@testitem "Server lifecycle: serve holds a wake guard on Julia 1.13 (#598)" tags=[:core, :network] setup=[NitroCommon] begin
+
+using Test
+using Nitro
+
+# JuliaLang/julia#63882: on 1.13.0-rc3 through 1.13.x a task parked on a `Timer` does not wake
+# while every default thread runs a yielding handler, unless another libuv handle is alive.
+# `serve` holds one never-firing `Timer` there. The stall itself is measured by
+# `bench/socket/wake.sh`, not here: it needs every default thread busy and no other live timer
+# in the process, which a test process cannot promise.
+using Nitro.Core.AppContext: _needs_wake_guard, _hold_wake_guard!, _release_wake_guard!,
+    _WAKE_GUARD_FORCED, Service
+
+@testset "the version gate" begin
+    @test !_needs_wake_guard(v"1.12.7")
+    @test !_needs_wake_guard(v"1.13.0-rc2")         # the bracket's last good build
+    @test _needs_wake_guard(v"1.13.0-rc3")          # its first bad one
+    @test _needs_wake_guard(v"1.13.0")
+    @test _needs_wake_guard(v"1.13.2")
+    @test _needs_wake_guard(v"1.13.9")
+    @test !_needs_wake_guard(v"1.14.0-DEV.3725")    # master is not affected
+    @test !_needs_wake_guard(v"1.14.0")
+end
+
+# The hold/release path, forced on so it runs on every Julia CI uses.
+@testset "a held guard is released only once nothing serves" begin
+    service = Service()
+    _hold_wake_guard!(service; needed = false)
+    @test isnothing(service.wake_guard[])
+
+    _hold_wake_guard!(service; needed = true)
+    guard = service.wake_guard[]
+    @test guard isa Timer && isopen(guard)
+    _hold_wake_guard!(service; needed = true)       # reused, never overwritten
+    @test service.wake_guard[] === guard
+
+    close(service)                                   # nothing serves: released
+    @test !isopen(guard)
+    @test isnothing(service.wake_guard[])
+
+    _hold_wake_guard!(service; needed = true)        # a closed guard is replaced
+    @test service.wake_guard[] isa Timer && isopen(service.wake_guard[])
+    close(service)
+    @test isnothing(service.wake_guard[])
+end
+
+@testset "serve() holds it while serving and terminate() releases it" begin
+    ctx = Nitro.Core.App()
+    Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
+        Nitro.path("/ok", req -> "ok"; method = "GET"),
+    ])
+    serve_once() = Nitro.Core.serve(ctx; port = get_free_port(), host = HOST, async = true,
+                                    show_banner = false, access_log = nothing)
+    # Forced on, so this exercises `startserver`'s call on the 1.12 CI runs too.
+    _WAKE_GUARD_FORCED[] = true
+    try
+        for _ in 1:2                                 # and again after a terminate
+            serve_once()
+            guard = ctx.service.wake_guard[]
+            try
+                @test guard isa Timer && isopen(guard)
+                # The drain-window branch: with a server still set, a release keeps the guard.
+                _release_wake_guard!(ctx.service)
+                @test ctx.service.wake_guard[] === guard && isopen(guard)
+            finally
+                Nitro.Core.terminate(ctx)
+            end
+            @test isnothing(ctx.service.wake_guard[])
+            @test !isopen(guard)
+        end
+    finally
+        _WAKE_GUARD_FORCED[] = false
+    end
+    # Unforced, the version gate decides.
+    serve_once()
+    try
+        guard = ctx.service.wake_guard[]
+        @test _needs_wake_guard() ? (guard isa Timer && isopen(guard)) : isnothing(guard)
+    finally
+        Nitro.Core.terminate(ctx)
+    end
+    @test isnothing(ctx.service.wake_guard[])
+end
+
+end

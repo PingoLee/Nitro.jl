@@ -26,7 +26,7 @@ import Nitro.Workers: AbstractWorkerStore, TaskInfo, TaskStatus, TaskOptions,
     claim_next!, renew_leases!, release_claim!, requeue_expired!, count_external_runs,
     LeaseRenewal, LeasePolicy,
     _successor_run, _lease_period, _check_consumer_id, _check_claim_queue, _lease_expiry_error, _lease_policy,
-    _release_bound_error,
+    _release_bound_error, _check_on_unknown_queue,
     _ExpiryTally, current_time_utc,
     get_queue_authorizer, set_queue_authorizer!,
     get_error_redactor, set_error_redactor!,
@@ -1657,12 +1657,19 @@ end
 const _EXPIRY_PAGE = 500
 
 function requeue_expired!(store::PormGWorkerStore, now::DateTime;
-                          policies::AbstractDict{String, LeasePolicy})
+                          policies::AbstractDict{String, LeasePolicy}, on_unknown_queue::Symbol = :fail)
     requeued = failed = unknown = lost = 0
     expired = ("status" => string(RUNNING), "lease_expires_at__@lt" => now)
+    # Under `:skip`, the scan reads only the policies' queues, so another app's rows are never read.
+    scan = if _check_on_unknown_queue(on_unknown_queue) === :skip
+        isempty(policies) && return _ExpiryTally((0, 0, 0, 0))
+        (expired..., "queue_name__@in" => collect(String, keys(policies)))
+    else
+        expired
+    end
     after = nothing
     while true
-        query = _task_objects(store).filter(expired...).values("id", "run_id", "queue_name", "attempt")
+        query = _task_objects(store).filter(scan...).values("id", "run_id", "queue_name", "attempt")
         rows = _keyset!(query, after, _EXPIRY_PAGE).list()
         isempty(rows) && break
         for row in rows

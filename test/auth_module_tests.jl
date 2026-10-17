@@ -1776,3 +1776,126 @@ mintime(f, n) = minimum(@elapsed(f()) for _ in 1:n)
 end
 
 end
+
+@testitem "Password hashing concurrency bound (#587)" tags=[:auth, :security, :core] setup=[NitroCommon] begin
+
+using Test
+using Nitro
+import Nitro.Auth: check_password, make_password, password_concurrency, set_password_concurrency!,
+    _bounded, _password_gate, _PASSWORD_GATE, _default_password_concurrency
+
+# Back to the lazily-sized default, as a fresh process has it.
+reset_gate!() = (@atomic _PASSWORD_GATE.gate = nothing; nothing)
+
+# Runs `n` tasks through `_bounded`, each parked 10 ms inside the gate, and returns the most that
+# were ever inside at once. A parked task gives its thread back, so without a bound they overlap.
+function peak_inside(n)
+    inside = Threads.Atomic{Int}(0)
+    peak = Threads.Atomic{Int}(0)
+    tasks = [Threads.@spawn _bounded() do
+                 Threads.atomic_max!(peak, Threads.atomic_add!(inside, 1) + 1)
+                 sleep(0.01)
+                 Threads.atomic_sub!(inside, 1)
+             end for _ in 1:n]
+    foreach(wait, tasks)
+    return peak[]
+end
+
+# A call that must wait while the test holds the only permit: not done after `hold` seconds,
+# done once the permit is released. Against an unbounded `f` the first check fails.
+function waits_for_permit(f; hold = 0.5)
+    set_password_concurrency!(1)
+    gate = _password_gate().sem
+    Base.acquire(gate)
+    t = Threads.@spawn f()
+    blocked = try
+        timedwait(() -> istaskdone(t), hold; pollint = 0.01) === :timed_out
+    finally
+        Base.release(gate)
+    end
+    @test timedwait(() -> istaskdone(t), 60.0; pollint = 0.01) === :ok
+    return blocked, fetch(t)
+end
+
+stored = make_password("right"; iterations = 1000)
+
+try
+    @testset "the default leaves two default threads free" begin
+        # CI runs 1 and 2 threads, where the formula is 1 either way; pin it at other sizes too.
+        @test [_default_password_concurrency(n) for n in (1, 2, 3, 4, 8, 16)] == [1, 1, 1, 2, 6, 14]
+        reset_gate!()
+        @test password_concurrency() == _default_password_concurrency()
+    end
+
+    @testset "the setter" begin
+        @test_throws ArgumentError set_password_concurrency!(-1)
+        @test set_password_concurrency!(3) == 3
+        @test password_concurrency() == 3
+        @test set_password_concurrency!(0) == 0
+        @test password_concurrency() == 0
+        @test isnothing(_password_gate().sem)
+    end
+
+    @testset "no more than the bound are ever inside" begin
+        set_password_concurrency!(0)
+        @test peak_inside(16) > 2           # the probe can see an overlap at all
+        set_password_concurrency!(2)
+        @test peak_inside(16) == 2
+        set_password_concurrency!(1)
+        @test peak_inside(8) == 1
+    end
+
+    @testset "check_password and make_password wait for a permit" begin
+        blocked, ok = waits_for_permit(() -> check_password("right", stored))
+        @test blocked && ok
+        blocked, ok = waits_for_permit(() -> check_password("wrong", stored))
+        @test blocked && !ok
+        # The unknown-user path waits like a known one; otherwise a full gate would answer it
+        # first, and the order of answers would tell the two apart.
+        blocked, ok = waits_for_permit(() -> check_password("right", nothing))
+        @test blocked && !ok
+        blocked, hash = waits_for_permit(() -> make_password("right"; iterations = 1000))
+        @test blocked && check_password("right", hash)
+    end
+
+    @testset "a refused password does not wait for a permit" begin
+        set_password_concurrency!(1)
+        gate = _password_gate().sem
+        Base.acquire(gate)
+        try
+            long = "x"^(Nitro.Auth.MAX_PASSWORD_BYTES + 1)
+            for f in (() -> check_password("", stored), () -> check_password(long, nothing),
+                      () -> try make_password(long) catch e; e end)
+                t = Threads.@spawn f()
+                @test timedwait(() -> istaskdone(t), 10.0; pollint = 0.01) === :ok
+            end
+        finally
+            Base.release(gate)
+        end
+    end
+
+    @testset "the timing equalizer does not take a second permit" begin
+        # `check_password(pw, nothing)` hashes through `make_password`'s body while it holds the
+        # only permit. A reentrant acquire would wait on itself forever.
+        set_password_concurrency!(1)
+        for unverifiable in (nothing, "!unusable")
+            t = Threads.@spawn check_password("pw", unverifiable)
+            @test timedwait(() -> istaskdone(t), 60.0; pollint = 0.01) === :ok
+            @test fetch(t) === false
+        end
+    end
+
+    @testset "answers do not depend on the bound" begin
+        for n in (0, 1, 4)
+            set_password_concurrency!(n)
+            @test check_password("right", stored)
+            @test !check_password("wrong", stored)
+            @test !check_password("right", nothing)
+            @test check_password("right", make_password("right"; iterations = 1000))
+        end
+    end
+finally
+    reset_gate!()
+end
+
+end

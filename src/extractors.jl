@@ -11,7 +11,7 @@ using ..Util.BodyParsers: NITRO_READ_STYLE, NitroReadStyle, _parse_json_bounded,
 using ..Util: TypeMemo, memoized, reset!
 using ..Reflection: struct_builder, extract_struct_info, kw_construct, kw_constructible
 using ..Util: _check_denial_factory, _deny
-using ..Errors: ValidationError, UnsupportedMediaTypeError, AuthDenial, is_unrecoverable
+using ..Errors: ValidationError, UnsupportedMediaTypeError, AuthDenial, ValidatorFault, is_unrecoverable
 # The Core stubs `getjson`/`getform`/`getprincipal` bind to (their bodies are in core/request.jl,
 # included later).
 using ...Core: getjson, getform, getprincipal
@@ -359,7 +359,9 @@ Nitro.validate(s::Search) = 1 <= s.limit <= 100
 ```
 
 Returning `false` is a `ValidationError` (400). An extractor-local validator, attached through the
-parameter's default (`Json(Search, f)`), runs *after* this one; both must pass.
+parameter's default (`Json(Search, f)`), runs *after* this one; both must pass. A validator that
+throws anything but a `ValidationError`, or returns a non-`Bool`, is a server bug and a `500`; its
+exception is dropped, because it may render the value the validator was handed (#595).
 """
 validate(type::T) where {T} = true
 
@@ -381,7 +383,9 @@ function try_validate(param::Param{U}, instance) :: T where {T, U <: Extractor{T
     # query and path parameters.
 
     # Case 1: Use global validate function - returns true if one isn't defined for this type
-    if !validate(instance)
+    passed = validator_verdict(validate, instance)
+    if passed !== true
+        passed === nothing && throw(validator_fault(param, T, global_validate_identity(instance)))
         impl = Base.which(validate, (typeof(instance),))
         throw(ValidationError("Validation failed for parameter '$(param.name)': $T rejected by $(impl.module).validate"))
     end
@@ -393,13 +397,50 @@ function try_validate(param::Param{U}, instance) :: T where {T, U <: Extractor{T
     # default was a `FieldError`, which is not a `ValidationError`, so the route answered
     # 500 whenever the value was present. It folds to a constant for a concrete `U`.
     if param.hasdefault && param.default isa U && hasfield(U, :validate) && !isnothing(param.default.validate)
-        if !param.default.validate(instance)
-            throw(ValidationError("Validation failed for parameter '$(param.name)': $T rejected by $(validator_identity(param.default.validate, param))"))
+        passed = validator_verdict(param.default.validate, instance)
+        if passed !== true
+            identity = validator_identity(param.default.validate, param)
+            passed === nothing && throw(validator_fault(param, T, identity))
+            throw(ValidationError("Validation failed for parameter '$(param.name)': $T rejected by $identity"))
         end
     end
 
     return instance
 end
+
+# A validator's verdict: `true`/`false`, or `nothing` when it threw or returned a non-`Bool` (#595).
+# A validator is application code handed the bound value -- a client's deserialized body, a token's
+# claims -- and its most likely accidental throw is a `MethodError`, which renders its arguments.
+# Reaching `handlerequest`'s `@error` that wrote the value to the log, so the exception is dropped
+# here. A non-`Bool` is caught by type, not by `!` throwing: `!x` is a `MethodError` holding `x`.
+#
+# The fault is raised by the CALLER, after this returns, never from inside the `catch`: a throw
+# from a `catch` block leaves the original on the task's exception stack (`current_exceptions()`),
+# still holding the value. A `ValidationError` is the validator's own message, so it passes.
+function validator_verdict(f::F, instance) :: Nullable{Bool} where {F}
+    try
+        ok = f(instance)
+        return ok isa Bool ? ok : nothing
+    catch e
+        (e isa ValidationError || is_unrecoverable(e)) && rethrow()
+        return nothing
+    end
+end
+
+# Which `validate` method faulted. `which` itself throws when the fault WAS the lookup -- two
+# `validate` methods ambiguous for the bound type are a `MethodError` too -- and the fault must
+# still be raised, so the identity degrades to the bare name.
+function global_validate_identity(instance) :: String
+    try
+        return "$(Base.which(validate, (typeof(instance),)).module).validate"
+    catch e
+        is_unrecoverable(e) && rethrow()
+        return "validate"
+    end
+end
+
+validator_fault(param::Param, ::Type{T}, identity::String) where {T} = ValidatorFault(
+    "Validator for parameter '$(param.name)' failed on a $T: $identity threw or returned a non-Bool")
 
 # Which validator rejected a value, for `ValidationError.msg`: a function and its module, never a
 # source location (#327). This used to interpolate `Base.which(...)`, which renders as
@@ -735,7 +776,10 @@ function extract(param::Param{Claims{T}}, request::LazyRequest) :: Claims{T} whe
     req = request.request
     unauthorized, denied = claims_factories(param)
     principal = getprincipal(req)
-    principal === nothing && throw(AuthDenial(_deny(unauthorized, req, :missing_credentials)))
+    if principal === nothing
+        @debug "Claims{T} refused: no token principal" parameter = param.name type = T
+        throw(AuthDenial(_deny(unauthorized, req, :missing_credentials)))
+    end
     claims = getfield(principal, :claims)
     instance = try
         claims_bind(T, claims)

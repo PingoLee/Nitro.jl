@@ -75,6 +75,98 @@ function set_default_algorithm!(algorithm::String)
     return alg
 end
 
+# ── How many password hashes run at once (#587) ──
+#
+# `make_password` and `check_password` compute for ~0.1 s (pbkdf2_sha256) to ~0.2 s (bcrypt) at
+# the defaults and never yield, so as many concurrent logins as there are `:default` threads stall
+# every other request for the length of one hash (#587 measured /plaintext falling from 99.7k to
+# 2.1k rps at k = 8 logins on 8 threads). A semaphore bounds how many hash at once; the rest wait
+# in `Base.acquire`, PARKED on a condition, which gives their thread back. It is the bounded-queue
+# rule of the deployment guide (*Handlers that compute*) applied to the primitive: tokio's bounded
+# `spawn_blocking` pool and the BEAM's dirty schedulers, without a foreign thread.
+#
+# Process-wide on purpose, the one place the #31 rule (state belongs to an `App`) does not apply:
+# what it protects is the process's default threads, which every `App` in the process shares.
+# Created at first use, never in the module body: its default size reads
+# `Threads.nthreads(:default)` at RUN time, and a module body runs only in the precompile worker.
+#
+# One immutable snapshot, published through one `@atomic` field, so a reader never pairs a new
+# size with an old semaphore or sees a semaphore before its fields. `nothing` means not sized yet.
+struct _PasswordGate
+    n::Int                                # 0 = unbounded
+    sem::Union{Nothing, Base.Semaphore}   # `nothing` exactly when `n == 0`
+end
+mutable struct _PasswordGateCell
+    @atomic gate::Union{Nothing, _PasswordGate}
+end
+const _PASSWORD_GATE = _PasswordGateCell(nothing)
+const _PASSWORD_GATE_LOCK = ReentrantLock()
+
+_default_password_concurrency(nthreads::Int = Threads.nthreads(:default)) = max(nthreads - 2, 1)
+
+# Every load starts unsized, so a gate built while precompiling (sized to the precompile worker's
+# threads, and serialized with the module) never reaches a running process. The flip side: an
+# app that calls `set_password_concurrency!` from its own module body is reset here too, which
+# is why the docs say to call it at startup, at run time.
+__init__() = (@atomic _PASSWORD_GATE.gate = nothing; nothing)
+
+_new_password_gate(n::Int) = _PasswordGate(n, n == 0 ? nothing : Base.Semaphore(n))
+
+function _password_gate()::_PasswordGate
+    gate = @atomic _PASSWORD_GATE.gate
+    gate === nothing || return gate
+    return lock(_PASSWORD_GATE_LOCK) do
+        current = @atomic _PASSWORD_GATE.gate
+        current === nothing || return current
+        fresh = _new_password_gate(_default_password_concurrency())
+        @atomic _PASSWORD_GATE.gate = fresh
+        fresh
+    end
+end
+
+# A permit is released to the semaphore it was taken from, so `set_password_concurrency!` can
+# swap the gate while hashes are in flight.
+function _bounded(f)
+    sem = _password_gate().sem
+    return sem === nothing ? f() : Base.acquire(f, sem)
+end
+
+"""
+    password_concurrency() -> Int
+
+How many [`make_password`](@ref) and [`check_password`](@ref) calls may hash at once in this
+process; `0` means unbounded. The default is `max(Threads.nthreads(:default) - 2, 1)`: however
+many logins arrive together, they never take more than that many default threads. Other bounds
+add to it rather than share it: a Workers queue of `nthreads - 2` busy at the same time takes
+its own threads on top. Change it with [`set_password_concurrency!`](@ref).
+"""
+password_concurrency() = _password_gate().n
+
+"""
+    set_password_concurrency!(n::Integer) -> Int
+
+Let at most `n` calls of [`make_password`](@ref) and [`check_password`](@ref) hash at once,
+process-wide; `0` removes the bound. Calls past it wait their turn parked, without holding a
+thread, so a burst of logins slows the logins and not the rest of the API. Call it at startup,
+at run time (in `main` or an `__init__`), not from a module body. A change applies to calls
+that arrive after it: calls already hashing or already waiting stay with the bound they found,
+so lowering it during a burst takes effect as that burst drains.
+
+A waiting call holds whatever its caller holds. Do not keep a pooled database connection or a
+lock across `check_password`: during a burst it is held for the whole wait, not just the hash.
+
+The bound covers the process's default threads, which every `App` shares, so it is a process
+setting rather than an `App` one. Raising it buys login throughput with the latency of every
+other request; see the deployment guide's *Handlers that compute*. The lower-level `encode` and
+`matches` are not bounded.
+"""
+function set_password_concurrency!(n::Integer)
+    n >= 0 || throw(ArgumentError("password concurrency must be >= 0 (0 = unbounded), got $n"))
+    gate = _new_password_gate(Int(n))
+    lock(() -> (@atomic _PASSWORD_GATE.gate = gate), _PASSWORD_GATE_LOCK)
+    return Int(n)
+end
+
 struct ValidationResult
     valid::Bool
     errors::Vector{String}
@@ -485,8 +577,20 @@ bytes, for a cost above what verification accepts (`iterations` up to 10 000 000
 32-byte key, `bcrypt_cost` 4–15), and for an unknown algorithm. The byte limit applies to raw client input, so cap or
 validate the field before calling this: a signup handler that lets the `ArgumentError` escape
 answers `500`.
+
+At most [`password_concurrency`](@ref) calls of `make_password` and `check_password` hash at
+once; the rest wait, parked, without holding a thread (see [`set_password_concurrency!`](@ref)).
 """
 function make_password(password::AbstractString; algorithm::String=DEFAULT_ALGORITHM(), iterations::Int=DEFAULT_PBKDF2_ITERATIONS, bcrypt_cost::Int=DEFAULT_BCRYPT_COST)
+    # Before the permit, so a refused password never waits behind real hashes.
+    _require_hashable(password)
+    return _bounded(() -> _make_password(password; algorithm, iterations, bcrypt_cost))
+end
+
+# The unbounded body. Everything inside this file calls this one, never the public name: the
+# gate is not reentrant, and `check_password`'s timing equalizer would otherwise wait on a
+# permit its own caller holds.
+function _make_password(password::AbstractString; algorithm::String=DEFAULT_ALGORITHM(), iterations::Int=DEFAULT_PBKDF2_ITERATIONS, bcrypt_cost::Int=DEFAULT_BCRYPT_COST)
     _require_hashable(password)
     algorithm = lowercase(algorithm)
 
@@ -515,7 +619,7 @@ end
 const _DUMMY_PASSWORD = "nitro-timing-equalizer"
 
 function _equalize_timing()
-    make_password(_DUMMY_PASSWORD)
+    _make_password(_DUMMY_PASSWORD)
     return nothing
 end
 
@@ -552,7 +656,15 @@ hashing and logged, without the hash. So is a malformed hash in a known format, 
 Either way that account cannot log in until it is re-hashed, and its fast `false` is the one
 answer that still tells it apart from an unknown user.
 """
-function check_password(password::AbstractString, encoded_hash::AbstractString)
+check_password(password::AbstractString, encoded_hash::AbstractString) =
+    _hashable(password) ? _bounded(() -> _check_password(password, encoded_hash)) : false
+
+# The unknown-user path goes through the same gate, so it waits exactly as long as a known one,
+# and refuses an unhashable password before the permit exactly as the known one does.
+check_password(password::AbstractString, ::Nothing) =
+    _hashable(password) ? _bounded(() -> _check_password(password, nothing)) : false
+
+function _check_password(password::AbstractString, encoded_hash::AbstractString)
     _hashable(password) || return false
     encoded = String(encoded_hash)
     if startswith(encoded, "bcrypt\$") || startswith(encoded, "{bcrypt}")
@@ -573,7 +685,7 @@ function check_password(password::AbstractString, encoded_hash::AbstractString)
     return matches(GLOBAL_PASSWORD_ENCODER[], password, encoded)
 end
 
-function check_password(password::AbstractString, ::Nothing)
+function _check_password(password::AbstractString, ::Nothing)
     _hashable(password) && _equalize_timing()
     return false
 end

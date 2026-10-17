@@ -605,8 +605,12 @@ end
     max_retries::Int = 3
 end
 
+# An in-process queue's buffer, and the default backlog bound of an external one: the same 100, so
+# moving a queue out of process does not change how many runs it admits.
+const _DEFAULT_QUEUE_BUFFER = 100
+
 """
-    External(; on_lease_expiry, max_attempts = 3, max_pending = nothing, options = TaskOptions())
+    External(; on_lease_expiry, max_attempts = 3, max_pending = 100, options = TaskOptions())
 
 The placement of a queue whose runs execute in a **separate consumer process**, not in the process
 that submits them ([#514](https://github.com/PingoLee/Nitro.jl/issues/514)). Declare it with
@@ -626,7 +630,9 @@ shared store, under a lease, and runs it.
   would let an email or a charge repeat silently. See [`LeasePolicy`](@ref).
 - **`max_attempts`** bounds `:requeue`: a run claimed that many times is recorded `FAILED`.
 - **`max_pending`** bounds the backlog: a submit is refused with `WorkerCapacityError(:queue, …)`
-  (a `503`) once the store holds that many `PENDING` runs of the queue. The count is read before
+  (a `503`) once the store holds that many `PENDING` runs of the queue. The default, 100, is an
+  in-process queue's buffer size, so moving a queue out of process admits the same backlog;
+  `max_pending = nothing` removes the bound. The count is read before
   the insert, so concurrent submits can overshoot it by a few rows. It bounds runaway callers; it
   is not an exact quota.
 - **`options`** are the queue's `TaskOptions`: the consumer runs every run of the queue
@@ -648,7 +654,8 @@ struct External
 end
 
 function External(; on_lease_expiry::Union{Nothing, Symbol} = nothing, max_attempts::Integer = 3,
-                  max_pending::Union{Nothing, Integer} = nothing, options::TaskOptions = TaskOptions())
+                  max_pending::Union{Nothing, Integer} = _DEFAULT_QUEUE_BUFFER,
+                  options::TaskOptions = TaskOptions())
     on_lease_expiry === nothing && throw(ArgumentError(
         "External(…) needs `on_lease_expiry`: `:requeue` runs a run again when its consumer dies " *
         "mid-run (the job must be idempotent), `:fail` records it FAILED. There is no default, " *
@@ -750,7 +757,7 @@ mutable struct WorkerQueue
     # same idempotent CAS.
     held::Vector{QueueItem}
 
-    function WorkerQueue(size::Int=100; concurrency::Int=1)
+    function WorkerQueue(size::Int=_DEFAULT_QUEUE_BUFFER; concurrency::Int=1)
         size >= 1 || throw(ArgumentError("WorkerQueue size must be at least 1, got $size"))
         concurrency >= 1 || throw(ArgumentError(
             "WorkerQueue concurrency must be at least 1, got $concurrency"))

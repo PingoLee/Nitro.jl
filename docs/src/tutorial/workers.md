@@ -207,7 +207,8 @@ a claim whose lease expires, and `on_lease_expiry` decides what happens then. It
 because only you know whether your job may run twice:
 
 - `:requeue` runs it again, up to `max_attempts` claims (default 3), then records it `FAILED`.
-  Choose it only for a job that is safe to repeat.
+  Choose it only for a job that is safe to repeat. Every hand-back at a deploy drain counts toward
+  `max_attempts` too, so a long run interrupted by that many deploys is recorded `FAILED`.
 - `:fail` records it `FAILED` on the first expiry. Choose it for a job with a side effect that must
   not repeat, such as an email or a charge.
 
@@ -220,7 +221,7 @@ What changes for a submit to an external queue:
 |---|---|---|
 | A closure | runs | `ArgumentError`: register the job and submit `Job(name, args)` |
 | `options = TaskOptions(…)` on the submit | applies | `ArgumentError`: set them on the declaration, `External(…; options)`, which the consumer reads |
-| The backlog bound | the queue's buffer (100) | `External(…; max_pending = n)`, counted in the store |
+| The backlog bound | the queue's buffer (100) | `External(…; max_pending = 100)` by default, counted in the store; `nothing` removes it |
 | `max_runs_per_owner` | this process's live runs | the same, plus the external runs the identity submitted (either scope), counted in the store |
 
 Both store counts are read before the insert, so concurrent submits can overshoot them by a few
@@ -237,8 +238,10 @@ rows: they bound runaway callers, they are not exact quotas. A full queue or own
   `declare_queues!`, so the two processes read their placements from one place.
 
 The web process also adjudicates expired leases on its retention tick, as a fallback for a queue
-whose consumers are all gone. That tick runs every `cleanup_interval_hours` (24 by default), so a
-deployment that relies on it should shorten the interval.
+whose consumers are all gone. It looks only at the queues its own runtime declares external, so
+two apps sharing a store, or an old web process during a deploy that adds a queue, never fail each
+other's runs. That tick runs every `cleanup_interval_hours` (24 by default), so a deployment that
+relies on it should shorten the interval.
 
 ### Running A Consumer
 

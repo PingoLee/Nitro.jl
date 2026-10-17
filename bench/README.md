@@ -24,7 +24,7 @@ bench/
 │   ├── httpparse.jl    # HTTP.jl's request-head parse on the connection task
 │   ├── holds.jl        # how long one large JSON / multipart / file call holds its thread (#588)
 │   └── passwords.jl    # one check_password at the default pbkdf2 and bcrypt costs (#587)
-├── socket/             # real-socket load: server.jl (Nitro vs bare HTTP.jl), run.sh, contention.sh, stall.sh (oha)
+├── socket/             # real-socket load: server.jl (Nitro vs bare HTTP.jl), run.sh, contention.sh, stall.sh, wake.sh (oha)
 │   └── go/             # the Go net/http reference server run.sh's `go` mode builds
 ├── tasks/              # Julia tasks vs goroutines, no HTTP: tasks.jl, go/, run.sh
 ├── results/            # JSON run outputs — gitignored (machine-specific)
@@ -112,6 +112,7 @@ JULIA="julia +1.12" bench/socket/run.sh              # another Julia, by juliaup
 bench/socket/contention.sh "8,1 6,2 8,0" 5 8s       # /health while the default pool is busy (#491)
 bench/socket/stall.sh "nitro nitro@8,0 go" 3 6s      # /plaintext while K handlers compute (#467)
 VARIANTS="login login_bcrypt" bench/socket/stall.sh "nitro go" 3 6s   # ... while K check a password (#587)
+bench/socket/wake.sh 3                               # does a parked handler wake while K yield? (#598)
 ```
 
 - `server.jl` serves `/plaintext`, `/json`, `/health`, `/cpu` and `/lag` in one of these `MODE`s:
@@ -181,9 +182,19 @@ VARIANTS="login login_bcrypt" bench/socket/stall.sh "nitro go" 3 6s   # ... whil
   `VARIANTS` runs the same work as `cpu` (in the handler), `cpu_yield` and `cpu_job` (a Workers
   queue, offered at the rate that would keep K busy and drained between passes); the `load_2xx`
   column is the share of those submissions the queue accepted. `login` and `login_bcrypt` keep K
-  password checks in flight instead, and start the servers with `LOGIN=1`. Modes are `nitro`,
+  password checks in flight instead, and start the servers with `LOGIN=1`; Nitro bounds those
+  checks itself since #587, and `PASSWORD_CONCURRENCY=0` in the environment turns the bound off
+  for an A/B. Modes are `nitro`,
   `nitro@N,M` and `go`, which runs `cpu` only. The latest table is in the deployment guide's *Handlers that
   compute*.
+- `wake.sh [rounds]` asks whether a handler parked on a `Timer` wakes while every default thread
+  runs a `yield()`ing handler: `LAG=1`'s probe is the parked task, K = 8 requests of `/cpu_yield`
+  (`SPIN_MS`, default 1500) the yielding ones, and `/lag`'s max is the answer, with and without
+  `/plaintext` traffic beside them. Each of `CONFIGS` is `<juliaup channel>/<PARK>/<GUARD>`
+  (`server.jl`'s two knobs): `event/0` is a server with no `Timer` of the bench's own, the shape
+  JuliaLang/julia#63882 stalls on 1.13.0-rc3..1.13.2 (#586). Since #598 `serve()` holds the guard
+  itself on those versions, so `event/0` there measures that guard; run it against an older
+  checkout's `src/` to see the stall.
 - `JULIA="julia +1.12"` runs the servers on another juliaup channel. Each Julia minor wants its
   own resolved manifest; `bench/Manifest-v1.12.toml` (gitignored) is the one 1.12 reads first, so
   copy `Manifest.toml` to it and `Pkg.resolve()` under 1.12 once.
@@ -269,6 +280,15 @@ What the second table says:
   every 1 ms no longer let a timer-woken task run: the heartbeat is about as late as with no
   yield at all. A 30-line repro without Nitro shows the same thing on 1.13.1 and 1.13.2, and not on 1.12.7
   or master. It is tracked in #586; the `:interactive` row is unaffected.
+- **That 1.13 row is a Julia bug, reported as
+  [JuliaLang/julia#63882](https://github.com/JuliaLang/julia/issues/63882).** It begins at
+  1.13.0-rc3, with the scheduler backports in JuliaLang/julia#62665 (rc2 does not stall), and it
+  needs the sleeper's own `Timer` to be the only live libuv handle in the process: any second live
+  `Timer`, even one that never fires, removes it. That is why `socket/server.jl`, which parks its
+  main task in `wait(Timer(typemax(Int32)))`, never showed it, and why `stall.sh` cannot be used to
+  look for it. `wake.sh` can: a Nitro server with no other timer stalled the same way on 1.13.2,
+  which is why `serve()` now holds such a guard on those versions (#598). Until a fixed 1.13.x
+  ships, compare this row only across versions, never as a property of `yield()`.
 
 ## juliac (compiled executable)
 

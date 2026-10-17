@@ -231,9 +231,12 @@ reads `claimed_by` off each `RunningTaskRef`, skips those runs **first**, and co
 into the SQL: like `zombie_min_age`'s filter, it runs in Julia so a skipped row is still counted.
 
 The web process runs `requeue_expired!` on its retention tick, in a `try` of its own between the
-periodic zombie sweep and retention, with its runtime's external policies
-(`_requeue_expired_tick!`). It is the fallback for a queue whose consumers are all gone, and a
-no-op on a runtime with no external queue. It is safe from any number of processes because every
+periodic zombie sweep and retention, with its runtime's external policies and
+`on_unknown_queue = :skip` (`_requeue_expired_tick!`). It is the fallback for a queue whose
+consumers are all gone, and a no-op on a runtime with no external queue. **It never adjudicates a
+queue its runtime does not declare**: that queue may belong to another app on the same store, or
+to a newer deploy, so failing its runs closed is the consumers' call (they keep the default
+`:fail`). It is safe from any number of processes because every
 outcome is fenced on the expiry, so it needs no bound the way the zombie sweep does.
 
 Since [#176](https://github.com/PingoLee/Nitro.jl/issues/176) that criterion is correct rather than

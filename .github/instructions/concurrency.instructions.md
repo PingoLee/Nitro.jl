@@ -116,14 +116,17 @@ lives in the code comment it names, and that comment is canonical.
   JuliaLang/julia#62665, and is reported as JuliaLang/julia#63882. **Any second live `Timer`
   removes it, even one that never fires.**
   - **Not affected:** the bounded queue, and new requests (#467's `cpu_yield` row did not move on
-    1.13.2). **Exposed:** an app with no live timer.
-  - **Who is protected:** Nitro's janitors keep a timer alive while they sleep: the session
-    pruner, `FixedRateLimiter`'s janitor and the Workers cleanup scheduler. An app that runs any
-    of them should not see this (read from the code, not tested with `serve()`).
-  - **The bench masks it:** `bench/socket/server.jl` waits on a `Timer` itself, so `stall.sh`
-    cannot show this.
-  - **Open question:** whether `serve()` should hold such a timer is #598. Drop this bullet once
-    a 1.13 release fixes it, and change the documents below with it.
+    1.13.2). **Exposed:** a process with no other live timer.
+  - **`serve()` holds the guard itself (#598).** On the versions `_needs_wake_guard`
+    (`src/context.jl`) names, `startserver` keeps one never-firing `Timer` in
+    `Service.wake_guard`, and `close(::Service)` releases it once nothing serves. Measured with
+    `bench/socket/wake.sh` on 1.13.2: a parked handler in a `serve()` with no other timer woke
+    1.48 s late without it, 10-23 ms with it. **Still exposed:** yielding loops while no server is
+    up. When a fixed 1.13.x ships, lower the gate's upper bound; once Nitro's floor passes the
+    last affected release, delete the guard and this bullet, and change the documents below
+    with it.
+  - **The bench masks it unless told not to:** `bench/socket/server.jl` parks on a `Timer` by
+    default, which is itself a guard; `wake.sh` runs it with `PARK=event`.
 - The measurements and the user-facing rule live in `docs/src/tutorial/deployment.md` (*Handlers
   that compute*) and `docs/src/tutorial/workers.md` (*CPU-Bound Jobs*); the `nitro-usage` skill
   carries the same rule for application code. Change all of them together, or none.
