@@ -24,9 +24,11 @@ bench/
 │   ├── httpparse.jl    # HTTP.jl's request-head parse on the connection task
 │   ├── holds.jl        # how long one large JSON / multipart / file call holds its thread (#588)
 │   ├── passwords.jl    # one check_password at the default pbkdf2 and bcrypt costs (#587)
-│   └── aggregate.jl    # the /aggregate kernel alone: sum, mean, groupby at N = 10^3..10^7 (#590)
-├── socket/             # real-socket load: server.jl (Nitro vs bare HTTP.jl), run.sh, contention.sh, stall.sh, wake.sh, quiet.sh (oha)
-│   └── go/             # the Go net/http reference server run.sh's `go` mode builds; `go test -bench Aggregate`
+│   └── aggregate.jl    # the /aggregate kernel alone, plain and yielding every 2 ms, at N = 10^3..10^7 (#590)
+├── socket/             # real-socket load: server.jl (Nitro vs bare HTTP.jl), run.sh, contention.sh, stall.sh, wake.sh,
+│   │                   #   slow_stream.sh, fairness.sh, quiet.sh (oha, curl, go/fairness)
+│   └── go/             # the Go net/http reference server run.sh's `go` mode builds; `go test -bench Aggregate`;
+│                       #   fairness/, the per-connection client fairness.sh drives
 ├── tasks/              # Julia tasks vs goroutines, no HTTP: tasks.jl, go/, run.sh
 ├── results/            # JSON run outputs — gitignored (machine-specific)
 └── .gitignore          # ignores results/, Manifest.toml and per-version Manifest-v*.toml
@@ -120,6 +122,8 @@ HOLDS=1 VARIANTS="route:/hold/multipart@bench/results/multipart-64mib.bin" \
 bench/socket/night2.sh                               # the #587/#588/#590 night run, unattended
 bench/socket/quiet.sh holds-1.12 bench/socket/stall.sh nitro 3 8s   # run a block only on a quiet box
 bench/socket/wake.sh 3                               # does a parked handler wake while K yield? (#598)
+bench/socket/slow_stream.sh 3 8s                     # /plaintext while K capped-rate clients stream (#588)
+bench/socket/fairness.sh "nitro bare_spawn go" 3 8s  # how evenly C connections are served (#590)
 ```
 
 - `server.jl` serves `/plaintext`, `/json`, `/health`, `/cpu` and `/lag` in one of these `MODE`s:
@@ -225,6 +229,15 @@ bench/socket/wake.sh 3                               # does a parked handler wak
   JuliaLang/julia#63882 stalls on 1.13.0-rc3..1.13.2 (#586). Since #598 `serve()` holds the guard
   itself on those versions, so `event/0` there measures that guard; run it against an older
   checkout's `src/` to see the stall.
+- `slow_stream.sh [rounds] [duration]` keeps K downloads of `TARGETS` (default `/hold/file_stream`
+  and `/hold/file`) in flight with curl, each capped at one of `RATES` bytes per second (`0` is
+  uncapped), while `/plaintext` is measured: whether a streamed body gives its thread up once the
+  client is slower than the server (#588). One server, `HOLDS=1`; `/gc` brackets each window.
+- `fairness.sh [modes] [rounds] [duration]` drives `go/fairness`, which keeps `CONNS` keep-alive
+  connections busy on `ROUTE`, one request at a time each, and reports requests completed per
+  connection (and Jain's index), every request's latency and each connection's longest wait: what
+  pooled percentiles cannot show, whether every connection waits a little or a few wait a lot
+  (#590). Modes are `nitro`, `bare_spawn` and `go`.
 - `quiet.sh <label> <command...>` runs one block only on a quiet box: it waits, for at most
   `QUIET_WAIT_S` (default 1800), until no julia, oha or go-server process is left and the 1-minute
   load is under `QUIET_LOAD` (default 0.5), then runs the command in a session of its own and
