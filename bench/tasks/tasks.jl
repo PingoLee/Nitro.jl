@@ -3,6 +3,10 @@
 # both to the same CPUs with the Julia default thread count equal to GOMAXPROCS.
 #
 #   julia --project=bench --threads=8,1 bench/tasks/tasks.jl [micro] [parked] [spin]
+#   VARIANT=B FAN_OUT_NS="1000 10000" julia --project=bench --threads=8,1 bench/tasks/tasks.jl micro
+#
+#   VARIANT  the multiqueue order (multiq_variant.jl, #618), applied before anything else runs
+#   FAN_OUT_NS  the fan-out sizes of `micro`, "1000" by default
 #
 #   micro   BenchmarkTools: spawn + wait one at a time (bench/suite/taskpattern.jl's
 #           `spawn_single`, the shape of Nitro's per-request spawn), a ping-pong round trip over
@@ -14,6 +18,7 @@
 #           pass has the spinners `yield()` about every millisecond.
 #
 # Every line is `kind <TAB> runtime <TAB> ...`, the format go/ prints, so run.sh can keep both.
+include(joinpath(@__DIR__, "multiq_variant.jl"))
 using BenchmarkTools
 
 @noinline _tiny_work() = length("pong")
@@ -27,8 +32,8 @@ end
 
 # ── micro ───────────────────────────────────────────────────────────────────────────────────
 
-const FAN_OUT_N = 1000
-const FAN_OUT_RESULTS = zeros(Int, FAN_OUT_N)
+const FAN_OUT_NS = parse.(Int, split(get(ENV, "FAN_OUT_NS", "1000")))
+const FAN_OUT_RESULTS = zeros(Int, maximum(FAN_OUT_NS))
 
 function fan_out(n::Int)
     @sync for j in 1:n
@@ -52,9 +57,11 @@ function micro()
     report("PingPong", @benchmark (put!($a, 1); take!($b)))
     close(a); wait(echo)
 
-    trial = @benchmark fan_out(FAN_OUT_N)
-    report("FanOut1000", trial)
-    report("FanOut1000", trial; per = FAN_OUT_N, unit = "task")
+    for n in FAN_OUT_NS
+        trial = @benchmark fan_out($n)
+        report("FanOut$n", trial)
+        report("FanOut$n", trial; per = n, unit = "task")
+    end
 end
 
 # ── parked ──────────────────────────────────────────────────────────────────────────────────
