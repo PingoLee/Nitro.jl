@@ -395,10 +395,12 @@ DELETE /api/products  →  405, Allow: GET, HEAD, POST
 
   Every request they answer gets a copy of the value, static mounts included, so the value
   itself is never changed. Nitro adds `Allow` to the `405`'s copy, and if your `405` already
-  sets `Allow`, Nitro leaves it alone. Use a buffered body, as `Res.json` and `Res.send` build:
-  the copies share it. A path outside `serve(prefix = …)` still gets the prefix layer's own
-  `404`. These are fixed values, not handlers, which keeps `App` compilable with
-  `juliac --trim`. To vary a miss per request, wrap the app in a middleware that checks
+  sets `Allow`, Nitro leaves it alone. The copies share the body, so it must be one that can be
+  sent any number of times: none (`HTTP.Response(404)`), a `String` or a `Vector{UInt8}`, which
+  is what `Res.json` and `Res.send` build. Anything else, a streaming or cursor body such as
+  `HTTP.BytesBody` included, is refused with an `ArgumentError` when the `App` is built. A path
+  outside `serve(prefix = …)` still gets the prefix layer's own `404`. These are fixed values,
+  not handlers, which keeps `App` compilable with `juliac --trim`. To vary a miss per request, wrap the app in a middleware that checks
   `route_missed(req)` on the response's way out.
 
 ## Modular Route Inclusion with `include_routes`

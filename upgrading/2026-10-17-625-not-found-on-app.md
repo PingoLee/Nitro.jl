@@ -17,8 +17,10 @@ it abstract too, which is what blocked compiling an app with `juliac --trim`
 |---|---|
 | `App(service = Service(router = HTTP.Router(my404)))` | `App(not_found = Res.json(…; status = 404))` |
 | `App(service = Service(router = HTTP.Router(my404, my405)))` | `App(not_found = …, method_not_allowed = …)` |
-| `my404`/`my405` are **functions** of the request | **fixed `HTTP.Response` values**: every request they answer gets a copy, which shares the value's body, so use a buffered one (`Res.json`, `Res.send`) |
-| `my405` could return a non-`Response` (a `Dict` for the serializer) | a value is always an `HTTP.Response` |
+| `my404`/`my405` are **functions** of the request | **fixed `HTTP.Response` values**: every request they answer gets a copy, which shares the value's body |
+| any body the handler built | the body is none (`HTTP.Response(404)`), a `String` or a `Vector{UInt8}` (what `Res.json` and `Res.send` build); another string or byte vector is copied into one |
+| a streaming or cursor body (`HTTP.BytesBody`) | `ArgumentError` at `App` construction, naming the keyword: only the first miss could have sent it |
+| `my405` could return a non-`Response` (a `Dict` for the serializer) | a value is always an `HTTP.Response`; `nothing`, a `Dict` or anything else is the same `ArgumentError` |
 | HTTP.jl router-level middleware, `HTTP.Router(_, _, mw)` | gone: a `Service` accepts only Nitro's own router |
 | `Service(router = <any other HTTP.Router>)` | `MethodError` at construction |
 

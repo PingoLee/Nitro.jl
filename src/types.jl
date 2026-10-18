@@ -39,13 +39,55 @@ _nitro_405(::HTTP.Request) = HTTP.Response(405)
 const NitroRouter = HTTP.Router{typeof(_nitro_404), typeof(_nitro_405), Nothing}
 nitro_router()::NitroRouter = HTTP.Router(_nitro_404, _nitro_405, nothing)
 
+# What `App(not_found = …, method_not_allowed = …)` holds. `HTTP.Response{B}` is a `UnionAll` over
+# its body type, so a field typed `HTTP.Response` was abstract, and it admitted a single-use body.
+# These are the three bodies HTTP.jl keeps as given and calls stateless, safe to send any number of
+# times (`_response_body_arg`, HTTP.jl 2.9 src/http_core.jl, JuliaWeb/HTTP.jl#1333). Every miss
+# answers with a copy that SHARES the body (`_miss_response`), so a cursor body such as
+# `HTTP.BytesBody`, or a streaming one, would be drained by the first miss and every later one
+# would send nothing against the stored `content_length`. A three-member union is split by
+# inference, so the miss path stays resolvable (docs/design/juliac-trim.md §3.1).
+const MissResponse = Union{HTTP.Response{HTTP.EmptyBody}, HTTP.Response{String},
+                           HTTP.Response{Vector{UInt8}}}
+
+"""
+    miss_response(keyword::Symbol, value) -> MissResponse
+
+`value` as a `MissResponse`: as it is when it already is one, with its body copied into a
+`String` or `Vector{UInt8}` when that body is another string or byte vector (a `SubString`, a
+`view`), both stateless. Anything else throws an `ArgumentError` naming `keyword`: a cursor or
+streaming body is refused rather than read into bytes, because buffering it here would hide which
+body the application meant to send.
+"""
+function miss_response(keyword::Symbol, @nospecialize(value))::MissResponse
+    value isa MissResponse && return value
+    if value isa HTTP.Response
+        body = value.body
+        body isa AbstractString && return _with_miss_body(value, String(body))
+        body isa AbstractVector{UInt8} && return _with_miss_body(value, Vector{UInt8}(body))
+    end
+    throw(ArgumentError(
+        "`App($keyword = …)` must be an `HTTP.Response` with a resendable body: `HTTP.EmptyBody` " *
+        "(`HTTP.Response(404)`), a `String` or a `Vector{UInt8}`, which is what `Res.json` and " *
+        "`Res.send` build. Got a `$(typeof(value))`. A cursor or streaming body such as " *
+        "`HTTP.BytesBody` is refused: every miss shares it, so only the first would send it."))
+end
+
+# `content_length` is the new body's own byte count, so the stored length can never disagree with
+# what every miss sends.
+_with_miss_body(res::HTTP.Response, body::Union{String, Vector{UInt8}}) = HTTP.Response{typeof(body)}(
+    res.status, res.reason, copy(res.headers), copy(res.trailers), body, Int64(sizeof(body)),
+    res.proto_major, res.proto_minor, res.close, res.request, res.request_url,
+    res.previous, res.redirect_count,
+)
+
 # The two fixed miss answers `App(not_found = …, method_not_allowed = …)` configures, carried
 # together to the sites that serve them: the pipeline's innermost layer (src/core/pipeline.jl),
 # the static mounts (src/core/staticfiles.jl) and `RetiredHeadHandler`. Built once per site, never
 # per request.
 struct MissResponses
-    not_found          :: HTTP.Response
-    method_not_allowed :: HTTP.Response
+    not_found          :: MissResponse
+    method_not_allowed :: MissResponse
 end
 
 abstract type Extractor{T} end

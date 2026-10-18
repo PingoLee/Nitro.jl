@@ -1062,6 +1062,43 @@ end
     @test isempty(text(r))
     @test allow(r) == "GET, HEAD"
 end
+
+@testset "the miss values hold only resendable bodies, and the fields say so (#625)" begin
+    MissResponse = Nitro.Core.Types.MissResponse
+    # A small Union of concrete types, never the `HTTP.Response` UnionAll: the miss path must stay
+    # resolvable for `juliac --trim`.
+    @test fieldtype(App, :not_found) === MissResponse
+    @test fieldtype(App, :method_not_allowed) === MissResponse
+    @test fieldtype(Nitro.Core.Types.MissResponses, :not_found) === MissResponse
+    @test fieldtype(Nitro.Core.Types.MissResponses, :method_not_allowed) === MissResponse
+    @test all(isconcretetype, Base.uniontypes(MissResponse))
+
+    # A cursor body is drained by the first miss that shares it, so it is refused, not buffered.
+    # The rest are not responses at all; each refusal names the keyword it came through.
+    refused = (HTTP.Response(404, HTTP.BytesBody(Vector{UInt8}("gone"))), nothing,
+               Dict("error" => "not found"))
+    for value in refused, keyword in (:not_found, :method_not_allowed)
+        err = try
+            App(; keyword => value)
+            nothing
+        catch e
+            e
+        end
+        @test err isa ArgumentError
+        @test occursin("App($keyword = …)", err.msg)
+        @test occursin("Vector{UInt8}", err.msg)
+    end
+
+    # The buffered kinds are kept as they are; another string or byte vector is copied into one.
+    nf = Res.send(Vector{UInt8}("bytes 404"); status = 404)
+    @test App(not_found = nf).not_found === nf
+    viewed = HTTP.Response(404, view(Vector{UInt8}("xx view 404"), 4:11))
+    ctx = App(not_found = viewed)
+    @test ctx.not_found isa HTTP.Response{Vector{UInt8}}
+    @test ctx.not_found.content_length == 8
+    urlpatterns(ctx, "", path("/c", ok))
+    @test text(send(ctx, "GET", "/nowhere")) == "view 404"
+end
 end
 
 @testitem "A custom not_found/method_not_allowed on the wire is never handed to HTTP.jl itself (#625)" tags=[:core, :network] setup=[NitroCommon] begin
@@ -1075,9 +1112,14 @@ import Nitro: App
 # serving the value itself would leave the last missed request reachable from the next miss and
 # could leave `close` set for good. Each miss therefore gets a copy; the values must come out of
 # any number of misses exactly as they went in. Only a real socket goes through the transport.
+# One of each buffered body kind: every miss shares the body, so each must still send all of it
+# the second time round, against the same Content-Length, or the keep-alive connection desyncs.
 nf  = Res.json(Dict("error" => "not found"); status = 404)
-mna = Res.send("custom 405"; status = 405)
+mna = Res.send(Vector{UInt8}("custom 405"); status = 405)
+@test nf isa HTTP.Response{String}
+@test mna isa HTTP.Response{Vector{UInt8}}
 ctx = App(not_found = nf, method_not_allowed = mna)
+@test ctx.not_found === nf && ctx.method_not_allowed === mna
 Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
     path("/only-get", (req::HTTP.Request) -> Res.send("ok")),
 ])
@@ -1096,12 +1138,15 @@ mktempdir() do dir
                          headers = ["Authorization" => "Bearer secret-token"])
             @test r.status == 404
             @test String(r.body) == """{"error":"not found"}"""
+            @test HTTP.header(r, "Content-Length") == string(sizeof(nf.body))
             r = HTTP.get(url("/files/nope.txt"); status_exception = false)
             @test r.status == 404
             @test String(r.body) == """{"error":"not found"}"""
+            @test HTTP.header(r, "Content-Length") == string(sizeof(nf.body))
             r = HTTP.post(url("/only-get"); status_exception = false)
             @test r.status == 405
             @test String(r.body) == "custom 405"
+            @test HTTP.header(r, "Content-Length") == string(sizeof(mna.body))
             @test HTTP.header(r, "Allow") == "GET, HEAD"
             r = HTTP.request("HEAD", url("/nowhere"); status_exception = false)
             @test r.status == 404

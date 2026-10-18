@@ -62,8 +62,11 @@ After, there are none: `router_entry` is
 `compose`'s closure. What the verifier still rejects there is `reduce(|>, [ … ])` itself, over
 vectors whose types are `Union{Vector{X}, Vector{Any}}` depending on the runtime flags. That is
 §3.2's first bullet. Because the verifier stops at that first dynamic call, it has not looked
-past the fold yet. The miss path #625 rewired (for example `add_response_headers` on an
-`HTTP.Response` whose body type is not known) may show up as new errors once §3.2 lands.
+past the fold yet. The miss path #625 rewired should not be one of the errors that appear once
+§3.2 lands: the miss values are `MissResponse`, a union of three concrete `HTTP.Response{B}`
+(no body, `String`, `Vector{UInt8}`), which inference splits: on Julia 1.12, `Base.return_types` gives
+`_miss_response`, `add_response_headers` and `_method_not_allowed` that same three-member union
+as their return type. The verifier itself has not checked it, because it stops at the fold.
 
 | Where | What | Kind |
 |---|---|---|
@@ -135,7 +138,9 @@ and costs 2.4 ns. The same finding rules FunctionWrappers.jl out for §3.2 and �
   registration refusal.
 - The custom 404/405 are `App(not_found = …, method_not_allowed = …)`. They are fixed
   `HTTP.Response` values, carried as `MissResponses` to the pipeline's miss path, the static
-  mounts and `RetiredHeadHandler`. A custom 405 still gets `Allow` on a copy.
+  mounts and `RetiredHeadHandler`. A custom 405 still gets `Allow` on a copy. Both are typed
+  `MissResponse` (`src/types.jl`), the three body types HTTP.jl keeps as given and can resend,
+  not the `HTTP.Response` UnionAll; `App` refuses any other body at construction.
 - `RouteResolution.router` is concrete as well.
 
 ### 3.2 The fold and the route boundary (#572, after §3.1)

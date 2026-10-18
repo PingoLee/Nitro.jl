@@ -178,8 +178,8 @@ end
 # `_reject_oversized_body!` in src/core/transport.jl). Served as-is, one slow client would leave `close` set on every later
 # miss, and `.request` would keep the last missed request, credentials included, reachable from the
 # next one. HTTP.jl's `default404` built a fresh response per miss, so the copy costs what it did.
-# The body is shared, which is why `App` asks for a buffered one.
-_miss_response(res::HTTP.Response) = Util._rebuild_with_headers(res, copy(res.headers))
+# The body is shared, which is why `App` holds only the resendable ones (`Types.MissResponse`).
+_miss_response(res::Types.MissResponse) = Util._rebuild_with_headers(res, copy(res.headers))
 
 # `gethandler` found no leaf: `nothing` is a miss, `missing` a method mismatch. See
 # `_route_unresolved` for why a `nothing` can still be a 405.
