@@ -2,11 +2,12 @@ module AppContext
 import Base: @kwdef, wait, close, isopen
 import Base.Threads: ReentrantLock
 using HTTP
-using HTTP: Server, Router
+using HTTP: Server
 using ..Types
 # Unexported from `Types` on purpose: `CopyOnWriteDict` is internal plumbing for `compose`,
 # so it is named explicitly here rather than widened onto `Core`'s reexport surface.
-using ..Types: CopyOnWriteDict, RouteMiddleware, NamedRoute
+using ..Types: CopyOnWriteDict, RouteMiddleware, NamedRoute, NitroRouter, nitro_router,
+    MissResponse, miss_response
 using ..Constants: SHUTDOWN_TIMEOUT_SECONDS, DEFAULT_MAX_FIELDS, AbstractApp
 
 export App, EagerReviseService, Service, wait, close, isopen
@@ -74,7 +75,10 @@ end
 # `x[]`/`x[] = v` call site are unchanged.
 @kwdef struct Service
     server              :: Base.RefValue{Nullable{Server}} = Ref{Nullable{Server}}(nothing)
-    router              :: Router                   = Router()
+    # Concrete, so every pipeline closure that captures it is too (#625). It is not a
+    # customization point: a router of another type does not convert. The custom 404/405 live on
+    # `App`; see `NitroRouter` (src/types.jl).
+    router              :: NitroRouter              = nitro_router()
     custommiddleware    :: CopyOnWriteDict{RouteMiddleware} = CopyOnWriteDict{RouteMiddleware}()
     named_routes        :: Dict{String, NamedRoute} = Dict{String, NamedRoute}()
     external_url        :: Base.RefValue{Nullable{String}} = Ref{Nullable{String}}(nothing)
@@ -137,7 +141,7 @@ end
 end
 
 """
-    App(; mod = nothing) -> App
+    App(; mod = nothing, not_found = HTTP.Response(404), method_not_allowed = HTTP.Response(405)) -> App
 
 A Nitro application: its own router, middleware, cookie config, lifecycle hooks and app
 context. Several can coexist in one process, each serving independently.
@@ -163,6 +167,25 @@ otherwise have to mutate that global.
   can be correct, because a `@__MODULE__` *default* would expand where `App` is defined (inside
   Nitro) rather than where it is called. Only `revise` reads this; leaving it `nothing` is fine
   for everything else and `serve` says so if you ask for `revise` without it.
+- `not_found = HTTP.Response(404)`: the response to a request no route matches, static mounts
+  included. A path outside `serve(prefix = …)` is the exception: the prefix layer answers it
+  with its own `404` before routing.
+- `method_not_allowed = HTTP.Response(405)`: the response to a request whose path is served under
+  other methods only. Nitro adds an `Allow` header listing those methods unless the response
+  already carries one.
+
+  Both are **fixed values**: every request they answer gets a copy, so the value itself is
+  never changed (`Allow` goes on the copy). The copies share the body, so it must be one that
+  can be sent any number of times: **no body** (`HTTP.Response(404)`), a **`String`** or a
+  **`Vector{UInt8}`**, which is what `Res.json(…; status = 404)` and `Res.send(…; status = 404)`
+  build. Another string or byte vector (a `SubString`, a `view`) is copied into one of those. A
+  `Vector{UInt8}` body is kept as given, so do not resize or overwrite it afterwards.
+  Anything else throws an `ArgumentError` naming the keyword, including a cursor or streaming
+  body such as `HTTP.BytesBody`, which only the first miss could send; it is refused, not read
+  into bytes. They are values rather than handlers, and of those three body types only, so that
+  `App` stays concretely typed, which `juliac --trim` needs (docs/design/juliac-trim.md §3.1). To
+  vary a miss per request, use a middleware that checks `route_missed(req)` on the response's
+  way out.
 
 The remaining fields are internal: `service` holds the router and per-server state, and
 `app_context` carries the payload passed to `serve(context = ...)` — read that through
@@ -173,6 +196,16 @@ removed.
     service :: Service          = Service()
     mod     :: Nullable{Module} = nothing
     app_context :: Ref{Any}     = Ref{Any}(missing) # This stores a reference to an Context{T} object
+    # Only the three resendable body types (`Types.MissResponse`); the constructor below converts
+    # or refuses anything else. Served through `_miss_response` (src/core/pipeline.jl), never
+    # as-is (#625).
+    not_found          :: MissResponse = HTTP.Response(404)
+    method_not_allowed :: MissResponse = HTTP.Response(405)
+
+    function App(service, mod, app_context, not_found, method_not_allowed)
+        return new(service, mod, app_context, miss_response(:not_found, not_found),
+                   miss_response(:method_not_allowed, method_not_allowed))
+    end
 end
 
 # SECURITY: `App` is public now, so it lands in REPL auto-display, `@show`, and interpolated

@@ -20,6 +20,9 @@ import Sockets
 #   • src/core/pipeline.jl — `_allowed_methods` walks the router's route tree to build a 405's
 #       `Allow` header (#281): `Router.routes`, the `Node`/`Leaf`/`Variable` fields, `match`,
 #       `_route_variable_matches` and `_router_request_path`.
+#   • src/types.jl — `NitroRouter` (#625) names the concrete router type as
+#       `Router{typeof(_404), typeof(_405), typeof(middleware)}`, which depends on `Router{T,S,F}`'s
+#       parameter order matching its positional constructor `Router(_404, _405, middleware)`.
 #   • src/routerhof.jl — `_gethandler` resolves an exact route without upstream's `split` and
 #       `Params()` (#445): `Node.exact`, `Node.segment`, `Params`, and `match` on an exhausted
 #       segment list.
@@ -118,6 +121,13 @@ end
     @test :context        in flds
     # Read by `_http_stream_request` as the declared body length: -1 chunked, 0 none, >0 fixed.
     @test :content_length in flds
+end
+
+@testset "`NitroRouter` is still the type `Router(_404, _405, nothing)` builds (#625)" begin
+    T = Nitro.Types
+    @test HTTP.Router(T._nitro_404, T._nitro_405, nothing) isa T.NitroRouter
+    @test isconcretetype(T.NitroRouter)
+    @test T.nitro_router().middleware === nothing
 end
 
 @testset "the route tree `_allowed_methods` walks is still shaped the same (#281)" begin

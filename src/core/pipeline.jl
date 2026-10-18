@@ -47,7 +47,7 @@ Bound by `_app_context_seed` for the request's whole dynamic extent; see
 serving_app()::Nullable{App} = Constants.REQUEST_SCOPE[].app
 
 """
-    _dispatch_resolved(r, req) -> response
+    _dispatch_resolved(r, misses, req) -> response
 
 The pipeline's innermost layer: dispatch `req` to its handler, reusing the lookup `compose`
 already did when there is one (#80).
@@ -81,12 +81,11 @@ The guard is `(router, method, target)` — every input `gethandler` reads — a
   leaf may run under the chain that already ran (#291). This used to take the fallback above,
   which ran the new leaf's handler without its guards.
 
-`r` is deliberately untyped: `Service.router` is declared as the unparameterized `Router`, and
-the caller `let`-binds it to keep that dynamic dispatch out of the request path. It doubles as
-the identity the stash is checked against, so this function needs nothing else to know which
-application it belongs to.
+`r` doubles as the identity the stash is checked against, so this function needs nothing else
+to know which application it belongs to. `misses` is that application's `not_found` and
+`method_not_allowed` (#625), which a miss on either path below answers with.
 """
-function _dispatch_resolved(r, req::HTTP.Request)
+function _dispatch_resolved(r::HTTP.Router, misses::Types.MissResponses, req::HTTP.Request)
     res = get(req.context, Types.ROUTE_RESOLUTION_KEY, nothing)
     if res isa Types.RouteResolution && res.router === r
         if res.method === req.method && res.target === req.target
@@ -94,13 +93,13 @@ function _dispatch_resolved(r, req::HTTP.Request)
             isempty(res.params) || (req.context[:params] = res.params)
             return res.handler(req)
         end
-        return _route_rerouted(r, req, res)
+        return _route_rerouted(r, misses, req, res)
     end
-    return _route_unresolved(r, req)
+    return _route_unresolved(r, misses, req)
 end
 
 """
-    _route_rerouted(r, req, res) -> response
+    _route_rerouted(r, misses, req, res) -> response
 
 The terminal for a request that router- or route-level middleware rewrote (`req.method` or
 `req.target`) after `compose` chose its chain from `res` (#291).
@@ -131,9 +130,10 @@ why. The log names both routes by their **patterns** and their **declared** meth
 `req.target`, which can carry a query string (access logging redacts those by default), and not
 a client-chosen method token, which a `"*"` leaf accepts verbatim.
 """
-function _route_rerouted(r::HTTP.Router, req::HTTP.Request, res::Types.RouteResolution)
+function _route_rerouted(r::HTTP.Router, misses::Types.MissResponses, req::HTTP.Request,
+                         res::Types.RouteResolution)
     handler, route, params = RouterHOF._gethandler(r, req)
-    (handler === nothing || handler === missing) && return _route_miss(r, req, handler)
+    (handler === nothing || handler === missing) && return _route_miss(r, misses, req, handler)
 
     ran = get(res.table, RouterHOF.genkey(res.mw_method, res.route), Types.NO_ROUTE_MIDDLEWARE)
     mw_method = handler isa Types.DeclaredMethodHandler ? handler.method : req.method
@@ -145,10 +145,11 @@ function _route_rerouted(r::HTTP.Router, req::HTTP.Request, res::Types.RouteReso
 end
 
 """
-    _route_unresolved(r, req) -> response
+    _route_unresolved(r, misses, req) -> response
 
 `(r::Router)(req)` (HTTP.jl `http_handlers.jl`), except that the lookup is
-[`RouterHOF._gethandler`](@ref), which skips upstream's allocations on an exact route (#445), and
+[`RouterHOF._gethandler`](@ref), which skips upstream's allocations on an exact route (#445), that
+a miss is answered with the app's `misses` rather than the router's own `_404`/`_405` (#625), and
 for how it answers a method mismatch (#281):
 
 - **A `405` carries `Allow`**, which RFC 9110 §15.5.6 requires. HTTP.jl's `default405` sends a
@@ -163,25 +164,34 @@ for how it answers a method mismatch (#281):
 
 The matched branch keeps upstream's order (`:route`, `:params` only when non-empty, then the
 handler) for the reason `_dispatch_resolved`'s fast branch gives.
-
-`r` is typed here, unlike in `_dispatch_resolved`: this is the function barrier that gives the
-lookup a concrete `Router`.
 """
-function _route_unresolved(r::HTTP.Router, req::HTTP.Request)
+function _route_unresolved(r::HTTP.Router, misses::Types.MissResponses, req::HTTP.Request)
     handler, route, params = RouterHOF._gethandler(r, req)
-    (handler === nothing || handler === missing) && return _route_miss(r, req, handler)
+    (handler === nothing || handler === missing) && return _route_miss(r, misses, req, handler)
     return _route_call(req, handler, route, params)
 end
 
+# A copy of one of the app's miss values, which is what a miss is answered with (#625). The value
+# itself is shared by every request it answers, and the transport hands the response it gets to
+# HTTP.jl, which writes to that object in place: `resp.request = req`, then `.close` on a failed
+# write, an undrained body or a write-deadline expiry (see the note above
+# `_reject_oversized_body!` in src/core/transport.jl). Served as-is, one slow client would leave `close` set on every later
+# miss, and `.request` would keep the last missed request, credentials included, reachable from the
+# next one. HTTP.jl's `default404` built a fresh response per miss, so the copy costs what it did.
+# The body is shared, which is why `App` holds only the resendable ones (`Types.MissResponse`).
+_miss_response(res::Types.MissResponse) = Util._rebuild_with_headers(res, copy(res.headers))
+
 # `gethandler` found no leaf: `nothing` is a miss, `missing` a method mismatch. See
 # `_route_unresolved` for why a `nothing` can still be a 405.
-function _route_miss(r::HTTP.Router, req::HTTP.Request, handler::Union{Nothing,Missing})
+function _route_miss(r::HTTP.Router, misses::Types.MissResponses, req::HTTP.Request,
+                     handler::Union{Nothing,Missing})
     _mark_route_miss!(req)   # what `route_missed` reads (#401)
     if handler === nothing
         allowed = _allowed_methods(r, req.target)
-        return isempty(allowed) ? r._404(req) : _method_not_allowed(r, req, allowed)
+        return isempty(allowed) ? _miss_response(misses.not_found) :
+                                  _method_not_allowed(r, misses, req, allowed)
     end
-    return _method_not_allowed(r, req)
+    return _method_not_allowed(r, misses, req)
 end
 
 # `(r::Router)(req)`'s matched branch: `:route`, `:params` only when non-empty, then the handler.
@@ -192,22 +202,20 @@ function _route_call(req::HTTP.Request, handler, route, params)
 end
 
 """
-    _method_not_allowed(r, req[, allowed]) -> response
+    _method_not_allowed(r, misses, req[, allowed]) -> response
 
-The router's own `_405`, plus an `Allow` header listing what `req.target` does answer (#281).
-`allowed` is that list when the caller already walked the tree for it; otherwise it is computed
-here, and only if the header is actually added.
+The app's `method_not_allowed` response, plus an `Allow` header listing what `req.target` does
+answer (#281). `allowed` is that list when the caller already walked the tree for it; otherwise
+it is computed here, and only if the header is actually added.
 
-A custom `_405` (`Service(router = Router(my404, my405))`) still decides the response. `Allow` is
-added to it only when it returned an `HTTP.Response` with no `Allow` of its own, and it is added
-by building a new response, since a handler's response may be a shared `const` (nitro-core §4).
-Anything else it returns (a `Dict` for the serializer, say) is passed through untouched.
+A custom one (`App(method_not_allowed = …)`, #625) still decides the response. `Allow` is added
+only when it carries no `Allow` of its own, and it is added by building a new response: the
+value is shared by every request it answers (nitro-core §4).
 """
-function _method_not_allowed(r::HTTP.Router, req::HTTP.Request,
+function _method_not_allowed(r::HTTP.Router, misses::Types.MissResponses, req::HTTP.Request,
                              allowed::Nullable{Vector{String}} = nothing)
-    res = r._405(req)
-    res isa HTTP.Response || return res
-    HTTP.hasheader(res, "Allow") && return res
+    res = misses.method_not_allowed
+    HTTP.hasheader(res, "Allow") && return _miss_response(res)
     list = allowed === nothing ? _allowed_methods(r, req.target) : allowed
     return add_response_headers(res, "Allow" => join(list, ", "))
 end
@@ -328,12 +336,14 @@ function setupmiddleware(ctx::App; middleware::Vector=[], serialize::Bool=true, 
     # installed it receives the accumulator directly, so without this adapter every
     # `serialize=false` app would fail at pipeline-construction time, before any request.
     #
-    # `let`-bound rather than closing over `ctx`: `Service.router` is declared as the
-    # unparameterized `Router` (an abstract UnionAll), so reading it per request would put a
-    # dynamic dispatch at the innermost layer of every request. `Service` is immutable, so the
-    # value is fixed at construction and hoisting it out is free.
-    router_entry = let r = ctx.service.router
-        (req::HTTP.Request) -> _dispatch_resolved(r, req)
+    # `let`-bound rather than closing over `ctx`: the router and the miss responses are fixed at
+    # construction (`Service` and `App` are immutable), so one closure over both values saves a
+    # field-load chain per request. `Service.router` is the concrete `NitroRouter`, so this
+    # closure's type is concrete too (#625). Under the old `HTTP.Router` field it was abstract,
+    # and so was every closure that captured it. Typing the fold below is #572's job.
+    router_entry = let r = ctx.service.router,
+                       misses = Types.MissResponses(ctx.not_found, ctx.method_not_allowed)
+        (req::HTTP.Request) -> _dispatch_resolved(r, misses, req)
     end
 
     return reduce(|>, [

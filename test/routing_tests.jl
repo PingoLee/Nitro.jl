@@ -837,13 +837,16 @@ end
     @test internalrequest(ctx, HTTP.Request("PUT", "/any")).status == 298
 end
 
-@testset "a router with HTTP.jl-level middleware gets no auto-HEAD" begin
-    # `register!` wraps the handler in the router's own middleware, so the leaf could no longer
-    # be told apart from an explicit HEAD, and would lose the GET route's guards. A 405 is safe.
-    ctx = App(service = Service(router = HTTP.Router(HTTP.Handlers.default404, HTTP.Handlers.default405, h -> (req -> h(req)))))
-    urlpatterns(ctx, "", path("/g", seen_method; middleware = [deny]))
-    @test leaf(ctx, "HEAD", "/g") === missing
-    @test head(ctx, "/g").status == 405
+@testset "a router other than Nitro's own does not fit in a Service (#625)" begin
+    # HTTP.jl-level middleware used to need its own handling here: `register!` wrapped every leaf
+    # in it, which hid the auto-HEAD's `DeclaredMethodHandler` and with it the GET route's guards.
+    # A `Service` now holds only the concrete `NitroRouter`, which carries none, so such a router
+    # cannot be registered on at all.
+    @test_throws MethodError Service(router = HTTP.Router(HTTP.Handlers.default404,
+                                                          HTTP.Handlers.default405, h -> (req -> h(req))))
+    @test_throws MethodError Service(router = HTTP.Router())
+    @test Service().router isa Nitro.Types.NitroRouter
+    @test isconcretetype(fieldtype(Service, :router))
 end
 
 @testset "route middleware on the GET route gates its HEAD" begin
@@ -997,23 +1000,166 @@ end
     end
 end
 
-@testset "a custom _405 gets Allow unless it set its own, and is never mutated" begin
-    shared = HTTP.Response(405)
-    ctx = App(service = Service(router = HTTP.Router(HTTP.Handlers.default404, req -> shared)))
+@testset "a custom method_not_allowed gets Allow unless it set its own, and is never mutated" begin
+    shared = HTTP.Response(405, "custom 405")
+    ctx = App(method_not_allowed = shared)
     urlpatterns(ctx, "", path("/c", ok))
-    r = send(ctx, "POST", "/c")
-    @test r.status == 405
-    @test allow(r) == "GET, HEAD"
-    # A new response, not the router's own object with a header appended.
-    @test r !== shared
+    # Twice: the value answers every 405, so the second must look exactly like the first.
+    for _ in 1:2
+        r = send(ctx, "POST", "/c")
+        @test r.status == 405
+        @test text(r) == "custom 405"
+        @test allow(r) == "GET, HEAD"
+        # A new response, not the app's own object with a header appended.
+        @test r !== shared
+    end
     @test !HTTP.hasheader(shared, "Allow")
 
-    ctx = App(service = Service(router = HTTP.Router(HTTP.Handlers.default404,
-        req -> HTTP.Response(418, ["Allow" => "BREW"]))))
+    own_allow = HTTP.Response(418, ["Allow" => "BREW"])
+    ctx = App(method_not_allowed = own_allow)
     urlpatterns(ctx, "", path("/c", ok))
     r = send(ctx, "POST", "/c")
     @test r.status == 418
     @test [v for (k, v) in r.headers if k == "Allow"] == ["BREW"]
+    # Kept as it is, but still a copy: the value itself is never handed out.
+    @test r !== own_allow
+end
+
+@testset "a retired auto-HEAD answers with the app's own method_not_allowed" begin
+    ctx = App(method_not_allowed = HTTP.Response(405, "custom 405"))
+    urlpatterns(ctx, "", path("/swap", ok))
+    urlpatterns(ctx, "", path("/swap", (stream::HTTP.Stream) -> nothing; method = "STREAM"))
+    @test leaf(ctx, "HEAD", "/swap") isa RetiredHeadHandler
+    r = send(ctx, "HEAD", "/swap")
+    @test r.status == 405
+    @test text(r) == "custom 405"
+    @test allow(r) == "GET, POST"
+end
+
+@testset "a custom not_found answers every true miss, and the defaults are bare (#625)" begin
+    shared = HTTP.Response(404, "custom 404")
+    ctx = App(not_found = shared)
+    urlpatterns(ctx, "", path("/users/<str:name>/posts", ok_name; middleware = [passthrough]))
+    # Both pipeline paths: a target `compose` resolves (a miss under per-route middleware) and
+    # one it does not reach a leaf for at all.
+    for target in ("/nowhere", "/users/x", "/users/x/posts/extra")
+        r = send(ctx, "GET", target)
+        @test r.status == 404
+        @test text(r) == "custom 404"
+        @test !HTTP.hasheader(r, "Allow")
+        # A copy per miss, never the value itself (see `_miss_response`).
+        @test r !== shared
+    end
+    @test isempty(shared.headers)
+
+    # The defaults are what the router used to answer: a bare 404 and a 405 with Allow only.
+    ctx = App()
+    urlpatterns(ctx, "", path("/c", ok))
+    @test send(ctx, "GET", "/nowhere").status == 404
+    @test isempty(text(send(ctx, "GET", "/nowhere")))
+    r = send(ctx, "POST", "/c")
+    @test r.status == 405
+    @test isempty(text(r))
+    @test allow(r) == "GET, HEAD"
+end
+
+@testset "the miss values hold only resendable bodies, and the fields say so (#625)" begin
+    MissResponse = Nitro.Core.Types.MissResponse
+    # A small Union of concrete types, never the `HTTP.Response` UnionAll: the miss path must stay
+    # resolvable for `juliac --trim`.
+    @test fieldtype(App, :not_found) === MissResponse
+    @test fieldtype(App, :method_not_allowed) === MissResponse
+    @test fieldtype(Nitro.Core.Types.MissResponses, :not_found) === MissResponse
+    @test fieldtype(Nitro.Core.Types.MissResponses, :method_not_allowed) === MissResponse
+    @test all(isconcretetype, Base.uniontypes(MissResponse))
+
+    # A cursor body is drained by the first miss that shares it, so it is refused, not buffered.
+    # The rest are not responses at all; each refusal names the keyword it came through.
+    refused = (HTTP.Response(404, HTTP.BytesBody(Vector{UInt8}("gone"))), nothing,
+               Dict("error" => "not found"))
+    for value in refused, keyword in (:not_found, :method_not_allowed)
+        err = try
+            App(; keyword => value)
+            nothing
+        catch e
+            e
+        end
+        @test err isa ArgumentError
+        @test occursin("App($keyword = …)", err.msg)
+        @test occursin("Vector{UInt8}", err.msg)
+    end
+
+    # The buffered kinds are kept as they are; another string or byte vector is copied into one.
+    nf = Res.send(Vector{UInt8}("bytes 404"); status = 404)
+    @test App(not_found = nf).not_found === nf
+    viewed = HTTP.Response(404, view(Vector{UInt8}("xx view 404"), 4:11))
+    ctx = App(not_found = viewed)
+    @test ctx.not_found isa HTTP.Response{Vector{UInt8}}
+    @test ctx.not_found.content_length == 8
+    urlpatterns(ctx, "", path("/c", ok))
+    @test text(send(ctx, "GET", "/nowhere")) == "view 404"
+end
+end
+
+@testitem "A custom not_found/method_not_allowed on the wire is never handed to HTTP.jl itself (#625)" tags=[:core, :network] setup=[NitroCommon] begin
+using Test
+using HTTP
+using Nitro
+import Nitro: App
+
+# The transport sets `resp.request = req` on the response it hands HTTP.jl, and HTTP.jl writes
+# `.close` on it in place (src/core/transport.jl). The app's miss values answer every miss, so
+# serving the value itself would leave the last missed request reachable from the next miss and
+# could leave `close` set for good. Each miss therefore gets a copy; the values must come out of
+# any number of misses exactly as they went in. Only a real socket goes through the transport.
+# One of each buffered body kind: every miss shares the body, so each must still send all of it
+# the second time round, against the same Content-Length, or the keep-alive connection desyncs.
+nf  = Res.json(Dict("error" => "not found"); status = 404)
+mna = Res.send(Vector{UInt8}("custom 405"); status = 405)
+@test nf isa HTTP.Response{String}
+@test mna isa HTTP.Response{Vector{UInt8}}
+ctx = App(not_found = nf, method_not_allowed = mna)
+@test ctx.not_found === nf && ctx.method_not_allowed === mna
+Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
+    path("/only-get", (req::HTTP.Request) -> Res.send("ok")),
+])
+mktempdir() do dir
+    write(joinpath(dir, "a.txt"), "a")
+    Nitro.staticfiles(ctx, dir, "files")
+
+    port = get_free_port()
+    Nitro.Core.serve(ctx; host = HOST, port = port, async = true,
+                     show_banner = false, show_errors = false, access_log = nothing)
+    @test timedwait(() -> Base.isopen(ctx.service), 10.0) === :ok
+    try
+        url(p) = "http://$HOST:$port$p"
+        for _ in 1:2   # twice, on the client's pooled keep-alive connection
+            r = HTTP.get(url("/nowhere"); status_exception = false,
+                         headers = ["Authorization" => "Bearer secret-token"])
+            @test r.status == 404
+            @test String(r.body) == """{"error":"not found"}"""
+            @test HTTP.header(r, "Content-Length") == string(sizeof(nf.body))
+            r = HTTP.get(url("/files/nope.txt"); status_exception = false)
+            @test r.status == 404
+            @test String(r.body) == """{"error":"not found"}"""
+            @test HTTP.header(r, "Content-Length") == string(sizeof(nf.body))
+            r = HTTP.post(url("/only-get"); status_exception = false)
+            @test r.status == 405
+            @test String(r.body) == "custom 405"
+            @test HTTP.header(r, "Content-Length") == string(sizeof(mna.body))
+            @test HTTP.header(r, "Allow") == "GET, HEAD"
+            r = HTTP.request("HEAD", url("/nowhere"); status_exception = false)
+            @test r.status == 404
+            @test isempty(r.body)
+        end
+        for value in (nf, mna)
+            @test value.request === nothing
+            @test !value.close
+            @test !HTTP.hasheader(value, "Allow")
+        end
+    finally
+        Nitro.Core.terminate(ctx)
+    end
 end
 end
 
