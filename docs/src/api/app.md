@@ -6,6 +6,7 @@ convenient in a script, but prefer an explicit `App` in library code and tests.
 
 ```@docs
 App
+Nitro.newapp
 serve
 terminate
 internalrequest

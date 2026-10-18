@@ -228,6 +228,7 @@ they **shadow** the same-named functions `using .Core` brings in. An `(app, …)
 | `src/Workers.jl`, `src/Workers/` | Background task queue: API, execution, registry. **`AbstractWorkerStore` is data access only**; `src/Workers/runtime.jl`'s `WorkerRuntime` owns the queues, cleanup scheduler and run handles, and is what `shutdown!` takes (#167). `src/Workers/consumer.jl` is `consume!`, the entry point of a separate consumer process for `External(…)` queues: claim loop, lease heartbeat, hand-back and drain (#514) |
 | `src/cookies.jl`, `src/crypto.jl` | Signed/encrypted cookies, `SecretString`, AES-GCM, secure randomness |
 | `src/exts.jl` | Partial definitions every package extension fills in (`pormg_nitro_worker`, `protobuf`, `mustache`, …) |
+| `src/newapp.jl` | `Nitro.newapp` (#417) — the public, unexported project scaffold: refusals, the template and the generated boot. Its `pormg = true` half is the `_newapp_pormg` stub in `src/exts.jl`, filled by `ext/NitroPormGExt.jl`; `test/extensions/newapp_pormg_tests.jl` pins the boot pasted into `docs/src/tutorial/bigger_applications.md` |
 | `src/precompile.jl` | `PrecompileTools` workload — keep in sync when the hot path changes |
 | `ext/` | Weak extensions: `NitroPormGExt`, `NitroReviseExt`, `MustacheExt`, `OteraEngineExt`, `ProtoBufExt`, `TimeZonesExt`. The **only** place a weak dependency may be imported |
 | `test/` | `ReTestItems` suite driven by the explicit ordered list in `test/runtests.jl` |
