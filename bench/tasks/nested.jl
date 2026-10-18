@@ -12,8 +12,8 @@
 #   fanout  the control with no nesting: tasks.jl's FanOut, N tiny tasks spawned by one task and
 #           then waited on, repeated R times per run (FANOUT, "N:R")
 #
-# VARIANT=A|A0|B|C picks the multiqueue order (multiq_variant.jl, included first, before any task
-# exists). The root of every workload is spawned on `:default`, so it starts there in both layouts.
+# VARIANT=A|A0|B|C|D<K>|D-inf picks the multiqueue order (multiq_variant.jl, included first,
+# before any task exists). The root of every workload is spawned on `:default`, so it starts there in both layouts.
 #
 # Each workload runs two passes in one process:
 #   clean   no instrumentation: wall time, bytes allocated, GC time, GC pauses and full sweeps, and
@@ -48,9 +48,12 @@
 # equal Int for fib, equal to `sort` for msort, the same Float64 bits for reduce (the halving fixes
 # the association order, so the sum does not depend on the schedule), the exact total for fanout.
 # `--report` also refuses a TSV in which a workload's digest differs between variants or rounds of
-# one build. VALIDATE=1 adds multiq_variant.jl's checks: single-heap order asserts, under C a live
-# assert in every pop that it takes its heap's minimum, calls into the new code on every `:default`
-# thread, and nothing left in the heaps at exit.
+# one build. VALIDATE=1 adds multiq_variant.jl's checks: single-heap order asserts, under C and D a
+# live assert in every pop that it takes its heap's minimum, calls into the new code on every
+# `:default` thread, and nothing left in the heaps at exit; under D also the slot probe, slot pops
+# and steals in every workload (slot pops on every `:default` thread in fine-grain fib) and nothing
+# left in the slots at exit (the fan-out needs steals only). Each validated run is under
+# `multiq_watchdog`: a stall kills it.
 #
 # GUARD=1 (the default) holds one never-firing `Timer`, as spawn_order.jl does: on 1.13.0-rc3..1.13.2
 # a process with no live timer can miss wake-ups (JuliaLang/julia#63882), a different bug.
@@ -80,7 +83,7 @@ const SPAWNED, STARTED, FINISHED, PEAK_QUEUED, PEAK_LIVE, PEAK_HEAPS = 1, 2, 3, 
 end
 @inline _peak!(tid::Int, k::Int, x::Int) = x > _get(tid, k) && _set!(tid, k, x)
 
-const HEAP_LISTS = MULTIQ_VARIANT == "C" ? Base.Partr.seq_heaps : Base.Partr.heaps
+const HEAP_LISTS = MULTIQ_SEQ_HEAPS ? Base.Partr.seq_heaps : Base.Partr.heaps
 
 function _in_heaps()
     tp = ccall(:jl_threadpoolid, Int8, (Int16,), Threads.threadid() - 1) + 1
@@ -283,7 +286,9 @@ function clean_runs(w::Workload, runs::Int, min_runs::Int, budget::Float64)
         GC.gc()
         hwm_ok = reset_hwm!()
         rss0 = proc_kib("VmRSS:")
+        multiq_watchdog(300)
         st = @timed w.run(Val(false))
+        multiq_watchdog(0)
         hwm = hwm_ok ? (proc_kib("VmHWM:") - rss0) / 1024 : NaN
         d = st.value
         isempty(rows) ? (digest = d) : (d == digest || error("$(w.name): digest changed between runs"))
@@ -302,7 +307,9 @@ function counted_runs(w::Workload, runs::Int, budget::Float64, digest::UInt64)
         GC.gc()
         _reset_counters!()
         t0 = time_ns()
+        multiq_watchdog(300)
         d = w.run(Val(true))
+        multiq_watchdog(0)
         wall = (time_ns() - t0) / 1e9
         d == digest || error("$(w.name): counted run's digest differs from the clean run's")
         s, st, f = _total(SPAWNED), _total(STARTED), _total(FINISHED)
@@ -333,9 +340,13 @@ function measure()
     ws = workloads()
     get(ENV, "NOHEADER", "0") == "1" || println(join(COLUMNS, '\t'))
     for w in ws
+        slots0 = multiq_slot_counts()
         clean, digest = clean_runs(w, runs, min_runs, budget)
         cnt = counted_runs(w, counted, budget, digest)
         w.check(digest)
+        # The fan-out's one spawner fills its own slot and the idle threads steal it: steals, few pops.
+        VALIDATE && multiq_slot_check(w.name, slots0; pops = w.name != "fanout", steals = true,
+                                      pops_everywhere = w.name == "fib_fine")
         v(k) = [getfield(r, k) for r in clean]
         c(k) = [getfield(r, k) for r in cnt]
         r(x) = round(x; sigdigits = 4)
