@@ -24,6 +24,7 @@
 #
 #   julia --threads=8,1 bench/tasks/spawn_order.jl           # one round of every cell, TSV on stdout
 #   D=8 CS="50 500" HS="0 2" MODES="spawn pool" CLIENTS="interactive default" ROUND=1 julia ...
+#   CELLS="50:0 500:0 500:2" julia ...                      # (C, H ms) pairs instead of CS × HS
 #   julia bench/tasks/spawn_order.jl --report results.tsv    # the Markdown tables of a TSV
 #
 # Each measured cell prints one TSV line (header first, unless NOHEADER=1): the run's labels, then
@@ -31,6 +32,16 @@
 # and for the slowest 1% of requests the share of their summed latency spent between the spawn
 # (or the `put!`) and the handler's start, and between the handler's end and the client's wake.
 # `spawn_order.sh` runs it on several Julia versions and thread layouts behind `quiet.sh`.
+#
+# VARIANT=A|A0|B|C picks the multiqueue order (multiq_variant.jl, included first, before any task
+# exists): stock, stock recompiled, `<=` in `multiq_sift_down`, or FIFO among equal priorities.
+# VALIDATE=1 is the instrumented check to run before timing a variant: single-heap order asserts,
+# every handler accounted for, the new code reached on every `:default` thread, and how far each
+# handler's start ran behind its spawn, counted in handlers (its start ordinal minus its spawn
+# ordinal). Use a small cell: `VALIDATE=1 D=1 CS=50 HS=0.2 VARIANT=C julia ...`.
+
+include(joinpath(@__DIR__, "multiq_variant.jl"))
+const VALIDATE = MULTIQ_VALIDATE
 
 const GUARD_TIMER = get(ENV, "GUARD", "1") == "1" ? Timer(typemax(Int32)) : nothing
 
@@ -51,21 +62,35 @@ mutable struct Slot
     t_start::UInt64
     t_end::UInt64
     sink::Float64
-    Slot() = new(Base.Event(true), 0, 0, 0.0)   # autoreset: one notify, one wake
+    spawn_ord::Int   # VALIDATE only, as are the ordinals below
+    start_ord::Int
+    Slot() = new(Base.Event(true), 0, 0, 0.0, 0, 0)   # autoreset: one notify, one wake
 end
+
+const SPAWNED = Threads.Atomic{Int}(0)
+const STARTED = Threads.Atomic{Int}(0)
+const HANDLED = Threads.Atomic{Int}(0)
 
 # Per client: latency, spawn -> start, end -> wake, all in ns.
 struct Rec
     lat::Vector{Int64}
     s2s::Vector{Int64}
     e2w::Vector{Int64}
-    Rec() = new(sizehint!(Int64[], 4096), sizehint!(Int64[], 4096), sizehint!(Int64[], 4096))
+    lag::Vector{Int64}   # VALIDATE only: start ordinal minus spawn ordinal
+    Rec() = new(sizehint!(Int64[], 4096), sizehint!(Int64[], 4096), sizehint!(Int64[], 4096), Int64[])
+end
+
+@inline function stamp_spawn!(slot::Slot)
+    VALIDATE && (slot.spawn_ord = Threads.atomic_add!(SPAWNED, 1))
+    return nothing
 end
 
 function handle!(slot::Slot, h::Float64)
+    VALIDATE && (slot.start_ord = Threads.atomic_add!(STARTED, 1))
     slot.t_start = time_ns()
     slot.sink += burn(h)
     slot.t_end = time_ns()
+    VALIDATE && Threads.atomic_add!(HANDLED, 1)
     notify(slot.ev)
     return nothing
 end
@@ -74,12 +99,14 @@ function record!(rec::Rec, slot::Slot, t0::UInt64, t1::UInt64)
     push!(rec.lat, Int64(t1 - t0))
     push!(rec.s2s, Int64(slot.t_start - t0))
     push!(rec.e2w, Int64(t1 - slot.t_end))
+    VALIDATE && push!(rec.lag, slot.start_ord - slot.spawn_ord)
     return nothing
 end
 
 function client_spawn(slot::Slot, rec::Rec, deadline::UInt64, h::Float64)
     while time_ns() < deadline
         t0 = time_ns()
+        stamp_spawn!(slot)
         Threads.@spawn handle!(slot, h)
         wait(slot.ev)
         record!(rec, slot, t0, time_ns())
@@ -89,6 +116,7 @@ end
 function client_pool(slot::Slot, rec::Rec, deadline::UInt64, jobs::Channel{Slot})
     while time_ns() < deadline
         t0 = time_ns()
+        stamp_spawn!(slot)
         put!(jobs, slot)
         wait(slot.ev)
         record!(rec, slot, t0, time_ns())
@@ -150,7 +178,7 @@ function metrics(recs::Vector{Rec}, wall::Float64)
             e2w_share = round(100 * sum(e2w[slow]) / slow_lat; digits = 1))
 end
 
-const COLUMNS = ["julia", "commit", "threads", "guard", "round", "mode", "clients", "c", "h_ms",
+const COLUMNS = ["julia", "commit", "threads", "guard", "variant", "round", "mode", "clients", "c", "h_ms",
                  "rps", "p50_ms", "p90_ms", "p99_ms", "max_ms", "count_min", "count_p1",
                  "count_median", "count_max", "jain", "slow1_spawn_to_start_pct",
                  "slow1_end_to_wake_pct"]
@@ -164,22 +192,51 @@ function measure()
     Threads.nthreads(:interactive) == 0 && filter!(!=(:interactive), clients)
     labels = (string(VERSION), Base.GIT_VERSION_INFO.commit_short,
               string(Threads.nthreads(:default), ",", Threads.nthreads(:interactive)),
-              GUARD_TIMER === nothing ? "0" : "1", get(ENV, "ROUND", "1"))
+              GUARD_TIMER === nothing ? "0" : "1", MULTIQ_VARIANT, get(ENV, "ROUND", "1"))
     handler_pool = fetch(Threads.@spawn :interactive fetch(Threads.@spawn Threads.threadpool()))
     println(stderr, "spawn_order: julia ", VERSION, " (", Base.GIT_VERSION_INFO.commit_short, " ",
             Base.GIT_VERSION_INFO.date_string, "), threads ", labels[3], ", guard ", labels[4],
-            ", a plain @spawn from :interactive lands on :", handler_pool, ", D = ", d, " s")
+            ", a plain @spawn from :interactive lands on :", handler_pool, ", D = ", d, " s, variant ",
+            MULTIQ_VARIANT)
+    VALIDATE && multiq_unit_asserts()
     # Compile every path before measuring; the warm-up cells are not reported.
     for mode in modes, cl in clients
         run_cell(String(mode), cl, 8, 0.1, 0.2)
     end
     get(ENV, "NOHEADER", "0") == "1" || println(join(COLUMNS, '\t'))
-    for mode in modes, cl in clients, c in cs, h in hs
+    cells = haskey(ENV, "CELLS") ?
+        [(parse(Int, a), parse(Float64, b)) for (a, b) in split.(split(ENV["CELLS"]), ':')] :
+        [(c, h) for c in cs for h in hs]
+    for mode in modes, cl in clients, (c, h) in cells
+        VALIDATE && (HANDLED[] = 0)
         recs, wall = run_cell(String(mode), cl, c, h, d)
         m = metrics(recs, wall)
         println(join((labels..., mode, cl, c, h, values(m)...), '\t'))
         flush(stdout)
+        VALIDATE && validate_cell(recs, String(mode), cl, c, h)
     end
+    VALIDATE && validate_threads()
+    multiq_variant_check()
+end
+
+# Every handler accounted for, and how far starts ran behind spawns.
+function validate_cell(recs::Vector{Rec}, mode::String, cl::Symbol, c::Int, h::Float64)
+    n = sum(r -> length(r.lat), recs)
+    n == HANDLED[] || error("validate: $n requests recorded, $(HANDLED[]) handled")
+    all(r -> length(r.lag) == length(r.lat), recs) || error("validate: an ordinal is missing")
+    lag = sort!(reduce(vcat, (r.lag for r in recs)))
+    println(stderr, "validate: ", MULTIQ_VARIANT, " ", mode, "/", cl, " C=", c, " H=", h, ": ", n,
+            " requests, all handled; start ordinal minus spawn ordinal: p50 ", q(lag, 0.5),
+            ", p99 ", q(lag, 0.99), ", max ", lag[end])
+end
+
+# The redefined scheduler ran on every `:default` thread (none to check for A).
+function validate_threads()
+    MULTIQ_VARIANT == "A" && return
+    calls = multiq_variant_calls()
+    tids = Threads.threadpooltids(:default)
+    all(tid -> calls[tid] > 0, tids) || error("validate: no calls into the new code on some :default tid: ", calls[tids])
+    println(stderr, "validate: calls into the new code per :default tid ", calls[tids])
 end
 
 # `--report <tsv>`: one Markdown table per (julia, threads), one row per cell, each value the median
@@ -191,11 +248,12 @@ function report(path::String)
     med(v) = (s = sort(v); n = length(s); isodd(n) ? s[(n + 1) ÷ 2] : (s[n ÷ 2] + s[n ÷ 2 + 1]) / 2)
     fmt(x) = x >= 1000 ? string(round(Int, x)) : string(round(x; sigdigits = 3))
     cell(v) = length(v) == 1 ? fmt(v[1]) : string(fmt(med(v)), " [", fmt(minimum(v)), "–", fmt(maximum(v)), "]")
-    groups = unique((r[col("julia")], r[col("commit")], r[col("threads")]) for r in rows)
+    key(r) = (r[col("julia")], r[col("commit")], r[col("threads")], r[col("variant")])
+    groups = unique(key(r) for r in rows)
     for g in groups
-        grows = filter(r -> (r[col("julia")], r[col("commit")], r[col("threads")]) == g, rows)
+        grows = filter(r -> key(r) == g, rows)
         cells = unique((r[col("mode")], r[col("clients")], r[col("c")], r[col("h_ms")]) for r in grows)
-        println("\n**Julia ", g[1], " (", g[2], "), --threads=", g[3], "**, ",
+        println("\n**Julia ", g[1], " (", g[2], "), --threads=", g[3], ", variant ", g[4], "**, ",
                 length(unique(r[col("round")] for r in grows)), " rounds\n")
         println("| mode | clients | C | H ms | req/s | p50 ms | p90 ms | p99 ms | max ms | per client: min / p1 / median / max | Jain | slowest 1%: spawn→start | slowest 1%: end→wake |")
         println("|---|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|")
