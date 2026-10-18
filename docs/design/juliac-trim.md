@@ -13,8 +13,10 @@ wall was cleared in [#571](https://github.com/PingoLee/Nitro.jl/issues/571), and
 > pipeline builds captures the router, so the request pipeline is abstract to a static compiler
 > however the layers are folded. Clearing that means `Service`'s type has to carry the router's
 > type, or Nitro has to own one router type. Both are API-shaped choices. **§4 is decided:
-> `--trim=safe` is a product target**, and §3.1 is decided: one Nitro-owned router type. That is
-> the first change.
+> `--trim=safe` is a product target**, and §3.1 is done
+> ([#625](https://github.com/PingoLee/Nitro.jl/issues/625)): one Nitro-owned router type, with the
+> custom 404/405 as fixed responses on `App`. Every pipeline closure is concrete now. The count
+> is still 20, because the first dynamic call on the pipeline path is now the fold itself (§3.2).
 
 ## 1. How to measure
 
@@ -40,16 +42,41 @@ trim mistake**, and that includes a `Symbol`. Type the value, then `print` it.
 
 ## 3. Remaining (20 errors on the minimal app)
 
+Measured 2026-10-17 on Julia 1.12.7, before and after #625. Both runs report 20 errors (each is
+printed twice, so 10 sites), from the same first frames in `src/`:
+
+| First frame in `src/` | Errors |
+|---|---|
+| `src/context.jl` `close` | 4 |
+| `src/core/pipeline.jl` `setupmiddleware` (the fold) | 4 |
+| `src/context.jl` `isopen` | 2 |
+| `src/context.jl` `_try_cancel` | 2 |
+| `src/core/lifecycle.jl` `serve` (two sites) | 2 + 2 |
+| `src/types.jl` `shutdown` | 2 |
+| outside `src/` (libuv read callback, a Base `string`) | 1 + 1 |
+
+What #625 changed is inside the `setupmiddleware` errors. Before, the closures in the fold were
+abstract: `var"#…"{HTTP.Handlers.Router{T, S, F}} where {T, S, F}`, 4 occurrences in the log.
+After, there are none: `router_entry` is
+`var"#…"{Router{typeof(_nitro_404), typeof(_nitro_405), Nothing}, MissResponses}`, and so is
+`compose`'s closure. What the verifier still rejects there is `reduce(|>, [ … ])` itself, over
+vectors whose types are `Union{Vector{X}, Vector{Any}}` depending on the runtime flags. That is
+§3.2's first bullet. Because the verifier stops at that first dynamic call, it has not looked
+past the fold yet. The miss path #625 rewired (for example `add_response_headers` on an
+`HTTP.Response` whose body type is not known) may show up as new errors once §3.2 lands.
+
 | Where | What | Kind |
 |---|---|---|
-| `setupmiddleware` → `_serve_listener` | the pipeline's type is not inferable | **the router field (§3.1)**, then the fold (§3.2) |
-| `startserver`'s `start` closure | captures the listener, whose type is the pipeline's | follows from §3.1 |
+| `setupmiddleware` → `_serve_listener` | the pipeline's type is not inferable | the fold (§3.2). The router field (§3.1) is cleared (#625) |
+| `startserver`'s `start` closure | captures the listener, whose type is the pipeline's | follows from §3.2 |
 | `isopen(::Service)`, `close(::Service)` → `_shutdown_server` | `Service.server` holds `HTTP.Server{F}`, a UnionAll | **the server field (§3.3)** |
 | `startup`/`shutdown` | `LifecycleMiddleware.on_startup`/`on_shutdown` are `Union{Function,Nothing}`-typed | lifecycle only (§3.4) |
 | the `revise = :eager` watcher's cancel | `Base.invokelatest` | dev-only and dynamic on purpose, so it stays |
 | `OpenSSL.jl`, libuv read callback | outside Nitro | upstream |
 
-### 3.1 The router field: the actual blocker for the request path
+### 3.1 The router field: cleared in #625
+
+*Kept as written when it was the blocker; the outcome is at the end of this section.*
 
 `Service.router` is declared as `HTTP.Router`, which is `Router{T,S,F}` with all three parameters
 free. A default `Router()` is concretely
@@ -92,6 +119,25 @@ The two shapes that would make it concrete:
 - **HTTP.jl's router-level middleware** (the router's third type parameter) goes. Nitro has its
   own chain, and it already refuses that middleware on some routes (#282).
 
+**The spike decided the field type: a fixed `HTTP.Response`**
+([#625, Phase 1](https://github.com/PingoLee/Nitro.jl/issues/625#issuecomment-6244200220)).
+A `FunctionWrapper` fails `--trim=safe` wherever it is built, and the trimmed binary crashes at
+its first call. Its `@cfunction` pointer is nulled when the image is serialized, so the first
+call re-initializes it, and that dispatches `gen_fptr` on a field typed `Any`. A wrapper built
+at runtime also needs a `@cfunction` that the trimmer does not keep. Under the JIT it is also
+slower than a plain `Function` field: 15.9 ns against 12.1 ns per call. A fixed response passes
+and costs 2.4 ns. The same finding rules FunctionWrappers.jl out for §3.2 and §3.4.
+
+**What landed (#625):**
+- `Service.router` is `NitroRouter`, which is
+  `HTTP.Router{typeof(_nitro_404), typeof(_nitro_405), Nothing}` (`src/types.jl`). `Service`
+  accepts no other router, so HTTP.jl-level router middleware is gone, and with it #282's
+  registration refusal.
+- The custom 404/405 are `App(not_found = …, method_not_allowed = …)`. They are fixed
+  `HTTP.Response` values, carried as `MissResponses` to the pipeline's miss path, the static
+  mounts and `RetiredHeadHandler`. A custom 405 still gets `Allow` on a copy.
+- `RouteResolution.router` is concrete as well.
+
 ### 3.2 The fold and the route boundary (#572, after §3.1)
 
 Once the router is concrete, the outer fold needs three things:
@@ -113,7 +159,7 @@ line. It does not remove it:
 | Goal | Boundary shape | Cost |
 |---|---|---|
 | JIT performance only | **one function barrier per request** into a concretely typed per-route chain (the trade #516 made for `json_bind`) | about one dynamic call per request. `--trim=safe` rejects it |
-| `--trim=safe` | **no unresolved call**: a fixed-signature callable (`FunctionWrapper{HTTP.Response, Tuple{HTTP.Request}}`) or dispatch unrolled over a tuple of routes | a trampoline per call, measure it; unconfirmed that `FunctionWrapper` passes the verifier at all; unrolled dispatch makes compile time grow with the route count |
+| `--trim=safe` | **no unresolved call**: dispatch unrolled over a tuple of routes, or an erasure point Nitro builds itself. A `FunctionWrapper{HTTP.Response, Tuple{HTTP.Request}}` is ruled out: it fails the verifier and crashes the trimmed binary (#625, §3.1) | unrolled dispatch makes compile time grow with the route count; a Nitro-built erasure point is undesigned and unmeasured |
 
 Prior art: Tower/axum type each layered stack fully and erase it at the router with
 `BoxCloneService`. That is one deliberate dynamic boundary per route. Even a fully static stack
@@ -132,8 +178,10 @@ never per request. A concrete field needs the same type-parameter decision as §
 ### 3.4 Lifecycle hooks
 
 `on_startup`/`on_shutdown` are `Union{Function,Nothing}`-typed (abstract), live in a `Vector{LifecycleMiddleware}`, and run
-only at startup and shutdown. The typed option is `FunctionWrapper{Nothing, Tuple{}}`, a new
-dependency whose trim behaviour is unverified. This is deliberately left until §4 is decided.
+only at startup and shutdown. The typed option this section used to name,
+`FunctionWrapper{Nothing, Tuple{}}`, is ruled out: FunctionWrappers.jl fails `--trim=safe`
+wherever the wrapper is built (#625, §3.1). The hooks need a shape of their own. That is open,
+and it comes fifth in §4's order.
 
 ## 4. The decision: `--trim=safe` is a target
 
@@ -158,8 +206,9 @@ buy is a startup and deployment win:
 
 The order:
 
-1. **§3.1, the router's type.** One Nitro-owned router type (decided 2026-10-18; see §3.1). Its
-   custom 404/405 surface waits on the `FunctionWrapper` spike.
+1. **§3.1, the router's type. Done (#625):** one Nitro-owned router type, and the custom
+   404/405 as fixed responses on `App`. It typed every pipeline closure, but cleared no verifier
+   error on its own: the fold behind it is the next wall on that path (§3).
 2. **§3.3, the server field.** Its type parameter is the pipeline's, which is fixed at `serve`
    time, not at `App` construction, so it needs its own shape. One candidate, not designed yet: a
    typed handle that `serve` returns and `terminate` takes.

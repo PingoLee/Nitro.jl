@@ -685,10 +685,13 @@ import Nitro: App, path, text, getparams
 # against the unpatched code. The pipeline-level testsets below are guards on the semantics the
 # hand-off must not change — they pass either way, by design.
 
-const DISPATCH = Nitro.Core._dispatch_resolved
+# The default miss pair, so a miss below is the bare 404/405 an `App()` answers with (#625).
+const MISSES = Nitro.Types.MissResponses(HTTP.Response(404), HTTP.Response(405))
+DISPATCH(r, req) = Nitro.Core._dispatch_resolved(r, MISSES, req)
 
+# `RouteResolution.router` is the concrete `NitroRouter`, so the stashed router is one too.
 function router_with(body::String)
-    r = HTTP.Router()
+    r = Nitro.Types.nitro_router()
     HTTP.register!(r, "GET", "/x", (::HTTP.Request) -> HTTP.Response(200, body))
     return r
 end
@@ -763,7 +766,7 @@ end
     # mutable field — the `X-HTTP-Method-Override` rewrite is the shape that hits this. Before
     # #80 the router resolved after every middleware layer, so such a rewrite changed which
     # handler ran; guarding on the method is what keeps that true.
-    router = HTTP.Router()
+    router = Nitro.Types.nitro_router()
     HTTP.register!(router, "GET",  "/x", (::HTTP.Request) -> HTTP.Response(200, "GET-ROUTER"))
     HTTP.register!(router, "POST", "/x", (::HTTP.Request) -> HTTP.Response(200, "POST-ROUTER"))
 
@@ -794,7 +797,7 @@ end
     # The sharper half of the same defect: the foreign App 404s, so honouring the stash turns
     # a 404 into a 200 serving a handler from an application this request never reached.
     router_a = router_with("A-ROUTER")
-    empty_router = HTTP.Router()
+    empty_router = Nitro.Types.nitro_router()
 
     req = HTTP.Request("GET", "/x")
     stash!(req, router_a; handler = stash_handler("A-STASH"))
@@ -1228,32 +1231,23 @@ end
     @test HTTP.header(internalrequest(ctx, HTTP.Request("POST", "/w")), "X-Tag") == "two"
 end
 
-@testset "a router with HTTP.jl-level middleware refuses a guarded route it cannot key" begin
-    # `register!` wraps the leaf in the router's own middleware, which hides the declared method.
-    # The guard would silently never run, so registration fails instead.
-    wrapped() = App(service = Service(router = HTTP.Router(HTTP.Handlers.default404,
-                                                           HTTP.Handlers.default405,
-                                                           h -> (req -> h(req)))))
-    for (method, handler) in (("*", ok),
-                              ("STREAM", (s::HTTP.Stream) -> nothing),
-                              ("WEBSOCKET", (ws::HTTP.WebSockets.WebSocket) -> nothing))
-        err = try
-            urlpatterns(wrapped(), "", path("/g", handler; method = method, middleware = [deny]))
-            nothing
-        catch e
-            e
-        end
-        @test err isa ArgumentError
-        @test occursin("would never run", sprint(showerror, err))
+@testset "a guarded \"*\", STREAM or WEBSOCKET route registers with its leaf visible (#625)" begin
+    # #282 refused these routes on a router built with HTTP.jl-level middleware, which wrapped the
+    # leaf and hid the declared method its guards are keyed on. A `Service` holds only the
+    # `NitroRouter` now, which carries none (Service(router = …) is refused, test/routing_tests.jl),
+    # so every such route registers and its leaf is the `DeclaredMethodHandler` itself.
+    for (method, handler, probe) in (("*", ok, "POST"),
+                                     ("STREAM", (s::HTTP.Stream) -> nothing, "GET"),
+                                     ("WEBSOCKET", (ws::HTTP.WebSockets.WebSocket) -> nothing, "GET"))
+        ctx = App()
+        urlpatterns(ctx, "", path("/g", handler; method = method, middleware = [deny]))
+        leaf = first(HTTP.Handlers.gethandler(ctx.service.router, HTTP.Request(probe, "/g")))
+        @test leaf isa Nitro.Types.DeclaredMethodHandler
+        @test leaf.method == method
     end
-
-    # With no middleware to key there is nothing to lose, so the route registers and is served.
-    ctx = wrapped()
-    urlpatterns(ctx, "", path("/g", ok; method = "*"))
-    @test status(ctx, "POST", "/g") == 200
-    # A concrete method keys on `req.method` and needs no tag, so it is not refused either.
-    urlpatterns(ctx, "", path("/c", ok; method = "POST", middleware = [deny]))
-    @test status(ctx, "POST", "/c") == 403
+    ctx = App()
+    urlpatterns(ctx, "", path("/g", ok; method = "*", middleware = [deny]))
+    @test status(ctx, "POST", "/g") == 403
 end
 end
 

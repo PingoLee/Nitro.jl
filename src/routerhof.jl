@@ -536,8 +536,8 @@ function compose(router::HTTP.Router, globalmiddleware::Vector{Function},
                 # Only under a key the CLIENT cannot choose. A `DeclaredMethodHandler` leaf keys on
                 # the method it was registered with, so its entries are bounded by the route
                 # table. Every other leaf keys on `req.method`, which the router matched exactly —
-                # except a bare leaf that matches any token (a `"*"` route whose wrapper is hidden
-                # by HTTP.jl-level router middleware, or one registered on the router directly).
+                # except a bare leaf that matches any token (a `"*"` route registered on the router
+                # directly with `HTTP.register!`, which bypasses the `DeclaredMethodHandler`).
                 # Caching those under every token a client sends would grow this table without
                 # bound, each insert copying the whole generation, so a method Nitro does not know
                 # is composed for that one request and never cached. The check sits on the miss

@@ -385,11 +385,21 @@ DELETE /api/products  →  405, Allow: GET, HEAD, POST
   `Allow`. A mounted file answers `GET` and `HEAD`, so its `405` lists those plus any app route
   at the same path. The one exception is `spafiles` history mode, which answers a `GET` or `HEAD`
   miss with the app shell.
-- **A custom 405 handler still decides the response.** With
-  `Service(router = HTTP.Router(my404, my405))`, Nitro calls `my405` and adds `Allow` to the
-  `HTTP.Response` it returns, as a new response, so a shared `const` response is safe. If `my405`
-  sets its own `Allow`, Nitro leaves it alone. Any other return value passes through unchanged.
-  A static mount's `405` goes through `my405` the same way.
+- **A custom 404 or 405 is a response value on the `App`.** Pass it when you build the app:
+
+  ```julia
+  app = App(mod = @__MODULE__,
+            not_found          = Res.json(Dict("error" => "not found"); status = 404),
+            method_not_allowed = Res.json(Dict("error" => "method not allowed"); status = 405))
+  ```
+
+  Every request they answer gets a copy of the value, static mounts included, so the value
+  itself is never changed. Nitro adds `Allow` to the `405`'s copy, and if your `405` already
+  sets `Allow`, Nitro leaves it alone. Use a buffered body, as `Res.json` and `Res.send` build:
+  the copies share it. A path outside `serve(prefix = …)` still gets the prefix layer's own
+  `404`. These are fixed values, not handlers, which keeps `App` compilable with
+  `juliac --trim`. To vary a miss per request, wrap the app in a middleware that checks
+  `route_missed(req)` on the response's way out.
 
 ## Modular Route Inclusion with `include_routes`
 

@@ -27,6 +27,27 @@ export Server, Nullable, Context,
 const Nullable{T} = Union{T, Nothing}
 const Server = HTTP.Server
 
+# The one router type an `App` holds (#625; docs/design/juliac-trim.md §3.1). `HTTP.Router{T,S,F}`
+# carries its 404 handler, its 405 handler and HTTP.jl-level middleware in its TYPE, so a field
+# typed `HTTP.Router` was abstract, and so was every pipeline closure that captured it. Nitro lets
+# HTTP.jl call none of the three: the miss answers are `App(not_found = …, method_not_allowed = …)`,
+# read by `_route_miss` and `_method_not_allowed` (src/core/pipeline.jl), and the middleware is
+# Nitro's own chain. So all three are fixed here and the type is concrete. `_nitro_404` and
+# `_nitro_405` answer only a direct `(r::Router)(req)`, which the pipeline never makes.
+_nitro_404(::HTTP.Request) = HTTP.Response(404)
+_nitro_405(::HTTP.Request) = HTTP.Response(405)
+const NitroRouter = HTTP.Router{typeof(_nitro_404), typeof(_nitro_405), Nothing}
+nitro_router()::NitroRouter = HTTP.Router(_nitro_404, _nitro_405, nothing)
+
+# The two fixed miss answers `App(not_found = …, method_not_allowed = …)` configures, carried
+# together to the sites that serve them: the pipeline's innermost layer (src/core/pipeline.jl),
+# the static mounts (src/core/staticfiles.jl) and `RetiredHeadHandler`. Built once per site, never
+# per request.
+struct MissResponses
+    not_found          :: HTTP.Response
+    method_not_allowed :: HTTP.Response
+end
+
 abstract type Extractor{T} end
 """
     AbstractSessionStore{K, V}
@@ -1815,8 +1836,8 @@ to where the second one used to happen.
 `_dispatch_resolved` honours this hand-off only when all three still match. That set is not a
 judgement call: the lookup (`_gethandler`, and upstream `gethandler` behind it) resolves from
 exactly `r.routes`, `req.method` and `req.target`, so re-checking those three is what makes "reuse the lookup" indistinguishable
-from "do the lookup again". A `router` mismatch falls through to `r(req)`, which is always
-correct; a `method` or `target` mismatch is the rewrite case below, and is not.
+from "do the lookup again". A `router` mismatch falls through to a fresh lookup
+(`_route_unresolved`), which is always correct; a `method` or `target` mismatch is the rewrite case below, and is not.
 
 **`router`** — because the stash lives on the *request*, while the invariant that makes it safe
 lives on the *`App`*. A single `HTTP.Request` object can be passed to `internalrequest` more
@@ -1827,25 +1848,22 @@ resolution is honoured by App B: B serves A's handler, skipping B's own route mi
 an `App` that never registered the path at all answers `200` instead of `404`.
 
 The identity check assumes **one `Router` per `App`**, which is how `Service` is constructed
-(`router = Router()` per instance). `Service` is exported and takes `router` as a keyword, so two
-`App`s deliberately built around one shared `Router` but separate `custommiddleware` tables would
-defeat it and reinstate the misroute. Nothing in `src/`, `test/` or `docs/` does that; it is
+(`router = nitro_router()` per instance). `Service` is exported and its `router` field is still a
+keyword, so two `App`s deliberately built around one shared router but separate
+`custommiddleware` tables would defeat it and reinstate the misroute. Nothing in `src/`, `test/` or `docs/` does that; it is
 recorded here so the assumption is written down rather than inferred. Found in review;
 regression: the cross-`App` items in test/custommiddleware_tests.jl, at both the
 `_dispatch_resolved` and the `internalrequest` level. (The `resetstate()` variant is the same
 mechanism — the dispatching router is not the one that stashed — and is deliberately *not* a
 test; the note at that testset says why.)
 
-!!! note "`router` is declared as the `UnionAll`, and parameterizing it was measured and rejected"
-    `HTTP.Router` is not concrete — every real instance is a
-    `Router{typeof(default404),typeof(default405),Nothing}` — so this field is a boxed
-    pointer. An isolated microbenchmark of the constructor makes `struct RouteResolution{R}`
-    with `router::R` look like it saves an allocation per matched request. **It does not, in
-    the pipeline**: measured through a built `setupmiddleware` chain, both shapes come out at
-    exactly 40 allocations and 1936 bytes per served request. `Service.router` is itself
-    declared as the unparameterized `Router`, so the concrete type is not known where it
-    matters anyway. Left unparameterized on purpose — do not re-derive the microbenchmark and
-    "fix" it.
+!!! note "`router` is the concrete `NitroRouter`, so `RouteResolution` needs no type parameter"
+    Until #625 this field was the `UnionAll` `HTTP.Router`. A `struct RouteResolution{R}` was
+    measured then and rejected: through a built `setupmiddleware` chain both shapes came out at
+    exactly 40 allocations and 1936 bytes per served request, because `Service.router` was
+    abstract too. Since #625 every `App` holds the one concrete `NitroRouter` (see its
+    definition at the top of this file), so this field is concrete without a parameter, and a
+    router of any other type does not fit in it.
 
 **`method`** and **`target`** — `gethandler` matches on both, and both are mutable fields. Since
 #291 `compose` resolves the route *after* global middleware, so a global
@@ -1910,7 +1928,7 @@ confines a stash to the router this reasoning is about.
 
 """
 struct RouteResolution
-    router     :: HTTP.Router
+    router     :: NitroRouter
     method     :: String
     target     :: String
     handler    :: Function
@@ -1948,9 +1966,9 @@ The auto-`HEAD` passes the request on as-is, still saying `req.method == "HEAD"`
 path drops the body (src/core/transport.jl). An explicit `HEAD` route replaces that leaf with a bare
 one and keys on `HEAD` as it always did.
 
-A router built with HTTP.jl-level `middleware` wraps every leaf in it, which hides this type.
-Registration handles that per case: no auto-`HEAD` at all, and an `ArgumentError` for a `"*"`,
-`STREAM` or `WEBSOCKET` route that has middleware to key (src/core/registration.jl).
+`HTTP.register!` stores this leaf as-is, because `NitroRouter` carries no HTTP.jl-level
+middleware to wrap it in (#625). A wrapped leaf would hide this type, and with it the method
+`compose` keys on.
 
 Subtypes `Function` so the `RouteResolution` hand-off stores it as-is, without the wrapper
 closure `compose` gives a non-`Function` leaf. `method` is a `String` for every `F`, so `compose`

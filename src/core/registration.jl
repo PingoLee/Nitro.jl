@@ -246,13 +246,15 @@ function register(ctx::App, httpmethod::String, route::Union{String,HOFRouter}, 
     registerhandler(ctx, ctx.service.router, httpmethod, route, func, func_details)
 end
 
-function register_internal(ctx::App, router::Router, httpmethod::String, route::Union{String,HOFRouter}, func::Function; type_hints::Dict{Symbol, Type}=Dict{Symbol, Type}())
+function register_internal(ctx::App, router::Types.NitroRouter, httpmethod::String, route::Union{String,HOFRouter}, func::Function; type_hints::Dict{Symbol, Type}=Dict{Symbol, Type}())
     route = Util._canonical_route(parse_route(httpmethod, route))
     func_details = parse_func_params(route, func; type_hints)
     registerhandler(ctx, router, httpmethod, route, func, func_details)
 end
 
-function registerhandler(ctx::App, router::Router, httpmethod::String, route::String, func::Function, func_details::NamedTuple)
+# `router` is a `NitroRouter`, which carries no HTTP.jl-level middleware (#625), so
+# `HTTP.register!` stores every leaf as-is and a `DeclaredMethodHandler` stays visible to `compose`.
+function registerhandler(ctx::App, router::Types.NitroRouter, httpmethod::String, route::String, func::Function, func_details::NamedTuple)
     method = first(methods(func))
     no_args = method.nargs == 1
 
@@ -302,8 +304,9 @@ function registerhandler(ctx::App, router::Router, httpmethod::String, route::St
         [get(METHOD_ALIASES, httpmethod, httpmethod)]
     end
 
-    # `HEAD` on the app's own router goes through the precedence table below (#277). Other
-    # routers (the static mounts register `"*"` on theirs) keep the plain registration.
+    # `HEAD` on the app's own router goes through the precedence table below (#277). Every caller
+    # passes that router today, the static mounts' `"*"` routes included; another `NitroRouter`
+    # would keep the plain registration.
     owns_head = router === ctx.service.router
     if owns_head && httpmethod == HEAD
         _register_head!(ctx, router, route, handle, :explicit)
@@ -313,7 +316,6 @@ function registerhandler(ctx::App, router::Router, httpmethod::String, route::St
     # No request carries `*`, `STREAM` or `WEBSOCKET`, so the leaf carries the declared method
     # for `compose` to key this route's middleware on (#282). See `DeclaredMethodHandler`.
     leaf = _is_declared_only(httpmethod) ? DeclaredMethodHandler(httpmethod, handle) : handle
-    _check_keyable(ctx, router, httpmethod, route)
 
     for resolved_httpmethod in resolved_methods
         HTTP.register!(router, resolved_httpmethod, route, leaf)
@@ -321,16 +323,13 @@ function registerhandler(ctx::App, router::Router, httpmethod::String, route::St
 
     # Literal `GET` only. `STREAM` and `WEBSOCKET` also resolve to `GET` above, but a handler
     # that writes to the raw stream or upgrades the connection has no meaningful `HEAD`.
-    #
-    # Not on a router built with HTTP.jl-level `middleware` either: `register!` wraps the handler
-    # in it, the leaf then no longer `isa DeclaredMethodHandler`, and `compose` would key the
-    # `HEAD` on `HEAD|…`, finding none of the `GET` route's guards. A `405` is the safe answer.
-    if owns_head && httpmethod == GET && router.middleware === nothing
+    if owns_head && httpmethod == GET
         _register_head!(ctx, router, route, DeclaredMethodHandler(GET, handle), :auto)
     elseif owns_head && (httpmethod == STREAM || httpmethod == WEBSOCKET)
         # These replace the `GET` leaf. An auto-`HEAD` left behind by an earlier `GET` at the same
         # path (Revise, a re-run `urlpatterns`) would keep serving that old handler.
-        _register_head!(ctx, router, route, RetiredHeadHandler(router), :retired)
+        misses = Types.MissResponses(ctx.not_found, ctx.method_not_allowed)
+        _register_head!(ctx, router, route, RetiredHeadHandler(router, misses), :retired)
     end
     return nothing
 end
@@ -341,35 +340,11 @@ _is_declared_only(httpmethod::String)::Bool =
     httpmethod == "*" || httpmethod == STREAM || httpmethod == WEBSOCKET
 
 """
-    _check_keyable(ctx, router, httpmethod, route)
-
-Refuse a `"*"`, `STREAM` or `WEBSOCKET` route that has middleware to key, on a router built with
-HTTP.jl-level `middleware` (#282). `HTTP.register!` wraps the leaf in that middleware, which
-hides the [`DeclaredMethodHandler`](@ref), so `compose` would key on `req.method`, find nothing,
-and never run the route's guards. Failing here is the loud form of that outcome.
-
-Only a route with published middleware is refused, so unguarded routes and the static mounts
-(`"*"`, no middleware) register as before. Both publishers run before `registerhandler`:
-`register_route` publishes, then registers, and `InnerRouter` publishes inside `parse_route`.
-"""
-function _check_keyable(ctx::App, router::Router, httpmethod::String, route::String)
-    router.middleware === nothing && return nothing
-    _is_declared_only(httpmethod) || return nothing
-    haskey(snapshot(ctx.service.custommiddleware), genkey(httpmethod, route)) || return nothing
-    throw(ArgumentError(
-        "Middleware on the $httpmethod route $route would never run: this router wraps every " *
-        "handler in HTTP.jl-level `middleware`, which hides the declared method Nitro keys " *
-        "route middleware on. Register the route on a router without HTTP.jl-level " *
-        "middleware, or, for \"*\", list the methods it serves with `methods = [...]`. " *
-        "Removing the route's middleware takes a restart: published middleware is not unpublished."))
-end
-
-"""
-    RetiredHeadHandler(router)
+    RetiredHeadHandler(router, misses)
 
 The `HEAD` leaf left where an auto-`HEAD` used to be, after a `STREAM`/`WEBSOCKET` route replaced
 the `GET` leaf beside it (#277). HTTP.jl cannot remove a leaf, so this one answers `405` in its
-place, with `Allow` (#281).
+place, with `Allow` (#281). The `405` is the app's own `method_not_allowed` (#625).
 
 It is a distinct type so [`_allowed_methods`](@ref) can leave `HEAD` out of that `Allow`: the
 router does resolve `HEAD` to this leaf, but the leaf refuses it.
@@ -377,13 +352,15 @@ router does resolve `HEAD` to this leaf, but the leaf refuses it.
 Subtypes `Function` so the `RouteResolution` hand-off stores it as-is, without the wrapper
 closure `compose` gives a non-`Function` leaf.
 """
-struct RetiredHeadHandler{R<:HTTP.Router} <: Function
-    router :: R
+struct RetiredHeadHandler <: Function
+    router :: Types.NitroRouter
+    misses :: Types.MissResponses
 end
 
 # A method miss like the router's own 405, so `route_missed` must say so (#401) -- the router
 # resolved `HEAD` to this leaf, so it never took the miss path that would have marked it.
-(h::RetiredHeadHandler)(req::HTTP.Request) = (_mark_route_miss!(req); _method_not_allowed(h.router, req))
+(h::RetiredHeadHandler)(req::HTTP.Request) =
+    (_mark_route_miss!(req); _method_not_allowed(h.router, h.misses, req))
 
 """
     _route_shape(route) -> String
@@ -416,7 +393,7 @@ HTTP.jl warns whenever a leaf is replaced. Replacing a leaf this table added its
 `:retired`) is expected, so it is silenced; the `GET` replacement that triggers it has already
 warned. Two explicit `HEAD` routes on one shape still warn, as before.
 """
-function _register_head!(ctx::App, router::Router, route::String, handler::Function, claim::Symbol)
+function _register_head!(ctx::App, router::Types.NitroRouter, route::String, handler::Function, claim::Symbol)
     shape = _route_shape(route)
     Base.lock(ctx.service.head_routes_lock) do
         owner = get(ctx.service.head_routes, shape, nothing)

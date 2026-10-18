@@ -897,27 +897,36 @@ end
             @test bodystr(r) == "visible"
         end
 
-        @testset "a miss still goes through the router's own not-found handler" begin
+        @testset "a miss still goes through the app's own not-found response" begin
             # The `**` route MATCHES every unmatched path under the prefix, so the mount handler
             # -- not the router -- decides what a miss returns. It must defer rather than invent
-            # a response, or an app that supplied `Service(router = Router(my404))` would find it
-            # silently disabled underneath every mount.
+            # a response, or an app that set `App(not_found = …)` would find it silently
+            # disabled underneath every mount.
             @test internalrequest(HTTP.Request("GET", "/static/nope.txt")).status == 404
             # ... and a path outside the mount is untouched by any of this.
             @test internalrequest(HTTP.Request("GET", "/elsewhere/nope.txt")).status == 404
 
             # Asserting `status == 404` alone is NOT the property: a hardcoded
             # `HTTP.Response(404)` in the mount handler satisfies it while silently disabling the
-            # app's own handler. Give the router a custom 404 with a recognisable body and
+            # app's own response. Give the app a custom 404 with a recognisable body and
             # require the mount's miss to carry it.
-            custom = Nitro.Core.App(service = Nitro.Core.Service(
-                router = HTTP.Router(_ -> HTTP.Response(404, "CUSTOM-NOT-FOUND"))))
+            custom = Nitro.Core.App(not_found = HTTP.Response(404, "CUSTOM-NOT-FOUND"))
             staticfiles(custom, root, "static")
             miss = internalrequest(custom, HTTP.Request("GET", "/static/nope.txt"))
             @test miss.status == 404
             @test bodystr(miss) == "CUSTOM-NOT-FOUND"
             # A hit is unaffected.
             @test bodystr(internalrequest(custom, HTTP.Request("GET", "/static/visible.txt"))) == "visible"
+
+            # The other two mounts build their own miss closures (#625). For `spafiles` a GET
+            # miss is the history fallback, so its miss is a non-GET one.
+            for (mount, method) in ((dynamicfiles, "GET"), (spafiles, "POST"))
+                app = Nitro.Core.App(not_found = HTTP.Response(404, "CUSTOM-NOT-FOUND"))
+                mount(app, root, "m")
+                miss = internalrequest(app, HTTP.Request(method, "/m/nope.txt"))
+                @test miss.status == 404
+                @test bodystr(miss) == "CUSTOM-NOT-FOUND"
+            end
         end
 
         @testset "an application route still beats the mount at the same path" begin
@@ -1503,10 +1512,9 @@ end
         @test r.status == 404
         @test allow(r) === nothing
 
-        # Both answers go through the router's own `_405`, as the misses already went through its
-        # `_404`, so a custom one decides the response and still gets `Allow`.
-        app = App(service = Nitro.Core.Service(router = HTTP.Router(HTTP.Handlers.default404,
-            req -> HTTP.Response(418))))
+        # Both answers go through the app's own `method_not_allowed`, as the misses already went
+        # through its `not_found`, so a custom one decides the response and still gets `Allow`.
+        app = App(method_not_allowed = HTTP.Response(418))
         staticfiles(app, root, "")
         urlpatterns(app, "", path("/api/items", ok))
         for target in ("/visible.txt", "/api/items")

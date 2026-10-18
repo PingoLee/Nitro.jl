@@ -55,7 +55,7 @@
 # mounted file gets whatever the rest of the router answers there (`_mount_miss`), and only a path
 # that *does* name one answers 405, with `Allow`. That is strictly more informative than Express's
 # default, which 404s even for a file that exists.
-function _register_mount(ctx::App, router::HTTP.Router, segments::Vector{String}, handler::F;
+function _register_mount(ctx::App, router::Types.NitroRouter, segments::Vector{String}, handler::F;
                          bare::Bool) where {F}
     register_internal(ctx, router, "*", Util.mount_route(vcat(segments, "**")), handler)
     bare && register_internal(ctx, router, "*", Util.mount_route(segments), handler)
@@ -66,8 +66,8 @@ end
 _is_mount_method(method::AbstractString) = method == GET || method == HEAD
 
 # A request the mount will not serve gets the answer the rest of the router gives at that path,
-# through the router's own `_404` and `_405`, so a custom handler and `Allow` behave as they do for
-# an app route (#281, #284).
+# through the app's own `not_found` and `method_not_allowed` (#625), so a custom response and
+# `Allow` behave as they do for an app route (#281, #284).
 #
 # A miss is not always a 404. The catch-all is a `"*"` leaf, and HTTP.jl falls through to it
 # whenever the exact node lacks the request's method: under a ROOT mount, `PUT /api/items` on a
@@ -78,14 +78,15 @@ _is_mount_method(method::AbstractString) = method == GET || method == HEAD
 # left out. With a mount at `static` and a `PUT` route at `/{x}/foo`, `PUT /static/foo` resolves
 # to the mount, so `GET /static/foo` is a 404, not a 405 advertising a `PUT` that would 404 too.
 #
-# `notfound` is the router's `_404` captured at mount time; see `staticfiles`.
+# `misses` is the app's pair, captured at mount time; see `staticfiles`.
 #
 # The router matched the catch-all, so it never took its own miss path; mark the miss here, or
 # every probe under a root `staticfiles` mount reads as answered to `route_missed` (#401).
-function _mount_miss(router::HTTP.Router, notfound::F, req::HTTP.Request) where {F}
+function _mount_miss(router::HTTP.Router, misses::Types.MissResponses, req::HTTP.Request)
     _mark_route_miss!(req)
     allowed = _allowed_methods(router, req.target)
-    return isempty(allowed) ? notfound(req) : _method_not_allowed(router, req, allowed)
+    return isempty(allowed) ? _miss_response(misses.not_found) :
+                              _method_not_allowed(router, misses, req, allowed)
 end
 
 # A path naming a mounted file, under a method the mount does not serve. `Allow` is the mount's
@@ -93,9 +94,10 @@ end
 # there while the mount serves `GET`, so neither list alone is what the path answers.
 #
 # A miss for `route_missed`, like the router's own 405 (#401); see `_mount_miss`.
-function _mount_method_not_allowed(router::HTTP.Router, req::HTTP.Request)
+function _mount_method_not_allowed(router::HTTP.Router, misses::Types.MissResponses,
+                                   req::HTTP.Request)
     _mark_route_miss!(req)
-    return _method_not_allowed(router, req,
+    return _method_not_allowed(router, misses, req,
                                sort!(union(String[GET, HEAD], _allowed_methods(router, req.target))))
 end
 
@@ -342,7 +344,7 @@ end
 
 function staticfiles(
     ctx::App,
-    router::HTTP.Router,
+    router::Types.NitroRouter,
     folder::String,
     mountdir::String="static";
     headers::Vector=[],
@@ -370,18 +372,18 @@ function staticfiles(
 
     segments = Util.mount_segments(mountdir)
     nprefix  = length(segments)
-    # Capture the router's OWN 404 rather than hardcoding one. The `**` route now *matches* every
-    # unmatched path under the prefix, so a miss never reaches the router's not-found handler on
-    # its own — and an app that supplied a custom one through `Service(router = Router(my404))`
-    # would have had it silently disabled under the mount.
-    notfound = router._404
+    # Capture the app's OWN miss responses rather than hardcoding them. The `**` route *matches*
+    # every unmatched path under the prefix, so a miss never reaches the pipeline's miss path on
+    # its own — and an app that set `App(not_found = …)` would have had it silently disabled
+    # under the mount.
+    misses = Types.MissResponses(ctx.not_found, ctx.method_not_allowed)
 
     handler = function (req::HTTP.Request)
         mf = _lookup_mount(table, req.target, nprefix)
         # A miss gets the router's own answer for EVERY method -- the mount does not claim a path
         # it cannot serve (see `_register_mount` and `_mount_miss`).
-        mf === nothing && return _mount_miss(router, notfound, req)
-        _is_mount_method(req.method) || return _mount_method_not_allowed(router, req)
+        mf === nothing && return _mount_miss(router, misses, req)
+        _is_mount_method(req.method) || return _mount_method_not_allowed(router, misses, req)
         return _serve_mounted(req, mf, policy, lru, headers, loadfile, cache_control)
     end
     _register_mount(ctx, router, segments, handler; bare = haskey(files, ""))
@@ -391,7 +393,7 @@ end
 
 function spafiles(
     ctx::App,
-    router::HTTP.Router,
+    router::Types.NitroRouter,
     folder::String,
     mountdir::String="static";
     headers::Vector=[],
@@ -434,7 +436,7 @@ function spafiles(
     # this comparison is exact and needs no filesystem call of its own.
     segments   = Util.mount_segments(mountdir)
     nprefix    = length(segments)
-    notfound   = router._404
+    misses     = Types.MissResponses(ctx.not_found, ctx.method_not_allowed)
     index_file = joinpath(folder, "index.html")
     index_idx  = findfirst(pair -> last(pair) == index_file, mounted)
 
@@ -442,11 +444,11 @@ function spafiles(
         @warn "spafiles: no servable 'index.html' in $folder. History mode fallback will not work."
         # No fallback: behave exactly like `staticfiles`. Registering a catch-all that 404s is not
         # the same as not registering one — but it is here, because the handler defers to the
-        # router's own not-found rather than inventing a response.
+        # app's own not-found rather than inventing a response.
         function (req::HTTP.Request)
             mf = _lookup_mount(table, req.target, nprefix)
-            mf === nothing && return _mount_miss(router, notfound, req)
-            _is_mount_method(req.method) || return _mount_method_not_allowed(router, req)
+            mf === nothing && return _mount_miss(router, misses, req)
+            _is_mount_method(req.method) || return _mount_method_not_allowed(router, misses, req)
             return _serve_mounted(req, mf, policy, lru, headers, loadfile, cache_control)
         end
     else
@@ -473,8 +475,8 @@ function spafiles(
             # SPA, and a 405 there would break its navigation. Only the non-GET miss, which was
             # a 404, becomes the router's 405.
             _is_mount_method(req.method) ||
-                return mf === nothing ? _mount_miss(router, notfound, req) :
-                                        _mount_method_not_allowed(router, req)
+                return mf === nothing ? _mount_miss(router, misses, req) :
+                                        _mount_method_not_allowed(router, misses, req)
             target = mf === nothing ? index_mf : mf
             return _serve_mounted(req, target, policy, lru, headers, loadfile, cache_control)
         end
@@ -488,7 +490,7 @@ end
 
 function dynamicfiles(
     ctx::App,
-    router::Router,
+    router::Types.NitroRouter,
     folder::String,
     mountdir::String="static";
     headers::Vector=[],
@@ -526,14 +528,14 @@ function dynamicfiles(
 
     segments = Util.mount_segments(mountdir)
     nprefix  = length(segments)
-    notfound = router._404
+    misses   = Types.MissResponses(ctx.not_found, ctx.method_not_allowed)
 
     handler = function (req::HTTP.Request)
         mf = _lookup_mount(table, req.target, nprefix)
         # A miss gets the router's own answer for EVERY method -- the mount does not claim a path
         # it cannot serve (see `_register_mount` and `_mount_miss`).
-        mf === nothing && return _mount_miss(router, notfound, req)
-        _is_mount_method(req.method) || return _mount_method_not_allowed(router, req)
+        mf === nothing && return _mount_miss(router, misses, req)
+        _is_mount_method(req.method) || return _mount_method_not_allowed(router, misses, req)
         return _serve_mounted(req, mf, policy, lru, headers, loadfile, cache_control)
     end
     _register_mount(ctx, router, segments, handler; bare = haskey(files, ""))
