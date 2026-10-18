@@ -135,6 +135,9 @@ julia bench/socket/probe_report.jl bench/results/fairness-<stamp>-raw  # the PRO
   connection task), and `bare_pool` (`bare_spawn` with the spawn replaced by `POOL` long-lived
   tasks, default `nthreads(:default)`, fed by a `Channel`: no task created per request, #468). `/cpu` burns `CPU_MS` (default 50) without yielding; `/lag` is live only with
   `LAG=1`. `/cpu_yield` burns the same but calls `yield()` every `YIELD_MS` (default 2).
+  The Nitro modes also serve `/query?id=7&name=bench`, which binds a `Query{T}` of a `@kwdef`
+  struct and answers `name`, so typed binding is measurable beside `/plaintext` (#537):
+  `ROUTES="/plaintext /json /query?id=7&name=bench" bench/socket/run.sh`.
   `WORKERS=1` adds `/burst?n=K` to the Nitro modes, which submits K Workers jobs that each burn
   `JOB_MS` (default 500), and `/cpu_job`, which submits one `/cpu` of work to a queue of
   concurrency `BURST_K` and answers `202` (a full queue answers `503`); `/jobs` counts the

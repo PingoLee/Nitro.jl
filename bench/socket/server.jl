@@ -117,6 +117,13 @@ end
 const PLAINTEXT = "Hello, World!"
 json_body() = JSON.json(Dict("message" => "Hello, World!"))
 
+# `/query?id=7&name=bench`, Nitro modes only: a `Query{T}` bind of a `@kwdef` struct, so typed
+# binding (`struct_builder`, #537) is on the measured path next to `/plaintext` and `/json`.
+Base.@kwdef struct QueryArgs
+    id::Int = 0
+    name::String = ""
+end
+
 include(joinpath(@__DIR__, "aggregate.jl"))
 const AGG_DATA = agg_rows(AGG_ROWS)
 
@@ -376,6 +383,7 @@ function start_nitro()
         path("/lag",       req -> Res.send(lag_body(); content_type = "application/json"); method = "GET"),
         path("/gc",        req -> Res.send(gc_body(); content_type = "application/json"); method = "GET"),
         path("/probe",     req -> Res.send(probe_body(); content_type = "text/tab-separated-values"); method = "GET"),
+        path("/query",     (req, q::Query{QueryArgs}) -> Res.send(q.payload.name); method = "GET"),
     )
     if HOLDS
         hold_json, hold_json_typed, hold_multipart, hold_file, hold_file_stream = hold_routes()
