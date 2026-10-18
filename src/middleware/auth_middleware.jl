@@ -6,7 +6,7 @@ using ...Types: _is_identity
 using ...Cookies: get_cookie
 using ...Errors: CookieError, is_unrecoverable
 using ...Crypto: SecretString, _cookie_secret
-using ...Util: _auth_credential, _check_denial_factory, _deny
+using ...Util: _auth_credential, _check_denial_factory, _deny, _takes_request
 
 export BearerAuth, CookieAuthMiddleware
 
@@ -275,10 +275,7 @@ function _extract_token(req::HTTP.Request, header::String, scheme::String, cooki
 end
 
 function _validate_token(validate_token::Function, req::HTTP.Request, token::String)
-    methods = Base.methods(validate_token)
-    if any(length(method.sig.parameters) - 1 == 2 for method in methods)
-        return validate_token(token, req)
-    end
+    _takes_request(validate_token) && return validate_token(token, req)
     return validate_token(token)
 end
 

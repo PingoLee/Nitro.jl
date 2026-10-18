@@ -462,6 +462,18 @@ function _check_denial_factory(f, keyword::Symbol)
                         "and return an `HTTP.Response`"))
 end
 
+# The app-supplied token and user validators take the request as an optional second argument:
+# `f(token)` or `f(token, req)` in `BearerAuth`/`CookieAuthMiddleware`, `f(principal)` or
+# `f(principal, req)` as `jwt_validator`'s `user_validator`. Which one is a question about `f`'s
+# methods, so it is answered once per validator type (#546): `Base.methods` walks the method table
+# and allocates a `MethodList`, ~0.7 µs -- most of a `BearerAuth` request with a trivial
+# validator. A `TypeMemo`, not a flag stored when the middleware is built: the memo is keyed on
+# the world counter, so a method Revise adds to the validator later is seen on the next request.
+const TAKES_REQUEST = TypeMemo()
+__init__() = reset!(TAKES_REQUEST)
+_takes_request(f::F) where {F} = memoized(_ -> _has_two_arg_method(f), TAKES_REQUEST, F)
+_has_two_arg_method(f) = any(method -> length(method.sig.parameters) - 1 == 2, Base.methods(f))
+
 # Fail closed. A factory returning `nothing` would turn a denial into an admission, and one
 # returning a `Dict` it meant to serialize would reach `GuardMiddleware` as a malformed guard
 # result. Anything but a response is an error here, at the factory that produced it, which the

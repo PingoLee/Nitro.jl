@@ -1,8 +1,5 @@
 function _invoke_user_validator(validator::Function, claims)
-    methods = Base.methods(validator)
-    if any(length(method.sig.parameters) - 1 == 2 for method in methods)
-        return validator(claims, nothing)
-    end
+    _takes_request(validator) && return validator(claims, nothing)
     return validator(claims)
 end
 
@@ -298,13 +295,10 @@ function jwt_validator(secret_or_keyset;
         end
         user = if req === nothing
             _invoke_user_validator(user_validator, principal)
+        elseif _takes_request(user_validator)
+            user_validator(principal, req)
         else
-            methods = Base.methods(user_validator)
-            if any(length(method.sig.parameters) - 1 == 2 for method in methods)
-                user_validator(principal, req)
-            else
-                user_validator(principal)
-            end
+            user_validator(principal)
         end
         # The auth middleware's own predicate, so a `user_validator` answering `false` is the
         # same `nothing` a missing user is, not a `(false, principal)` tuple for the middleware
