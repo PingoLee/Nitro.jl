@@ -1,8 +1,8 @@
-# juliac `--trim`: the walls, and the decision they wait on
+# juliac `--trim`: the walls, and the order to clear them in
 
 Design record for compiling a Nitro app with Julia 1.12's `juliac --trim`. It covers what the
 verifier reports, which walls are cleared, which remain, why each remaining one is a design
-question rather than a patch, and the decision none of them can be fixed without. The measuring
+question rather than a patch, and the decision (§4) that makes clearing them the goal. The measuring
 harness is `bench/juliac/` ([#570](https://github.com/PingoLee/Nitro.jl/issues/570)). The first
 wall was cleared in [#571](https://github.com/PingoLee/Nitro.jl/issues/571), and
 [#572](https://github.com/PingoLee/Nitro.jl/issues/572) is where this record was written.
@@ -12,8 +12,9 @@ wall was cleared in [#571](https://github.com/PingoLee/Nitro.jl/issues/571), and
 > values whose type depends on the *app*: the router and the running server. Every closure the
 > pipeline builds captures the router, so the request pipeline is abstract to a static compiler
 > however the layers are folded. Clearing that means `Service`'s type has to carry the router's
-> type, or Nitro has to own one router type. Both are API-shaped choices. **No route is chosen
-> here.** The open question in §4 comes first.
+> type, or Nitro has to own one router type. Both are API-shaped choices. **§4 is decided:
+> `--trim=safe` is a product target.** §3.1's choice between the two shapes is the next decision,
+> and the first change.
 
 ## 1. How to measure
 
@@ -118,15 +119,48 @@ never per request. A concrete field needs the same type-parameter decision as §
 only at startup and shutdown. The typed option is `FunctionWrapper{Nothing, Tuple{}}`, a new
 dependency whose trim behaviour is unverified. This is deliberately left until §4 is decided.
 
-## 4. The open decision
+## 4. The decision: `--trim=safe` is a target
 
-**Is `--trim=safe` a product target for Nitro, or a ratchet that only keeps new dynamic seams
-out?**
+**The question was:** is `--trim=safe` a product target for Nitro, or a ratchet that only keeps
+new dynamic seams out?
 
-- As a **ratchet**: §2's fixes are the whole value (they also helped the JIT build). New code keeps
+- As a **ratchet**, §2's fixes are the whole value (they also helped the JIT build). New code keeps
   the slots concrete and avoids `repr` of an un-inferred value. §3 stays as it is.
-- As a **target**: §3.1 is the first change and an API one, then §3.2's route boundary, then the
-  request path the audit predicted (#537, #538, #546, #566). It is worth deciding before
+- As a **target**, §3.1 is the first change, and it is an API one. Then come §3.2's route boundary
+  and the request path the audit predicted (#537, #538, #546, #566). It is worth deciding before
   publication, while a breaking change to `App`/`Service` is still cheap.
 
-Recorded, not decided.
+**Decided by the maintainer (2026-10-18): a target.** It is chosen over further work on the
+runtime limits the performance passes measured: no preemption (#469), the order spawned tasks
+run in (#618), GC safepoints (#588). Nitro cannot change those, and a compiled binary inherits
+them unchanged, so a compiled binary is not expected to fix any of them. What it is expected to
+buy is a startup and deployment win:
+- time to listen, already measured untrimmed: 0.53 s against 2.48 s under the JIT;
+- binary size: 3.8 MB trimmed;
+- resident memory and time to first request: **neither measured trimmed yet.** Untrimmed, the
+  first request is no faster (1.33 s against 1.28 s), because the image keeps the JIT.
+
+The order:
+
+1. **§3.1, the router's type.** Choose between `Service{R}`/`App{S}` and one Nitro-owned router
+   type. This is the next decision.
+2. **§3.3, the server field.** Its type parameter is the pipeline's, which is fixed at `serve`
+   time, not at `App` construction, so it needs its own shape. One candidate, not designed yet: a
+   typed handle that `serve` returns and `terminate` takes.
+3. **§3.2, the fold and the route boundary (#572).** It does nothing until 1 and 2 land, and it
+   is where the per-route erasure point is chosen.
+4. **The request path:** #537, #538, #546, #566. Those four also help the JIT build, so they need
+   not wait for 1–3.
+5. **§3.4, the lifecycle hooks.**
+6. **Outside Nitro:** OpenSSL.jl and the libuv read callback, reported upstream.
+
+Two rules come with the target:
+
+- **The JIT build is the one users run today, so it must not pay for the target.** A change made
+  for `--trim` that costs the JIT request path more than the noise, such as a `FunctionWrapper`
+  trampoline per request where a function barrier would do (§3.2), has to justify that cost with
+  a measurement (`bench/socket/run.sh`, interleaved with `main`).
+- **Every wall cleared is re-measured with `bench/juliac/build.sh unsafe-warn`, counted by first
+  frame in `src/`**, so this record's §3 stays the live backlog. Once the minimal app passes
+  `--trim=safe`, the trimmed exe's first request, resident memory and throughput against the JIT
+  are the numbers that say whether the target paid off.
