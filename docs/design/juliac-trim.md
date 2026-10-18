@@ -13,8 +13,8 @@ wall was cleared in [#571](https://github.com/PingoLee/Nitro.jl/issues/571), and
 > pipeline builds captures the router, so the request pipeline is abstract to a static compiler
 > however the layers are folded. Clearing that means `Service`'s type has to carry the router's
 > type, or Nitro has to own one router type. Both are API-shaped choices. **§4 is decided:
-> `--trim=safe` is a product target.** §3.1's choice between the two shapes is the next decision,
-> and the first change.
+> `--trim=safe` is a product target**, and §3.1 is decided: one Nitro-owned router type. That is
+> the first change.
 
 ## 1. How to measure
 
@@ -75,6 +75,22 @@ The two shapes that would make it concrete:
 |---|---|
 | **`Service{R}` / `App{S}`**: the router's type becomes a type parameter (axum's `Router<S>`) | `App` becomes a UnionAll, so `CONTEXT::Ref{App}` and every `::App` signature turn abstract unless a concrete default alias is pinned. A custom router stays supported |
 | **One Nitro-owned router type**: custom 404/405 move from the router's type into a typed field or a fixed callable | Keeps `App` concrete. It is a breaking change to `Service(router = HTTP.Router(my404, …))` and needs a new customization surface and an `upgrading/` entry |
+
+**Decided by the maintainer (2026-10-18): one Nitro-owned router type.** `App` stays concrete, so
+`CONTEXT::Ref{App}` and every `::App` signature are unchanged. What the choice leaves to design:
+
+- **Where the custom 404/405 go.** Nitro already calls them itself: `r._404`/`r._405` in
+  `_route_miss` and `_method_not_allowed` (`src/core/pipeline.jl`), and `router._404` captured by
+  the static mounts (`src/core/staticfiles.jl`). Nitro dispatches with its own `_gethandler`, so
+  nothing relies on HTTP.jl calling them. They can therefore leave the router for a field Nitro
+  owns, set through `App`.
+- **The field's type is the open part.** A `Function` field is abstract, and `--trim=safe` rejects
+  the call. That leaves two candidates: a fixed response value, which loses per-request logic, or
+  a `FunctionWrapper{HTTP.Response, Tuple{HTTP.Request}}`, which brings in a new dependency whose
+  verifier behaviour is unconfirmed (§3.2, §3.4). A spike under `juliac --trim=safe` decides it,
+  and the same answer serves §3.2 and §3.4.
+- **HTTP.jl's router-level middleware** (the router's third type parameter) goes. Nitro has its
+  own chain, and it already refuses that middleware on some routes (#282).
 
 ### 3.2 The fold and the route boundary (#572, after §3.1)
 
@@ -142,8 +158,8 @@ buy is a startup and deployment win:
 
 The order:
 
-1. **§3.1, the router's type.** Choose between `Service{R}`/`App{S}` and one Nitro-owned router
-   type. This is the next decision.
+1. **§3.1, the router's type.** One Nitro-owned router type (decided 2026-10-18; see §3.1). Its
+   custom 404/405 surface waits on the `FunctionWrapper` spike.
 2. **§3.3, the server field.** Its type parameter is the pipeline's, which is fixed at `serve`
    time, not at `App` construction, so it needs its own shape. One candidate, not designed yet: a
    typed handle that `serve` returns and `terminate` takes.
