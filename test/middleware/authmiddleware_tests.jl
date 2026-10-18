@@ -656,3 +656,62 @@ end
 end
 
 end
+
+@testitem "Auth middleware — a validator's arity is decided once per type, and sees redefinition (#546)" tags=[:middleware, :auth] setup=[NitroCommon] begin
+using HTTP
+using Nitro
+
+bearer(t) = HTTP.Request("GET", "/", ["Authorization" => "Bearer $t"])
+ok = _ -> HTTP.Response(200)
+
+@testset "one- and two-argument token validators get what they declare" begin
+    for mw in (BearerAuth, CookieAuthMiddleware)
+        seen = Ref{Any}(nothing)
+        one = mw(t -> (seen[] = (t,); "u"); cookie_name = "c")(ok)
+        two = mw((t, r) -> (seen[] = (t, r); "u"); cookie_name = "c")(ok)
+        for (handler, arity) in ((one, 1), (two, 2))
+            req = mw === BearerAuth ? bearer("tok") : HTTP.Request("GET", "/", ["Cookie" => "c=tok"])
+            @test handler(req).status == 200
+            @test (mw, length(seen[])) == (mw, arity)
+            arity == 2 && @test seen[][2] === req
+        end
+    end
+end
+
+# The memo is keyed on the world counter, not stored when the middleware was built: a method
+# added to the validator afterwards -- what Revise does -- is used on the very next request.
+struct GrowingValidator <: Function end
+(::GrowingValidator)(t) = "one:$t"
+
+@testset "a two-argument method added after the first request is seen on the next" begin
+    who = Ref{Any}(nothing)
+    handler = BearerAuth(GrowingValidator())(req -> (who[] = getuser(req); HTTP.Response(200)))
+    @test handler(bearer("a")).status == 200
+    @test who[] == "one:a"
+    @eval (::GrowingValidator)(t, req) = "two:$t"
+    @test handler(bearer("b")).status == 200
+    @test who[] == "two:b"
+end
+
+@testset "jwt_validator's user_validator: (principal), (principal, req), and no request" begin
+    key = jwtkey("arity-secret")
+    token = Nitro.Auth.encode_jwt(Dict("sub" => "7"), key; expires_in = 60)
+    req = bearer(token)
+    one = Nitro.Auth.jwt_validator(key; user_validator = p -> "one:$(p.id)")
+    two = Nitro.Auth.jwt_validator(key; user_validator = (p, r) -> (r === req || r === nothing) ? "two:$(p.id):$(r === nothing)" : nothing)
+    @test first(one(token, req)) == "one:7"
+    @test first(one(token)) == "one:7"
+    @test first(two(token, req)) == "two:7:false"
+    @test first(two(token)) == "two:7:true"
+end
+
+# Before #546 every credentialed request asked `Base.methods(validator)`, a walk that allocates a
+# `MethodList`. Under the suite's flags that request measured 20 allocations, and 11 without the
+# walk; the bound sits between the two.
+@testset let handler = BearerAuth(t -> "u")(ok), req = bearer("tok"),
+             per_request = allocs(() -> handler(req)),
+             methods_walk = allocs(() -> any(m -> length(m.sig.parameters) == 2, Base.methods(handler)))
+    @test methods_walk.count >= 5          # the positive control: the walk this removed allocates
+    @test per_request.count <= 15
+end
+end
