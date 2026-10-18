@@ -2,7 +2,7 @@
 # the same shapes, so the two isolate the runtimes from HTTP. Run it through run.sh, which pins
 # both to the same CPUs with the Julia default thread count equal to GOMAXPROCS.
 #
-#   julia --project=bench --threads=8,1 bench/tasks/tasks.jl [micro] [parked] [spin]
+#   julia --project=bench --threads=8,1 bench/tasks/tasks.jl [micro] [queued] [parked] [spin]
 #   VARIANT=B FAN_OUT_NS="1000 10000" julia --project=bench --threads=8,1 bench/tasks/tasks.jl micro
 #
 #   VARIANT  the multiqueue order (multiq_variant.jl, #618), applied before anything else runs
@@ -11,6 +11,8 @@
 #   micro   BenchmarkTools: spawn + wait one at a time (bench/suite/taskpattern.jl's
 #           `spawn_single`, the shape of Nitro's per-request spawn), a ping-pong round trip over
 #           unbuffered channels, and a fan-out of 1000 tasks with one wait for all.
+#   queued  every `:default` thread held busy while N tasks are spawned, then released: the drain
+#           time per task with all N waiting in the multiqueue heaps (QUEUED_NS, QUEUED_REPS)
 #   parked  100,000 tasks blocked on one `Base.Event`: creation time and resident memory per task.
 #   spin    one task per `:default` thread that computes for 1.5 s without yielding, and a
 #           heartbeat that wants to wake every 1 ms -- once on `:default` (where Nitro runs
@@ -61,6 +63,54 @@ function micro()
         trial = @benchmark fan_out($n)
         report("FanOut$n", trial)
         report("FanOut$n", trial; per = n, unit = "task")
+    end
+end
+
+# ── queued ──────────────────────────────────────────────────────────────────────────────────
+# The fan-out rows never queue deeply: one
+# spawner cannot outrun the threads popping, so the multiqueue heaps stay a few tasks deep, and a
+# cost that grows with heap depth (#618's variant B) does not show there. Here every `:default`
+# thread except the spawner's is held by a spinner while `n` tasks are spawned, so all `n` sit in
+# the heaps (about n / 16 per heap at 8 threads); then the spinners are released and the drain is
+# timed: release -> every task done, per task.
+
+const QUEUED_NS = parse.(Int, split(get(ENV, "QUEUED_NS", "10000 100000")))
+const QUEUED_REPS = parse(Int, get(ENV, "QUEUED_REPS", "5"))
+const QUEUED_DONE = Threads.Atomic{Int}(0)
+
+function queued_once(n::Int)
+    hold = Threads.Atomic{Bool}(true)
+    started = Threads.Atomic{Int}(0)
+    # A spinner on every :default thread, less the one this task is on if it is a :default one.
+    k = Threads.nthreads(:default) - (Threads.threadpool() === :default ? 1 : 0)
+    spinners = [Threads.@spawn :default (Threads.atomic_add!(started, 1);
+                                         while hold[]; GC.safepoint(); end) for _ in 1:k]
+    while started[] < k
+        yield()
+    end
+    QUEUED_DONE[] = 0
+    t0 = time_ns()
+    tasks = Vector{Task}(undef, n)
+    for j in 1:n
+        tasks[j] = Threads.@spawn :default (Threads.atomic_add!(QUEUED_DONE, 1); nothing)
+    end
+    t1 = time_ns()
+    hold[] = false
+    foreach(wait, tasks)
+    t2 = time_ns()
+    foreach(wait, spinners)
+    return (t1 - t0) / n, (t2 - t1) / n
+end
+
+function queued()
+    for n in QUEUED_NS
+        queued_once(n)   # compile, and warm the heaps' storage
+        rs = [queued_once(n) for _ in 1:QUEUED_REPS]
+        spawn, drain = sort(first.(rs)), sort(last.(rs))
+        mid = (QUEUED_REPS + 1) ÷ 2
+        println("queued\tjulia\tQueued", n, "\tspawn_ns_per_task=", round(spawn[mid]; digits = 1),
+                "\tdrain_ns_per_task=", round(drain[mid]; digits = 1),
+                "\tdrain_min=", round(drain[1]; digits = 1), "\tdrain_max=", round(drain[end]; digits = 1))
     end
 end
 
@@ -165,5 +215,6 @@ println(stderr, "Julia ", VERSION, " threads default=", Threads.nthreads(:defaul
         " interactive=", Threads.nthreads(:interactive))
 what = isempty(ARGS) ? ["micro", "parked", "spin"] : ARGS
 "micro" in what && micro()
+"queued" in what && queued()
 "parked" in what && parked()
 "spin" in what && spin()

@@ -14,8 +14,10 @@
 #
 #   VARIANTS     multiq_variant.jl variants to run, "A" (stock) by default
 #   A0_CELLS     CELLS for variant A0 only (it is a cost control; default: CELLS)
-#   MICRO_OUT    also run tasks.jl `micro` for each channel, layout and variant, appending its lines
-#                to this file prefixed with round, julia version, layout and variant
+#   CELLS=none   skip spawn_order.jl (run only the tasks.jl rows below)
+#   MICRO_OUT    also run tasks.jl for each channel, layout and variant, appending its lines to this
+#                file prefixed with round, julia version, layout and variant
+#   MICRO_WHAT   what tasks.jl runs, "micro" by default (e.g. "micro queued")
 #   MICRO_PROJECT  the environment for tasks.jl (it needs BenchmarkTools), default bench/; "{mm}"
 #                is replaced with the channel's major.minor, for one environment per version
 #   TIMEOUT_S    each process is killed after this many seconds (default 900); a hang is a failure
@@ -32,6 +34,7 @@ CPUS="${CPUS:-0,1,2,3,6,7,8,9}"
 TIMEOUT_S="${TIMEOUT_S:-900}"
 MICRO_OUT="${MICRO_OUT:-}"
 MICRO_PROJECT="${MICRO_PROJECT:-$HERE/..}"
+MICRO_WHAT="${MICRO_WHAT:-micro}"
 mkdir -p "$(dirname "$TSV")"
 
 for ch in $CHANNELS; do
@@ -42,17 +45,19 @@ for ch in $CHANNELS; do
     for variant in $VARIANTS; do
       cells="${CELLS:-}"
       [ "$variant" = A0 ] && cells="${A0_CELLS:-$cells}"
-      header=0; [ -s "$TSV" ] && header=1
-      env ROUND="$ROUND" NOHEADER="$header" VARIANT="$variant" ${cells:+"CELLS=$cells"} \
-        timeout -s KILL "$TIMEOUT_S" taskset -c "$CPUS" "$jl" --threads="$layout" \
-        "$HERE/spawn_order.jl" >>"$TSV" ||
-        { echo "spawn_order.sh: julia +$ch --threads=$layout VARIANT=$variant failed or timed out" >&2; exit 1; }
+      if [ "$cells" != none ]; then
+        header=0; [ -s "$TSV" ] && header=1
+        env ROUND="$ROUND" NOHEADER="$header" VARIANT="$variant" ${cells:+"CELLS=$cells"} \
+          timeout -s KILL "$TIMEOUT_S" taskset -c "$CPUS" "$jl" --threads="$layout" \
+          "$HERE/spawn_order.jl" >>"$TSV" ||
+          { echo "spawn_order.sh: julia +$ch --threads=$layout VARIANT=$variant failed or timed out" >&2; exit 1; }
+      fi
       if [ -n "$MICRO_OUT" ]; then
         VARIANT="$variant" timeout -s KILL "$TIMEOUT_S" taskset -c "$CPUS" "$jl" \
-          --project="${MICRO_PROJECT//\{mm\}/$mm}" --threads="$layout" "$HERE/tasks.jl" micro |
+          --project="${MICRO_PROJECT//\{mm\}/$mm}" --threads="$layout" "$HERE/tasks.jl" $MICRO_WHAT |
           sed "s/^/$ROUND\t$ver\t$layout\t$variant\t/" >>"$MICRO_OUT"
         [ "${PIPESTATUS[0]}" = 0 ] ||
-          { echo "spawn_order.sh: tasks.jl micro +$ch --threads=$layout VARIANT=$variant failed or timed out" >&2; exit 1; }
+          { echo "spawn_order.sh: tasks.jl $MICRO_WHAT +$ch --threads=$layout VARIANT=$variant failed or timed out" >&2; exit 1; }
       fi
     done
   done

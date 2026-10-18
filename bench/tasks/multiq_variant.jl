@@ -143,17 +143,25 @@ elseif MULTIQ_VARIANT == "C"
             end
         end
 
+        # C: an ordinary d-ary sift-down, one swap per level with the least child. The build's
+        # loop swaps with every child less than the parent, in turn, and recurses into each: cheap
+        # while equal priorities make it swap nothing, but under a strict order it walks much of the
+        # heap, the cost that got `<=` reverted (single heap, no scheduler, 1.12.7: 64 µs a pop at
+        # 50,000 tasks against 10 ns stock).
         function multiq_sift_down(heap::seqheap, idx::Int32)
-            if idx <= heap.ntasks
-                for child = (heap_d * idx - heap_d + 2):(heap_d * idx + 1)
-                    child = Int(child)
-                    child > length(heap.tasks) && break
-                    if isassigned(heap.tasks, child) &&
-                            seq_less(heap, child, Int(idx))
-                        seq_swap!(heap, Int(idx), child)
-                        multiq_sift_down(heap, Int32(child))
+            i = Int(idx)
+            n = Int(heap.ntasks)
+            while true
+                first = Int(heap_d) * (i - 1) + 2
+                least = i
+                for child = first:min(first + Int(heap_d) - 1, n)
+                    if seq_less(heap, child, least)
+                        least = child
                     end
                 end
+                least == i && return
+                seq_swap!(heap, i, least)
+                i = least
             end
         end
 
@@ -490,6 +498,17 @@ function _interleaved(n::Int)
     return popped
 end
 
+# Fill N, then time the drain: ns per pop, on one heap with no scheduler and no contention.
+function _drain_ns(n::Int)
+    h, ids = _newheap(), IdDict{Task,Int}()
+    foreach(i -> _push!(h, _dummy(ids, i)), 1:n)
+    t0 = time_ns()
+    for _ in 1:n
+        _pop!(h)
+    end
+    return (time_ns() - t0) / n
+end
+
 function multiq_unit_asserts()
     n, m = 30, 3000
     fd, (worst, waiting), il = _fill_drain(20), _steady(n, m), _interleaved(2000)
@@ -510,5 +529,8 @@ function multiq_unit_asserts()
     println(stderr, "multiq_variant: single-heap asserts passed for ", MULTIQ_VARIANT,
             ": fill/drain of 20 pops ", fd, "; steady state N = ", n, ": worst served after ", worst,
             " pops, oldest waiting ", waiting, " of ", m)
+    _drain_ns(1000)
+    println(stderr, "multiq_variant: single-heap drain, ns per pop (best of 3): ",
+            join(("n = $n: $(round(minimum(_drain_ns(n) for _ in 1:3); digits = 1))" for n in (1000, 10_000)), ", "))
     return nothing
 end
