@@ -658,3 +658,192 @@ end
     @test Nitro.text(send("/j", body; ct = "application/json")) == "mallory"
 end
 end
+
+@testitem "the generated binder binds exactly what the reflective walk did (#537)" tags=[:core] setup=[NitroCommon] begin
+using Test
+using HTTP
+using JSON
+using Nitro
+using Nitro: App, Nullable, ValidationError
+using Nitro: Query, Form, Header, Path, JsonFragment
+using Nitro.Core.Reflection: struct_builder, bind_value, kw_construct, kw_constructible, dict_builder
+
+# `struct_builder` as it was before #537, verbatim: the reference every result below must equal.
+function reference_builder(::Type{T}, source::AbstractDict) :: T where {T}
+    T <: AbstractDict && return dict_builder(T, source)
+    if kw_constructible(T)
+        kwargs = Pair{Symbol, Any}[]
+        for name in fieldnames(T)
+            key = String(name)
+            haskey(source, key) || continue
+            push!(kwargs, name => bind_value(fieldtype(T, name), source[key]))
+        end
+        return kw_construct(T, kwargs)
+    end
+    args = Any[]
+    for name in fieldnames(T)
+        key = String(name)
+        ftype = fieldtype(T, name)
+        if haskey(source, key)
+            push!(args, bind_value(ftype, source[key]))
+        elseif Nothing <: ftype
+            push!(args, nothing)
+        elseif Missing <: ftype
+            push!(args, missing)
+        else
+            throw(ValidationError("Missing required field '$name'"))
+        end
+    end
+    T <: NamedTuple && return T(Tuple(args))
+    return T(args...)
+end
+
+# Declared defaults (one of them a non-`nothing` default on a `Nullable` field, which a static
+# null-fill would get wrong), required fields, fields only a null can fill, and the positional
+# shapes.
+Base.@kwdef struct KwDefaults
+    a::Int = 0
+    b::String = "d"
+    c::Nullable{Int} = 1
+end
+Base.@kwdef struct KwRequired
+    a::Int
+    b::Union{Nothing, String}
+    c::Union{Missing, Int}
+end
+Base.@kwdef struct KwMixed
+    a::Int
+    b::String = "d"
+    c::Nullable{Int} = nothing
+end
+struct PlainABC
+    a::Int
+    b::Union{Nothing, String}
+    c::Union{Missing, Int}
+end
+struct PlainRequired
+    a::Int
+    b::String
+    c::Nullable{Int}
+end
+const NTABC = @NamedTuple{a::Int, b::String, c::Nullable{Int}}
+Base.@kwdef struct KwEmpty end
+Base.@kwdef struct Leaf
+    x::Int = 5
+end
+Base.@kwdef struct Nested
+    a::Int = 0
+    leaf::Leaf = Leaf()
+end
+
+# A parametric struct, an `Any` field, an inner constructor that validates (`a = -1` is refused
+# by it, not by binding), and defaults that read another field (`b` and `c` from a required `a`).
+Base.@kwdef struct KwParam{X}
+    a::X = zero(X)
+    b::Any = "any"
+    c::Nullable{Int} = nothing
+end
+struct PlainValidated
+    a::Int
+    b::String
+    c::Nullable{Int}
+    PlainValidated(a, b, c) = a >= 0 ? new(a, b, c) : throw(ArgumentError("a must be >= 0"))
+end
+Base.@kwdef struct KwDependent
+    a::Int
+    b::String = string(a)
+    c::Int = a + 1
+end
+
+const TYPES = (KwDefaults, KwRequired, KwMixed, PlainABC, PlainRequired, NTABC,
+               KwParam{Int}, PlainValidated, KwDependent)
+const VALUES = Dict("a" => "1", "b" => "s", "c" => "3")
+subsets(keys) = [[k for (i, k) in enumerate(keys) if (m >> (i - 1)) & 1 == 1] for m in 0:(2^length(keys) - 1)]
+# Every presence pattern, plus an unknown key, plus a value that does not bind.
+sources() = vcat([Dict{String, String}(k => VALUES[k] for k in ks) for ks in subsets(["a", "b", "c"])],
+                 [Dict("a" => "1", "b" => "s", "c" => "3", "zzz" => "1"), Dict("a" => "x", "b" => "s", "c" => "3"),
+                  Dict("a" => "-1", "b" => "s", "c" => "3")])
+
+outcome(f) = try
+    (:ok, f())
+catch e
+    (:err, typeof(e), e isa ValidationError ? e.msg : sprint(showerror, e))
+end
+
+@testset "unit: every type, every presence pattern" begin
+    for T in TYPES, source in sources()
+        @test (T, source, outcome(() -> struct_builder(T, source))) ==
+              (T, source, outcome(() -> reference_builder(T, source)))
+    end
+    @test struct_builder(KwEmpty, Dict("a" => "1")) === reference_builder(KwEmpty, Dict("a" => "1"))
+    # A JSON object for a struct field still recurses, defaults applying at every level.
+    for source in (Dict{String, Any}("a" => 2, "leaf" => Dict{String, Any}("x" => 9)),
+                   Dict{String, Any}("leaf" => Dict{String, Any}()), Dict{String, Any}())
+        @test (source, struct_builder(Nested, source)) == (source, reference_builder(Nested, source))
+    end
+    # A target the generated binders do not take fails as it always did.
+    @test outcome(() -> struct_builder(Tuple{Int, String}, Dict("1" => "1"))) ==
+          outcome(() -> reference_builder(Tuple{Int, String}, Dict("1" => "1")))
+end
+
+# Through each extractor that binds with `struct_builder`, from a real request.
+seen = Ref{Any}(nothing)
+routename(T) = T === NTABC ? "NTABC" : string(nameof(T))
+app = App(mod = @__MODULE__)
+for T in TYPES
+    n = routename(T)
+    @eval urlpatterns(app, "",
+        path($("/q/$n"), (req, x::Query{$T}) -> (seen[] = x.payload; "ok")),
+        path($("/f/$n"), (req, x::Form{$T}) -> (seen[] = x.payload; "ok"); method = "POST"),
+        path($("/h/$n"), (req, x::Header{$T}) -> (seen[] = x.payload; "ok")),
+        path($("/j/$n"), (req, frag::JsonFragment{$T}) -> (seen[] = frag.payload; "ok"); method = "POST"),
+        path($("/p/$n/{a}/{b}/{c}"), (req, x::Path{$T}) -> (seen[] = x.payload; "ok")))
+end
+form(source) = join(("$k=$v" for (k, v) in source), "&")
+function via(T, kind, source)
+    n = routename(T)
+    seen[] = nothing
+    res = if kind === :query
+        internalrequest(app, HTTP.Request("GET", "/q/$n?" * form(source)))
+    elseif kind === :form
+        internalrequest(app, HTTP.Request("POST", "/f/$n", ["Content-Type" => "application/x-www-form-urlencoded"], form(source)))
+    elseif kind === :header
+        internalrequest(app, HTTP.Request("GET", "/h/$n", collect(source)))
+    elseif kind === :json
+        internalrequest(app, HTTP.Request("POST", "/j/$n", ["Content-Type" => "application/json"],
+                                          JSON.json(Dict("frag" => source))))
+    else
+        internalrequest(app, HTTP.Request("GET", "/p/$n/$(source["a"])/$(source["b"])/$(source["c"])"))
+    end
+    return res.status == 200 ? (:ok, seen[]) : (:refused, res.status)
+end
+expected(T, source) = (o = outcome(() -> reference_builder(T, source)); first(o) === :ok ? o : (:refused, 400))
+
+@testset "routes: Query, Form, Header, JsonFragment and Path bind what the reference does" begin
+    for T in TYPES, source in sources(), kind in (:query, :form, :header, :json)
+        @test (T, kind, source, via(T, kind, source)) == (T, kind, source, expected(T, source))
+    end
+    for T in TYPES, source in (VALUES, Dict("a" => "x", "b" => "s", "c" => "3"))
+        @test (T, :path, source, via(T, :path, source)) == (T, :path, source, expected(T, source))
+    end
+end
+
+# The reflective walk paid a `String` per field, a boxed `Pair` per value and a keyword call built
+# from a runtime vector. With every field present the generated binder makes a static call:
+# under the suite's flags 5 allocations here against the walk's 22. The bound sits between them;
+# `reference_builder` is the positive control.
+@testset let full = Dict("a" => "1", "b" => "s", "c" => "3"),
+             generated = allocs(() -> struct_builder(KwDefaults, full)),
+             reflective = allocs(() -> reference_builder(KwDefaults, full))
+    @test reflective.count >= 15
+    @test generated.count <= 10
+end
+# The positional binder too, so a plain struct cannot fall back to the walk unnoticed: 3
+# allocations against the walk's 8 under the suite's flags.
+@testset let full = Dict("a" => "1", "b" => "s", "c" => "3"),
+             generated = allocs(() -> struct_builder(PlainRequired, full)),
+             reflective = allocs(() -> reference_builder(PlainRequired, full))
+    @test reflective.count >= 6
+    @test generated.count <= 5
+end
+end

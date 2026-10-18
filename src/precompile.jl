@@ -164,10 +164,11 @@ end
     # feature, and nothing above reached `extract`, `struct_builder`, or `validate`. On the same
     # fresh-process-per-shape basis as the block above, each kind cost 1.5–1.8s on first use and
     # now costs 0.37–0.49s. They are warmed here over one concrete `T`, which is what
-    # specializes the generic binding machinery — `struct_builder`'s reflection, the
-    # per-extractor `extract` methods, and the `Res.json`-of-a-struct return. An application's
-    # own `T` still pays its own `struct_builder` specialization; the shared plumbing no longer
-    # does, which is the same honest split the middleware-cache block above documents.
+    # specializes the generic binding machinery — the per-extractor `extract` methods, the
+    # `bind_value` paths, `kw_construct`, and the `Res.json`-of-a-struct return. An application's
+    # own `T` still pays its own `struct_builder` specialization, and since #537 that includes
+    # running the generated binders for `T`'s fields; the shared plumbing no longer does, which
+    # is the same honest split the middleware-cache block above documents.
     Core.Routing.urlpatterns(ctx, "", RouteDefinition[
         path("/precompile/extract/query", (req::Request, q::Query{PrecompileRecord}) ->
              Res.json(q.payload)),

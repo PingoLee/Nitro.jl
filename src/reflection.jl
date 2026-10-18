@@ -516,10 +516,69 @@ parameters follow. A `@kwdef` struct is built by keyword, so an absent field tak
 default; a plain struct is built positionally, and an absent field binds `nothing` or `missing`
 if its type admits one. Any other absent field is a `ValidationError` naming the field. A target
 that is itself a dictionary type keeps every key and binds each value the same way.
+
+The binding is generated per type (#537): one unrolled step per field, with its key a literal and
+its type folded, so nothing about `T` is looked up per request. A plain struct ends in a static
+`T(v1, …, vn)`. A `@kwdef` struct with every field present ends in a static `T(; a = v1, …)`.
+With a field absent, the present ones go to `kw_construct`, which leaves declared defaults to the
+constructor exactly as before: which fields are absent is known only per request, and a default
+can only apply by omitting its keyword.
 """
 function struct_builder(::Type{T}, source::AbstractDict) :: T where {T}
     T <: AbstractDict && return dict_builder(T, source)
-    if kw_constructible(T)
+    kw_constructible(T) && return bind_by_keyword(T, source)
+    return bind_positionally(T, source)
+end
+
+# What the generated binders need of `T`: a concrete struct whose fields have names. Anything
+# else (a `Tuple`, an abstract type) takes the reflective walk, which fails for it exactly as
+# it always has.
+_generated_binder_target(T) = T isa DataType && !isabstracttype(T) && all(n -> n isa Symbol, fieldnames(T))
+
+@generated function bind_by_keyword(::Type{T}, source::AbstractDict) where {T}
+    _generated_binder_target(T) || return :(reflective_struct_builder(T, source, true))
+    names = fieldnames(T)
+    keys = map(String, names)
+    types = fieldtypes(T)
+    present = [Symbol(:present_, i) for i in eachindex(names)]
+    lookups = [:($(present[i]) = haskey(source, $(keys[i]))) for i in eachindex(names)]
+    all_present = isempty(names) ? true : foldl((a, b) -> :($a && $b), present)
+    # Keyword values evaluate left to right, so the fields bind in declaration order, as before.
+    kws = [Expr(:kw, names[i], :(bind_value($(types[i]), source[$(keys[i])]))) for i in eachindex(names)]
+    pushes = [:($(present[i]) && push!(kwargs, $(QuoteNode(names[i])) => bind_value($(types[i]), source[$(keys[i])])))
+              for i in eachindex(names)]
+    return quote
+        $(lookups...)
+        $all_present && return T(; $(kws...))
+        kwargs = Pair{Symbol, Any}[]
+        $(pushes...)
+        return kw_construct(T, kwargs)
+    end
+end
+
+@generated function bind_positionally(::Type{T}, source::AbstractDict) where {T}
+    _generated_binder_target(T) || return :(reflective_struct_builder(T, source, false))
+    names = fieldnames(T)
+    values = [Symbol(:value_, i) for i in eachindex(names)]
+    steps = map(eachindex(names)) do i
+        key, FT = String(names[i]), fieldtype(T, names[i])
+        absent = Nothing <: FT ? nothing :
+                 Missing <: FT ? missing :
+                 :(throw(ValidationError($("Missing required field '$(names[i])'"))))
+        :($(values[i]) = haskey(source, $key) ? bind_value($FT, source[$key]) : $absent)
+    end
+    # A `NamedTuple` from a tuple of its values, as in `reflective_struct_builder`.
+    construct = T <: NamedTuple ? :(T(($(values...),))) : :(T($(values...)))
+    return quote
+        $(steps...)
+        return $construct
+    end
+end
+
+# The walk `struct_builder` did for every type before #537, kept for the targets the generated
+# binders do not take.
+function reflective_struct_builder(::Type{T}, source::AbstractDict, by_keyword::Bool) :: T where {T}
+    if by_keyword
         kwargs = Pair{Symbol, Any}[]
         for name in fieldnames(T)
             key = String(name)
