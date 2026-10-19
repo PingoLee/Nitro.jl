@@ -10,8 +10,9 @@ which changes the rules (see §1.5).
 > Nitro**. Nitro's `_write_response_body!` writes the body non-destructively, so the
 > upstream "a `BytesBody` is single-use" footgun (which also hit `String` bodies on HTTP
 > ≤ 2.6) does not apply inside Nitro's serve path. The shared `const` error responses in `src/middleware/auth_middleware.jl`
-> are correct and endorsed. The one rule: don't reintroduce HTTP's consuming writer
-> (see §3, Guardrails).
+> are correct and endorsed. The object is safe too, because the transport never hands the
+> pipeline's value to HTTP.jl itself, only a copy (§1.5, #628). The rules: don't reintroduce
+> HTTP's consuming writer, and don't bypass that copy (see §3, Guardrails).
 
 ## 1. The raw HTTP.jl behavior
 
@@ -67,8 +68,8 @@ function _write_response_body!(stream::HTTP.Stream, body::HTTP.BytesBody)
 end
 ```
 
-Because it reads the underlying `.data` rather than draining the cursor, a shared
-`Response` — `String` body included — can be emitted any number of times. Verified:
+Because it reads the underlying `.data` rather than draining the cursor, the body of a
+shared `Response` — `String` included — can be sent any number of times. Verified:
 returning a module-level `const` `String`-bodied `Response` through Nitro serves the
 body on every request, where the same object under raw `HTTP.serve!` breaks on
 request 2.
@@ -79,14 +80,26 @@ endorsed Nitro pattern. The module-level `const` error responses in
 `MISSING_COOKIE`) are correct by design — they are Nitro's equivalent of a Spring
 immutable `ResponseEntity` constant (§2).
 
-A shared response is **body + headers**, and both must be safe. Body reuse is handled by
-the non-consuming write above. **Header** safety is handled separately: Nitro's
+A shared response is **body + headers + the object itself**, and all three must be safe. Body
+reuse is handled by the non-consuming write above. **Header** safety is handled separately: Nitro's
 header-adding middleware (CORS, session, CSRF, rate limiter) never mutate a returned
 response in place — they build a fresh one via `own_response_headers` /
 `add_response_headers` (`src/utilities/misc.jl`). Mutating a shared response's `headers`
 in place would otherwise **accumulate** headers across requests and **leak** per-request
 headers — an echoed `Origin`, or worse, a session `Set-Cookie` minted for one visitor —
 onto the shared object, and would race other request threads. See §3 (P2, Guardrails).
+
+The **object** is the part the body fix did not cover, and until #628 nothing did. HTTP.jl
+writes to the response it is handed in place: Nitro's own `stream_handler` sets `.request`,
+and HTTP 2.9 sets `.close` on a failed write, a write-deadline expiry or an undrained body,
+back-fills `.content_length`, and on its error path calls `setstatus` and `removeheader` on
+`.headers`. Handed a shared value as-is, every request it answered left the previous request
+(its `Authorization` and `Cookie` headers, and its body) reachable through `res.request`, and a
+single slow client could leave `Connection: close` on it for the life of the process. So
+`stream_handler` hands HTTP `_handoff_copy(resp)`: a shallow copy with its own headers and
+trailers, sharing the body. One copy at the boundary covers every shared value at once,
+including a `const` a handler returns, which no per-site copy can reach. It costs one
+field-constructor `Response` and one headers vector per request.
 
 This safety is load-bearing and depends on two things, both guarded by tests:
 
@@ -218,6 +231,10 @@ layer expecting a later layer to still see it; if you need the bytes, materializ
   may be a shared `const` read concurrently by other request threads — mutating it leaks
   per-request headers (an echoed `Origin`, a session `Set-Cookie`) across requests and
   races. Regression: `test/middleware/shared_response_mutation_tests.jl`.
+- **Nothing reaches `stream.response` without `_handoff_copy`** unless it was built fresh for
+  that request — the 413/503 refusals in `src/core/transport.jl`, which answer before the
+  pipeline runs. Regression: the #628 item in
+  `test/middleware/shared_response_mutation_tests.jl`.
 
 ### What P2 costs, and why it is a rule rather than an accumulator (#447)
 

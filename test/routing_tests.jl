@@ -1021,8 +1021,9 @@ end
     r = send(ctx, "POST", "/c")
     @test r.status == 418
     @test [v for (k, v) in r.headers if k == "Allow"] == ["BREW"]
-    # Kept as it is, but still a copy: the value itself is never handed out.
-    @test r !== own_allow
+    # Kept as it is, and the value itself is unchanged. On the wire the transport hands HTTP.jl a
+    # copy of it (#628, the socket item below).
+    @test own_allow.headers == ["Allow" => "BREW"]
 end
 
 @testset "a retired auto-HEAD answers with the app's own method_not_allowed" begin
@@ -1047,8 +1048,6 @@ end
         @test r.status == 404
         @test text(r) == "custom 404"
         @test !HTTP.hasheader(r, "Allow")
-        # A copy per miss, never the value itself (see `_miss_response`).
-        @test r !== shared
     end
     @test isempty(shared.headers)
 
@@ -1110,8 +1109,9 @@ import Nitro: App
 # The transport sets `resp.request = req` on the response it hands HTTP.jl, and HTTP.jl writes
 # `.close` on it in place (src/core/transport.jl). The app's miss values answer every miss, so
 # serving the value itself would leave the last missed request reachable from the next miss and
-# could leave `close` set for good. Each miss therefore gets a copy; the values must come out of
-# any number of misses exactly as they went in. Only a real socket goes through the transport.
+# could leave `close` set for good. The transport therefore hands HTTP.jl a copy (#628; each miss
+# copied the value itself under #625); the values must come out of any number of misses exactly as
+# they went in. Only a real socket goes through the transport.
 # One of each buffered body kind: every miss shares the body, so each must still send all of it
 # the second time round, against the same Content-Length, or the keep-alive connection desyncs.
 nf  = Res.json(Dict("error" => "not found"); status = 404)

@@ -174,9 +174,10 @@ otherwise have to mutate that global.
   other methods only. Nitro adds an `Allow` header listing those methods unless the response
   already carries one.
 
-  Both are **fixed values**: every request they answer gets a copy, so the value itself is
-  never changed (`Allow` goes on the copy). The copies share the body, so it must be one that
-  can be sent any number of times: **no body** (`HTTP.Response(404)`), a **`String`** or a
+  Both are **fixed values**, shared by every request they answer, and never changed: `Allow`
+  goes on a new response, and the server hands HTTP.jl a copy of whatever it sends, as it does
+  for every response. The copies share the body, so it must be one that can be sent any number
+  of times: **no body** (`HTTP.Response(404)`), a **`String`** or a
   **`Vector{UInt8}`**, which is what `Res.json(…; status = 404)` and `Res.send(…; status = 404)`
   build. Another string or byte vector (a `SubString`, a `view`) is copied into one of those. A
   `Vector{UInt8}` body is kept as given, so do not resize or overwrite it afterwards.
@@ -197,8 +198,8 @@ removed.
     mod     :: Nullable{Module} = nothing
     app_context :: Ref{Any}     = Ref{Any}(missing) # This stores a reference to an Context{T} object
     # Only the three resendable body types (`Types.MissResponse`); the constructor below converts
-    # or refuses anything else. Served through `_miss_response` (src/core/pipeline.jl), never
-    # as-is (#625).
+    # or refuses anything else. Shared by every miss; the transport hands HTTP.jl a copy
+    # (`_handoff_copy` in src/core/transport.jl, #628).
     not_found          :: MissResponse = HTTP.Response(404)
     method_not_allowed :: MissResponse = HTTP.Response(405)
 

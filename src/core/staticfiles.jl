@@ -85,7 +85,7 @@ _is_mount_method(method::AbstractString) = method == GET || method == HEAD
 function _mount_miss(router::HTTP.Router, misses::Types.MissResponses, req::HTTP.Request)
     _mark_route_miss!(req)
     allowed = _allowed_methods(router, req.target)
-    return isempty(allowed) ? _miss_response(misses.not_found) :
+    return isempty(allowed) ? misses.not_found :
                               _method_not_allowed(router, misses, req, allowed)
 end
 

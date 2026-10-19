@@ -393,15 +393,16 @@ DELETE /api/products  →  405, Allow: GET, HEAD, POST
             method_not_allowed = Res.json(Dict("error" => "method not allowed"); status = 405))
   ```
 
-  Every request they answer gets a copy of the value, static mounts included, so the value
-  itself is never changed. Nitro adds `Allow` to the `405`'s copy, and if your `405` already
-  sets `Allow`, Nitro leaves it alone. The copies share the body, so it must be one that can be
-  sent any number of times: none (`HTTP.Response(404)`), a `String` or a `Vector{UInt8}`, which
-  is what `Res.json` and `Res.send` build. Anything else, a streaming or cursor body such as
-  `HTTP.BytesBody` included, is refused with an `ArgumentError` when the `App` is built. A path
-  outside `serve(prefix = …)` still gets the prefix layer's own `404`. These are fixed values,
-  not handlers, which keeps `App` compilable with `juliac --trim`. To vary a miss per request, wrap the app in a middleware that checks
-  `route_missed(req)` on the response's way out.
+  One value answers every miss, static mounts included, and Nitro never changes it: it adds
+  `Allow` to a new `405` built from yours, and if your `405` already sets `Allow`, Nitro leaves it
+  alone. The server sends a copy of every response, and those copies share the body, so it must be
+  one that can be sent any number of times: none (`HTTP.Response(404)`), a `String` or a
+  `Vector{UInt8}`, which is what `Res.json` and `Res.send` build. Anything else, a streaming or
+  cursor body such as `HTTP.BytesBody` included, is refused with an `ArgumentError` when the `App`
+  is built. A path outside `serve(prefix = …)` still gets the prefix layer's own `404`. These are
+  fixed values, not handlers, which keeps `App` compilable with `juliac --trim`. To vary a miss
+  per request, wrap the app in a middleware that checks `route_missed(req)` on the response's way
+  out.
 
 ## Modular Route Inclusion with `include_routes`
 

@@ -43,7 +43,8 @@ nitro_router()::NitroRouter = HTTP.Router(_nitro_404, _nitro_405, nothing)
 # its body type, so a field typed `HTTP.Response` was abstract, and it admitted a single-use body.
 # These are the three bodies HTTP.jl keeps as given and calls stateless, safe to send any number of
 # times (`_response_body_arg`, HTTP.jl 2.9 src/http_core.jl, JuliaWeb/HTTP.jl#1333). Every miss
-# answers with a copy that SHARES the body (`_miss_response`), so a cursor body such as
+# answers with this one value, and the copy the transport hands HTTP.jl SHARES its body
+# (`_handoff_copy`), so a cursor body such as
 # `HTTP.BytesBody`, or a streaming one, would be drained by the first miss and every later one
 # would send nothing against the stored `content_length`. A three-member union is split by
 # inference, so the miss path stays resolvable (docs/design/juliac-trim.md §3.1).
