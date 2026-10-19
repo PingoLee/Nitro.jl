@@ -33,12 +33,15 @@
 # (or the `put!`) and the handler's start, and between the handler's end and the client's wake.
 # `spawn_order.sh` runs it on several Julia versions and thread layouts behind `quiet.sh`.
 #
-# VARIANT=A|A0|B|C picks the multiqueue order (multiq_variant.jl, included first, before any task
-# exists): stock, stock recompiled, `<=` in `multiq_sift_down`, or FIFO among equal priorities.
+# VARIANT=A|A0|B|C|D<K>|D-inf picks the multiqueue order (multiq_variant.jl, included first, before
+# any task exists): stock, stock recompiled, `<=` in `multiq_sift_down`, FIFO among equal
+# priorities, or FIFO behind a LIFO slot per `:default` thread with a budget of K pops in a row.
 # VALIDATE=1 is the instrumented check to run before timing a variant: single-heap order asserts,
 # every handler accounted for, the new code reached on every `:default` thread, and how far each
 # handler's start ran behind its spawn, counted in handlers (its start ordinal minus its spawn
-# ordinal). Use a small cell: `VALIDATE=1 D=1 CS=50 HS=0.2 VARIANT=C julia ...`.
+# ordinal); under D also the slot probe, the slot counts of each cell (slot pops required with
+# `:default` clients) and empty slots at exit. Each validated cell runs under `multiq_watchdog`.
+# Use a small cell: `VALIDATE=1 D=1 CS=50 HS=0.2 VARIANT=C julia ...`.
 
 include(joinpath(@__DIR__, "multiq_variant.jl"))
 const VALIDATE = MULTIQ_VALIDATE
@@ -209,11 +212,16 @@ function measure()
         [(c, h) for c in cs for h in hs]
     for mode in modes, cl in clients, (c, h) in cells
         VALIDATE && (HANDLED[] = 0)
+        slots0 = multiq_slot_counts()
+        multiq_watchdog(ceil(Int, d) + 60)
         recs, wall = run_cell(String(mode), cl, c, h, d)
+        multiq_watchdog(0)
         m = metrics(recs, wall)
         println(join((labels..., mode, cl, c, h, values(m)...), '\t'))
         flush(stdout)
         VALIDATE && validate_cell(recs, String(mode), cl, c, h)
+        # Under D a `:default` client spawns or wakes its handler from a `:default` thread: the slot.
+        VALIDATE && multiq_slot_check("$mode/$cl C=$c H=$h", slots0; pops = cl === :default)
     end
     VALIDATE && validate_threads()
     multiq_variant_check()
