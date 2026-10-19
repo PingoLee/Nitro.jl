@@ -41,6 +41,11 @@ mutable struct ConsumerHandle{S <: AbstractWorkerStore}
     const lease_seconds::Float64
     const poll_seconds::Float64
     const drain_timeout::Float64
+    # The recycle bounds (§7): past either, or idle under `exit_when_idle`, the consumer stops
+    # claiming and exits once the runs it holds have finished.
+    const max_runs::Union{Nothing, Int}
+    const max_rss_mb::Union{Nothing, Float64}
+    const exit_when_idle::Bool
 
     # Under `lock`. `held` is what the heartbeat renews and the drain cancels. `busy` is each
     # queue's occupied slots, and outlives a `held` entry when a deadline abandoned a callback:
@@ -61,6 +66,16 @@ mutable struct ConsumerHandle{S <: AbstractWorkerStore}
     @atomic beating::Bool
     @atomic drained::Bool             # the drain has begun; a second caller waits for it
     @atomic finished::Bool            # the drain has ended, however it ended
+    @atomic runs_started::Int         # runs `_start_run!` accepted, what `max_runs` counts
+    # An adjudication (`requeue_expired!`) has succeeded since the start. `exit_when_idle` waits
+    # for it: an idle exit after a failed one would leave a crashed predecessor's expired run
+    # unclaimed until the next start.
+    @atomic adjudicated::Bool
+    # The bound that began a recycle, and then the one that ended it: `:none` until a recycle
+    # begins, and `exit_reason` stays `:stopped` unless a recycle ran to its end, so a stop that
+    # cut one short reads as a stop.
+    @atomic recycle_reason::Symbol
+    @atomic exit_reason::Symbol
     claim_task::Union{Nothing, Task}
     heartbeat_task::Union{Nothing, Task}
     # Held for the consumer's lifetime on the Julia versions `_needs_wake_guard` names, closed by
@@ -93,7 +108,8 @@ _default_consumer_id() = string(first(gethostname(), 128), ":", getpid(), ":", f
 
 """
     consume!(app::App; store, queues, lease = Second(60), consumer_id = <host:pid:random>,
-             drain_timeout = WORKER_DRAIN_TIMEOUT_SECONDS, poll_interval = Second(1))
+             drain_timeout = WORKER_DRAIN_TIMEOUT_SECONDS, poll_interval = Second(1),
+             max_runs = nothing, max_rss_mb = nothing, exit_when_idle = false) -> Symbol
 
 Run `app`'s `External(…)` queues in **this** process, until it is told to stop
 ([#514](https://github.com/PingoLee/Nitro.jl/issues/514)). It is the consumer's entry point: the
@@ -150,6 +166,31 @@ their leases to expire, as after a crash.
 (`InMemoryWorkerStore`); and **a process with no interactive thread**: start it with
 `julia -t k,1`, so the heartbeat has a thread a job cannot take.
 
+**Recycling** ([#514](https://github.com/PingoLee/Nitro.jl/issues/514), step 4). A process's
+memory rises to its heaviest run's peak and stays there until a full collection runs, which an
+idle consumer, allocating little, may not trigger for a long time. A long-lived consumer can be told to make way for a fresh one:
+
+- `max_runs = n`: after it has started `n` runs;
+- `max_rss_mb = m`: once the process's **peak** resident memory, `Sys.maxrss()`, passes `m`
+  MiB. It is checked when a run finishes and before each claim pass. **The peak never goes down**: once
+  a run has taken the process past `m`, the consumer recycles after the runs it holds, even if a
+  garbage collection has since given that memory back to the OS. So `m` bounds the heaviest run
+  so far, not the current size. A bound the process is already past when `consume!` is called is
+  refused, since it would end every start before its first run;
+- `exit_when_idle = true`: when every queue answers "nothing to claim" **and** it holds no run,
+  so never under a running job, nor after a claim that failed. Checked only once expired leases
+  have been adjudicated, so a crashed predecessor's run whose lease has expired is back in its
+  queue first. While the store keeps failing, it waits rather than exits.
+
+Past a bound it **stops claiming and waits for the runs it holds to finish**: no `:shutdown`, no
+`drain_timeout`, their leases still renewed. Then `consume!` returns, the script ends, and a
+supervisor starts a fresh process. A stop request during that wait drains as above.
+`consume!(app; …, max_runs = 1, exit_when_idle = true)` is the **one-shot** consumer an external
+scheduler starts for rare heavy jobs: it runs one, or none if there is nothing to run, and exits.
+
+It returns why it ended: `:max_runs`, `:max_rss`, `:idle`, or `:stopped` for a stop request,
+which includes one that cut a recycle short.
+
 A consumer never runs the zombie sweep: the web process's in-process runs look exactly like
 zombies from here.
 """
@@ -157,22 +198,32 @@ function consume!(app::App; store::AbstractWorkerStore, queues::AbstractVector,
                   lease::Union{Real, Dates.Period} = CONSUMER_DEFAULT_LEASE,
                   consumer_id::AbstractString = _default_consumer_id(),
                   drain_timeout::Real = WORKER_DRAIN_TIMEOUT_SECONDS,
-                  poll_interval::Union{Real, Dates.Period} = Dates.Second(1))
+                  poll_interval::Union{Real, Dates.Period} = Dates.Second(1),
+                  max_runs::Union{Nothing, Integer} = nothing,
+                  max_rss_mb::Union{Nothing, Real} = nothing,
+                  exit_when_idle::Bool = false)
     # The keywords are named, not forwarded (#607): `_start_consumer`'s `require_interactive =
     # false` turns off the interactive-thread refusal, and only the tests and the heartbeat bench
     # may reach it.
-    c = _start_consumer(app; store, queues, lease, consumer_id, drain_timeout, poll_interval)
+    c = _start_consumer(app; store, queues, lease, consumer_id, drain_timeout, poll_interval,
+                        max_runs, max_rss_mb, exit_when_idle)
     # A supervisor's SIGTERM, and a SIGINT outside a REPL, end the process through `exit`, which
     # runs the `atexit` hooks but never returns to the wait below (probed on 1.12 and 1.13: a hook
     # can still spawn and wait on tasks on other threads). So the drain is registered here, at call
     # time, never in a module body. After a normal return it finds the drain done and returns.
     atexit(() -> _drain!(c))
+    return _await_consumer!(c)
+end
+
+# Everything `consume!` does after the start, apart from the `atexit` hook: wait for a stop
+# request, drain, and say why it ended. Separate so the in-process tests run the same path.
+function _await_consumer!(c::ConsumerHandle)
     try
         wait(c.stop_requested)
     finally
         _drain!(c)
     end
-    return nothing
+    return @atomic c.exit_reason
 end
 
 function _start_consumer(app::App; store::AbstractWorkerStore, queues::AbstractVector,
@@ -180,6 +231,9 @@ function _start_consumer(app::App; store::AbstractWorkerStore, queues::AbstractV
                          consumer_id::AbstractString = _default_consumer_id(),
                          drain_timeout::Real = WORKER_DRAIN_TIMEOUT_SECONDS,
                          poll_interval::Union{Real, Dates.Period} = Dates.Second(1),
+                         max_runs::Union{Nothing, Integer} = nothing,
+                         max_rss_mb::Union{Nothing, Real} = nothing,
+                         exit_when_idle::Bool = false,
                          require_interactive::Bool = true)
     isempty(queues) && throw(ArgumentError(
         "consume! needs at least one queue to run, like `queues = [\"heavy\" => 4]`"))
@@ -205,13 +259,27 @@ function _start_consumer(app::App; store::AbstractWorkerStore, queues::AbstractV
     lease_seconds = _positive_seconds(lease, "lease")
     poll_seconds = _positive_seconds(poll_interval, "poll_interval")
     _check_consumer_id(consumer_id)
+    max_runs === nothing || max_runs >= 1 ||
+        throw(ArgumentError("`max_runs` must be at least 1, or `nothing` for no bound, got $max_runs"))
+    max_rss_mb === nothing || (isfinite(max_rss_mb) && max_rss_mb > 0) ||
+        throw(ArgumentError("`max_rss_mb` must be a positive number of MiB, or `nothing` for no bound, got $max_rss_mb"))
+    # A bound the process is already past would end every start before its first run, and a
+    # restarting supervisor would then restart it for ever.
+    if max_rss_mb !== nothing && _rss_mb() > max_rss_mb
+        throw(ArgumentError("`max_rss_mb = $max_rss_mb` is below this process's peak resident " *
+                            "memory before its first run ($(round(Int, _rss_mb())) MiB), so the consumer would exit " *
+                            "without running anything. Raise it above the process's floor"))
+    end
 
     c = ConsumerHandle(app, WorkerRuntime(store), String(consumer_id), specs, placements,
                        Dict{String, LeasePolicy}(name => p.policy for (name, p) in declared),
                        lease_seconds, poll_seconds, Float64(drain_timeout),
+                       max_runs === nothing ? nothing : Int(max_runs),
+                       max_rss_mb === nothing ? nothing : Float64(max_rss_mb), exit_when_idle,
                        ReentrantLock(), Dict{UUID, _HeldRun}(), Dict{String, Int}(), Set{String}(), 0,
                        Base.Event(true), Base.Event(true), Base.Event(),
-                       false, true, false, false, nothing, nothing, _consumer_wake_guard())
+                       false, true, false, false, 0, false, :none, :stopped, nothing, nothing,
+                       _consumer_wake_guard())
 
     # Every start has a stop on every path (#427): a claim loop that fails to start must not
     # leave the heartbeat it started renewing nothing for ever, nor the guard open.
@@ -229,13 +297,58 @@ function _start_consumer(app::App; store::AbstractWorkerStore, queues::AbstractV
         c.wake_guard === nothing || close(c.wake_guard)
         rethrow()
     end
-    @info "Nitro.Workers: consumer started" consumer_id = c.consumer_id queues = c.queues lease_seconds
+    @info "Nitro.Workers: consumer started" consumer_id = c.consumer_id queues = c.queues lease_seconds max_runs max_rss_mb exit_when_idle
     return c
 end
 
 # -- Claiming --
 
 _request_stop!(c::ConsumerHandle) = (notify(c.stop_requested); nothing)
+
+# -- Recycling (§7) --
+#
+# Not a drain: a recycle stops the claims and lets the held runs finish, with no cancel token and
+# no timeout, and the heartbeat keeps their leases. The drain that `consume!` runs afterwards then
+# finds nothing held. The first bound reached names the recycle; a later one changes nothing.
+# Nothing held and no slot taken, read under the lock `_start_run!` holds while it registers a
+# run: a run being registered is either counted here or sees `stopping` and is given back.
+_settled(c::ConsumerHandle) =
+    lock(() -> isempty(c.held) && all(==(0), values(c.busy)), c.lock)
+
+function _begin_recycle!(c::ConsumerHandle, reason::Symbol)
+    # A drain that has begun owns the stop; a bound reached during it is not a recycle.
+    (@atomic c.drained) && return nothing
+    (@atomicreplace c.recycle_reason :none => reason).success || return nothing
+    @atomic c.stopping = true
+    notify(c.wake)
+    @info "Nitro.Workers: consumer recycling: no more claims; it exits once its runs finish" consumer_id = c.consumer_id reason runs_held = (@atomic c.held_count)
+    _finish_recycle_if_settled!(c)
+    return nothing
+end
+
+# Called whenever a held run settles, and once when a recycle begins. Only a recycle that ran to
+# its end sets `exit_reason`, so a stop request that cut it short still reads `:stopped`.
+function _finish_recycle_if_settled!(c::ConsumerHandle)
+    reason = @atomic c.recycle_reason
+    (reason === :none || (@atomic c.drained)) && return nothing
+    lock(() -> isempty(c.held), c.lock) || return nothing
+    @atomic c.exit_reason = reason
+    _request_stop!(c)
+    return nothing
+end
+
+# The tests set `_RSS_OVERRIDE_MB` to move the reading across a bound without allocating a
+# process's peak; `NaN` reads the real one.
+const _RSS_OVERRIDE_MB = Ref(NaN)
+_rss_mb() = isnan(_RSS_OVERRIDE_MB[]) ? Sys.maxrss() / 2^20 : _RSS_OVERRIDE_MB[]
+
+function _check_rss!(c::ConsumerHandle)
+    bound = c.max_rss_mb
+    bound === nothing && return false
+    _rss_mb() > bound || return false
+    _begin_recycle!(c, :max_rss)
+    return true
+end
 
 function _free_slot(c::ConsumerHandle, queue::String, k::Int)
     return lock(c.lock) do
@@ -258,11 +371,16 @@ function _claim_loop(c::ConsumerHandle)
         # loop. A dead claim loop under a live heartbeat would be a consumer that never claims
         # again and never exits, which a supervisor reads as healthy.
         try
+            # Before each pass, not only when a run ends: a consumer whose start-up already passed
+            # the bound must not take a run it would then hold past it.
+            _check_rss!(c) && break
             claimed = false
+            answered = true
             for (queue, k) in c.queues
                 (@atomic c.stopping) && break
                 _free_slot(c, queue, k) || continue
-                run = _claim_one(c, queue)
+                run, ok = _claim_one(c, queue)
+                answered &= ok
                 run === nothing && continue
                 claimed = true
                 _start_run!(c, run, queue)
@@ -270,6 +388,15 @@ function _claim_loop(c::ConsumerHandle)
             # Claimed something: look again at once, there may be more. Otherwise park until a
             # slot frees, the poll interval passes, or a stop.
             claimed && continue
+            # Idle means every queue answered "nothing to claim", nothing is held, and no slot is
+            # still taken by a callback a deadline abandoned (`busy` outlives `held`). This loop
+            # is the only one that starts runs, so that stays true until it claims again. It also
+            # waits for one successful adjudication, so a crashed predecessor's expired run is
+            # back in its queue before "nothing to claim" is believed.
+            if c.exit_when_idle && answered && (@atomic c.adjudicated) && _settled(c)
+                _begin_recycle!(c, :idle)
+                break
+            end
             timer = Timer(_ -> notify(c.wake), c.poll_seconds)
             try
                 (@atomic c.stopping) || wait(c.wake)
@@ -302,9 +429,11 @@ function _claim_loop(c::ConsumerHandle)
     return nothing
 end
 
-function _claim_one(c::ConsumerHandle, queue::String)
+# The claimed run, or `nothing`; and whether the store answered. A claim that threw says nothing
+# about whether the queue is empty, so `exit_when_idle` must not read it as idle.
+function _claim_one(c::ConsumerHandle, queue::String)::Tuple{Union{Nothing, TaskInfo}, Bool}
     try
-        return claim_next!(c.runtime.store, queue, c.consumer_id; lease_seconds = c.lease_seconds)
+        return (claim_next!(c.runtime.store, queue, c.consumer_id; lease_seconds = c.lease_seconds), true)
     catch e
         _is_interrupt(e) && throw(InterruptException())
         if e isa ClaimPoisonedError
@@ -314,10 +443,13 @@ function _claim_one(c::ConsumerHandle, queue::String)
             @error "Nitro.Workers: this consumer stopped claiming from a queue: two of its head " *
                    "rows in one claim did not decode, so the cause is probably not the rows. " *
                    "Inspect them before restarting the consumer" queue consumer_id = c.consumer_id exception_type = e.exception_type
+            # The queue leaves the claim rotation, so this refusal does not keep the consumer
+            # from being idle.
+            return (nothing, true)
         else
             @error "Nitro.Workers: a claim failed; retrying on the next poll" queue exception = (e, catch_backtrace())
         end
-        return nothing
+        return (nothing, false)
     end
 end
 
@@ -333,6 +465,9 @@ function _start_run!(c::ConsumerHandle, run::TaskInfo, queue::String)
     end
     accepted || return (_hand_back!(c, run, queue); nothing)
     errormonitor(_spawn_detached(() -> _run_claimed!(c, run, queue)))
+    # Counted once the run is held, so the recycle it begins waits for it.
+    started = @atomic c.runs_started += 1
+    c.max_runs !== nothing && started >= c.max_runs && _begin_recycle!(c, :max_runs)
     return nothing
 end
 
@@ -387,7 +522,10 @@ function _run_claimed!(c::ConsumerHandle, run::TaskInfo, queue::String)
         end
         # The last straggler of a drain that timed out: the heartbeat stops now, not a tick later.
         emptied && !(@atomic c.beating) && notify(c.beat)
+        # The bound first: freeing the slot wakes the claim loop, which must already see it.
+        _check_rss!(c)
         _handed_off(handoff[]) || _release_slot!(c, queue)
+        emptied && _finish_recycle_if_settled!(c)
     end
     return nothing
 end
@@ -526,6 +664,7 @@ end
 function _consumer_requeue!(c::ConsumerHandle, now::DateTime = current_time_utc())
     try
         tally = requeue_expired!(c.runtime.store, now; policies = c.policies)
+        @atomic c.adjudicated = true
         if tally.requeued + tally.failed > 0
             @info "Nitro.Workers: expired leases adjudicated" consumer_id = c.consumer_id requeued = tally.requeued failed = tally.failed unknown_queue = tally.unknown_queue
         end
@@ -593,7 +732,7 @@ function _drain!(c::ConsumerHandle)
             hb === nothing || timedwait(() -> istaskdone(hb) || (@atomic c.held_count) > 0, 5.0; pollint = 0.05)
             claim = c.claim_task
             claim === nothing || timedwait(() -> istaskdone(claim), 5.0; pollint = 0.05)
-            @info "Nitro.Workers: consumer stopped" consumer_id = c.consumer_id runs_still_renewed = (@atomic c.held_count)
+            @info "Nitro.Workers: consumer stopped" consumer_id = c.consumer_id reason = (@atomic c.exit_reason) runs_still_renewed = (@atomic c.held_count)
         catch e
             _is_interrupt(e) || @error "Nitro.Workers: the consumer's stop did not finish cleanly" exception = (e, catch_backtrace())
         end

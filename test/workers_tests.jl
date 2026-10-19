@@ -6734,4 +6734,181 @@ end
     end
 end
 
+# -- Recycling and one-shot (#514, step 4) --
+
+# `consume!` minus its `atexit` hook, on a task, so a test can wait for it to return.
+await(c) = Threads.@spawn _W._await_consumer!(c)
+ended_with(t; timeout = 10) = waitfor(() -> istaskdone(t); timeout) ? fetch(t) : :still_running
+
+# `pair`, but with the runs submitted BEFORE the consumer starts. A consumer under
+# `exit_when_idle` that starts on an empty queue may return `:idle` before a submit lands.
+function pair_after(submits; heavy = External(on_lease_expiry = :requeue), queues = ["heavy" => 1], kw...)
+    store = SharedStore()
+    web = setup!(App(); heavy)
+    start!(web; store, cleanup_enabled = false, recover_zombies = false)
+    ids = [submit(web, tag, mode; n) for (tag, mode, n) in submits]
+    worker = setup!(App(); heavy)
+    c = _start_consumer(worker; store, queues, lease = 1.0, poll_interval = 0.05, drain_timeout = 3,
+                        require_interactive = false, kw...)
+    return web, c, store, ids
+end
+
+@testset "consume! refuses a recycle bound that could never be met" begin
+    store = SharedStore()
+    app = setup!(App())
+    for (kw, msg) in ((; max_runs = 0) => "at least 1", (; max_rss_mb = 0) => "positive number",
+                      (; max_rss_mb = Inf) => "positive number", (; max_rss_mb = NaN) => "positive number")
+        @test_throws msg _start_consumer(app; store, queues = ["heavy" => 1], require_interactive = false, kw...)
+    end
+    # A bound below what the process already holds would exit every start before its first run.
+    @test_throws "below this process's peak" _start_consumer(app; store, queues = ["heavy" => 1],
+                                                            max_rss_mb = 1, require_interactive = false)
+end
+
+@testset "max_runs: the consumer runs that many, lets them finish, and returns :max_runs" begin
+    web, c, store = pair(; k = 2, max_runs = 2)
+    try
+        a = submit(web, "ra", "block")
+        b = submit(web, "rb", "block")
+        t = await(c)
+        @test waitfor(() -> seen("ra") === :started && seen("rb") === :started)
+        # Submitted once both slots are taken: claims go by `created_at` at millisecond resolution,
+        # so a third submit beside the first two could have been claimed in their place.
+        rest = submit(web, "rc", "return"; n = 1)
+        # The bound is reached while both still run: no cancel token, no third claim, no return.
+        sleep(0.5)
+        @test !istaskdone(t)
+        @test (@atomic c.recycle_reason) === :max_runs
+        @test !cancel_requested(get_task_info(store, a)) && !cancel_requested(get_task_info(store, b))
+        @test status(store, rest) == PENDING
+        notify(gate("ra")); notify(gate("rb"))
+        @test ended_with(t) === :max_runs
+        # Recorded as the runs' own outcome, not handed back as a drain would.
+        @test status(store, a) == COMPLETED && status(store, b) == COMPLETED
+        @test status(store, rest) == PENDING
+        @test get_task_info(store, rest).attempt == 0
+    finally
+        stop!(web, c)
+    end
+end
+
+@testset "exit_when_idle: returns :idle on an empty queue, never under a running job" begin
+    web, c, store = pair(; exit_when_idle = true)
+    try
+        @test ended_with(await(c)) === :idle
+    finally
+        stop!(web, c)
+    end
+
+    # A run submitted before the consumer starts is claimed first; the consumer exits only once it
+    # has finished.
+    web, c, store, (id,) = pair_after([("idle-hold", "block", 0)]; exit_when_idle = true)
+    try
+        t = await(c)
+        @test waitfor(() -> seen("idle-hold") === :started)
+        sleep(0.5)                 # many claim passes find nothing, but a run is held
+        @test !istaskdone(t)
+        notify(gate("idle-hold"))
+        @test ended_with(t) === :idle
+        @test status(store, id) == COMPLETED
+    finally
+        stop!(web, c)
+    end
+end
+
+@testset "exit_when_idle: a claim that failed is not an empty queue" begin
+    # A store blip at a one-shot's start must not read as "nothing to run", or the run waits for
+    # the next scheduled start.
+    store = SharedStore()
+    store.claim_hook[] = _ -> error("the store is unreachable")
+    web, c, _ = pair(; store, exit_when_idle = true)
+    try
+        t = await(c)
+        sleep(0.5)                 # many passes, every claim failing
+        @test !istaskdone(t)
+        store.claim_hook[] = nothing
+        @test ended_with(t) === :idle
+    finally
+        store.claim_hook[] = nothing
+        stop!(web, c)
+    end
+end
+
+@testset "exit_when_idle: a callback a deadline abandoned still holds its slot" begin
+    # The run is recorded FAILED at the deadline and is no longer held, but its callback still runs
+    # on a thread. That is a running job, so the consumer is not idle until it returns.
+    heavy = External(on_lease_expiry = :requeue, options = TaskOptions(timeout = 1))
+    web, c, store, (id,) = pair_after([("abandoned", "block", 0)]; heavy, exit_when_idle = true)
+    try
+        t = await(c)
+        @test waitfor(() -> status(store, id) == FAILED)          # the 1 s deadline passed
+        sleep(0.5)
+        @test !istaskdone(t)
+        notify(gate("abandoned"))
+        @test ended_with(t) === :idle
+    finally
+        notify(gate("abandoned"))
+        stop!(web, c)
+    end
+end
+
+@testset "one-shot: max_runs = 1 with exit_when_idle runs one run and leaves the rest" begin
+    web, c, store, ids = pair_after([("os1", "return", 1), ("os2", "return", 2)];
+                                    max_runs = 1, exit_when_idle = true)
+    try
+        @test ended_with(await(c)) === :max_runs
+        @test count(id -> status(store, id) == COMPLETED, ids) == 1
+        @test count(id -> status(store, id) == PENDING, ids) == 1
+    finally
+        stop!(web, c)
+    end
+end
+
+@testset "the max_rss_mb reading is Sys.maxrss(), the process's peak" begin
+    # What makes the bound monotone: it reads the peak, which the OS never lowers, rather than the
+    # current resident size, which a collection can bring back down (#514, step 4).
+    @test isnan(_W._RSS_OVERRIDE_MB[])
+    before = Sys.maxrss() / 2^20
+    @test before <= _W._rss_mb() <= Sys.maxrss() / 2^20
+end
+
+# The override stands in for `Sys.maxrss()` and, like it, never moves back down: the run takes the
+# process past the bound and returns after freeing what it allocated, and the consumer still
+# recycles.
+@testset "max_rss_mb: past the bound when a run finishes, the consumer returns :max_rss" begin
+    _W._RSS_OVERRIDE_MB[] = 100.0
+    web, c, store = pair(; max_rss_mb = 500)
+    try
+        t = await(c)
+        id = submit(web, "rss", "block")
+        @test waitfor(() -> seen("rss") === :started)
+        _W._RSS_OVERRIDE_MB[] = 600.0          # the run's peak
+        later = submit(web, "rss-later", "return"; n = 1)
+        notify(gate("rss"))
+        @test ended_with(t) === :max_rss
+        @test status(store, id) == COMPLETED
+        @test status(store, later) == PENDING
+    finally
+        _W._RSS_OVERRIDE_MB[] = NaN
+        stop!(web, c)
+    end
+end
+
+@testset "a stop request during a recycle wait drains, and returns :stopped" begin
+    web, c, store = pair(; max_runs = 1)
+    try
+        t = await(c)
+        id = submit(web, "cut", "loop")
+        @test waitfor(() -> status(store, id) == RUNNING)
+        @test waitfor(() -> (@atomic c.recycle_reason) === :max_runs)   # recycling, waiting for the run
+        @test !istaskdone(t)
+        _request_stop!(c)
+        @test ended_with(t) === :stopped
+        @test seen("cut") === :shutdown
+        @test status(store, id) == PENDING       # handed back, as any drain does
+    finally
+        stop!(web, c)
+    end
+end
+
 end
