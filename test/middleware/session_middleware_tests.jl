@@ -1650,3 +1650,194 @@ end
 end
 
 end
+
+@testitem "a session store call that throws never logs what it was handed (#612)" tags=[:middleware, :security] setup=[NitroCommon] begin
+using Test
+using HTTP
+using Nitro
+using Nitro: App, SessionMiddleware
+using Nitro.Core.Types: MemoryStore, AbstractSessionStore, get_session
+using Nitro.Core.Errors: store_contract_error
+using Nitro.Core.Cookies: storesession!, regenerate_session!
+import Nitro.Core.Types: set_session!, update_session!, rotate_session!, delete_session!,
+    session_store_full
+
+# One sentinel in the session data, one as the session id: the session id is a bearer credential.
+sentinel = "S3NT1NEL-data"
+sid_sentinel = "S3NT1NEL-sid"
+
+# A `MemoryStore` with ONE broken method, `at`, broken in one of three ways:
+#   :mismatch -- the `MethodError` `store_contract_error` raises over the call's real arguments,
+#                which is what the fallbacks do when the store's own method does not match;
+#   :quote    -- a store's own error quoting the key and the data;
+#   :nonbool  -- returns the session data where the contract's `Bool` is due.
+struct FaultyStore <: AbstractSessionStore{String, Dict{String,Any}}
+    inner::MemoryStore{String, Dict{String,Any}}
+    at::Function
+    how::Symbol
+end
+FaultyStore(at, how) = FaultyStore(MemoryStore{String, Dict{String,Any}}(), at, how)
+
+function fault(s::FaultyStore, f, args...)
+    s.how === :mismatch && store_contract_error(f, AbstractSessionStore, 1, s, args...)
+    s.how === :quote && error("store down: key=$(args[1]) args=$(args)")
+    return last(args)       # :nonbool -- the data
+end
+
+Base.get(s::FaultyStore, id, default) =
+    s.at === Base.get ? fault(s, Base.get, id, default) : Base.get(s.inner, id, default)
+set_session!(s::FaultyStore, id, data; ttl::Int = 3600) =
+    s.at === set_session! ? fault(s, set_session!, id, data) : set_session!(s.inner, id, data; ttl)
+update_session!(s::FaultyStore, id, data; ttl::Int = 3600) =
+    s.at === update_session! ? fault(s, update_session!, id, data) : update_session!(s.inner, id, data; ttl)
+rotate_session!(s::FaultyStore, old, new, data; ttl::Int = 3600) =
+    s.at === rotate_session! ? fault(s, rotate_session!, old, new, data) :
+                               rotate_session!(s.inner, old, new, data; ttl)
+delete_session!(s::FaultyStore, id) = delete_session!(s.inner, id)
+session_store_full(s::FaultyStore) = s.at === session_store_full ? :full : false
+
+struct EmptyStore <: AbstractSessionStore{String, Dict{String,Any}} end
+struct InterruptingStore <: AbstractSessionStore{String, Dict{String,Any}} end
+Base.get(::InterruptingStore, id, default) = throw(InterruptException())
+
+function seeded(at, how, data...)
+    store = FaultyStore(at, how)
+    storesession!(store.inner, sid_sentinel, Dict{String,Any}(data...); ttl = 3600)
+    return store
+end
+
+app = App(mod = @__MODULE__)
+urlpatterns(app, "",
+    path("/read", req -> "ok"),
+    path("/who", req -> (getsession(req)["who"] = sentinel; "ok")),
+    path("/signin", req -> (getsession(req)["user_id"] = sentinel; "ok")),
+)
+mw(store) = [SessionMiddleware(; cookie_name = "sid", secure = false, store)]
+get_(target, sid) = HTTP.Request("GET", target, sid === nothing ? Pair{String,String}[] : ["Cookie" => "sid=$sid"])
+
+# Everything a log sink could render: the message, every kwarg as `show` prints it, and an
+# `exception=(e, bt)` kwarg the way ConsoleLogger prints it.
+function rendered(l)
+    out = string(l.message, sprint(show, l.kwargs))
+    ex = get(l.kwargs, :exception, nothing)
+    ex isa Tuple && (out *= sprint(showerror, ex[1], ex[2]))
+    return out
+end
+leaks(s) = occursin(sentinel, s) || occursin(sid_sentinel, s)
+
+# (label, the broken method, the request that reaches it, the name the fault must carry)
+calls = (
+    ("Base.get, loading the session", Base.get, () -> seeded(Base.get, :x), get_("/read", sid_sentinel), "`get`"),
+    ("set_session!, saving a new session", set_session!, () -> FaultyStore(set_session!, :x),
+     get_("/who", nothing), "`storesession!`"),
+    ("update_session!, writing a loaded session back", update_session!,
+     () -> seeded(update_session!, :x, "cart" => 1), get_("/who", sid_sentinel), "`update_session!`"),
+    ("rotate_session!, rotating on sign-in", rotate_session!,
+     () -> seeded(rotate_session!, :x, "cart" => sentinel), get_("/signin", sid_sentinel), "`rotate_session!`"),
+)
+hows = (:mismatch, :quote)
+
+@testset "$label, $how: a 500 with the fixed body, the value in no log record" for
+        (label, at, mk, req, name) in calls, how in hows
+    proto = mk()
+    store = FaultyStore(proto.inner, at, how)
+    logs, r = Test.collect_test_logs(; min_level = Base.CoreLogging.Debug) do
+        internalrequest(app, req; middleware = mw(store))
+    end
+    @test r.status == 500
+    @test Nitro.json(r) == Dict("message" => "500: Internal Server Error")
+    @test !leaks(Nitro.text(r))
+    @test !any(l -> leaks(rendered(l)), logs)
+    # Still a server bug, logged at @error -- as a fault naming the method and what it threw.
+    errors = [rendered(l) for l in logs if l.level >= Base.CoreLogging.Error]
+    @test length(errors) == 1
+    @test occursin("Session Store Fault", only(errors))
+    @test occursin(name, only(errors))
+    @test occursin(how === :mismatch ? "MethodError" : "ErrorException", only(errors))
+end
+
+@testset "$label: a non-Bool return is a value-free fault" for (label, at, mk, req) in (
+        ("update_session!", update_session!, () -> seeded(update_session!, :nonbool, "cart" => 1),
+         get_("/who", sid_sentinel)),
+        ("rotate_session!", rotate_session!, () -> seeded(rotate_session!, :nonbool, "cart" => sentinel),
+         get_("/signin", sid_sentinel)),
+        ("session_store_full", session_store_full, () -> FaultyStore(session_store_full, :x),
+         get_("/who", nothing)))
+    logs, r = Test.collect_test_logs(; min_level = Base.CoreLogging.Debug) do
+        internalrequest(app, req; middleware = mw(mk()))
+    end
+    @test r.status == 500
+    @test !any(l -> leaks(rendered(l)), logs)
+    errors = [rendered(l) for l in logs if l.level >= Base.CoreLogging.Error]
+    @test length(errors) == 1
+    @test occursin("Session Store Fault", only(errors))
+    @test occursin("`$label` returned a value of type", only(errors))
+    @test occursin("not a Bool", only(errors))
+end
+
+@testset "the original is not left on the exception stack" begin
+    # With no serializer the fault reaches the caller, which sees every exception still live.
+    stack = try
+        internalrequest(app, get_("/read", sid_sentinel);
+                        middleware = mw(seeded(Base.get, :mismatch)), serialize = false)
+        nothing
+    catch
+        current_exceptions()
+    end
+    @test stack !== nothing
+    @test all(s -> s.exception isa Nitro.Errors.SessionStoreFault, stack)
+    @test !any(s -> leaks(sprint(show, s.exception)), stack)
+end
+
+@testset "outside the middleware: get_session and a handler's own regenerate_session!" begin
+    for how in hows
+        err = try get_session(seeded(Base.get, how), sid_sentinel); nothing catch e; e end
+        @test err isa Nitro.Errors.SessionStoreFault
+        @test !leaks(sprint(show, err)) && !leaks(sprint(showerror, err))
+
+        # No session yet: `regenerate_session!` creates one with `set_session!`.
+        req = HTTP.Request("GET", "/")
+        req.context[:session] = Dict{String,Any}("who" => sentinel)
+        err = try regenerate_session!(req, FaultyStore(set_session!, how)); nothing catch e; e end
+        @test err isa Nitro.Errors.SessionStoreFault
+        @test occursin("`set_session!`", sprint(showerror, err))
+        @test !leaks(sprint(show, err)) && !leaks(sprint(showerror, err))
+    end
+end
+
+@testset "a store that implements nothing still says which method is missing" begin
+    # `StoreInterfaceError` carries only types, so it is not replaced: it is the store author's
+    # pointer to the missing method.
+    @test_throws Nitro.Errors.StoreInterfaceError internalrequest(app, get_("/read", sid_sentinel);
+                                                                  middleware = mw(EmptyStore()), serialize = false)
+end
+
+@testset "an interrupt from a store still propagates" begin
+    @test_throws InterruptException internalrequest(app, get_("/read", sid_sentinel);
+                                                    middleware = mw(InterruptingStore()))
+end
+
+# The guard costs nothing on the request path: `_store_call` once compiled a `Vararg{Any}` method
+# that called the store dynamically, which allocated on every load and write.
+@testset "a guarded store call allocates exactly what the direct call does" begin
+    store = MemoryStore{String, Dict{String,Any}}()
+    storesession!(store, "k", Dict{String,Any}("a" => 1); ttl = 60)
+    data = Dict{String,Any}("a" => 2)
+    _store_call = Nitro.Core.Types._store_call
+    @test allocs(() -> _store_call(Base.get, store, "k", nothing)).count ==
+          allocs(() -> Base.get(store, "k", nothing)).count
+    @test allocs(() -> _store_call(update_session!, store, "k", data; ttl = 60)).count ==
+          allocs(() -> update_session!(store, "k", data; ttl = 60)).count
+end
+
+@testset "a healthy store is unaffected: load, update, rotate" begin
+    store = seeded(delete_session!, :x, "cart" => 1)      # `delete_session!` is never broken
+    r = internalrequest(app, get_("/signin", sid_sentinel); middleware = mw(store))
+    @test r.status == 200
+    new_sid = String(match(r"sid=([^;]+)", HTTP.header(r, "Set-Cookie")).captures[1])
+    @test new_sid != sid_sentinel
+    @test Base.get(store.inner, new_sid, nothing).data["user_id"] == sentinel
+    @test get_session(store, new_sid)["cart"] == 1
+end
+
+end

@@ -429,7 +429,8 @@ end
         return HTTP.Response(200, "logged in")
     end
 
-    @test_throws "session write failed" middleware(handler)(HTTP.Request("GET", "/login"))
+    # Still thrown, but as a value-free fault: the store's own message could quote the key (#612).
+    @test_throws Nitro.Errors.SessionStoreFault middleware(handler)(HTTP.Request("GET", "/login"))
 end
 
 @testset "regenerate_session! fails closed on store rotate errors" begin
@@ -438,8 +439,9 @@ end
     req.context[:session_id] = "old-session-id"
     req.context[:session] = Dict{String,Any}("user_id" => 42)
 
-    # A store FAILURE propagates; it is never read as "the session was logged out".
-    @test_throws "session rotate failed" Nitro.regenerate_session!(req, store; ttl=3600)
+    # A store FAILURE propagates; it is never read as "the session was logged out". It propagates as
+    # a value-free fault, because the store's own message could quote the key (#612).
+    @test_throws Nitro.Errors.SessionStoreFault Nitro.regenerate_session!(req, store; ttl=3600)
     @test req.context[:session_id] == "old-session-id"
 end
 

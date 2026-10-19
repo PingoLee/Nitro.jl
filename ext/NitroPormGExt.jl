@@ -8,6 +8,7 @@ using UUIDs
 
 import Nitro.Auth: make_password, check_password, password_needs_upgrade
 import Nitro.Core.Types: AbstractSessionStore, SessionPayload, get_session, set_session!, update_session!, rotate_session!, delete_session!, cleanup_expired_sessions!, session_store_full, is_expired, Nullable
+using Nitro.Core.Types: _store_call
 import Nitro.Core.Cookies: storesession!, prunesessions!
 import Nitro: pormg_nitro_session, sync_pormg_env!
 # Stored JSON is read through the same depth bound as request JSON, and written only when it can
@@ -382,7 +383,8 @@ function _parse_db_datetime(val)::DateTime
 end
 
 function get_session(store::PormGSessionStore, session_id::String)
-    payload = Base.get(store, session_id, nothing)
+    # Guarded like the generic `get_session`: the call is handed the session id (#612).
+    payload = _store_call(Base.get, store, session_id, nothing)
     if isnothing(payload)
         return nothing
     end

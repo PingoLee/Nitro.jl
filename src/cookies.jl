@@ -4,7 +4,7 @@ using HTTP
 using Dates
 using UUIDs
 using ..Types
-using ..Types: _normalize_domain
+using ..Types: _normalize_domain, _store_call, _store_bool
 using ..Errors
 
 using ..Crypto: encrypt_payload, decrypt_payload, secure_uuid4, SecretString, _cookie_secret
@@ -833,13 +833,16 @@ function regenerate_session!(req::HTTP.Request, store::AbstractSessionStore{Stri
 
     if isnothing(old_id)
         # No session at all, so none that a logout could have deleted: create one.
-        set_session!(store, new_id, session_data; ttl=ttl)
+        _store_call(set_session!, store, new_id, session_data; ttl=ttl)
     elseif get(req.context, :session_new, false) !== true
         # A session this request LOADED. Move it only if it is still there (#361).
-        # `::Bool`: the contract's return type, asserted so a store returning anything else fails
-        # here by name, and inference does not carry `Any` (the arguments come out of
-        # `req.context`).
-        rotate_session!(store, old_id, new_id, session_data; ttl=ttl)::Bool || return nothing
+        # The contract's `Bool`, checked so a store returning anything else fails here by name,
+        # and inference does not carry `Any` (the arguments come out of `req.context`). Both calls
+        # are guarded: they are handed the session ids, which are credentials, and the data, and
+        # whatever they throw could hold either, so they raise a value-free `SessionStoreFault`
+        # instead (#612). Inside this function, so a handler's direct call is covered too.
+        _store_bool(rotate_session!,
+            _store_call(rotate_session!, store, old_id, new_id, session_data; ttl=ttl)) || return nothing
     end
     # Otherwise the id was minted by `SessionMiddleware` in this request: never stored, never
     # sent, so no other request can hold it. Asking the store to move it would find nothing and

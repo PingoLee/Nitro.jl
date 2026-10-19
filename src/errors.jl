@@ -205,6 +205,37 @@ end
 Base.showerror(io::IO, e::ValidatorFault) = print(io, "Validator Fault: ", e.msg)
 
 """
+    SessionStoreFault(msg::String)
+
+What Nitro raises in place of an exception thrown by a session store call that is handed the
+session id, which is a bearer credential, or the session data (#612): `Base.get`, `set_session!`,
+`update_session!` and `rotate_session!`, from `SessionMiddleware`, `regenerate_session!` and
+`get_session`. It is also raised when `update_session!`, `rotate_session!` or
+`session_store_full` returns something other than a `Bool`.
+
+The original could hold either value. `store_contract_error` raises a `MethodError` over the call's
+real arguments when a store's method does not match the call, the `TypeError` of a return assert
+holds the returned value (which can be the session), and a store's own error can quote the key. So
+the original is dropped, and `msg` names the store method and the **type name** of what it threw or
+returned, never a value -- the rule `SessionMiddleware`'s `_end_session!` already followed. A
+`StoreInterfaceError` is not replaced: it carries only types, and it tells a store author which
+method is missing.
+
+A store is a contract implementer rather than a callback, which is why this is not a
+`ValidatorFault`. Inside `SessionMiddleware` it is answered the same way: the fixed `500` body,
+logged at `@error` with a backtrace. A handler that calls `regenerate_session!` or `get_session`
+itself sees it thrown; catch it as `Nitro.Errors.SessionStoreFault`, since the store's own
+exception no longer reaches the caller.
+
+Deliberately **not exported**: an application never raises it.
+"""
+struct SessionStoreFault <: Exception
+    msg::String
+end
+
+Base.showerror(io::IO, e::SessionStoreFault) = print(io, "Session Store Fault: ", e.msg)
+
+"""
     UnsupportedMediaTypeError(msg::String)
 
 The exception Nitro raises when a request's body has the wrong `Content-Type` for the extractor

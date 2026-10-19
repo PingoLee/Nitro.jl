@@ -11,8 +11,8 @@ using Base: @kwdef
 using DataStructures: CircularDeque
 using LRUCache: LRU
 using ..Util
-using ..Errors: ValidationError, StoreInterfaceError, ValidatorFault, implements_contract_method,
-    store_contract_error, is_unrecoverable
+using ..Errors: ValidationError, StoreInterfaceError, ValidatorFault, SessionStoreFault,
+    implements_contract_method, store_contract_error, is_unrecoverable
 using ..Crypto: SecretString, _cookie_secret
 
 export Server, Nullable, Context,
@@ -241,7 +241,7 @@ Param(name::Symbol, type::Type{T}, default, hasdefault::Bool) where {T} =
 isrequired(param::Param) = !param.hasdefault
 
 function get_session(store::AbstractSessionStore{K, V}, session_id::K) where {K, V}
-    payload = Base.get(store, session_id, nothing)
+    payload = _store_call(Base.get, store, session_id, nothing)
     if isnothing(payload)
         return nothing
     end
@@ -371,6 +371,48 @@ end
 
 @noinline function delete_session!(store::AbstractSessionStore, session_id)
     store_contract_error(delete_session!, AbstractSessionStore, 1, store, session_id)
+end
+
+# A store call that is handed the session id -- a bearer credential -- or the session data (#612).
+# Whatever it throws can hold either: the `MethodError` `store_contract_error` raises over the real
+# arguments, or a store's own error quoting the key. Reaching the error boundary's `@error`, that
+# wrote them to the log. So the exception is dropped here and `_store_call` raises a value-free
+# `SessionStoreFault` naming its type after `_try_store` returns, never from inside the `catch`,
+# which would leave the original on the task's exception stack (#595). A `StoreInterfaceError`
+# passes: it carries only types, and it is what tells a store author which method is missing.
+struct _StoreFaulted
+    type::Symbol
+end
+
+# `Vararg{Any,N}`, not a bare `args...`: an untyped vararg that is only splatted compiles one
+# `Vararg{Any}` method and calls `f` dynamically -- +48 bytes on every `Base.get` of a
+# `MemoryStore`, +208 on every write. Naming `N` makes Julia specialize on the argument types, and
+# the call costs exactly what the direct call does (pinned in session_middleware_tests).
+function _try_store(f::F, args::Vararg{Any,N}; kwargs...) where {F,N}
+    try
+        return f(args...; kwargs...)
+    catch e
+        (e isa StoreInterfaceError || is_unrecoverable(e)) && rethrow()
+        # The type's NAME: a full type can carry a value as a parameter (`Val{secret}`).
+        return _StoreFaulted(nameof(typeof(e)))
+    end
+end
+
+function _store_call(f::F, args::Vararg{Any,N}; kwargs...) where {F,N}
+    result = _try_store(f, args...; kwargs...)
+    result isa _StoreFaulted &&
+        throw(SessionStoreFault("the session store's `$(nameof(f))` threw an exception of type " *
+                                "`$(result.type)`"))
+    return result
+end
+
+# The contract's `Bool`, checked rather than asserted: the `TypeError` of a `::Bool` assert holds
+# the returned value, which can be the session (#612). Typed `::Bool`, so inference does not carry
+# `Any` out of a call whose arguments come from `req.context`.
+function _store_bool(f::F, result)::Bool where {F}
+    result isa Bool && return result
+    throw(SessionStoreFault("the session store's `$(nameof(f))` returned a value of type " *
+                            "`$(nameof(typeof(result)))`, not a Bool"))
 end
 
 """

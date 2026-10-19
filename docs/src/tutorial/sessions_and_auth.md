@@ -266,6 +266,15 @@ using Nitro.Types: missing_session_methods   # not exported from `Nitro` itself
 `Nitro.Workers.missing_store_methods` is the equivalent for the worker-queue contract
 ([`AbstractWorkerStore`](workers.md)).
 
+Anything else your store throws from a call that is handed the session id or data (`Base.get`,
+`set_session!` or a `storesession!` method of your own, `update_session!`, `rotate_session!`) is
+answered with a `500` and logged as a
+`Session Store Fault` that names the method and the exception's **type**, never its message. The
+same happens when `update_session!`, `rotate_session!` or `session_store_full` returns something
+other than a `Bool`. The session id is a bearer credential, and a `MethodError` over the call's
+arguments, or a driver error that quotes the key, would otherwise write it to the log. So when you
+debug a store, call it directly in a test, where you see the original exception.
+
 ## Using `getsession(req)` — Django-style
 
 `getsession(req)` is a `Dict{String, Any}` injected by `SessionMiddleware`.
