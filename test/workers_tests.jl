@@ -6649,6 +6649,39 @@ end
     end
 end
 
+# #623: the heartbeat renews, then adjudicates expired leases. A renewal stamps its lease from the
+# time it was called, so one that returns after that lease has run out (a first call compiling
+# under load did, in the two-process test) left the consumer's own runs expired, and the same
+# tick's adjudication took them back: a `:fail` run was FAILED while it still ran here.
+@testset "a renewal slower than the lease does not make the consumer take back its own runs" begin
+    store = SharedStore()
+    web, c, _ = pair(; store, queues = ["other" => 1])
+    slowed = Threads.Atomic{Bool}(false)
+    returned = Threads.Atomic{Bool}(false)
+    adjudicated_after = Threads.Atomic{Int}(0)
+    try
+        id = submit(web, "slow-renew", "block"; queue = "other")
+        @test waitfor(() -> seen("slow-renew") === :started)
+        store.renew_hook[] = runs -> if !isempty(runs) && !Threads.atomic_xchg!(slowed, true)
+            sleep(1.6)                                              # the lease is 1 s
+            returned[] = true
+        end
+        # The adjudications that ran after the slow renewal returned, the first of them in the
+        # same tick: waiting for two means the check below cannot run before it.
+        store.requeue_hook[] = () -> returned[] && Threads.atomic_add!(adjudicated_after, 1)
+        @test waitfor(() -> adjudicated_after[] >= 2; timeout = 10)
+        @test status(store, id) == RUNNING
+        @test get_task_info(store, id).claimed_by == c.consumer_id
+        notify(gate("slow-renew"))
+        @test waitfor(() -> status(store, id) == COMPLETED)
+        @test get_task_info(store, id).attempt == 1
+    finally
+        store.renew_hook[] = nothing
+        store.requeue_hook[] = nothing
+        stop!(web, c)
+    end
+end
+
 @testset "a poisoned queue stops being claimed; the others go on" begin
     store = SharedStore()
     store.claim_hook[] = q -> q == "heavy" && throw(ClaimPoisonedError(q, ErrorException))
