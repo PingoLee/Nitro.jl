@@ -88,9 +88,12 @@ jobs:
           - macos-latest
           - windows-latest
         threads: [1, 2]
-        include:
-          # The 1.13 entry that used to sit here as one ubuntu leg moved into `version`
-          # above. It had replaced a `version: '1'` (latest stable) entry, which sounded like
+        # No `include:` for now: the 1.13 entry that used to sit here as one ubuntu leg moved
+        # into `version` above, and the `nightly` entry is parked. Restore the key together
+        # with the first entry that comes back: a YAML `include:` with no items reads as
+        # `null`, which the workflow parser refuses.
+          #
+          # The 1.13 entry had replaced a `version: '1'` (latest stable) entry, which sounded like
           # it covered the release above the floor but did not: `'1'` resolves to whatever is
           # *released*, which was still 1.12.x while 1.13 sat in rc, so it duplicated the
           # floor jobs while 1.13 went untested. Keep that in mind for the `~1.14.0-0` entry.
