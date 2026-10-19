@@ -510,6 +510,25 @@ end
     @test hasmethod(HTTP.peeraddr, Tuple{HTTP.Stream})
 end
 
+@testset "disconnect probe surface (src/core/transport.jl `_peer_gone`, #466)" begin
+    # `cancel_reason(req)` asks the kernel whether the client left, through Reseau internals that
+    # no HTTP.jl release covers: hence the direct `Reseau = "~1.6"` pin. A rename here would not
+    # fail loudly at every request, only when a handler polls, so each link is pinned by name.
+    # test/request_cancellation_tests.jl is the behavioral net (FIN, RST, still connected).
+    R = Nitro.Core.Reseau
+    @test HTTP.TCP === R.TCP                      # the Reseau HTTP's conns come from is the one pinned
+    @test fieldtype(HTTP.Stream, :write_closed) === Bool
+    @test R.TCP.Conn <: fieldtype(HTTP._ServerConn, :conn)
+    fd = fieldtype(R.TCP.Conn, :fd)
+    @test fieldtype(fd, :pfd) === R.IOPoll.FD
+    @test hasmethod(R.IOPoll._with_fd_ref, Tuple{Function, R.IOPoll.FD})
+    @test R.IOPoll.NetClosingError <: Exception
+    @test R.SocketOps.MSG_PEEK isa Cint
+    @test hasmethod(R.SocketOps.recv_from!,
+                    Tuple{fieldtype(R.IOPoll.FD, :sysfd), Ptr{UInt8}, Csize_t, Cint})
+    @test hasmethod(R.SocketOps.last_error, Tuple{})
+end
+
 # Stand-ins for what `HTTP.peeraddr` returns — Reseau's `SocketAddrV4`/`SocketAddrV6`, whose
 # `ip` field is an octet tuple. Defined at test-item top level because `struct` is illegal
 # inside a `@testset` local scope.

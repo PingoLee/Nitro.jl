@@ -127,7 +127,10 @@ under *Area rule files* and are canonical **there**.
   `HTTP` is pinned with `~` (one minor series), never `^`, because core depends on
   `HTTP.BytesBody` and other internals no SemVer covers (see nitro-core §4); moving it is a
   deliberate bump that re-runs `test/http_internals_contract_tests.jl` and writes an `upgrading/`
-  entry, never a CompatHelper merge.
+  entry, never a CompatHelper merge. **`Reseau` is pinned with `~` for the same reason**: it is
+  HTTP.jl's transport, a direct dependency only because the disconnect probe behind
+  `cancel_reason(req)` reaches its fd-reference and `recv` internals (#466), and HTTP's own
+  `^1.4.3` compat would let a minor release move them.
 
 - **Never log or serialize secrets.** No session payloads, CSRF tokens, JWTs, cookie values,
   connection strings, or `SecretString` contents in logs, error bodies, or issue text. Use
@@ -200,8 +203,8 @@ they **shadow** the same-named functions `using .Core` brings in. An `(app, …)
 |------|------|
 | `src/Nitro.jl` | Package root — include chain, the `CONTEXT[]` singleton, and the public `export` surface |
 | `src/core.jl` | `Core` module hub — the submodule include chain, the accessor forward-declaration stubs, the public `export` surface, and the `src/core/` includes. No implementation of its own (#32) |
-| `src/core/request.jl` | Per-request caches and the exported request accessors — `getparams`/`getquery`/`getjson`/`getform`/`getfiles`/`getpost`/`getsession`/`getuser`/`getip`/`getpeerip`/`getcontext`, `payload` |
-| `src/core/transport.jl` | HTTP.jl v2 / Reseau internals: the stream-request shim, `_peer_ip` (via the public `HTTP.peeraddr`), the **non-consuming response write path** (`_write_response_body!`), and the stream handlers |
+| `src/core/request.jl` | Per-request caches and the exported request accessors — `getparams`/`getquery`/`getjson`/`getform`/`getfiles`/`getpost`/`getsession`/`getuser`/`getip`/`getpeerip`/`getcontext`, `payload` — and the request's cooperative-cancellation token, `cancel_requested`/`cancel_reason` (#466; Workers extends the same functions for `TaskInfo`) |
+| `src/core/transport.jl` | HTTP.jl v2 / Reseau internals: the stream-request shim, `_peer_ip` (via the public `HTTP.peeraddr`), the **non-consuming response write path** (`_write_response_body!`), the disconnect probe behind `cancel_reason(req)` (`_peer_gone`, #466), and the stream handlers |
 | `src/core/framework_middleware.jl` | The Core-owned layers `setupmiddleware` installs: `AccessLogMiddleware`, `PrefixStripMiddleware`, `DefaultSerializer` |
 | `src/core/pipeline.jl` | Middleware assembly — `setupmiddleware`, `_app_context_seed` — and the in-process entry point `internalrequest` |
 | `src/core/lifecycle.jl` | Server lifecycle — `serve`/`terminate`/`startserver`, the startup banner, Revise wiring, and the secret-safe `NitroStreamHandler` `show` |

@@ -157,7 +157,7 @@ without `Any`. `Constants` loads before `App` exists (src/core.jl).
 abstract type AbstractApp end
 
 """
-    RequestScope(app, max_fields)
+    RequestScope(app, max_fields[, shutting_down])
 
 What the pipeline binds for one request's dynamic extent, as the single value of
 [`REQUEST_SCOPE`](@ref):
@@ -167,8 +167,12 @@ What the pipeline binds for one request's dynamic extent, as the single value of
 - `max_fields` -- that app's own `service.max_fields` cell, shared rather than copied, so
   `serve(max_fields = …)` is seen by every pipeline already built. Read it through
   [`request_max_fields`](@ref).
+- `shutting_down` -- the flag `terminate` sets for the server run this pipeline was built in
+  (#466), read by `cancel_reason(req)` as `:shutdown`. Captured per pipeline, not read off the
+  service per request, so a run that is still draining keeps its own flag while a new `serve`
+  starts with a clean one. The two-argument form uses `NEVER_SHUTTING_DOWN`, which is never set.
 
-**Mutable only so that it is a heap object**, both fields `const`. A scope stores its values in a
+**Mutable only so that it is a heap object**, every field `const`. A scope stores its values in a
 `PersistentDict{ScopedValue, Any}`, so an immutable value is boxed on every insert. One instance is
 built per pipeline (`_app_context_seed`) and every request binds that same object, which costs one
 insert and no box (#444). It used to be two `ScopedValue`s (`SERVING_APP`, `REQUEST_MAX_FIELDS`),
@@ -178,7 +182,15 @@ mutable struct RequestScope
     # `Union{…, Nothing}` spelled out: `Nullable` lives in `Types`, which loads after this.
     const app        :: Union{AbstractApp, Nothing}
     const max_fields :: Base.RefValue{Int64}
+    const shutting_down :: Threads.Atomic{Bool}
 end
+
+# The shutdown flag of a `RequestScope` that belongs to no server run: outside a request, and in a
+# scope built without one. Shared, so building such a scope allocates nothing for it. Never set
+# it; nothing would ever clear it.
+const NEVER_SHUTTING_DOWN = Threads.Atomic{Bool}(false)
+
+RequestScope(app, max_fields) = RequestScope(app, max_fields, NEVER_SHUTTING_DOWN)
 
 """
     REQUEST_SCOPE :: ScopedValue{RequestScope}

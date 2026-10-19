@@ -569,6 +569,13 @@ end
 # Documented on the public `Nitro.terminate` (src/methods.jl); see the note on `serve` above.
 function terminate(context::App; timeout::Nullable{Real} = nothing)
     if isopen(context.service)
+        # First, before any hook can block: every in-flight request now reads `:shutdown` from
+        # `cancel_reason(req)` (#466), so a handler that polls it winds down during the drain
+        # below instead of being force-closed at its end. Swap, then set: the pipelines of this
+        # run captured the old flag, and anything built from now on gets the fresh one.
+        stopping = context.service.shutting_down[]
+        context.service.shutting_down[] = Threads.Atomic{Bool}(false)
+        stopping[] = true
         # LIFO (#74): the exact reverse of `startserver`'s startup sequence, which ran
         # route-owned then serve-owned, each in registration order. So: serve-owned reversed,
         # then route-owned reversed. Teardown order is a specified contract now, not hash

@@ -235,8 +235,9 @@ trade. The bound covers logins only: a Workers queue sized the same way takes it
 on top of it, so an app running both at full load should size the two together.
 
 No setting in Nitro bounds a computing handler: `read_timeout` and `write_timeout` are socket
-deadlines, and nothing can stop a task from outside. The `AccessLog` middleware records each
-request's `duration_ms`, which is where a slow handler shows up.
+deadlines, and nothing can stop a task from outside. A handler can stop itself when its client
+leaves or the server shuts down ([Long-Running Handlers](@ref)). The `AccessLog` middleware
+records each request's `duration_ms`, which is where a slow handler shows up.
 
 **Nitro's own primitives hold a thread too, in proportion to the body.** Parsing or building a
 body is computing.
@@ -253,6 +254,62 @@ Julia 1.12.7:
 up. Static mounts already stream above `stream_threshold`. Whether the larger JSON and multipart
 holds matter under load is what #588's stall pass will decide; until then, the rule above applies
 to them: a body large enough to take longer than your latency budget is computing.
+
+### Long-Running Handlers
+
+Nothing can stop a handler from outside. Julia tasks cannot be killed, and throwing into one that
+is running is unsafe ([#127](https://github.com/PingoLee/Nitro.jl/issues/127)). So a handler that
+runs long (a report, an export, a long poll) is asked to stop and decides for itself, as a
+[background job](workers.md) is. `cancel_requested(req)` turns `true`, and `cancel_reason(req)`
+says why, when:
+
+- **`:client_disconnected`**: the client closed or reset the connection, so nobody will read the
+  response.
+- **`:shutdown`**: `terminate` has begun. The server is draining and will force-close whatever is
+  still running after `shutdown_timeout`.
+
+```julia
+function export_report(req)
+    rows = Row[]
+    for page in 1:npages
+        if cancel_requested(req)
+            # A deploy: the client is still there, so tell it to retry.
+            cancel_reason(req) === :shutdown && return Res.status(503)
+            # The client left: nobody reads this status, but the access log records it.
+            return Res.status(499)
+        end
+        append!(rows, fetch_page(page))
+    end
+    return Res.json(rows)
+end
+```
+
+Without the check, the handler runs to the end and writes a response nobody reads. During a
+deploy it is force-closed at the end of `shutdown_timeout` instead of finishing its own way.
+
+**What a check costs.** Nitro probes the socket (a non-blocking peek, on the handler's own thread)
+at most once every 10 ms. A check in between is a lookup in the request's context, a clock read
+and two atomic loads, and allocates nothing, so polling in a hot loop is fine. A handler that
+never checks pays nothing: no task is started for it and nothing is written to its request. The
+probe never runs on the interactive thread.
+
+**A check is not a yield.** It answers a question and gives up no thread. A loop that computes
+still holds its thread until it returns ([Handlers that compute](@ref)). Check where you would
+yield, or call both.
+
+**What it cannot see:**
+- A client that sends its request and then half-closes its side (`shutdown(SHUT_WR)`) reads as
+  disconnected. Go's `net/http` treats it the same way.
+- A pipelined next request, already sent on the same connection, hides a later disconnect.
+- A connection that died without a FIN or a reset (a cable pulled, a NAT that dropped it) looks
+  alive until the kernel gives up on it.
+- Once the response is written, the client is no longer probed: the connection may already
+  carry the next request.
+- An `internalrequest` has no connection, so only `:shutdown` can fire.
+
+Check from the handler's own task. Each check reads the request's context, as the other
+per-request accessors do, and that context is not safe to read while another task writes to it.
+Do not poll `req` from a task you spawn while the handler goes on using it.
 
 ## Memory and GC
 

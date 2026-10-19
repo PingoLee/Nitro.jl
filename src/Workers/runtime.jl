@@ -942,7 +942,7 @@ user"` reached the record *only* when a drain had put it there. Alerting that re
 "a person did this" can now filter on the message instead.
 
 A callback that wants to do something *other* than stop — checkpoint, say — can read
-[`cancel_reason`](@ref) and branch on `:shutdown`.
+[`cancel_reason`](@ref cancel_reason(::TaskInfo)) and branch on `:shutdown`.
 
 **The run calling this is excluded.** `_snapshot_runs` skips it (see `CURRENT_RUN_KEY`), so a
 `shutdown!` invoked from inside a callback neither waits for nor reports on its own run — and can

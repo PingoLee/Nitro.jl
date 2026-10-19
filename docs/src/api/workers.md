@@ -53,8 +53,8 @@ Nitro.Workers.release_task!
 Nitro.Workers.get_all_tasks
 Nitro.Workers.get_queue_status
 Nitro.Workers.update_progress!
-Nitro.Workers.cancel_requested
-Nitro.Workers.cancel_reason
+Nitro.Workers.cancel_requested(::Nitro.Workers.TaskInfo)
+Nitro.Workers.cancel_reason(::Nitro.Workers.TaskInfo)
 Nitro.Workers.CANCEL_REASONS
 Nitro.Workers.checkpoint!
 Nitro.Workers.TaskCancelledError

@@ -27,7 +27,7 @@
 # request binds the same heap object, which is one scope insert and no box (#444). See
 # `RequestScope` (src/constants.jl) for why its shape is what costs.
 function _app_context_seed(ctx::App)
-    scope = Constants.RequestScope(ctx, ctx.service.max_fields)
+    scope = Constants.RequestScope(ctx, ctx.service.max_fields, ctx.service.shutting_down[])
     return function(handler::Function)
         return function(req::HTTP.Request)
             haskey(req.context, REQUEST_CONTEXT_KEY) ||
