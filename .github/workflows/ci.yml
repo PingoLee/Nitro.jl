@@ -64,37 +64,40 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # `1.12` is the floor `[compat]` declares (`julia = "^1.12"`), so it gets the full
-        # OS x thread-count grid. The `include`s below cover the rest of that bound and
-        # the future, one job each -- version-specific breakage is not OS-specific, so there
-        # is nothing to learn from running them three times.
+        # Julia 1.13 only, on the full OS x thread-count grid: the maintainer's decision on
+        # #526. It is the version every application on Nitro runs, and the floor `[compat]`
+        # will declare once the floor PR lands (`julia = "^1.13"`). Until it does, the declared
+        # floor `^1.12` is deliberately NOT tested: a leg for a version nothing ships would be
+        # the configuration-nobody-runs CI the PormG pin rules warn about. 1.12 used to hold
+        # this grid while 1.13 ran on one ubuntu leg, on the reasoning that version-specific
+        # breakage is not OS-specific; #301's Windows-only crash and the macOS-only e2e reds
+        # (#623) say it can be, so the one version in use gets every leg.
+        #
+        # `~1.13.0-0` rather than `'1.13'` because plain semver ranges exclude
+        # pre-releases; the `-0` lower bound opts them in. It resolves to >=1.13.0-0 and
+        # <1.14.0, so it tracks the newest 1.13.x patch with no edit.
+        #
+        # MAINTENANCE: when 1.14 enters pre-release, add `~1.14.0-0` as a one-leg `include`
+        # (the shape the 1.13 entry had before this), and restore the `nightly` entry below.
+        # There is no self-maintaining "next release" spec (julia-actions/setup-julia#84
+        # proposes one).
         version:
-          - '1.12'
+          - '~1.13.0-0'
         os:
           - ubuntu-latest
           - macos-latest
           - windows-latest
         threads: [1, 2]
-        include:
-          # The release above the floor. `[compat]` promises `julia = "^1.12"`, i.e. 1.13+ as
-          # well, and this is the entry that actually tests that claim.
+        # No `include:` for now: the 1.13 entry that used to sit here as one ubuntu leg moved
+        # into `version` above, and the `nightly` entry is parked. Restore the key together
+        # with the first entry that comes back: a YAML `include:` with no items reads as
+        # `null`, which the workflow parser refuses.
           #
-          # It replaces a `version: '1'` (latest stable) entry, which sounded like it covered
-          # this but did not: `'1'` resolves to whatever is *released*, which was still 1.12.x
-          # while 1.13 sat in rc -- so it ran an exact duplicate of the floor jobs above while
-          # 1.13 went untested.
+          # The 1.13 entry had replaced a `version: '1'` (latest stable) entry, which sounded like
+          # it covered the release above the floor but did not: `'1'` resolves to whatever is
+          # *released*, which was still 1.12.x while 1.13 sat in rc, so it duplicated the
+          # floor jobs while 1.13 went untested. Keep that in mind for the `~1.14.0-0` entry.
           #
-          # `~1.13.0-0` rather than `'1.13'` because plain semver ranges exclude
-          # pre-releases; the `-0` lower bound opts them in. It resolves to >=1.13.0-0 and
-          # <1.14.0: it tracked the 1.13 rcs, and now that 1.13 has shipped it resolves to the
-          # newest 1.13.x patch (1.13.1 as of 2026-09) with no edit.
-          #
-          # MAINTENANCE: when 1.14 enters pre-release, bump this to `~1.14.0-0` -- and at the
-          # same time restore the `nightly` entry below. There is no self-maintaining "next
-          # release" spec (julia-actions/setup-julia#84 proposes one).
-          - version: '~1.13.0-0'
-            os: ubuntu-latest
-            threads: 2
           # Nitro is unusually exposed to compiler and Base churn: it redefines
           # `Base.getproperty(::HTTP.Request, ::Symbol)` at runtime, pirates
           # `HTTP.queryparams`, reads the `HTTP.BytesBody.data` internal, and treats type
@@ -149,11 +152,11 @@ jobs:
       # `test/runtests.jl`, above `covering`.
       - uses: julia-actions/julia-runtest@6e050c8013b833b1195105ff2fce9cd802f53271 # v1.12.0
         with:
-          coverage: ${{ matrix.os == 'ubuntu-latest' && matrix.threads == '1' && matrix.version == '1.12' }}
+          coverage: ${{ matrix.os == 'ubuntu-latest' && matrix.threads == '1' && matrix.version == '~1.13.0-0' }}
       - uses: julia-actions/julia-processcoverage@03114f09f119417c3242a9fb6e0b722676aedf38 # v1.2.2
-        if: matrix.os == 'ubuntu-latest' && matrix.threads == '1' && matrix.version == '1.12'
+        if: matrix.os == 'ubuntu-latest' && matrix.threads == '1' && matrix.version == '~1.13.0-0'
       - uses: coverallsapp/github-action@8d6379e14d29928660c4ba802d8e85393440b329 # v2.3.8
-        if: matrix.os == 'ubuntu-latest' && matrix.threads == '1' && matrix.version == '1.12'
+        if: matrix.os == 'ubuntu-latest' && matrix.threads == '1' && matrix.version == '~1.13.0-0'
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           file: lcov.info
