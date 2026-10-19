@@ -64,37 +64,37 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # `1.12` is the floor `[compat]` declares (`julia = "^1.12"`), so it gets the full
-        # OS x thread-count grid. The `include`s below cover the rest of that bound and
-        # the future, one job each -- version-specific breakage is not OS-specific, so there
-        # is nothing to learn from running them three times.
+        # Both versions `[compat]` admits (`julia = "^1.12"`) get the full OS x thread-count
+        # grid. `1.12` is the declared floor. `~1.13.0-0` is the release above it, and the
+        # version every application on Nitro runs: #526 proposes making it the floor, and this
+        # grid is what says whether its Windows and macOS legs are green before that happens.
+        # Until this entry, 1.13 ran on one leg (ubuntu, 2 threads), on the reasoning that
+        # version-specific breakage is not OS-specific; #301's Windows-only crash and the
+        # macOS-only e2e reds (#623) say it can be, so the apps' version gets the whole grid.
+        #
+        # `~1.13.0-0` rather than `'1.13'` because plain semver ranges exclude
+        # pre-releases; the `-0` lower bound opts them in. It resolves to >=1.13.0-0 and
+        # <1.14.0, so it tracks the newest 1.13.x patch with no edit.
+        #
+        # MAINTENANCE: when 1.14 enters pre-release, add `~1.14.0-0` as a one-leg `include`
+        # (the shape the 1.13 entry had before this), and restore the `nightly` entry below.
+        # There is no self-maintaining "next release" spec (julia-actions/setup-julia#84
+        # proposes one).
         version:
           - '1.12'
+          - '~1.13.0-0'
         os:
           - ubuntu-latest
           - macos-latest
           - windows-latest
         threads: [1, 2]
         include:
-          # The release above the floor. `[compat]` promises `julia = "^1.12"`, i.e. 1.13+ as
-          # well, and this is the entry that actually tests that claim.
+          # The 1.13 entry that used to sit here as one ubuntu leg moved into `version`
+          # above. It had replaced a `version: '1'` (latest stable) entry, which sounded like
+          # it covered the release above the floor but did not: `'1'` resolves to whatever is
+          # *released*, which was still 1.12.x while 1.13 sat in rc, so it duplicated the
+          # floor jobs while 1.13 went untested. Keep that in mind for the `~1.14.0-0` entry.
           #
-          # It replaces a `version: '1'` (latest stable) entry, which sounded like it covered
-          # this but did not: `'1'` resolves to whatever is *released*, which was still 1.12.x
-          # while 1.13 sat in rc -- so it ran an exact duplicate of the floor jobs above while
-          # 1.13 went untested.
-          #
-          # `~1.13.0-0` rather than `'1.13'` because plain semver ranges exclude
-          # pre-releases; the `-0` lower bound opts them in. It resolves to >=1.13.0-0 and
-          # <1.14.0: it tracked the 1.13 rcs, and now that 1.13 has shipped it resolves to the
-          # newest 1.13.x patch (1.13.1 as of 2026-09) with no edit.
-          #
-          # MAINTENANCE: when 1.14 enters pre-release, bump this to `~1.14.0-0` -- and at the
-          # same time restore the `nightly` entry below. There is no self-maintaining "next
-          # release" spec (julia-actions/setup-julia#84 proposes one).
-          - version: '~1.13.0-0'
-            os: ubuntu-latest
-            threads: 2
           # Nitro is unusually exposed to compiler and Base churn: it redefines
           # `Base.getproperty(::HTTP.Request, ::Symbol)` at runtime, pirates
           # `HTTP.queryparams`, reads the `HTTP.BytesBody.data` internal, and treats type
