@@ -14,7 +14,7 @@ import Nitro: pormg_nitro_session, sync_pormg_env!
 # Stored JSON is read through the same depth bound as request JSON, and written only when it can
 # be read back (#344). `is_unrecoverable` is the #254 catch policy every request-path site uses.
 import Nitro.Core.Util.BodyParsers: _parse_json_bounded, _json_for_storage
-import Nitro.Core.Errors: is_unrecoverable, ClaimPoisonedError
+import Nitro.Core.Errors: is_unrecoverable, ClaimPoisonedError, loggable
 
 import Nitro.Workers: AbstractWorkerStore, TaskInfo, TaskStatus, TaskOptions,
     PENDING, RUNNING, COMPLETED, FAILED, CANCELLED,
@@ -317,6 +317,25 @@ end
 
 # -- Store interface implementation --
 
+# What a store's warning may say about a failed query (#646). Never the live exception: on
+# PostgreSQL the driver's error carries the server's DETAIL line, and a constraint violation's
+# DETAIL quotes the row -- `Key (session_key)=(<the id>) already exists`, `Failing row contains
+# (<key>, <data>, …)`. The id is a bearer credential; a task row carries its owner and arguments.
+#
+# PormG's `DatabaseError` keeps that text only in `.cause`, and renders itself from value-free
+# fields: SQLSTATE, constraint, table, and the server's primary message. So it is logged through
+# `loggable`, which keeps that rendering and drops the object and its `.cause`, and an outage
+# stays diagnosable. Anything else is logged by its type NAME only: its message is unknown text,
+# and a full type can carry a value as a parameter.
+#
+# Out of Nitro's reach: LibPQ logs the failed statement itself (`[warn | LibPQ]`, DETAIL
+# included) before PormG wraps it. An app that needs that line silent sets the level of LibPQ's
+# Memento logger.
+function _db_fault(e)
+    e isa PormG.DatabaseError && return (exception = loggable(e), sqlstate = e.sqlstate)
+    return (exception_type = nameof(typeof(e)),)
+end
+
 function Base.get(store::PormGSessionStore, session_id::String, default)
     # Both catches below follow #254: an interrupt, a stack overflow or an out-of-memory is not
     # "no session" -- reported as one, it would log the visitor out and carry on in a process
@@ -325,15 +344,16 @@ function Base.get(store::PormGSessionStore, session_id::String, default)
         _session_objects(store).filter("session_key" => session_id).first()
     catch e
         is_unrecoverable(e) && rethrow()
-        @warn "PormGSessionStore: failed to read session" exception=(e, catch_backtrace())
+        @warn "PormGSessionStore: failed to read session" _db_fault(e)...
         return default
     end
     isnothing(result) && return default
     # Decoding is a separate `try` so it can log differently from the query above (#267). A JSON
     # parse error quotes the stored text around the failure, and that text is a session payload,
     # so this warning carries the exception TYPE only. It never carries the session key either,
-    # because the key is the credential. The query failure above keeps its full exception, since a
-    # driver error quotes no payload and an outage needs its message to be diagnosed.
+    # because the key is the credential. The query failure above used to keep its full exception,
+    # on the belief that a driver error quotes no payload. On PostgreSQL it can (#646), so it logs
+    # through `_db_fault`, which keeps PormG's value-free text for diagnosing an outage.
     try
         expires_at = _parse_db_datetime(result[:expires_at])
         created_at = _parse_db_datetime(result[:created_at])
@@ -425,7 +445,7 @@ function set_session!(store::PormGSessionStore, session_id::String, data::Dict{S
             )
         end
     catch e
-        @warn "PormGSessionStore: failed to write session" exception=(e, catch_backtrace())
+        @warn "PormGSessionStore: failed to write session" _db_fault(e)...
         rethrow()
     end
     return data
@@ -448,7 +468,7 @@ function update_session!(store::PormGSessionStore, session_id::String, data::Dic
             "expires_at"   => now_utc + Dates.Second(ttl),
         )
     catch e
-        @warn "PormGSessionStore: failed to write session" exception=(e, catch_backtrace())
+        @warn "PormGSessionStore: failed to write session" _db_fault(e)...
         rethrow()
     end
     return matched > 0
@@ -497,7 +517,7 @@ function rotate_session!(store::PormGSessionStore, old_id::String, new_id::Strin
             "created_at"   => created_at,
         )
     catch e
-        @warn "PormGSessionStore: failed to rotate session" exception=(e, catch_backtrace())
+        @warn "PormGSessionStore: failed to rotate session" _db_fault(e)...
         rethrow()
     end
     return true
@@ -509,7 +529,7 @@ function delete_session!(store::PormGSessionStore, session_id::String)
         deleted = first(_session_objects(store).filter("session_key" => session_id).delete())
         _capped(store) && Threads.atomic_sub!(store.count, Int(deleted))
     catch e
-        @warn "PormGSessionStore: failed to delete session" exception=(e, catch_backtrace())
+        @warn "PormGSessionStore: failed to delete session" _db_fault(e)...
         rethrow()
     end
     return nothing
@@ -523,7 +543,7 @@ function cleanup_expired_sessions!(store::PormGSessionStore)
         # other processes on the same table since the last tick (#440).
         _capped(store) && _recount_sessions!(store)
     catch e
-        @warn "PormGSessionStore: failed to cleanup expired sessions" exception=(e, catch_backtrace())
+        @warn "PormGSessionStore: failed to cleanup expired sessions" _db_fault(e)...
     end
     return nothing
 end
@@ -1032,7 +1052,7 @@ function _write_task!(store::PormGWorkerStore, task_id::String, task_info::TaskI
             _update_task_row!(store, task_id, record, false)
         end
     catch e
-        @warn "PormGWorkerStore: failed to write task" exception=(e, catch_backtrace())
+        @warn "PormGWorkerStore: failed to write task" _db_fault(e)...
         rethrow()
     end
     return task_info
@@ -1152,7 +1172,7 @@ function delete_task!(store::PormGWorkerStore, task_id::String)
     try
         _task_objects(store).filter("id" => task_id).delete()
     catch e
-        @warn "PormGWorkerStore: failed to delete task" exception=(e, catch_backtrace())
+        @warn "PormGWorkerStore: failed to delete task" _db_fault(e)...
         rethrow()
     end
     return nothing
@@ -1229,7 +1249,7 @@ function cleanup_tasks!(store::PormGWorkerStore, retain_days::Int)
         # Swallowed into the warning below, it made Ctrl-C during a sweep a no-op.
         _interrupted(e) && throw(InterruptException())
         # What earlier pages already deleted is gone either way, so it is what this reports.
-        @warn "PormGWorkerStore: failed to cleanup old tasks" deleted exception=(e, catch_backtrace())
+        @warn "PormGWorkerStore: failed to cleanup old tasks" deleted _db_fault(e)...
         return deleted
     end
 end
@@ -1471,7 +1491,7 @@ function list_running_task_refs(store::PormGWorkerStore; after::Union{Nothing, S
             ref === nothing || push!(refs, ref)
         end
     catch e
-        @warn "PormGWorkerStore: failed to list running tasks" exception=(e, catch_backtrace())
+        @warn "PormGWorkerStore: failed to list running tasks" _db_fault(e)...
         rethrow()
     end
 end

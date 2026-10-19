@@ -4132,4 +4132,57 @@ else
     end
 end
 
+# The session store's #646 shape over task rows: a constraint violation's DETAIL line quotes
+# the row (the task id, which carries its owner, and its arguments), and PormG keeps that text in
+# its error's `.cause`. A failed query's warning logs neither.
+struct LeakyQueryModel
+    exc::Exception
+end
+
+function Base.getproperty(m::LeakyQueryModel, name::Symbol)
+    name === :objects && return m
+    name === :db && return (_db_key::String) -> m
+    return (args...; kwargs...) -> throw(getfield(m, :exc))
+end
+
+@testset "a failed task query's warning never quotes the row (#646)" begin
+    detail = "duplicate key value violates unique constraint \"nitro_task_pkey\"\n" *
+             "DETAIL:  Key (id)=(S3NT1NEL-owner::job) already exists.\n" *
+             "DETAIL:  Failing row contains (S3NT1NEL-owner::job, {\"card\":\"S3NT1NEL-arg\"})."
+    function rendered(l)
+        out = string(l.message, sprint(show, l.kwargs))
+        ex = get(l.kwargs, :exception, nothing)
+        ex isa Tuple && (ex = ex[1])
+        ex isa Exception && (out *= sprint(showerror, ex) * sprint(dump, ex))
+        return out
+    end
+    calls = (
+        s -> set_task!(s, "S3NT1NEL-owner::job", TaskInfo("S3NT1NEL-owner::job")),
+        s -> delete_task!(s, "S3NT1NEL-owner::job"),
+        s -> cleanup_tasks!(s, 1),
+        s -> list_running_task_refs(s),
+    )
+    wrapped = PormG.IntegrityError("postgresql", ErrorException(detail); sqlstate = "23505",
+                                   constraint = "nitro_task_pkey", table = "nitro_task",
+                                   message = "duplicate key value violates unique constraint")
+    for exc in (ErrorException(detail), wrapped), call in calls
+        s = RealPormGWorkerStore(model=LeakyQueryModel(exc))
+        logger = Test.TestLogger(; min_level = Base.CoreLogging.Warn)
+        Base.CoreLogging.with_logger(logger) do
+            try
+                call(s)
+            catch
+            end
+        end
+        record = only(logger.logs)
+        @test !occursin("S3NT1NEL", rendered(record))
+        if exc isa PormG.DatabaseError
+            @test record.kwargs[:sqlstate] == "23505"
+            @test occursin("nitro_task_pkey", rendered(record))
+        else
+            @test record.kwargs[:exception_type] === :ErrorException
+        end
+    end
+end
+
 end
