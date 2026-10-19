@@ -240,10 +240,10 @@ using Sockets
 # The transport sets `.request` on the response it hands HTTP.jl, and HTTP.jl writes `.close`,
 # `.content_length`, and on its error path the status and headers, on that object in place. A
 # shared value -- a handler's module-level `const`, a middleware's captured one (the shape of the
-# framework layers' `NOT_FOUND`/`BAD_REQUEST`), the auth rejections, the guards' 403, the `Claims`
-# 401 -- answered as-is kept the last request it answered, credentials and body included,
-# reachable from the next, and a single slow write could leave `close` set on it for the life of
-# the process. Only a real socket goes through the transport; `internalrequest` never does.
+# framework layers' `BAD_REQUEST` and the app's miss values), the auth rejections, the guards'
+# 403, the `Claims` 401 -- answered as-is kept the last request it answered, credentials and body
+# included, reachable from the next, and a single slow write could leave `close` set on it for the
+# life of the process. Only a real socket goes through the transport; `internalrequest` never does.
 const HANDLER_CONST = HTTP.Response(200, "shared handler body")
 const LAYER_CONST   = HTTP.Response(404, "shared layer body")
 const INVALID_HEADER      = Nitro.Core.Middleware.AuthMiddleware.INVALID_HEADER

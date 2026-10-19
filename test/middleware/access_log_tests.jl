@@ -420,7 +420,7 @@ end
 using HTTP
 using Nitro
 
-strip = Nitro.Core.PrefixStripMiddleware("/api")(req -> HTTP.Response(200, "in"))
+strip = Nitro.Core.PrefixStripMiddleware("/api", HTTP.Response(404))(req -> HTTP.Response(200, "in"))
 outside = HTTP.Request("GET", "/elsewhere")
 @test strip(outside).status == 404
 @test route_missed(outside)

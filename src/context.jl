@@ -168,8 +168,7 @@ otherwise have to mutate that global.
   Nitro) rather than where it is called. Only `revise` reads this; leaving it `nothing` is fine
   for everything else and `serve` says so if you ask for `revise` without it.
 - `not_found = HTTP.Response(404)`: the response to a request no route matches, static mounts
-  included. A path outside `serve(prefix = …)` is the exception: the prefix layer answers it
-  with its own `404` before routing.
+  and a path outside `serve(prefix = …)` included.
 - `method_not_allowed = HTTP.Response(405)`: the response to a request whose path is served under
   other methods only. Nitro adds an `Allow` header listing those methods unless the response
   already carries one.
@@ -186,7 +185,8 @@ otherwise have to mutate that global.
   into bytes. They are values rather than handlers, and of those three body types only, so that
   `App` stays concretely typed, which `juliac --trim` needs (docs/design/juliac-trim.md §3.1). To
   vary a miss per request, use a middleware that checks `route_missed(req)` on the response's
-  way out.
+  way out. A miss outside `serve(prefix = …)` is the one it cannot reach: that is answered before
+  any middleware passed to `serve`, a router or a route runs.
 
 The remaining fields are internal: `service` holds the router and per-server state, and
 `app_context` carries the payload passed to `serve(context = ...)` — read that through
