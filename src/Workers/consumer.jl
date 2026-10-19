@@ -449,6 +449,10 @@ function _heartbeat_tick!(c::ConsumerHandle)
     # lease length exists for.
     now = current_time_utc()
     renew_s = 0.0
+    # How much of the renewal was the JIT: tells a first call compiling from a store waiting on a
+    # lock. Process-wide, and it counts only while `Base.cumulative_compile_timing(true)` is on,
+    # which the two-process test's child turns on; otherwise it reads 0.
+    renew_compile_s = 0.0
     kept_count = -1
     @debug "Nitro.Workers: consumer heartbeat tick begins" consumer_id = c.consumer_id held = length(held) at = Dates.now(Dates.UTC)
     # Each step on its own, as in the drain (#608): a failed renewal, or one run's failed lookup,
@@ -460,8 +464,10 @@ function _heartbeat_tick!(c::ConsumerHandle)
         # own leases before it renews them. The adjudication reads `now`, for the reason above.
         kept = try
             t0 = time()
+            ct0 = first(Base.cumulative_compile_time_ns())
             k = Set{UUID}(renew_leases!(store, c.consumer_id, renewals; lease_seconds = c.lease_seconds))
             renew_s = time() - t0
+            renew_compile_s = (first(Base.cumulative_compile_time_ns()) - ct0) / 1e9
             kept_count = length(k)
             k
         catch e
@@ -487,7 +493,7 @@ function _heartbeat_tick!(c::ConsumerHandle)
     # consumer that returned claims nothing and adjudicates nothing.
     t0 = time()
     (@atomic c.beating) && _consumer_requeue!(c, now)
-    @debug "Nitro.Workers: consumer heartbeat tick" consumer_id = c.consumer_id held = length(held) kept = kept_count renew_s = round(renew_s; digits = 3) requeue_s = round(time() - t0; digits = 3) tick_s = round(time() - tick_start; digits = 3) at = Dates.now(Dates.UTC)
+    @debug "Nitro.Workers: consumer heartbeat tick" consumer_id = c.consumer_id held = length(held) kept = kept_count renew_s = round(renew_s; digits = 3) renew_compile_s = round(renew_compile_s; digits = 3) requeue_s = round(time() - t0; digits = 3) tick_s = round(time() - tick_start; digits = 3) at = Dates.now(Dates.UTC)
     return nothing
 end
 

@@ -19,6 +19,8 @@ function Base.CoreLogging.handle_message(l::FlushingLogger, args...; kwargs...)
     flush(stderr)
 end
 Base.CoreLogging.global_logger(FlushingLogger(Base.CoreLogging.SimpleLogger(stderr)))
+# So the heartbeat's `renew_compile_s` says how much of a slow renewal was the JIT (#623).
+Base.cumulative_compile_timing(true)
 
 dbspec, outdir, consumer_id, lease = ARGS[1], ARGS[2], ARGS[3], parse(Float64, ARGS[4])
 e2e_is_postgres(dbspec) && @eval using LibPQ
