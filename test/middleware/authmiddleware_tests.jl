@@ -705,6 +705,36 @@ end
     @test first(two(token)) == "two:7:true"
 end
 
+# A `where` clause makes a method's signature a `UnionAll`, which has no `parameters` field. The
+# arity check read it anyway and threw a `FieldError` on every request, which the middleware's catch
+# turned into a 401: the validator was never called, and nothing was logged (#627).
+@testset "a validator with a `where` clause is called, with the arity it declares (#627)" begin
+    one_where = ((t::T) where {T<:AbstractString}) -> "one:$t"
+    two_where = ((t::T, r::R) where {T<:AbstractString, R}) -> "two:$t:$(r isa HTTP.Request)"
+    @test !Nitro.Core.Util._has_two_arg_method(one_where)
+    @test Nitro.Core.Util._has_two_arg_method(two_where)
+    for mw in (BearerAuth, CookieAuthMiddleware), (validator, expected) in ((one_where, "one:tok"),
+                                                                           (two_where, "two:tok:true"))
+        who = Ref{Any}(nothing)
+        handler = mw(validator; cookie_name = "c")(req -> (who[] = getuser(req); HTTP.Response(200)))
+        req = mw === BearerAuth ? bearer("tok") : HTTP.Request("GET", "/", ["Cookie" => "c=tok"])
+        @test (mw, handler(req).status) == (mw, 200)
+        @test (mw, who[]) == (mw, expected)
+    end
+
+    key = jwtkey("where-secret")
+    token = Nitro.Auth.encode_jwt(Dict("sub" => "7"), key; expires_in = 60)
+    one = Nitro.Auth.jwt_validator(key; user_validator = ((p::P) where {P}) -> "one:$(p.id)")
+    two = Nitro.Auth.jwt_validator(key;
+        user_validator = ((p::P, r::R) where {P, R}) -> "two:$(p.id):$(r === nothing)")
+    @test first(one(token, bearer(token))) == "one:7"
+    @test first(one(token)) == "one:7"
+    @test first(two(token, bearer(token))) == "two:7:false"
+    @test first(two(token)) == "two:7:true"
+    # Through the middleware, as an app wires it.
+    @test BearerAuth(two)(ok)(bearer(token)).status == 200
+end
+
 # Before #546 every credentialed request asked `Base.methods(validator)`, a walk that allocates a
 # `MethodList`. Under the suite's flags that request measured 20 allocations, and 11 without the
 # walk; the bound sits between the two.

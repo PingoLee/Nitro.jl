@@ -478,7 +478,11 @@ end
 const TAKES_REQUEST = TypeMemo()
 __init__() = reset!(TAKES_REQUEST)
 _takes_request(f::F) where {F} = memoized(_ -> _has_two_arg_method(f), TAKES_REQUEST, F)
-_has_two_arg_method(f) = any(method -> length(method.sig.parameters) - 1 == 2, Base.methods(f))
+# `unwrap_unionall`: a method written with a `where` clause has a `UnionAll` signature, which has no
+# `parameters` field. Reading it threw a `FieldError` on every request, which the auth middleware's
+# catch turned into a silent 401 for a validator that was never called (#627).
+_has_two_arg_method(f) =
+    any(method -> length(Base.unwrap_unionall(method.sig).parameters) - 1 == 2, Base.methods(f))
 
 # Fail closed. A factory returning `nothing` would turn a denial into an admission, and one
 # returning a `Dict` it meant to serialize would reach `GuardMiddleware` as a malformed guard
