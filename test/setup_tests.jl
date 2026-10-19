@@ -480,8 +480,13 @@ struct SharedStore <: AbstractWorkerStore
     # `invokelatest`: the consumer's loops start before the test defines the hook it then sets.
     read_hook::Base.RefValue{Any}
     requeue_hook::Base.RefValue{Any}
+    # Run inside every `renew_leases!` with the runs, after the lease's start time is read and
+    # before it is written, as PormG's renewal does: a test sleeps in it to make a renewal return
+    # after the lease it wrote has run out (#623).
+    renew_hook::Base.RefValue{Any}
 end
-SharedStore() = SharedStore(InMemoryWorkerStore(), Ref{Any}(nothing), Ref{Any}(nothing), Ref{Any}(nothing))
+SharedStore() = SharedStore(InMemoryWorkerStore(), Ref{Any}(nothing), Ref{Any}(nothing), Ref{Any}(nothing),
+                            Ref{Any}(nothing))
 
 # Each forward with the contract's own arity: a varargs forward can be ambiguous with the
 # generated fixed-arity fallbacks on `AbstractWorkerStore`.
@@ -489,7 +494,7 @@ for (f, n) in ((:set_task!, 2), (:replace_task!, 2), (:add_watcher!, 2),
                (:try_transition!, 3), (:delete_task!, 1), (:try_delete_task!, 2), (:cleanup_tasks!, 1),
                (:get_all_tasks, 1), (:get_queue_authorizer, 0), (:set_queue_authorizer!, 1),
                (:get_watch_authorizer, 0), (:set_watch_authorizer!, 1), (:get_error_redactor, 0),
-               (:set_error_redactor!, 1), (:renew_leases!, 2), (:release_claim!, 2),
+               (:set_error_redactor!, 1), (:release_claim!, 2),
                (:count_external_runs, 1), (:clear_records!, 0),
                (:list_running_task_refs, 0))
     args = [Symbol("a", i) for i in 1:n]
@@ -506,6 +511,11 @@ function _W.requeue_expired!(s::SharedStore, now; kw...)
     hook = s.requeue_hook[]
     hook === nothing || Base.invokelatest(hook)
     return _W.requeue_expired!(s.inner, now; kw...)
+end
+function _W.renew_leases!(s::SharedStore, consumer, runs; now = _W.current_time_utc(), kw...)
+    hook = s.renew_hook[]
+    hook === nothing || Base.invokelatest(hook, runs)
+    return _W.renew_leases!(s.inner, consumer, runs; now, kw...)
 end
 function _W.claim_next!(s::SharedStore, queue::String, consumer::String; kw...)
     hook = s.claim_hook[]

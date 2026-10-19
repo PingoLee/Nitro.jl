@@ -658,8 +658,22 @@ two-process test, which adds SQLite.jl as a test dependency. Where it departs fr
     until the last of them returns, renewing them and nothing else: no claim, no `requeue_expired!`.
     They finish under a live lease and hand themselves back. A run that never returns keeps its
     lease for the life of the process. A process that exits is unchanged.
-- **The heartbeat renews first and adjudicates second.** A heartbeat that was itself late does not
-  take back its own leases before renewing them.
+- **The heartbeat renews first and adjudicates second, against a clock read before the renewal.**
+  A heartbeat that was itself late does not take back its own leases before renewing them. Reading
+  the clock first is the half that order alone did not give
+  ([#623](https://github.com/PingoLee/Nitro.jl/issues/623)):
+  - a renewal stamps its leases from the time it was called;
+  - a slow one returns after the lease it wrote has run out. In the two-process test, a first call
+    compiling under CPU load took 2.4 s against a 2 s lease;
+  - an adjudication that read the clock again then found the consumer's own runs expired, and
+    re-queued or failed them while they were still running.
+
+  Against a reading taken before the renewal, a lease that tick renewed, or a run claimed since,
+  cannot be expired yet. Other consumers' expired leases are adjudicated at most one tick later.
+  The renewal keeps its own reading, so its lease is as long as it can be. What a renewal slower
+  than the lease still risks is **another** process's adjudicator, which can find that lease
+  already expired when it is written: the case the rule "the lease must exceed the worst pause"
+  covers, and a reason a lease far above the heartbeat's period is the default.
 - **One attempt loop.** `_run_attempts!` (`src/Workers/queue.jl`) is now the loop of the queued
   executor, the async one and the consumer, which differ only in `on_complete` / `on_cancel`. The
   two executors used to carry identical copies. A third copy for the consumer is what this avoided.

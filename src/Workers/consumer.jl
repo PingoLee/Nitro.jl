@@ -343,9 +343,11 @@ end
 _gives_back(info::TaskInfo) = cancel_reason(info) in (:shutdown, :lease_lost)
 
 function _hand_back!(c::ConsumerHandle, info::TaskInfo, queue::String)
+    t0 = time()
     try
         # Outside `lock_tasks`, as every claim operation must be (workers §2).
-        release_claim!(c.runtime.store, info.id, info.run_id; policy = c.placements[queue].policy)
+        released = release_claim!(c.runtime.store, info.id, info.run_id; policy = c.placements[queue].policy)
+        @debug "Nitro.Workers: consumer hand-back" consumer_id = c.consumer_id task_id = info.id released elapsed_s = round(time() - t0; digits = 3) at = Dates.now(Dates.UTC)
     catch e
         _is_interrupt(e) && throw(InterruptException())
         @error "Nitro.Workers: a consumer could not hand a run back; its lease will expire instead" task_id = info.id exception = (e, catch_backtrace())
@@ -432,15 +434,36 @@ end
 function _heartbeat_tick!(c::ConsumerHandle)
     store = c.runtime.store
     held = lock(() -> collect(values(c.held)), c.lock)
+    # Two lines per tick when debug logging is on for Nitro (#623): one as it begins, and one with
+    # how many runs it renewed, how many the store kept and how long each store call took. That
+    # tells a heartbeat that never ticked from a renewal that blocked on the store, which shows as
+    # a begin with no end.
+    tick_start = time()
+    # The tick's adjudication reads the clock HERE, before the renewal (#623). A renewal stamps
+    # its leases from the time it was called, and a slow one, a first call that compiles under
+    # load or a store waiting on a lock, can return after the lease it wrote has already run out.
+    # Adjudicating against a reading taken after it then took back this process's own runs while
+    # they still ran. Against this earlier one, a lease this tick renewed, or a run claimed since,
+    # is never expired yet. The renewal keeps its own, later reading, so its lease is as long as
+    # it can be: what a slow renewal still risks is another process's adjudicator, the case the
+    # lease length exists for.
+    now = current_time_utc()
+    renew_s = 0.0
+    kept_count = -1
+    @debug "Nitro.Workers: consumer heartbeat tick begins" consumer_id = c.consumer_id held = length(held) at = Dates.now(Dates.UTC)
     # Each step on its own, as in the drain (#608): a failed renewal, or one run's failed lookup,
     # must not hold back the other runs' signals nor this tick's adjudication.
     if !isempty(held)
         renewals = LeaseRenewal[LeaseRenewal((h.info.id, h.info.run_id, Float64(@atomic h.info.progress)))
                                 for h in held]
         # Renew first, adjudicate second: a heartbeat that was itself late must not take back its
-        # own leases before it renews them.
+        # own leases before it renews them. The adjudication reads `now`, for the reason above.
         kept = try
-            Set{UUID}(renew_leases!(store, c.consumer_id, renewals; lease_seconds = c.lease_seconds))
+            t0 = time()
+            k = Set{UUID}(renew_leases!(store, c.consumer_id, renewals; lease_seconds = c.lease_seconds))
+            renew_s = time() - t0
+            kept_count = length(k)
+            k
         catch e
             _is_interrupt(e) && throw(InterruptException())
             @error "Nitro.Workers: a consumer's lease renewal failed; retrying on the next heartbeat" runs = length(renewals) exception = (e, catch_backtrace())
@@ -462,7 +485,9 @@ function _heartbeat_tick!(c::ConsumerHandle)
     end
     # Once the drain has ended, the heartbeat only keeps the runs it left going alive (#607): a
     # consumer that returned claims nothing and adjudicates nothing.
-    (@atomic c.beating) && _consumer_requeue!(c)
+    t0 = time()
+    (@atomic c.beating) && _consumer_requeue!(c, now)
+    @debug "Nitro.Workers: consumer heartbeat tick" consumer_id = c.consumer_id held = length(held) kept = kept_count renew_s = round(renew_s; digits = 3) requeue_s = round(time() - t0; digits = 3) tick_s = round(time() - tick_start; digits = 3) at = Dates.now(Dates.UTC)
     return nothing
 end
 
@@ -492,9 +517,9 @@ function _lost_claim_reason(store::AbstractWorkerStore, info::TaskInfo)
     return rec.created_at == info.created_at ? :lease_lost : :superseded
 end
 
-function _consumer_requeue!(c::ConsumerHandle)
+function _consumer_requeue!(c::ConsumerHandle, now::DateTime = current_time_utc())
     try
-        tally = requeue_expired!(c.runtime.store, current_time_utc(); policies = c.policies)
+        tally = requeue_expired!(c.runtime.store, now; policies = c.policies)
         if tally.requeued + tally.failed > 0
             @info "Nitro.Workers: expired leases adjudicated" consumer_id = c.consumer_id requeued = tally.requeued failed = tally.failed unknown_queue = tally.unknown_queue
         end
@@ -528,6 +553,9 @@ function _drain!(c::ConsumerHandle)
             @atomic c.stopping = true
             notify(c.wake)
             snapshot = lock(() -> collect(values(c.held)), c.lock)
+            # Where a drain got to, when debug logging is on (#623): a drain the `atexit` hook ran
+            # on top of an interrupted task has been seen to hang before its first `@info`.
+            @debug "Nitro.Workers: consumer drain begins" consumer_id = c.consumer_id runs = length(snapshot) task = string(current_task()) at = Dates.now(Dates.UTC)
             for h in snapshot
                 _request_cancel!(h.info, :shutdown)
             end
@@ -535,6 +563,7 @@ function _drain!(c::ConsumerHandle)
             # holds the lock to deregister itself, which is how it settles.
             timedwait(() -> (@atomic c.held_count) == 0, c.drain_timeout; pollint = 0.05)
             left = @atomic c.held_count
+            @debug "Nitro.Workers: consumer drain wait ended" consumer_id = c.consumer_id runs_left = left at = Dates.now(Dates.UTC)
             if left > 0
                 @warn "Nitro.Workers: the consumer's drain timed out with runs still going. The " *
                       "heartbeat keeps renewing their leases until they return; if the process " *

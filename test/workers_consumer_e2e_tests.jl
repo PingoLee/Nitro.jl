@@ -37,14 +37,19 @@ submit(queue, tag; who = owner) =
 marker(tag, name) = joinpath(outdir, "$tag.$name")
 rec(id) = get_task_info(store, id)
 
+# The children's logs, printed when a wait times out or a scenario's outcome is wrong. Each child
+# flushes every record and logs each heartbeat tick at `@debug` (#623), so the tail shows whether
+# its heartbeat ticked and how long each renewal took.
 logs = String[]
 function dump_logs()
     for log in logs
         isfile(log) || continue
-        println("── $(basename(log)) (last 60 lines) ──")
-        foreach(println, last(readlines(log), 60))
+        println("── $(basename(log)) (last 300 lines) ──")
+        foreach(println, last(readlines(log), 300))
     end
 end
+# After a scenario's `@test`s, which keep their own evaluated output: the logs when it went wrong.
+or_dump(ok::Bool) = ok || (dump_logs(); false)
 function waitfor(f, what; timeout = 120)
     timedwait(f, timeout; pollint = 0.1) === :ok && return true
     @warn "timed out waiting for $what"
@@ -60,6 +65,7 @@ function start_consumer(name)
     io = open(log, "w")
     cmd = `$(Base.julia_cmd()) --code-coverage=none --threads=2,1 --startup-file=no
            --project=$(Base.active_project()) $child $dbspec $outdir $name $LEASE`
+    cmd = addenv(cmd, "JULIA_DEBUG" => "Nitro")
     return run(pipeline(ignorestatus(cmd); stdout = io, stderr = io); wait = false), io
 end
 
@@ -94,7 +100,10 @@ try
         @test rec(s1).claimed_by == "A"
         # Progress goes to the database with the heartbeat's renewal, not only to the object.
         @test waitfor(() -> rec(s1).progress == 40.0, "s1's progress"; timeout = 20)
-        @test rec(s1).lease_expires_at > now(UTC)
+        # Waited for, not read once: the first renewal can be slower than the 2 s lease (#623),
+        # so the lease it writes may have lapsed by the time it lands. The next one renews it.
+        @test waitfor(() -> rec(s1).lease_expires_at > now(UTC), "s1's lease to be live"; timeout = 20)
+        or_dump(rec(s1).progress == 40.0 && rec(s1).lease_expires_at > now(UTC))
     end
 
     @testset "a user cancel reaches the consumer's job as :user" begin
@@ -134,6 +143,7 @@ try
         @test rec(s1).status == PENDING && rec(s1).attempt == 1          # :requeue
         @test rec(s2).status == FAILED                                   # :fail
         @test occursin("on_lease_expiry = :fail", rec(s2).error)
+        or_dump(tally.requeued == 1 && tally.failed == 1 && rec(s1).status == PENDING)
     end
 
     pB, ioB = start_consumer("B")
@@ -159,7 +169,12 @@ try
         @test r5.claimed_by === nothing
         @test r5.attempt == 1
         flush(ioB)
-        @test occursin("consumer stopped", read(joinpath(dir, "B.log"), String))
+        blog = read(joinpath(dir, "B.log"), String)
+        @test occursin("consumer stopped", blog)
+        # A drain that timed out also exits and also writes that line, with the run still going
+        # (#623): only the count tells it from a drain that handed the run back.
+        @test occursin(r"runs_still_renewed = 0\b", blog)
+        or_dump(r5.status == PENDING && r5.claimed_by === nothing && occursin(r"runs_still_renewed = 0\b", blog))
         # It left through the `atexit` drain, never back through `consume!`'s wait.
         @test !isfile(joinpath(outdir, "B.returned"))
     end
