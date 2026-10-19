@@ -87,7 +87,10 @@ end
     @test r.status == 500
     @test length(logger.logs) == 1
     err, bt = logger.logs[1].kwargs[:exception]
-    @test err isa ErrorException && err.msg == "traceable"
+    # The record carries the rendered exception, never the live one (#613): its type's name and
+    # the `showerror` text, which for an `ErrorException` is the message.
+    @test err isa Nitro.Errors.LoggedException
+    @test err.type === :ErrorException && err.text == "traceable"
     frames = stacktrace(bt)
     @test any(f -> f.func === :distinctively_named_middleware_frame, frames)
 end

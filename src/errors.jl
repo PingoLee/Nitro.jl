@@ -236,6 +236,53 @@ end
 Base.showerror(io::IO, e::SessionStoreFault) = print(io, "Session Store Fault: ", e.msg)
 
 """
+    LoggedException
+
+What Nitro puts in a log record's `exception` in place of the exception itself (#613), built by
+`loggable(e)`. Two fields, both safe to keep:
+
+- `type::Symbol` -- the exception type's **name**, `nameof(typeof(e))`: `:MethodError`, `:ArgumentError`.
+  It is the name, not the type, because a full type can carry a value as a parameter (`Val{secret}`).
+- `text::String` -- `sprint(showerror, e)`, what `ConsoleLogger` printed for the original.
+
+`show` and `showerror` both print `text`. That is the whole point. `ConsoleLogger` renders an
+exception with `showerror`, which prints a `MethodError`'s arguments and a `TypeError`'s value as
+**types**. A sink that `show`s the record instead (a JSON or structured logger) printed the live
+object, values included. A handler that threw a `MethodError` over a parsed body, a token, or the
+request (whose target carries the query string) therefore wrote them to the log. HTTP.jl masks
+`Authorization` and `Cookie` when it renders a request, but it masks nothing else. Every sink now
+sees what the console sees. The console's text is the same, but uncoloured, because it is
+rendered once, ahead of the sink.
+
+It is done at the log line, not at each callback. That is the one choke point that also covers
+application handlers, which Nitro cannot wrap. It does not make `showerror` value-free: an
+exception whose own message quotes a value still prints it, there as on the console, so a fault
+that must not even name a value is replaced earlier (`ValidatorFault`, `SessionStoreFault`).
+
+Used by the error boundary (`handlerequest`) and by the `AccessLog` and `access_log_skip` hook
+warnings. Deliberately **not exported**: a log filter that dispatched on the original exception type
+matches on `.type` instead.
+"""
+struct LoggedException <: Exception
+    type::Symbol
+    text::String
+end
+
+Base.showerror(io::IO, e::LoggedException) = print(io, e.text)
+Base.show(io::IO, e::LoggedException) = print(io, e.text)
+
+function loggable(e)::LoggedException
+    e isa LoggedException && return e
+    text = try
+        sprint(showerror, e; context = :limit => true)
+    catch err
+        is_unrecoverable(err) && rethrow()    # #254: an interrupt is never turned into log text
+        "$(nameof(typeof(e))) (its `showerror` threw)"
+    end
+    return LoggedException(nameof(typeof(e)), text)
+end
+
+"""
     UnsupportedMediaTypeError(msg::String)
 
 The exception Nitro raises when a request's body has the wrong `Content-Type` for the extractor

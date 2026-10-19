@@ -118,6 +118,7 @@ const TEST_FILES = [
     "middleware/shared_response_mutation_tests.jl",
     "middleware/guards_tests.jl",
     "middleware/middleware_error_boundary_tests.jl",
+    "middleware/log_exposure_tests.jl",
 
     # ── Quality Gate ──────────────────────────────────────────────────────────
     "closure_boxing_tests.jl",
