@@ -10,11 +10,17 @@ using .Errors: loggable
 
 # A buggy hook must never cost the request, nor silently the line: warn and log anyway, the
 # structured `AccessLog`'s `_skips` rule.
+#
+# An interrupt is not a buggy hook, so it propagates (#649) -- but only the interrupt, unlike
+# `_skips`. This layer sits OUTSIDE the error boundary (`setupmiddleware`), so a rethrown stack
+# overflow or out-of-memory would reach HTTP.jl as the bodyless, unlogged 500 the boundary exists
+# to replace. Here the warning is the only record of it, so it stays one (`is_unrecoverable`).
 function _console_skips(skip, req, resp)::Bool
     skip === nothing && return false
     try
         return skip(req, resp) === true
     catch err
+        err isa InterruptException && rethrow()
         @warn "access_log_skip hook errored (logging request anyway)" exception=loggable(err)
         return false
     end
@@ -51,7 +57,7 @@ displays it.
 is known; return `true` to write no line for that request (#401). It is the same hook
 `AccessLog(sink; skip = …)` takes, so one predicate can quiet both, e.g. scanner probes no route
 answered: `(req, resp) -> route_missed(req)`. A hook that throws is warned about and
-the line is written anyway.
+the line is written anyway. The exception is an `InterruptException`, which propagates (#649).
 """
 function AccessLogMiddleware(; log_query::Bool=false, skip::Union{Nothing,Function}=nothing)
     _check_access_log_skip(skip, "serve(access_log_skip = …)")
