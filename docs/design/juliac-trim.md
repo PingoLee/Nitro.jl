@@ -65,8 +65,9 @@ vectors whose types are `Union{Vector{X}, Vector{Any}}` depending on the runtime
 past the fold yet. The miss path #625 rewired should not be one of the errors that appear once
 §3.2 lands: the miss values are `MissResponse`, a union of three concrete `HTTP.Response{B}`
 (no body, `String`, `Vector{UInt8}`), which inference splits: on Julia 1.12, `Base.return_types` gives
-`_miss_response`, `add_response_headers` and `_method_not_allowed` that same three-member union
-as their return type. The verifier itself has not checked it, because it stops at the fold.
+`add_response_headers` and `_method_not_allowed` that same three-member union as their return
+type (and gave it for `_miss_response`, the per-miss copy #628 folded into the transport). The
+verifier itself has not checked it, because it stops at the fold.
 
 | Where | What | Kind |
 |---|---|---|

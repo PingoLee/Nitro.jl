@@ -228,3 +228,112 @@ keyword_rebuild(resp, headers) = HTTP.Response(resp.status, resp.body; reason = 
     end
 end
 end
+
+@testitem "A shared response on the wire is never handed to HTTP.jl itself (#628)" tags=[:core, :middleware, :network, :security] setup=[NitroCommon] begin
+using Test
+using HTTP
+using Nitro
+using Nitro: App, Claims
+using Nitro.Core: _handoff_copy
+using Sockets
+
+# The transport sets `.request` on the response it hands HTTP.jl, and HTTP.jl writes `.close`,
+# `.content_length`, and on its error path the status and headers, on that object in place. A
+# shared value -- a handler's module-level `const`, a middleware's captured one (the shape of the
+# framework layers' `NOT_FOUND`/`BAD_REQUEST`), the auth rejections, the guards' 403, the `Claims`
+# 401 -- answered as-is kept the last request it answered, credentials and body included,
+# reachable from the next, and a single slow write could leave `close` set on it for the life of
+# the process. Only a real socket goes through the transport; `internalrequest` never does.
+const HANDLER_CONST = HTTP.Response(200, "shared handler body")
+const LAYER_CONST   = HTTP.Response(404, "shared layer body")
+const INVALID_HEADER      = Nitro.Core.Middleware.AuthMiddleware.INVALID_HEADER
+const FORBIDDEN           = Nitro.Core.Middleware.GuardsMiddleware.FORBIDDEN
+const CLAIMS_UNAUTHORIZED = Nitro.Core.Extractors.CLAIMS_UNAUTHORIZED
+# Too large for the socket buffers to absorb, so a client that hangs up mid-body makes the write
+# fail, and HTTP.jl sets `close = true` on the response it holds. Handed the shared value, that was
+# the value itself: `Connection: close` on every later response it answered. The happy path never
+# shows whether HTTP held the shared object's `close`; this does.
+const BIG = HTTP.Response(200, repeat("x", 32 * 1024 * 1024))
+
+struct Who
+    sub::String
+end
+
+@testset "the hand-off copy owns every mutable part but the body" begin
+    resp = HTTP.Response(201, ["X-A" => "1"], "body")
+    owned = _handoff_copy(resp)
+    @test owned !== resp
+    @test owned.headers == resp.headers && owned.headers !== resp.headers
+    @test owned.trailers !== resp.trailers
+    @test owned.body === resp.body
+    @test (owned.status, owned.content_length, owned.close) == (201, 4, false)
+    # A handler's own `close` is its decision, and survives the copy.
+    resp.close = true
+    @test _handoff_copy(resp).close
+end
+
+validator(t) = t == "user-token" ? Dict("sub" => "2", "role" => "user") : nothing
+claims_handler(req, c::Claims{Who}) = Res.send(c.payload.sub)
+function closing(req::HTTP.Request)
+    resp = Res.send("bye")
+    resp.close = true
+    return resp
+end
+
+ctx = App(mod = @__MODULE__)
+urlpatterns(ctx, "",
+    path("/const", req -> HANDLER_CONST),
+    path("/layer", req -> "unreachable"; middleware = [handler -> (req -> LAYER_CONST)]),
+    path("/bearer", req -> "unreachable"; middleware = [BearerAuth(validator)]),
+    path("/admin", req -> "unreachable";
+         middleware = [BearerAuth(validator), GuardMiddleware(role_required("admin"))]),
+    path("/claims", claims_handler),
+    path("/closing", closing),
+    path("/big", req -> BIG))
+
+shared = (HANDLER_CONST, LAYER_CONST, INVALID_HEADER, FORBIDDEN, CLAIMS_UNAUTHORIZED, BIG)
+before = [(copy(v.headers), v.content_length, v.status) for v in shared]
+
+port = get_free_port()
+Nitro.Core.serve(ctx; host = HOST, port = port, async = true,
+                 show_banner = false, show_errors = false, access_log = nothing)
+@test timedwait(() -> Base.isopen(ctx.service), 10.0) === :ok
+try
+    addr(p) = "http://$HOST:$port$p"
+    fetch_(p, h = Pair{String,String}[]) = HTTP.get(addr(p), h; status_exception = false)
+    for _ in 1:2   # twice, on the client's pooled keep-alive connection
+        r = fetch_("/const", ["Cookie" => "sid=secret-session"])
+        @test (r.status, String(r.body)) == (200, "shared handler body")
+        r = HTTP.request("HEAD", addr("/const"); status_exception = false)
+        @test r.status == 200 && isempty(r.body)
+        r = fetch_("/layer", ["Authorization" => "Bearer secret-token"])
+        @test (r.status, String(r.body)) == (404, "shared layer body")
+        r = fetch_("/bearer")
+        @test (r.status, String(r.body)) == (401, INVALID_HEADER.body)
+        r = fetch_("/admin", ["Authorization" => "Bearer user-token"])
+        @test r.status == 403
+        r = fetch_("/claims")
+        @test r.status == 401
+    end
+    r = fetch_("/closing")
+    @test String(r.body) == "bye"
+    @test HTTP.header(r, "Connection") == "close"
+    # Hang up mid-body. Under the identity hand-off `BIG.close` flips at once; give it 2 s.
+    for _ in 1:2
+        sock = Sockets.connect(HOST, port)
+        write(sock, "GET /big HTTP/1.1\r\nHost: x\r\n\r\n")
+        @test !isempty(readavailable(sock))   # the response is under way
+        close(sock)
+        @test timedwait(() -> BIG.close, 2.0) === :timed_out
+    end
+
+    for (value, (headers, len, status)) in zip(shared, before)
+        @test value.request === nothing
+        @test !value.close
+        @test value.headers == headers
+        @test (value.content_length, value.status) == (len, status)
+    end
+finally
+    Nitro.Core.terminate(ctx)
+end
+end

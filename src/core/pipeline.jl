@@ -171,16 +171,11 @@ function _route_unresolved(r::HTTP.Router, misses::Types.MissResponses, req::HTT
     return _route_call(req, handler, route, params)
 end
 
-# A copy of one of the app's miss values, which is what a miss is answered with (#625). The value
-# itself is shared by every request it answers, and the transport hands the response it gets to
-# HTTP.jl, which writes to that object in place: `resp.request = req`, then `.close` on a failed
-# write, an undrained body or a write-deadline expiry (see the note above
-# `_reject_oversized_body!` in src/core/transport.jl). Served as-is, one slow client would leave `close` set on every later
-# miss, and `.request` would keep the last missed request, credentials included, reachable from the
-# next one. HTTP.jl's `default404` built a fresh response per miss, so the copy costs what it did.
-# The body is shared, which is why `App` holds only the resendable ones (`Types.MissResponse`).
-_miss_response(res::Types.MissResponse) = Util._rebuild_with_headers(res, copy(res.headers))
-
+# A miss is answered with the app's value itself, shared by every request it answers: the transport
+# hands HTTP.jl a copy (`_handoff_copy`, #628), so HTTP's in-place writes never reach it. Until
+# then each miss copied it here (#625). The body is shared either way, which is why `App` holds
+# only the resendable ones (`Types.MissResponse`).
+#
 # `gethandler` found no leaf: `nothing` is a miss, `missing` a method mismatch. See
 # `_route_unresolved` for why a `nothing` can still be a 405.
 function _route_miss(r::HTTP.Router, misses::Types.MissResponses, req::HTTP.Request,
@@ -188,7 +183,7 @@ function _route_miss(r::HTTP.Router, misses::Types.MissResponses, req::HTTP.Requ
     _mark_route_miss!(req)   # what `route_missed` reads (#401)
     if handler === nothing
         allowed = _allowed_methods(r, req.target)
-        return isempty(allowed) ? _miss_response(misses.not_found) :
+        return isempty(allowed) ? misses.not_found :
                                   _method_not_allowed(r, misses, req, allowed)
     end
     return _method_not_allowed(r, misses, req)
@@ -215,7 +210,7 @@ value is shared by every request it answers (nitro-core §4).
 function _method_not_allowed(r::HTTP.Router, misses::Types.MissResponses, req::HTTP.Request,
                              allowed::Nullable{Vector{String}} = nothing)
     res = misses.method_not_allowed
-    HTTP.hasheader(res, "Allow") && return _miss_response(res)
+    HTTP.hasheader(res, "Allow") && return res
     list = allowed === nothing ? _allowed_methods(r, req.target) : allowed
     return add_response_headers(res, "Allow" => join(list, ", "))
 end

@@ -573,12 +573,13 @@ end
 #
 # Built fresh on every rejection rather than hoisted to a module-level `const`, which is otherwise
 # Nitro's endorsed pattern for a fixed error response (nitro-core §4). The difference is that this
-# response is assigned to `stream.response`, and HTTP writes to that object IN PLACE on the way
-# out — `startwrite` sets `.close` when the request body was not fully consumed (which is exactly
-# our case) and back-fills `.content_length`, `_server_closeread` sets `.close` again, and
-# `_serve_h1_conn!`'s error path calls `removeheader(stream.response.headers, …)`. A shared `const`
-# would take all of that concurrently, across every rejecting connection. A rejection is rare by
-# construction, so the allocation costs nothing worth saving.
+# response never reaches `_handoff_copy`: it is assigned to `stream.response` directly, and HTTP
+# writes to that object IN PLACE on the way out — `startwrite` sets `.close` when the request body
+# was not fully consumed (which is exactly our case) and back-fills `.content_length`,
+# `_server_closeread` sets `.close` again, and `_serve_h1_conn!`'s error path calls
+# `removeheader(stream.response.headers, …)`. A shared `const` would take all of that concurrently,
+# across every rejecting connection. A rejection is rare by construction, so the allocation costs
+# nothing worth saving.
 #
 # Note it is NOT the `Connection: close` header that does this: `_write_server_stream_head!` copies
 # the headers vector before calling `setheader` on it. That was this comment's original claim and
@@ -788,9 +789,9 @@ end
 # (RFC 6455 §4.4). Anything else wrong with a declared upgrade — a missing version or key, a
 # method other than GET on a `method = "*"` route: 400 (RFC 6455 §4.2.1).
 #
-# Fresh responses: `stream_handler` sets `resp.request` on what it writes. And no `resp.close`,
-# which would make HTTP.jl replace `Connection: Upgrade` with `close`; on h2 HTTP.jl strips both
-# headers and the bare 426 still stands.
+# Fresh responses, though `stream_handler` hands HTTP.jl a copy either way (`_handoff_copy`).
+# And no `resp.close`, which would make HTTP.jl replace `Connection: Upgrade` with `close`; on h2
+# HTTP.jl strips both headers and the bare 426 still stands.
 function _not_an_upgrade(req::HTTP.Request)::HTTP.Response
     if !(HTTP.headercontains(req, "Upgrade", "websocket") &&
          HTTP.headercontains(req, "Connection", "upgrade"))
@@ -996,6 +997,21 @@ function _with_head_content_length(resp::HTTP.Response)::HTTP.Response
     return add_response_headers(resp, "Content-Length" => string(resp.content_length))
 end
 
+# The object HTTP.jl gets is never the one the pipeline returned (#628). HTTP writes to
+# `stream.response` in place: `stream_handler` itself sets `.request`, HTTP sets `.close` on a
+# failed or timed-out write and on an undrained body, back-fills `.content_length`, and
+# its error path calls `setstatus` and `removeheader` on `.headers`. The pipeline's value may be
+# shared — a module-level `const` (the auth rejections, `FORBIDDEN`, a handler's own), or an
+# `App(not_found = …)` — and served concurrently, so handed over as-is one slow client left `close`
+# set on every later response built from it, and `.request` kept the last request, credentials and
+# body included, reachable from the next. A copy here covers every such value at once, including
+# the ones a handler returns, which no per-site copy can reach.
+#
+# Shallow: the body is shared by reference, which the non-consuming write path makes safe to send
+# again (nitro-core §4), and is still released through the pipeline's value in the `finally`. The
+# headers vector is copied because HTTP's error path edits it; the trailers are copied too.
+_handoff_copy(resp::HTTP.Response)::HTTP.Response = own_response_headers(resp)
+
 # ── The in-flight request cap (#298) ─────────────────────────────────────────────────────────────
 #
 # `max_concurrent_requests` (`0` = unlimited, the default) bounds how many requests this server
@@ -1079,6 +1095,8 @@ function stream_handler(middleware::Function; max_body_bytes::Int64 = DEFAULT_MA
                 if !_response_started(stream)
                     resp = produced === nothing ? HTTP.Response(200) : produced
                     stream.message.method == "HEAD" && (resp = _with_head_content_length(resp))
+                    # Only the pipeline's own value needs it: the two above are built here.
+                    resp === produced && (resp = _handoff_copy(resp))
                     resp.request = req
                     stream.response = resp
                     # `HEAD` gets the head and no body, so there is nothing to drain — and draining it
