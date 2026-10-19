@@ -488,6 +488,14 @@ msgs = lines(Nitro.Core.AccessLogMiddleware(skip = (req, resp) -> error("hook bo
 @test any(m -> occursin("access_log_skip hook errored", m), msgs)
 @test any(m -> occursin("\"GET /ok\" 200", m), msgs)
 
+# An interrupt is not a buggy hook: it propagates (#649). An overflow stays a warning, because this
+# layer is outside the error boundary and the warning is the only record HTTP.jl would leave of it.
+@test_throws InterruptException Nitro.Core.AccessLogMiddleware(
+    skip = (req, resp) -> throw(InterruptException()))(_req -> HTTP.Response(200))(HTTP.Request("GET", "/ok"))
+msgs = lines(Nitro.Core.AccessLogMiddleware(skip = (req, resp) -> throw(StackOverflowError())),
+             HTTP.Request("GET", "/ok"))
+@test any(m -> occursin("access_log_skip hook errored", m), msgs)
+
 # The old one-argument shape and a non-function are refused before `serve` touches the App.
 @test_throws ArgumentError Nitro.Core.AccessLogMiddleware(skip = req -> true)
 app = App(mod = @__MODULE__)
@@ -672,4 +680,93 @@ Base.CoreLogging.with_logger(logger) do
 end
 @test occursin(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d - nothing - \"GET /x\" 200$",
                string(only(logger.logs).message))
+end
+
+# #649: AccessLog's catches made no #254 carve-out, so Ctrl-C in a `skip` or `annotate` hook became
+# a warning and the request carried on, and an overflow in a hook was reported as a buggy hook.
+@testitem "AccessLog does not swallow an interrupt or an overflow (#649)" tags=[:middleware] setup=[NitroCommon] begin
+using Nitro
+using HTTP
+using Nitro.Core: startup, shutdown
+
+app = App(mod = @__MODULE__)
+urlpatterns(app, "", path("/ok", () -> "ok"))
+
+# What the request returned or threw, and every record logged while it ran.
+function outcome(lf)
+    logger = Test.TestLogger(; min_level = Base.CoreLogging.Debug)
+    startup(lf)
+    got = Base.CoreLogging.with_logger(logger) do
+        try
+            internalrequest(app, HTTP.Request("GET", "/ok"); middleware = [lf])
+        catch e
+            e
+        end
+    end
+    shutdown(lf)
+    return got, logger.logs
+end
+hook_warned(logs) = any(l -> occursin("hook errored", string(l.message)), logs)
+
+hooks = (
+    ("skip", exc -> AccessLog(_ -> nothing; skip = (req, resp) -> throw(exc))),
+    ("annotate", exc -> AccessLog(_ -> nothing; annotate = req -> throw(exc))),
+)
+
+@testset "an interrupt in the $name hook reaches the caller" for (name, mk) in hooks
+    got, logs = outcome(mk(InterruptException()))
+    @test got isa InterruptException
+    @test !hook_warned(logs)
+end
+
+@testset "an overflow in the $name hook is the error boundary's 500, not a hook warning" for (name, mk) in hooks
+    got, logs = outcome(mk(StackOverflowError()))
+    @test got isa HTTP.Response && got.status == 500
+    @test !hook_warned(logs)
+    @test any(l -> l.level >= Base.CoreLogging.Error, logs)
+end
+
+@testset "an ordinary hook failure is still a warning, and the request is logged" for (name, mk) in hooks
+    records = AccessRecord[]
+    lk = ReentrantLock()
+    lf = name == "skip" ?
+        AccessLog(recs -> lock(() -> append!(records, recs), lk); skip = (req, resp) -> error("boom")) :
+        AccessLog(recs -> lock(() -> append!(records, recs), lk); annotate = req -> error("boom"))
+    got, logs = outcome(lf)
+    @test got isa HTTP.Response && got.status == 200
+    @test hook_warned(logs)
+    @test [r.path for r in records] == ["/ok"]
+end
+
+# The writer is a background task: an interrupt there ends the drain with one warning, the
+# janitor's shape (#369), and a restart writes again. On the old code the sink's interrupt was a
+# "sink failed" warning and the writer drained on, so "/while-stopped" was written too.
+@testset "an interrupt in the sink stops the writer with one warning; a restart writes again" begin
+    records = AccessRecord[]
+    lk = ReentrantLock()
+    interrupt_next = Threads.Atomic{Bool}(true)
+    sink = function (recs)
+        Threads.atomic_xchg!(interrupt_next, false) && throw(InterruptException())
+        lock(() -> append!(records, recs), lk)
+    end
+    lf = AccessLog(sink; batch = 10)
+    handler = lf.middleware(req -> HTTP.Response(200, "ok"))
+    logger = Test.TestLogger(; min_level = Base.CoreLogging.Warn)
+    messages() = lock(() -> [string(l.message) for l in logger.logs], logger.lock)
+    stopped(ms) = count(m -> occursin("interrupt (Ctrl-C) reached the access-log writer", m), ms)
+    Base.CoreLogging.with_logger(logger) do
+        startup(lf)                                   # the writer inherits this logger
+        handler(HTTP.Request("GET", "/first"))        # its batch meets the interrupt
+        @test timedwait(() -> stopped(messages()) == 1, 10.0; pollint = 0.05) === :ok
+        handler(HTTP.Request("GET", "/while-stopped"))
+        shutdown(lf)                                  # must not hang on the stopped writer
+        startup(lf)
+        handler(HTTP.Request("GET", "/second"))
+        shutdown(lf)
+    end
+    ms = messages()
+    @test stopped(ms) == 1
+    @test !any(m -> occursin("sink failed", m), ms)
+    @test [r.path for r in records] == ["/second"]
+end
 end

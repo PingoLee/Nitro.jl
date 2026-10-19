@@ -259,8 +259,10 @@ application handlers, which Nitro cannot wrap. It does not make `showerror` valu
 exception whose own message quotes a value still prints it, there as on the console, so a fault
 that must not even name a value is replaced earlier (`ValidatorFault`, `SessionStoreFault`).
 
-Used by the error boundary (`handlerequest`) and by the `AccessLog` and `access_log_skip` hook
-warnings. Deliberately **not exported**: a log filter that dispatched on the original exception type
+Used by every log line on a request's path that carries an exception: the error boundary
+(`handlerequest`), the `AccessLog` and `access_log_skip` hook warnings, a failed `Res.sse`
+producer, a failed streamed response body, the peer-address lookup, and the rate limiters' `decide`
+(#648). The PormG stores use it for PormG's own database errors. Deliberately **not exported**: a log filter that dispatched on the original exception type
 matches on `.type` instead.
 """
 struct LoggedException <: Exception
@@ -542,6 +544,7 @@ of these sites call (a user's `validate_token`, a user's session store):
 | `src/middleware/csrf_middleware.jl` ×2 | `getform`/`getjson` |
 | `src/middleware/session_middleware.jl` ×2 | `_end_session!`'s delete through the app's session store, and `_validator_marker`'s call of the app's `validator` (#602) |
 | `src/types.jl` ×1 | `_call_auth_hash_hook`'s call of the app's `session_auth_hash` (#602) |
+| `src/middleware/access_log.jl` ×3 | `AccessLog`'s app hooks on the request task (#649): `_skips` (the `skip` hook), `_annotate` (the `annotate` hook), and `_capture!`, which `_annotate` runs inside and which would otherwise swallow its rethrow one frame up |
 | `ext/NitroPormGExt.jl` ×5 | the PormG stores' reads of their own stored JSON (#344): the session query and decode in `Base.get(::PormGSessionStore, …)`, which `SessionMiddleware` calls per request; `_parse_stored_json` for a task's `result`/`watchers`; `_listed_task`, which would otherwise swallow what `_parse_stored_json` rethrows one frame up; and `_claim_row!`'s decode of the head row a consumer claims (#514) |
 | `src/Workers/jobs.jl` ×2 | a named job's arguments (#514): `_encode_job`'s serialize-and-bind-back at submit, and `NamedJobRun`'s bind of the stored JSON when the run starts. Both reach `JSON.parse` through `stored_json_bind` (`json_bind` without the request field cap, since arguments are stored data), and the run-side one turns every other failure into a terminal `JobError` |
 
@@ -576,12 +579,18 @@ different reasons**, and conflating them is how this list rots:
    because the heartbeat must keep renewing while the drain runs. `_drain!`'s catch is
    shutdown code and swallows everything (#427). `src/response.jl`'s `_run_sse_producer` (#160) is the same
    discipline one level down: the producer task nothing waits on, where the expected failure is
-   the client disconnecting. Do not "fix" these to match the table above.
+   the client disconnecting. `AccessLog`'s writer (`_run`/`_flush!` in
+   `src/middleware/access_log.jl`, #649) is this group too: the app's sink failing with an
+   overflow costs one dropped batch, and an interrupt ends the drain with a `@warn`, the janitor's
+   shape. Do not "fix" these to match the table above.
 3. **The error boundary itself — the place the other two are MEANT to arrive.**
    `ErrorBoundary` in `src/core/framework_middleware.jl` (#256) wraps the whole middleware chain
    so that what this predicate lets through gets logged and answered with a 500. Widening it would
    send `StackOverflowError`/`OutOfMemoryError` straight back to HTTP.jl as the bodyless, unlogged
-   500 it exists to replace. Only the interrupt goes past it.
+   500 it exists to replace. Only the interrupt goes past it. The console access log's
+   `_console_skips` (`src/core/framework_middleware.jl`, #649) keeps the same narrow form for the
+   same reason: it runs OUTSIDE the boundary, so the app's `access_log_skip` hook overflowing is
+   logged as a warning rather than rethrown into HTTP.jl unlogged.
 
 Group 1 also holds `_bound_swallow!` in `src/core/transport.jl` (it wraps a Reseau read-deadline
 setter, #298) and `_gc_target_bytes` in

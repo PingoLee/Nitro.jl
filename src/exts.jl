@@ -44,6 +44,16 @@ before serializing it, so even a payload deep enough to overflow `JSON.json` get
 `ArgumentError` rather than a `StackOverflowError`. A row stored deeper
 before this bound existed reads as no session, and logs a warning that names no payload.
 
+A failed query logs a warning that names no session key or payload either (#646). On
+PostgreSQL a constraint violation's `DETAIL` line quotes the row, session key included, and the
+key is a bearer credential. So the warning carries PormG's own rendering of the error, which is
+built from the SQLSTATE, the constraint, the table and the server's primary message, plus a
+`sqlstate` field. It never carries the error object, whose `.cause` keeps the driver's full text.
+An error that is not one of PormG's database errors is logged by its type name only.
+LibPQ logs the failed statement itself, `DETAIL` included, through its own Memento logger
+(`[warn | LibPQ]`) before Nitro sees it. To keep that line out of your logs, raise the level of
+LibPQ's Memento logger in your application.
+
 `db_key` names the PormG connection, defaulting to `"db"`. It governs **both** halves: the
 table is created on that connection, and the returned store routes every session query — read,
 write, delete and prune — to the same one. Pass a different key when your session database uses

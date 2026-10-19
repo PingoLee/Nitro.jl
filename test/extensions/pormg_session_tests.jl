@@ -886,6 +886,56 @@ end
             @test_throws typeof(exc) Base.get(throwing, "sess-boom", :fallback)
         end
     end
+
+    @testset "a failed query's warning never quotes the row (#646, #647)" begin
+        # On PostgreSQL the driver's error carries the server's DETAIL line, and a constraint
+        # violation's DETAIL quotes the row: the session id, which is a bearer credential, and on a
+        # failing-row error the payload too. PormG keeps that text only in its error's `.cause`.
+        detail = "duplicate key value violates unique constraint \"nitro_sessions_pkey\"\n" *
+                 "DETAIL:  Key (session_key)=(S3NT1NEL-sid) already exists.\n" *
+                 "DETAIL:  Failing row contains (S3NT1NEL-sid, {\"csrf\":\"S3NT1NEL-payload\"})."
+        # Everything a log sink could render: the message, the kwargs as `show` prints them, the
+        # exception as ConsoleLogger prints it, and its fields the way a structured sink walks them.
+        function rendered(l)
+            out = string(l.message, sprint(show, l.kwargs))
+            ex = get(l.kwargs, :exception, nothing)
+            ex isa Tuple && (ex = ex[1])
+            ex isa Exception && (out *= sprint(showerror, ex) * sprint(dump, ex))
+            return out
+        end
+        payload = Dict{String,Any}("csrf" => "S3NT1NEL-payload")
+        calls = (
+            s -> Base.get(s, "S3NT1NEL-sid", :fallback),
+            s -> set_session!(s, "S3NT1NEL-sid", payload; ttl=3600),
+            s -> update_session!(s, "S3NT1NEL-sid", payload; ttl=3600),
+            s -> rotate_session!(s, "S3NT1NEL-old", "S3NT1NEL-sid", payload; ttl=3600),
+            s -> delete_session!(s, "S3NT1NEL-sid"),
+            s -> cleanup_expired_sessions!(s),
+        )
+        # An exception of unknown shape quoting the row, and PormG's own wrapper around one.
+        wrapped = PormG.IntegrityError("postgresql", ErrorException(detail); sqlstate = "23505",
+                                       constraint = "nitro_sessions_pkey", table = "nitro_sessions",
+                                       message = "duplicate key value violates unique constraint")
+        for exc in (ErrorException(detail), wrapped), call in calls
+            s = RealPormGSessionStore(model=ThrowingMockModel(exc))
+            logger = Test.TestLogger(; min_level = Base.CoreLogging.Warn)
+            Base.CoreLogging.with_logger(logger) do
+                try
+                    call(s)
+                catch
+                end
+            end
+            record = only(logger.logs)
+            @test !occursin("S3NT1NEL", rendered(record))
+            if exc isa PormG.DatabaseError
+                # PormG's value-free rendering is kept, so an outage can still be diagnosed.
+                @test record.kwargs[:sqlstate] == "23505"
+                @test occursin("nitro_sessions_pkey", rendered(record))
+            else
+                @test record.kwargs[:exception_type] === :ErrorException
+            end
+        end
+    end
 end
 
 # #440: a database store had no size bound, so anonymous session writes grew the table without

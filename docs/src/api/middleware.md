@@ -23,8 +23,11 @@ logged at `@debug`. The access log records the status either way. An `InterruptE
 the original's type name (`:MethodError`), and `text`, what `showerror` printed for it. Its `show`
 prints the same `text`, without colour. So a JSON or structured log sink records exactly what the console shows,
 and never the arguments of a `MethodError` or the value in a `TypeError`. Those used to reach any
-sink that `show`ed the record: a request's query string, a parsed body, a token. The warnings that
-`AccessLog` and `access_log_skip` log when a hook or the sink throws carry the same type.
+sink that `show`ed the record: a request's query string, a parsed body, a token. Every other log
+line on a request's path that carries an exception carries the same type: the warnings that
+`AccessLog` and `access_log_skip` log when a hook or the sink throws, a failed
+[`Res.sse`](@ref) producer, a failed streamed response body, and a rate
+limiter whose decision threw.
 
 A [`Claims`](@ref) refusal is not on this list because it is not converted at all: the `401` or
 `403` its denial factory built is the route's response, served under `catch_errors=false` and

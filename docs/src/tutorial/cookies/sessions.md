@@ -319,6 +319,14 @@ than ending at once.
     opened on a **different** connection raises PormG's `TransactionError`, which names the
     connection the call needs a transaction on.
 
+!!! warning "LibPQ logs a failed statement itself"
+    The store's warnings never quote a session key or payload. On PostgreSQL, though, LibPQ
+    logs a failed statement through its own Memento logger before Nitro sees the error, and
+    that `[warn | LibPQ]` line includes the server's `DETAIL`. For a duplicate key, the
+    `DETAIL` is `Key (session_key)=(…) already exists.`, which prints the session key. If that
+    line must stay out of your logs, raise the level of LibPQ's Memento logger in your
+    application. See [`pormg_nitro_session`](@ref Nitro.pormg_nitro_session).
+
 ### Custom Store Interface
 
 Implement these methods for your own backend:

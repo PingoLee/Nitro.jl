@@ -38,6 +38,9 @@ using Dates: DateTime, unix2datetime
 using MIMEs: MIME, mime_from_path, contenttype_from_mime
 using SHA: sha256
 import JSON
+# The SSE producer is application code, so its failure is logged as `loggable(err)`, never the
+# live exception (#648, the #613 rule).
+using ..Errors: loggable
 
 function apply_headers!(target::Union{HTTP.Response,HTTP.Headers}, headers)
     for header in headers
@@ -476,12 +479,12 @@ function _run_sse_producer(producer::Function, events::HTTP.SSEStream)
         # `ArgumentError`, so they stay at error level even when the stream is closed, which is
         # exactly the case that used to be swallowed.
         if !isopen(events) && _is_closed_stream_error(err)
-            @debug "Nitro.Res.sse: producer stopped because the event stream was closed" exception=err
+            @debug "Nitro.Res.sse: producer stopped because the event stream was closed" exception=loggable(err)
             return nothing
         end
         # Deliberately no event payload in the message — an SSE body carries whatever the
         # application chose to stream, which may be session- or user-scoped.
-        @error "Nitro.Res.sse: the event producer failed" exception=(err, catch_backtrace())
+        @error "Nitro.Res.sse: the event producer failed" exception=(loggable(err), catch_backtrace())
     finally
         HTTP.body_close!(events)
     end

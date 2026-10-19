@@ -28,7 +28,7 @@ using HTTP
 using Dates
 using ...Core: getip, route_missed, LifecycleMiddleware
 using ...Util: _log_target_path, _check_access_log_skip
-using ...Errors: loggable
+using ...Errors: loggable, is_unrecoverable
 using ..JanitorMiddleware: _janitor
 
 export AccessLog, AccessRecord
@@ -120,11 +120,18 @@ end
 # Every warning in this file logs `loggable(err)`, never `err` (#613). The hooks are handed `req`,
 # whose target carries the query string, and the sink the records, with client IPs and user agents.
 # A `MethodError` over either put them in the record, where a sink that `show`s it printed them.
+#
+# The hook catches and `_capture!`'s run on the REQUEST task, so they make the #254 carve-out
+# every request-path catch makes (#649): an interrupt, a stack overflow or an out-of-memory is not
+# a buggy hook, and reported as one it made Ctrl-C a no-op and kept serving from a process that may
+# be corrupted. They propagate instead. `AccessLog` is user middleware, so it sits inside the error
+# boundary: the overflow there is logged and answered 500, and only the interrupt goes further.
 function _skips(skip, req, resp)::Bool
     skip === nothing && return false
     try
         return skip(req, resp) === true
     catch err
+        is_unrecoverable(err) && rethrow()
         @warn "AccessLog: skip hook errored (logging request anyway)" exception=loggable(err)
         return false
     end
@@ -138,6 +145,7 @@ function _annotate(annotate, req)::Dict{Symbol, Any}
                v isa AbstractDict ? Dict{Symbol, Any}(Symbol(k) => val for (k, val) in v) :
                _EMPTY_CONTEXT
     catch err
+        is_unrecoverable(err) && rethrow()
         @warn "AccessLog: annotate hook errored" exception=loggable(err)
         return _EMPTY_CONTEXT
     end
@@ -234,6 +242,9 @@ function _capture!(r::_Run, req::HTTP.Request, resp, t0::UInt64, annotate, log_q
                            ip, user_agent, _annotate(annotate, req))
         _enqueue!(r, rec)
     catch err
+        # `_annotate` runs inside this `try`, so without this line its rethrow above would be
+        # caught one frame up and swallowed here after all.
+        is_unrecoverable(err) && rethrow()
         @warn "AccessLog: failed to capture request" exception=loggable(err)
     end
     return nothing
@@ -256,23 +267,41 @@ end
 # The optional RETENTION pruner (#159) is the opposite case, and does use `_janitor`: it is
 # exactly "sleep `prune_interval`, then call the app's `prune`", over app code that may block on a
 # SQL DELETE -- the session prune's shape, not this writer's. See `AccessLog`.
+#
+# ── An interrupt (#649) ──
+#
+# The writer is a background task, so it follows the janitor's decision (#369, canonical next to
+# `_cleanup_scheduler_loop` in src/Workers/api.jl), not the request path's. An interrupt, wherever
+# it lands -- parked in `take!`, or in the app's sink through `_flush!`'s rethrow -- ends the drain
+# with one `@warn`. Rethrowing it only killed the writer with an `errormonitor` "Unhandled Task
+# ERROR", and swallowing it and draining on would park this task again as the one every later
+# Ctrl-C lands in. Records are then buffered up to `capacity` and dropped, never blocking a
+# request, until the server restarts: `on_shutdown` closes this activation and `on_startup` spawns
+# a fresh one, so no state needs resetting here.
 function _run(sink, r::_Run, max_batch::Int)
-    while true
-        local rec
-        try
-            rec = take!(r.channel)          # blocks until a record arrives
-        catch
-            break                           # channel closed & drained → shut down
-        end
-        _release!(r, rec)
-        batch = AccessRecord[rec]
-        while length(batch) < max_batch && isready(r.channel)
-            rec = take!(r.channel)
+    try
+        while true
+            local rec
+            try
+                rec = take!(r.channel)          # blocks until a record arrives
+            catch e
+                e isa InterruptException && rethrow()
+                break                           # channel closed & drained → shut down
+            end
             _release!(r, rec)
-            push!(batch, rec)
+            batch = AccessRecord[rec]
+            while length(batch) < max_batch && isready(r.channel)
+                rec = take!(r.channel)
+                _release!(r, rec)
+                push!(batch, rec)
+            end
+            _flush!(sink, batch)
+            _report_drops(r)
         end
-        _flush!(sink, batch)
-        _report_drops(r)
+    catch e
+        e isa InterruptException || rethrow()
+        @warn "Nitro.AccessLog: an interrupt (Ctrl-C) reached the access-log writer instead of the server. " *
+              "It has stopped writing records until the server is started again. Press Ctrl-C again to stop the server."
     end
     return nothing
 end
@@ -289,6 +318,11 @@ function _flush!(sink, batch::Vector{AccessRecord})
     try
         sink(batch)
     catch err
+        # The interrupt goes to `_run`'s outer handler, which stops the drain (#649). A stack
+        # overflow or out-of-memory in the app's sink stays a dropped batch, as any failure does
+        # in a janitor's tick: this is a background task, a rethrow reaches nobody who can act on
+        # it, and a dead audit writer is worse than one lost batch (`is_unrecoverable`, group 2).
+        err isa InterruptException && rethrow()
         @warn "AccessLog: sink failed; dropping $(length(batch)) record(s)" exception=(loggable(err), catch_backtrace())
     end
     return nothing
@@ -328,7 +362,12 @@ its background writer starts and stops with the server.
 - `prune`, `retention`, `prune_interval` — optional retention pruner; see below
 
 Best-effort by contract: never blocks or throws into the request; a full buffer or a
-failing sink costs records (counted and warned), never latency or correctness.
+failing sink costs records (counted and warned), never latency or correctness. A `skip` or
+`annotate` hook that throws is warned about and the request is logged anyway. The exceptions are
+an `InterruptException`, a `StackOverflowError` or an `OutOfMemoryError` raised in a hook: they
+are not a buggy hook, so they propagate like a handler's (#649). An interrupt that reaches the
+writer task stops it, with one warning, until the server is started again. Records captured
+meanwhile are dropped, and they are not counted in the drop warnings.
 
 # Scanner traffic
 
