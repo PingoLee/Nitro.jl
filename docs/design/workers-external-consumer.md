@@ -792,7 +792,11 @@ Where it departs from §7, or settles what §7 left open, each choice was agreed
   - Reaching a bound sets `stopping`, so no more claims, and records the bound. No `:shutdown`
     token is set, there is no timeout, and the heartbeat goes on renewing.
   - When the last held run settles, the consumer requests its own stop. `consume!`'s `finally`
-    then drains, and that drain finds nothing held.
+    then drains, and that drain finds nothing held. Settled means what `exit_when_idle` means:
+    nothing held **and** no slot still taken by a callback a deadline abandoned. That callback is
+    recorded `FAILED` and no longer held, but it runs on a thread until it returns, and a recycle
+    that exited under it would end the process on top of it, which is the drain's behaviour the
+    recycle exists not to have.
   - A stop request during the wait drains what is left, as any stop does.
   - Only a recycle that ran to its end sets the exit reason, so a stop that cut one short returns
     `:stopped`.

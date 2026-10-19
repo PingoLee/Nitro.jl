@@ -342,7 +342,8 @@ consume!(app; store, queues = ["heavy" => 4], max_runs = 500, max_rss_mb = 2048)
 
 **A recycle waits; a drain cancels.**
 - Past a bound, the consumer stops claiming and lets the runs it holds **finish**: no `:shutdown`
-  token, no `drain_timeout`, and their leases stay renewed. Then `consume!` returns, and the script
+  token, no `drain_timeout`, and their leases stay renewed. A callback its deadline abandoned
+  still counts as running until it returns. Then `consume!` returns, and the script
   ends.
 - A `SIGTERM` or Ctrl-C during that wait drains as described above.
 - `consume!` returns why it ended: `:max_runs`, `:max_rss`, `:idle`, or `:stopped` for a stop

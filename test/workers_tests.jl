@@ -6854,6 +6854,25 @@ end
     end
 end
 
+@testset "max_runs: a callback a deadline abandoned still holds its slot" begin
+    # The same case under a recycle: the run is FAILED at the deadline and no longer held, but its
+    # callback still runs. A recycle that returned here would let the script end on top of it.
+    heavy = External(on_lease_expiry = :requeue, options = TaskOptions(timeout = 1))
+    web, c, store, (id,) = pair_after([("abandoned-recycle", "block", 0)]; heavy, max_runs = 1)
+    try
+        t = await(c)
+        @test waitfor(() -> status(store, id) == FAILED)          # the 1 s deadline passed
+        @test (@atomic c.recycle_reason) === :max_runs
+        sleep(0.5)
+        @test !istaskdone(t)
+        notify(gate("abandoned-recycle"))
+        @test ended_with(t) === :max_runs
+    finally
+        notify(gate("abandoned-recycle"))
+        stop!(web, c)
+    end
+end
+
 @testset "one-shot: max_runs = 1 with exit_when_idle runs one run and leaves the rest" begin
     web, c, store, ids = pair_after([("os1", "return", 1), ("os2", "return", 2)];
                                     max_runs = 1, exit_when_idle = true)
