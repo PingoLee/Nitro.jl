@@ -319,8 +319,10 @@ already gone. Only a cancel a person or a deadline asked for is terminal.
   at exit keeps its lease until it expires, and is then adjudicated by its queue's policy (§4). The
   drain follows `concurrency.instructions.md` §3–§4: every start has a stop on every path (#427), and
   shutdown code never throws.
-- **Recycling is not a drain.** A process's RSS rises to a heavy run's peak and tends to stay there,
-  and the established fix is to recycle: `consume!(…; max_runs = 500, max_rss_mb = 2048)`. Past
+- **Recycling is not a drain.** A process's RSS rises to a heavy run's peak and stays there until a
+  full collection runs, which an idle consumer, allocating little, may not trigger for a long time
+  (measured in §15), and the established
+  fix is to recycle: `consume!(…; max_runs = 500, max_rss_mb = 2048)`. Past
   either bound it **stops claiming and waits for the runs it holds to finish**, with no cancellation
   token and no timeout, then exits, and the supervisor restarts it. Reusing the drain here would set
   `:shutdown` on healthy runs and abandon them after the drain timeout, every time. The cost is the
@@ -781,3 +783,70 @@ It runs on SQLite in CI, and was run by hand against PostgreSQL 16, through
 `NITRO_E2E_POSTGRES=<libpq conninfo>` and an environment with LibPQ: green on both. Store load
 was not measured beyond that; step 5's docs should not quote a number for it yet.
 
+## 15. Implementation notes: step 4, recycling and one-shot (2026-10-19)
+
+Step 4 shipped `consume!(…; max_runs, max_rss_mb, exit_when_idle)` and `consume!`'s return value.
+Where it departs from §7, or settles what §7 left open, each choice was agreed with the maintainer:
+
+- **A recycle is its own path, not a flavour of the drain.**
+  - Reaching a bound sets `stopping`, so no more claims, and records the bound. No `:shutdown`
+    token is set, there is no timeout, and the heartbeat goes on renewing.
+  - When the last held run settles, the consumer requests its own stop. `consume!`'s `finally`
+    then drains, and that drain finds nothing held.
+  - A stop request during the wait drains what is left, as any stop does.
+  - Only a recycle that ran to its end sets the exit reason, so a stop that cut one short returns
+    `:stopped`.
+- **`consume!` returns why it ended**: `:max_runs`, `:max_rss`, `:idle` or `:stopped`. It used to
+  return `nothing`. It has never been released, so this is additive.
+- **`max_runs` counts the runs `_start_run!` accepted**, after they are held, so the recycle it
+  begins waits for the run that reached it. A run claimed while a recycle begins is handed back,
+  exactly as one claimed while a drain begins.
+- **`max_rss_mb` compares against `Sys.maxrss()`, the peak** (maintainer). That is Celery's
+  `max_memory_per_child` precedent (`ru_maxrss`), and it is portable. Current RSS would need code
+  per OS.
+  - The peak never goes down. The docstring and the tutorial say so, and the bench below shows the
+    consequence: a process whose heap a collection has returned still recycles.
+  - The bound is checked when a run settles and before each claim pass.
+  - A bound the process is already past at `consume!` is an `ArgumentError`. Otherwise every start
+    would end before its first run, and a restarting supervisor would loop.
+  - The tests move the reading with `_RSS_OVERRIDE_MB` instead of allocating past the shared test
+    process's own peak.
+- **`exit_when_idle` is checked by the claim loop**, after a pass in which every queue answered
+  "nothing to claim", with nothing held and no slot still taken by a callback a deadline abandoned.
+  That loop is the only one that starts runs, so the condition cannot change under it. The
+  conditions came out of review:
+  - **A claim that throws is not an empty queue.** Otherwise a one-shot that met a store blip at
+    its start would exit 0 and leave the run for the next scheduled start.
+  - **The idle exit also waits for one successful `requeue_expired!`**, so a crashed
+    predecessor's run whose lease has expired is back in its queue first.
+  - **A poisoned queue is out of the rotation** and does not keep the consumer from being idle.
+
+**Measured: what a consumer keeps after a heavy run** (`bench/consumer/rss_recycle.jl`, `-t 2,1`,
+one run holding 1 GiB of small objects for 5 s, then returning):
+
+| Julia | floor | run returned | 5 s idle | after `GC.gc(true)` | after `malloc_trim(0)` | `Sys.maxrss()` at the end |
+|---|---|---|---|---|---|---|
+| 1.12.7 | 473 MiB | 2159 | 2160 | **537** | 534 | 2159 |
+| 1.13.2 | 406 MiB | 2103 | 2104 | **476** | 476 | 2104 |
+
+- **An idle process keeps the peak.** It allocates too little for a collection to come within the
+  5 s measured, and nothing says one comes soon after.
+- **A full collection gives back about 96% of the run's growth on both versions.** `malloc_trim`
+  adds nothing measurable. §7's "tends to stay there" holds only for the idle case. Heaps with
+  live data interleaved with garbage will return less; this bench frees everything at once.
+- **So recycling is the guaranteed measure, and an explicit `GC.gc(true)` after a heavy job is
+  the cheap one.** The tutorial says both.
+- **Against the peak, `max_rss_mb` recycles a process that has already shrunk back.** That is the
+  documented price of a portable, monotone signal. If it turns out to recycle too often, the
+  alternative is current RSS read per OS.
+
+**Checked once against a real scheduler.**
+- The tutorial's `Type=oneshot` service and `.timer` ran as user units, with the timer firing
+  every minute, over a SQLite store holding two pending runs. Each firing was its own process, and
+  each exited 0:
+  - the first two each claimed one run, completed it and returned `:max_runs`;
+  - the third found nothing and returned `:idle`, 0.5 s after the consumer started;
+  - both rows ended `COMPLETED` at attempt 1, each claimed by a different one-shot process;
+  - each firing spent about 11 s loading the app before it claimed. That is the per-run cost §7
+    accepts for heavy, rare jobs, and a sysimage lowers it.
+- The Kubernetes `CronJob` is written but was **not** run: no cluster was available.

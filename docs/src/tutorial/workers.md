@@ -302,6 +302,123 @@ their leases to expire, exactly as after a crash.
 A consumer never runs the zombie sweep: from its point of view, every run the web process
 executes in-process looks like a zombie.
 
+### Recycling And One-Shot Consumers
+
+A process's memory rises to its heaviest run's peak and **stays there until a full garbage
+collection runs**, and an idle consumer allocates so little that one may not come for a long time.
+
+When a collection does run, much of that memory can go back to the OS. In
+`bench/consumer/rss_recycle.jl`, a run that held 1 GiB of small objects took the process from
+about 450 MiB to 2.1 GiB, and `GC.gc(true)` brought it back to about 500 MiB, on Julia 1.12 and
+1.13 alike. How much comes back depends on the heap: live data interleaved with garbage keeps more.
+
+Two measures follow from that:
+- calling `GC.gc(true)` at the end of a heavy job is cheap and often enough;
+- **recycling** the process is the measure that always works.
+
+A long-lived consumer can be told to step aside for a fresh process, which its supervisor then
+starts:
+
+```julia
+consume!(app; store, queues = ["heavy" => 4], max_runs = 500, max_rss_mb = 2048)
+```
+
+- **`max_runs = n`**: after it has started `n` runs.
+- **`max_rss_mb = m`**: once the process's **peak** resident memory (`Sys.maxrss()`) passes `m`
+  MiB. It is checked when a run finishes and before each claim pass.
+  - **The peak never goes down.** Once a run has taken the process past `m`, the consumer recycles
+    after the runs it holds, **even if a collection has since given the memory back**. In the bench
+    above, `Sys.maxrss()` stayed at 2.1 GiB with the current size back at 500 MiB. So `m` bounds
+    the heaviest run so far, not the process's current size. Pick it as "no process that has once
+    grown past `m` keeps running", and use `max_runs` for a periodic recycle.
+  - Set `m` above the process's floor (several hundred MiB for a loaded app): `consume!` refuses a
+    bound the process is already past, since it would exit before its first run.
+- **`exit_when_idle = true`**: when every queue answers "nothing to claim" **and** it holds no run,
+  so never under a running job, nor after a claim that failed. It checks only once it has
+  adjudicated expired leases, so a crashed predecessor's run whose lease has expired is back in its
+  queue, and claimable, before the consumer believes the queue is empty. While the store keeps
+  failing, it waits (logging each failed attempt) rather than exiting: a missed exit costs a
+  process, a wrong one costs the run's whole schedule slot.
+
+**A recycle waits; a drain cancels.**
+- Past a bound, the consumer stops claiming and lets the runs it holds **finish**: no `:shutdown`
+  token, no `drain_timeout`, and their leases stay renewed. Then `consume!` returns, and the script
+  ends.
+- A `SIGTERM` or Ctrl-C during that wait drains as described above.
+- `consume!` returns why it ended: `:max_runs`, `:max_rss`, `:idle`, or `:stopped` for a stop
+  request, including one that cut a recycle short.
+
+**One-shot consumers for rare, heavy jobs.** A queue that runs a few heavy jobs a day should not
+keep a consumer process, with its memory floor, alive around the clock. Start one when a run is
+due, let it run one, and let it exit:
+
+```julia
+# consumer_oneshot.jl
+using MyApp, Nitro, Nitro.Workers
+app = MyApp.build_app()
+MyApp.setup_workers!(app)
+consume!(app; store = pormg_nitro_worker(), queues = ["heavy" => 1],
+         max_runs = 1, exit_when_idle = true)
+```
+
+It runs `requeue_expired!` first, takes one run if there is one, runs it to completion, and exits.
+With nothing to run, it exits at once. Start it from a scheduler, shortly after the time the job
+is submitted. With **systemd**:
+
+```ini
+# /etc/systemd/system/myapp-heavy.service
+[Unit]
+Description=MyApp one-shot consumer for the heavy queue
+
+[Service]
+Type=oneshot
+WorkingDirectory=/srv/myapp
+ExecStart=/usr/bin/julia -t 4,1 --project=. consumer_oneshot.jl
+# A heavy run may take hours: no start timeout. A stop drains, so allow drain_timeout and more.
+TimeoutStartSec=infinity
+TimeoutStopSec=60
+
+# /etc/systemd/system/myapp-heavy.timer
+[Unit]
+Description=Start the heavy queue's one-shot consumer twice a day
+
+[Timer]
+OnCalendar=*-*-* 03:05,15:05
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+```
+
+Enable it with `systemctl enable --now myapp-heavy.timer`. A `Type=oneshot` service whose
+previous start is still running is not started again, so a long run never overlaps the next one.
+
+With **Kubernetes**, the same thing is a `CronJob`:
+
+```yaml
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: myapp-heavy
+spec:
+  schedule: "5 3,15 * * *"
+  concurrencyPolicy: Forbid            # never two one-shot consumers at once
+  jobTemplate:
+    spec:
+      backoffLimit: 0                  # a failed run is the queue's business, not the Job's
+      template:
+        spec:
+          restartPolicy: Never
+          terminationGracePeriodSeconds: 60
+          containers:
+            - name: consumer
+              image: registry.example.com/myapp:latest
+              command: ["julia", "-t", "4,1", "--project=/app", "/app/consumer_oneshot.jl"]
+```
+
+If the cluster runs KEDA, a `ScaledJob` on the queue's pending count does the same thing without a
+fixed schedule.
+
 ### Switching A Queue's Placement
 
 **Switching a queue's placement is a deploy step.** A queue's declaration is fixed for the life of
