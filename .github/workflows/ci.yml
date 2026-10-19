@@ -64,13 +64,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Both versions `[compat]` admits (`julia = "^1.12"`) get the full OS x thread-count
-        # grid. `1.12` is the declared floor. `~1.13.0-0` is the release above it, and the
-        # version every application on Nitro runs: #526 proposes making it the floor, and this
-        # grid is what says whether its Windows and macOS legs are green before that happens.
-        # Until this entry, 1.13 ran on one leg (ubuntu, 2 threads), on the reasoning that
-        # version-specific breakage is not OS-specific; #301's Windows-only crash and the
-        # macOS-only e2e reds (#623) say it can be, so the apps' version gets the whole grid.
+        # Julia 1.13 only, on the full OS x thread-count grid: the maintainer's decision on
+        # #526. It is the version every application on Nitro runs, and the floor `[compat]`
+        # will declare once the floor PR lands (`julia = "^1.13"`). Until it does, the declared
+        # floor `^1.12` is deliberately NOT tested: a leg for a version nothing ships would be
+        # the configuration-nobody-runs CI the PormG pin rules warn about. 1.12 used to hold
+        # this grid while 1.13 ran on one ubuntu leg, on the reasoning that version-specific
+        # breakage is not OS-specific; #301's Windows-only crash and the macOS-only e2e reds
+        # (#623) say it can be, so the one version in use gets every leg.
         #
         # `~1.13.0-0` rather than `'1.13'` because plain semver ranges exclude
         # pre-releases; the `-0` lower bound opts them in. It resolves to >=1.13.0-0 and
@@ -81,7 +82,6 @@ jobs:
         # There is no self-maintaining "next release" spec (julia-actions/setup-julia#84
         # proposes one).
         version:
-          - '1.12'
           - '~1.13.0-0'
         os:
           - ubuntu-latest
@@ -152,11 +152,11 @@ jobs:
       # `test/runtests.jl`, above `covering`.
       - uses: julia-actions/julia-runtest@6e050c8013b833b1195105ff2fce9cd802f53271 # v1.12.0
         with:
-          coverage: ${{ matrix.os == 'ubuntu-latest' && matrix.threads == '1' && matrix.version == '1.12' }}
+          coverage: ${{ matrix.os == 'ubuntu-latest' && matrix.threads == '1' && matrix.version == '~1.13.0-0' }}
       - uses: julia-actions/julia-processcoverage@03114f09f119417c3242a9fb6e0b722676aedf38 # v1.2.2
-        if: matrix.os == 'ubuntu-latest' && matrix.threads == '1' && matrix.version == '1.12'
+        if: matrix.os == 'ubuntu-latest' && matrix.threads == '1' && matrix.version == '~1.13.0-0'
       - uses: coverallsapp/github-action@8d6379e14d29928660c4ba802d8e85393440b329 # v2.3.8
-        if: matrix.os == 'ubuntu-latest' && matrix.threads == '1' && matrix.version == '1.12'
+        if: matrix.os == 'ubuntu-latest' && matrix.threads == '1' && matrix.version == '~1.13.0-0'
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           file: lcov.info

@@ -287,7 +287,7 @@ julia --project=docs -e 'using Pkg; Pkg.develop(PackageSpec(path=pwd())); Pkg.in
 julia --project=docs docs/make.jl
 ```
 
-- **CI runs the suite on Julia 1.12 and 1.13 across Linux/macOS/Windows at `JULIA_NUM_THREADS` 1 **and** 2.**
+- **CI runs the suite on Julia 1.13 across Linux/macOS/Windows at `JULIA_NUM_THREADS` 1 **and** 2.** (1.12 left the matrix by decision on #526, ahead of the floor moving to `^1.13`.)
   A change that only passes single-threaded is not green.
 - **`PormG` is a git-pinned source dependency** (`[sources] PormG = {url = …, rev = <sha>}`) and a
   hard test dependency: Pkg fetches that exact commit into the depot, so `Pkg.test()` resolves with
