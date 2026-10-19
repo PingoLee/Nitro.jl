@@ -30,6 +30,7 @@ bench/
 │   └── go/             # the Go net/http reference server run.sh's `go` mode builds; `go test -bench Aggregate`;
 │                       #   fairness/, the per-connection client fairness.sh drives
 ├── tasks/              # Julia tasks vs goroutines, no HTTP: tasks.jl, go/, run.sh
+├── scope/              # collide.jl: what one @with costs when its ScopedValue key shares a HAMT slot (#633)
 ├── results/            # JSON run outputs — gitignored (machine-specific)
 └── .gitignore          # ignores results/, Manifest.toml and per-version Manifest-v*.toml
 ```
