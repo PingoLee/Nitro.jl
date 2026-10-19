@@ -366,7 +366,7 @@ Keyword-only. Register routes with `urlpatterns(...)` first.
 | `access_log_query` | `false` | Turning on logs query strings — leaks tokens in URLs |
 | `context` | `missing` | Your typed app config; read with `getcontext(req)` |
 | `prefix` | `nothing` | Global path prefix |
-| `shutdown_timeout` | `10.0` | Seconds `terminate()` drains in-flight requests before force-closing; `0` skips the graceful phase |
+| `shutdown_timeout` | `10.0` | Seconds `terminate()` drains in-flight requests before force-closing; `0` skips the graceful phase. A handler polling `cancel_requested(req)` sees `:shutdown` when the drain begins |
 | `reuseaddr` | platform | `true` on Linux/macOS, `false` on Windows (where `SO_REUSEADDR` lets another process hijack a live port) |
 | `external_url` | `nothing` | Advertised base URL |
 | `revise` | `:none` | `:lazy` / `:eager` with the Revise extension |
@@ -377,9 +377,12 @@ no socket), `App(mod = @__MODULE__)` for a self-contained router isolated from t
 
 `terminate` is a **bounded** graceful shutdown: the listener is released immediately, in-flight
 requests get up to `timeout` seconds (default 10, or `serve(shutdown_timeout=…)`), then whatever is
-left is force-closed. Long-lived WebSocket/SSE/STREAM handlers hold their connection for their whole
-lifetime and are therefore always cut at the timeout — if one must finish cleanly, notify it from a
-`LifecycleMiddleware`'s `on_shutdown`, which runs before the drain. Calling `serve()` on a context
+left is force-closed. From the moment `terminate` is entered, before any shutdown hook runs, every
+in-flight request reads `cancel_reason(req) === :shutdown` (#466), so a handler that polls it can
+finish inside the drain. Long-lived WebSocket/SSE/STREAM handlers hold their connection for their
+whole lifetime and are therefore always cut at the timeout unless they stop themselves: poll
+`cancel_requested(req)` where `req` is in hand, or notify them from a `LifecycleMiddleware`'s
+`on_shutdown`, which runs before the drain. Calling `serve()` on a context
 that is already serving throws; terminate THAT app first, or give the second listener its own `App`.
 
 ---
