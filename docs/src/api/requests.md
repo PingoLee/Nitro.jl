@@ -42,6 +42,18 @@ getcontext
 Nitro.Principal
 ```
 
+## Cancellation
+
+A handler cannot be stopped from outside: Julia tasks cannot be killed. One that runs long asks
+instead whether to stop, the same way a background job does. `cancel_requested(req)` turns `true`
+when the client disconnects or `terminate` begins the shutdown drain, and `cancel_reason(req)`
+says which. [Long-Running Handlers](@ref) has the pattern and what it costs.
+
+```@docs
+cancel_reason(::Nitro.Request)
+cancel_requested(::Nitro.Request)
+```
+
 ## Request Body Parsers
 
 The bare `text`, `json`, `binary`, `formdata` and `multipart` are the *body parsers* the accessors

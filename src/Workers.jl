@@ -6,6 +6,8 @@ using Base: @kwdef
 import Base.Threads: ReentrantLock, lock
 
 using ..Core: App, LifecycleMiddleware
+# Extended, not owned: the request token's methods live on the same functions (#466).
+import ..Core: cancel_requested, cancel_reason
 using ..Core.AppContext: set_extension!, get_extension, delete_extension!, _needs_wake_guard, _WAKE_GUARD_FORCED
 using ..Core: AuthorizationError, StoreInterfaceError, WorkerUnavailableError, WorkerCapacityError,
     ClaimPoisonedError

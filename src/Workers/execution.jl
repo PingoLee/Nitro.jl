@@ -287,7 +287,7 @@ Run `callback` under a deadline and return its value, or throw [`TaskTimeoutErro
 
 `task_info` is taken rather than closed over so the deadline can reach the callback: on expiry
 this sets the run's cancellation token, which a cooperative callback polls with
-[`cancel_requested`](@ref). Taking it here also keeps the world-age probe in
+[`cancel_requested`](@ref cancel_requested(::TaskInfo)). Taking it here also keeps the world-age probe in
 `_invoke_task_callback` at a single call site.
 
 **The deadline bounds the WAIT, not the work.** Nothing stops a Julia task, so a callback that

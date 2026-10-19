@@ -32,6 +32,14 @@ end
     ])
     Core.internalrequest(ctx, Request("GET", "/precompile/ping"); catch_errors=false)
 
+    # ── A handler that polls for cancellation (#466) ────────────────────
+    # The accessor and its lazily created state. The socket probe needs a real connection, so
+    # an `internalrequest` cannot reach it; a polling handler compiles it on its first probe.
+    Core.Routing.urlpatterns(ctx, "", RouteDefinition[
+        path("/precompile/cancel", (req::Request) -> Res.json(Dict("cancelled" => cancel_requested(req))))
+    ])
+    Core.internalrequest(ctx, Request("GET", "/precompile/cancel"); catch_errors=false)
+
     # ── GET with Int path param → Res.json ──────────────────────────────
     Core.Routing.urlpatterns(ctx, "", RouteDefinition[
         path("/precompile/items/<int:id>", (req::Request, id::Int) -> Res.json(Dict("id" => id)))

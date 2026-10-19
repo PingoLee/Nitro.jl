@@ -25,7 +25,7 @@ in-flight runs and warns.
 **Half of `Nitro.Core.SHUTDOWN_TIMEOUT_SECONDS`, on purpose.** The HTTP drain only has to reap idle
 keep-alive connections, so ten seconds is an outer bound it essentially never approaches. A worker
 drain is the opposite: background jobs are long by definition, so a callback that does not poll
-[`cancel_requested`](@ref) will sit against this ceiling as a matter of course rather than as a
+[`cancel_requested`](@ref cancel_requested(::TaskInfo)) will sit against this ceiling as a matter of course rather than as a
 pathology. And the two budgets **add** — `terminate` runs every `LifecycleMiddleware` shutdown hook,
 `worker_startup`'s among them, *before* it closes the listener, so worst-case process exit is this
 plus the HTTP timeout. Five seconds keeps that sum inside a default container stop grace period.
@@ -371,7 +371,7 @@ end
 """
     CANCEL_REASONS
 
-The five things that can request a cancellation, as the symbols [`cancel_reason`](@ref) reports.
+The five things that can request a cancellation, as the symbols [`cancel_reason`](@ref cancel_reason(::TaskInfo)) reports.
 
 | Reason | Who set it | What it already did to the record |
 |---|---|---|
@@ -385,7 +385,7 @@ That last column is why the reason exists. Most causes have already decided the 
 time the callback notices, so only a drain leaves the run to write its own terminal state — and
 before #183 it wrote `"Cancelled by user"` for a shutdown no user asked for. A job on an external
 queue reads `:lease_lost` as *stop, and assume the run will happen again*, never as a person's
-cancel: a cancel a person asked for always reads `:user`. See [`cancel_reason`](@ref).
+cancel: a cancel a person asked for always reads `:user`. See [`cancel_reason`](@ref cancel_reason(::TaskInfo)).
 """
 const CANCEL_REASONS = (:user, :timeout, :superseded, :shutdown, :lease_lost)
 
@@ -471,7 +471,7 @@ round-trip. Re-running a key builds a fresh `TaskInfo`, so the token starts unse
 construction rather than by being cleared; see [`TaskInfo`](@ref).
 
 `true` on a `FAILED` task means the deadline fired, mirroring Go's `ctx.Err() ==
-DeadlineExceeded` — and [`cancel_reason`](@ref) now says so outright rather than leaving it to
+DeadlineExceeded` — and [`cancel_reason`](@ref cancel_reason(::TaskInfo)) now says so outright rather than leaving it to
 be inferred from the status.
 
 **This is a function, not a field read.** It was `task_info.cancel_requested` until #183, which
@@ -536,7 +536,7 @@ Base.showerror(io::IO, e::TaskTimeoutError) = print(io, "Timeout of $(e.timeout)
     TaskCancelledError(reason::Symbol)
 
 What [`checkpoint!`](@ref) throws once the run has been asked to stop. `reason` is the
-[`cancel_reason`](@ref) it found, one of [`CANCEL_REASONS`](@ref).
+[`cancel_reason`](@ref cancel_reason(::TaskInfo)) it found, one of [`CANCEL_REASONS`](@ref).
 
 Both executors recognise it: the run is recorded through the same compare-and-set as every other
 cancellation, and it is **never retried**, since the token is never reset and a retry would start
@@ -575,7 +575,7 @@ costs about a microsecond, almost all of it the `yield` (0.6 µs on the main tas
 a worker run, measured on Julia 1.12), so a call per millisecond of work costs about 0.1%.
 
 **It is the task API's `yield()` plus the cancellation check, in one call.** After the yield it
-reads the same token [`cancel_requested`](@ref) does, so it honours every cause in
+reads the same token [`cancel_requested`](@ref cancel_requested(::TaskInfo)) does, so it honours every cause in
 [`CANCEL_REASONS`](@ref): a `cancel_task`, an expired `TaskOptions(timeout=…)`, a re-run of the key,
 and a teardown drain. The throw unwinds the callback, and the executor records the run as the
 cancellation it was. A callback that would rather finish its current unit of work first can still

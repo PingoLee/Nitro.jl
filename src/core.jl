@@ -4,6 +4,8 @@ using Base: @kwdef
 # HTTP.jl v2 newly exports top-level names (`Cookie`, `Form`, `Middleware`, ...) that
 # collide with Nitro's. Import qualified-only and pull in just the bare names we rely on.
 import HTTP
+# Only `core/transport.jl` reaches into it: the disconnect probe behind `cancel_reason(req)` (#466).
+import Reseau
 using HTTP: Router
 using Sockets
 using JSON
@@ -48,6 +50,11 @@ function setip! end
 function getpeerip end
 function getcontext end
 function route_missed end
+# One generic pair for both cooperative-cancellation tokens (#466): `core/request.jl` adds the
+# `HTTP.Request` methods, and Workers imports these and adds the `TaskInfo` ones, so
+# `using Nitro, Nitro.Workers` binds one function rather than two that must be qualified.
+function cancel_requested end
+function cancel_reason end
 # Not an accessor, and not exported: the WebSocket branch of `select_handler` (src/handlers.jl)
 # calls it, and its body lives in core/transport.jl with the rest of the stream handling (#374).
 function _upgrade_websocket! end
@@ -63,7 +70,8 @@ include("routing.jl");      @reexport using .Routing
 export serve, terminate,
     internalrequest, staticfiles, dynamicfiles, spafiles,
     getparams, getquery, getjson, getform, getfiles, getpost,
-    getsession, setsession!, getuser, getprincipal, getip, setip!, getpeerip, getcontext, payload, route_missed
+    getsession, setsession!, getuser, getprincipal, getip, setip!, getpeerip, getcontext, payload, route_missed,
+    cancel_requested, cancel_reason
 
 # ── Implementation ──────────────────────────────────────────────────────────────
 # Split out of this file by responsibility (#32), which left it the thin

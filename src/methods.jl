@@ -97,7 +97,9 @@ is explicit introspection, not accidental disclosure.)
 - `revise=:none`: `:lazy`/`:eager` enable Revise-based hot reload (dev only).
 - `secret_key`, `httponly`, `secure`, `samesite`: override cookie defaults for this run.
 - `shutdown_timeout=10.0`: seconds `terminate` waits for in-flight requests to drain
-  before force-closing what remains. `0` skips the graceful phase entirely.
+  before force-closing what remains. `0` skips the graceful phase entirely. A handler that
+  polls `cancel_requested(req)` sees the drain begin (`cancel_reason(req) === :shutdown`) and
+  can finish inside it.
 - `max_body_bytes=64*1024*1024`: ceiling on a buffered request body. A request declaring or
   sending more is answered **413** before any middleware runs, and its connection is closed.
   Pass `nothing` to buffer without a ceiling. The default matches the cap the bundled HTTP fork
@@ -803,6 +805,10 @@ Shutdown is a **bounded graceful drain**, modeled on Go's `http.Server.Shutdown(
 listening socket is released immediately — the port is free as soon as `terminate` is entered
 — then Nitro waits up to `timeout` seconds for in-flight requests to finish and force-closes
 whatever remains.
+
+Nothing can stop a running handler, so from the moment `terminate` is entered, before any
+shutdown hook runs, every in-flight request reads `cancel_reason(req) === :shutdown`. A handler
+that polls it can wind down within the drain instead of being cut at its end.
 
 `timeout` defaults to the server's own `serve(shutdown_timeout = …)`, itself defaulting to
 `Nitro.Core.SHUTDOWN_TIMEOUT_SECONDS` (10 seconds). `timeout = 0` skips the graceful phase.

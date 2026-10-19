@@ -129,6 +129,14 @@ end
     extensions            :: Dict{Symbol, Any}      = Dict{Symbol, Any}()
     extensions_lock       :: ReentrantLock          = ReentrantLock()
     shutdown_timeout      :: Base.RefValue{Float64} = Ref{Float64}(SHUTDOWN_TIMEOUT_SECONDS)
+    # The current server run's shutdown flag (#466), which `cancel_reason(req)` reads as
+    # `:shutdown`. A handler that polls it can finish inside `shutdown_timeout` instead of being
+    # force-closed. It is a flag, not a registry of in-flight requests, so nothing is written per
+    # request. Each pipeline captures the flag current when it is built (`_app_context_seed`).
+    # `terminate` swaps in a fresh one and only then sets the old one. So the run it stops
+    # drains with its own flag set, while a `serve` admitted during that drain (the port is
+    # free before the drain ends) builds on the clean one.
+    shutting_down         :: Base.RefValue{Threads.Atomic{Bool}} = Ref(Threads.Atomic{Bool}(false))
     # `serve(max_fields = …)`. The pipeline's outermost layer binds THIS cell, not a copy, in
     # `REQUEST_SCOPE` for each request's extent (#327, #444), so a pipeline built before `serve`
     # sets it still sees it. Concrete `RefValue` so the scope can hold it without a conversion.

@@ -149,6 +149,76 @@ _http_origin_allowed_default(req::HTTP.Request, server_secure::Bool)::Bool =
 # framework still needs to emit a serialized `Response`.
 _response_started(stream::HTTP.Stream)::Bool = (@atomic :acquire stream.response_started)
 
+# ── Has the client gone? (#466) ──────────────────────────────────────────────────────────────────
+#
+# HTTP.jl 2.9 cannot tell a server: on HTTP/1.1 nothing reads the socket while the handler runs,
+# and every `isopen` it offers reports only this side's own closes. So `cancel_reason(req)` asks
+# the kernel, on the caller's own task, only when a handler asks:
+#
+#   recv(fd, 1 byte, MSG_PEEK) on the already non-blocking socket
+#     0                          → the peer sent FIN                  → gone
+#     ECONNRESET and friends     → the peer reset it                  → gone
+#     EAGAIN                     → nothing to read, still connected   → here
+#     > 0                        → a pipelined next request's bytes   → here (cannot see past them)
+#
+# Why it is safe beside the connection task:
+#   - The whole request body is read before the middleware runs (`_http_stream_request`), so the
+#     only bytes a peek can meet belong to a next request, and `MSG_PEEK` consumes none of them.
+#   - It takes no read lock. Reseau's own `eof` peek blocks while holding the fd read lock, which
+#     would stall the connection task's next read past the end of the handler.
+#   - `_with_fd_ref` holds a lifetime reference on the descriptor, so a concurrent close cannot
+#     recycle the fd number under the `recv`. Once the connection is closed the reference is
+#     refused with `NetClosingError`, which means gone as well.
+#
+# Nothing here runs on the interactive connection task, and nothing runs at all for a handler
+# that never asks: the scarcest thread in the process is untouched (concurrency §2).
+#
+# Reseau internals, pinned by `Reseau = "~1.6"` and canaried in
+# test/http_internals_contract_tests.jl: `IOPoll._with_fd_ref`, `IOPoll.NetClosingError`,
+# `SocketOps.recv_from!`, `SocketOps.last_error`, `SocketOps.MSG_PEEK`, `TCP.Conn.fd.pfd`, and
+# HTTP.jl's `Stream.tracked.conn`.
+#
+# A TLS connection is not probed (`false`): a peek there would meet TLS records, not the
+# request's bytes. Nor is an HTTP/2 stream: the connection is shared, so its socket says nothing
+# about one stream. Nitro serves plaintext HTTP/1.1 (h2c refused, #375); both are belt and braces.
+function _peer_gone(stream::HTTP.Stream)::Bool
+    # The response is done, and the connection may already carry the next request: its bytes,
+    # or its client's FIN, are not this request's to report.
+    (@atomic :acquire stream.write_closed) && return false
+    stream.h2_conn === nothing || return false
+    tracked = stream.tracked
+    tracked === nothing && return false
+    conn = tracked.conn
+    conn isa Reseau.TCP.Conn || return false
+    return _peer_gone(conn)
+end
+
+function _peer_gone(conn::Reseau.TCP.Conn)::Bool
+    pfd = conn.fd.pfd
+    try
+        return Reseau.IOPoll._with_fd_ref(_peek_says_gone, pfd)
+    catch err
+        err isa Reseau.IOPoll.NetClosingError && return true
+        rethrow()
+    end
+end
+
+# The errno values that mean the peer is gone rather than "try later". `last_error` maps WinSock's
+# codes onto these, so one set serves every platform.
+const _PEER_GONE_ERRNOS = (Int32(Base.Libc.ECONNRESET), Int32(Base.Libc.ECONNABORTED),
+                           Int32(Base.Libc.ENOTCONN), Int32(Base.Libc.EPIPE),
+                           Int32(Base.Libc.ETIMEDOUT), Int32(Base.Libc.ENETRESET),
+                           Int32(Base.Libc.EHOSTUNREACH), Int32(Base.Libc.ENETUNREACH))
+
+function _peek_says_gone(sysfd)::Bool
+    byte = Ref{UInt8}(0x00)
+    n = GC.@preserve byte Reseau.SocketOps.recv_from!(
+        sysfd, Base.unsafe_convert(Ptr{UInt8}, byte), Csize_t(1), Reseau.SocketOps.MSG_PEEK)
+    n == 0 && return true
+    n > 0 && return false
+    return Reseau.SocketOps.last_error() in _PEER_GONE_ERRNOS
+end
+
 # The peer address as a Julia value, in ONE canonical spelling per host. Two byte forms of
 # the same IPv4 host reach here: four bytes from an AF_INET socket, and sixteen bytes in the
 # `::ffff:0:0/96` block when a dual-stack AF_INET6 listener reports an IPv4 client. Without

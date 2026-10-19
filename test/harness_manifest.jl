@@ -79,6 +79,7 @@ const TEST_FILES = [
     "app_tests.jl",
     "server_show_tests.jl",
     "server_lifecycle_tests.jl",
+    "request_cancellation_tests.jl",
     "h2c_tests.jl",
     "parallel_tests.jl",
     "middleware_tests.jl",

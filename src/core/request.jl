@@ -430,3 +430,120 @@ fields, and query parameters from the incoming request.
 function payload(req::HTTP.Request)::Dict{String, Any}
     return request_input(req)
 end
+
+# ── Cooperative cancellation (#466) ─────────────────────────────────────────────────────────────
+
+const REQUEST_CANCEL_STATE_KEY = :__nitro_request_cancel_state
+
+# How often `cancel_reason(req)` may ask the kernel whether the client is still there. Between two
+# probes a check is a lookup in `req.context`, a clock read and two atomic loads, so a handler can
+# poll it in a hot loop.
+# 10 ms is well under any client's patience and well over a `recv` syscall's cost.
+const CANCEL_PROBE_INTERVAL_NS = UInt64(10_000_000)
+
+# Per request, created on the first `cancel_reason`/`cancel_requested` call and never before, so a
+# handler that never asks pays nothing. Every field is atomic or `const`, but reaching it means a
+# lookup in `req.context`, an unsynchronized `Dict`: hence "call it from the handler's task".
+mutable struct _CancelState
+    @atomic reason        :: Symbol
+    @atomic next_probe_ns :: UInt64
+    # The flag of the server run that is handling this request (`RequestScope`), captured on the
+    # first call: the run's flag, not whatever scope a later call happens to run in.
+    const shutting_down   :: Threads.Atomic{Bool}
+    # `nothing` for a request with no socket of its own (`internalrequest`).
+    const stream          :: Union{Nothing, HTTP.Stream}
+end
+
+function _cancel_state(req::HTTP.Request)::_CancelState
+    return request_cache!(req, REQUEST_CANCEL_STATE_KEY) do
+        stream = Base.get(req.context, :stream, nothing)
+        _CancelState(:none, zero(UInt64), Constants.REQUEST_SCOPE[].shutting_down,
+                     stream isa HTTP.Stream ? stream : nothing)
+    end::_CancelState
+end
+
+# First cause wins, as for a worker run: a client that left before the deploy stays
+# `:client_disconnected`.
+function _settle_cancel!(state::_CancelState, reason::Symbol)::Symbol
+    @atomicreplace state.reason :none => reason
+    return @atomic state.reason
+end
+
+"""
+    cancel_reason(req::HTTP.Request) -> Symbol
+
+Why the server would like this request's handler to stop, or `:none`:
+
+| Reason | What happened |
+|---|---|
+| `:client_disconnected` | The client closed or reset the connection; nobody will read the response |
+| `:shutdown` | `terminate` has begun: the server is draining, and will force-close what is left after `shutdown_timeout` |
+
+Nitro cannot stop a handler: Julia tasks cannot be killed, and throwing into a running one is
+unsafe (#127). This is the cooperative alternative. A handler that runs long checks it, and
+stops on its own:
+
+```julia
+function export_report(req)
+    rows = Row[]
+    for page in 1:npages
+        if cancel_requested(req)
+            # A deploy: the client is still there, so tell it to retry.
+            cancel_reason(req) === :shutdown && return Res.status(503)
+            # The client left: nobody reads this status, but the access log records it.
+            return Res.status(499)
+        end
+        append!(rows, fetch_page(page))
+    end
+    return Res.json(rows)
+end
+```
+
+**The first cause wins**, and a reason never resets.
+
+**Cheap enough to poll in a loop.** Whether the client is still there is asked of the kernel
+(a non-blocking peek at the socket) at most once every 10 ms. Between probes, a check is a lookup
+in `req.context`, a clock read and two atomic loads, and allocates nothing. Nothing runs for a
+handler that never asks.
+
+**What it cannot see:**
+- A client that half-closes its side (`shutdown(SHUT_WR)`) after sending reads as disconnected.
+  Go's `net/http` treats it the same way.
+- A pipelined next request on the same connection, already sent, hides a later disconnect.
+- A connection that died without a FIN or a reset (a cable pulled) looks alive until the kernel
+  gives up on it.
+- `internalrequest` has no connection, so only `:shutdown` can fire.
+
+Once the response is written, the client is no longer probed: the connection may already be
+carrying the next request.
+
+**Call it from the handler's own task.** Every check reads `req.context`, as the other
+per-request accessors do, and `req.context` is not safe to read while another task writes to it:
+another accessor's first call, or `setsession!`, does. Do not poll `req` from a task you spawn
+while the handler goes on using it.
+
+The same function answers for a background job: `cancel_reason(task_info::TaskInfo)` reports
+why a worker run was asked to stop. See `Nitro.Workers.cancel_reason`.
+"""
+function cancel_reason(req::HTTP.Request)::Symbol
+    state = _cancel_state(req)
+    reason = @atomic state.reason
+    reason === :none || return reason
+    state.shutting_down[] && return _settle_cancel!(state, :shutdown)
+    stream = state.stream
+    stream === nothing && return :none
+    now = time_ns()
+    now < (@atomic state.next_probe_ns) && return :none
+    @atomic state.next_probe_ns = now + CANCEL_PROBE_INTERVAL_NS
+    _peer_gone(stream) && return _settle_cancel!(state, :client_disconnected)
+    return :none
+end
+
+"""
+    cancel_requested(req::HTTP.Request) -> Bool
+
+`true` once the client has disconnected or the server has begun shutting down: exactly
+`cancel_reason(req) !== :none`. See `cancel_reason(req)` for what each cause means, what the
+check costs, and what it cannot see.
+"""
+cancel_requested(req::HTTP.Request)::Bool = cancel_reason(req) !== :none
