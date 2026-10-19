@@ -41,6 +41,7 @@ const TEST_FILES = [
     "extensions/crypto_tests.jl",
     "extensions/pormg_session_tests.jl",
     "extensions/pormg_worker_tests.jl",
+    "extensions/pormg_worker_log_exposure_tests.jl",
     "extensions/pormg_env_tests.jl",
     "extensions/newapp_pormg_tests.jl",
 

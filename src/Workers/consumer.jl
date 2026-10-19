@@ -442,7 +442,7 @@ function _claim_loop(c::ConsumerHandle)
                 _request_stop!(c)
                 return nothing
             end
-            @error "Nitro.Workers: a consumer's claim pass failed; retrying after the poll interval" exception = (e, catch_backtrace())
+            @error "Nitro.Workers: a consumer's claim pass failed; retrying after the poll interval" exception = (loggable(e), catch_backtrace())
             # Parked like the normal path, so a drain cuts it short. Inside its own `try`: an
             # interrupt here must still become a stop request, not end the task.
             try
@@ -480,7 +480,7 @@ function _claim_one(c::ConsumerHandle, queue::String)::Tuple{Union{Nothing, Task
             # from being idle.
             return (nothing, true)
         else
-            @error "Nitro.Workers: a claim failed; retrying on the next poll" queue exception = (e, catch_backtrace())
+            @error "Nitro.Workers: a claim failed; retrying on the next poll" queue exception = (loggable(e), catch_backtrace())
         end
         return (nothing, false)
     end
@@ -518,7 +518,7 @@ function _hand_back!(c::ConsumerHandle, info::TaskInfo, queue::String)
         @debug "Nitro.Workers: consumer hand-back" consumer_id = c.consumer_id task_id = info.id released elapsed_s = round(time() - t0; digits = 3) at = Dates.now(Dates.UTC)
     catch e
         _is_interrupt(e) && throw(InterruptException())
-        @error "Nitro.Workers: a consumer could not hand a run back; its lease will expire instead" task_id = info.id exception = (e, catch_backtrace())
+        @error "Nitro.Workers: a consumer could not hand a run back; its lease will expire instead" task_id = info.id exception = (loggable(e), catch_backtrace())
     end
     return info
 end
@@ -546,7 +546,7 @@ function _run_claimed!(c::ConsumerHandle, run::TaskInfo, queue::String)
         _is_interrupt(e) && throw(InterruptException())
         # A store write that threw. The lease is still this process's and will run out, and
         # `requeue_expired!` then decides the run by its queue's policy.
-        @error "Nitro.Workers: a consumer run ended without a recorded outcome; its lease will expire" task_id = run.id exception = (e, catch_backtrace())
+        @error "Nitro.Workers: a consumer run ended without a recorded outcome; its lease will expire" task_id = run.id exception = (loggable(e), catch_backtrace())
     finally
         emptied = lock(c.lock) do
             delete!(c.held, run.run_id)
@@ -629,7 +629,7 @@ function _heartbeat_loop(c::ConsumerHandle)
                 _request_stop!(c)
                 continue
             end
-            @error "Nitro.Workers: a consumer heartbeat failed; retrying on the next one" exception = (e, catch_backtrace())
+            @error "Nitro.Workers: a consumer heartbeat failed; retrying on the next one" exception = (loggable(e), catch_backtrace())
         end
     end
     # After a drain that timed out, this loop outlives the drain, so it closes the wake guard
@@ -679,7 +679,7 @@ function _heartbeat_tick!(c::ConsumerHandle)
             k
         catch e
             _is_interrupt(e) && throw(InterruptException())
-            @error "Nitro.Workers: a consumer's lease renewal failed; retrying on the next heartbeat" runs = length(renewals) exception = (e, catch_backtrace())
+            @error "Nitro.Workers: a consumer's lease renewal failed; retrying on the next heartbeat" runs = length(renewals) exception = (loggable(e), catch_backtrace())
             nothing
         end
         # A failed renewal says nothing about which runs were lost, so nothing is looked up.
@@ -691,7 +691,7 @@ function _heartbeat_tick!(c::ConsumerHandle)
                     reason === nothing || _request_cancel!(h.info, reason)
                 catch e
                     _is_interrupt(e) && throw(InterruptException())
-                    @error "Nitro.Workers: a consumer could not read why a run's renewal missed; retrying on the next heartbeat" task_id = h.info.id exception = (e, catch_backtrace())
+                    @error "Nitro.Workers: a consumer could not read why a run's renewal missed; retrying on the next heartbeat" task_id = h.info.id exception = (loggable(e), catch_backtrace())
                 end
             end
         end
@@ -739,7 +739,7 @@ function _consumer_requeue!(c::ConsumerHandle, now::DateTime = current_time_utc(
         end
     catch e
         _is_interrupt(e) && throw(InterruptException())
-        @error "Nitro.Workers: a consumer's lease adjudication failed; retrying on the next heartbeat" exception = (e, catch_backtrace())
+        @error "Nitro.Workers: a consumer's lease adjudication failed; retrying on the next heartbeat" exception = (loggable(e), catch_backtrace())
     end
     return nothing
 end
@@ -787,7 +787,7 @@ function _drain!(c::ConsumerHandle)
             if _is_interrupt(e)
                 @warn "Nitro.Workers: a second interrupt reached the consumer's drain; stopping without waiting further"
             else
-                @error "Nitro.Workers: the consumer's drain failed; stopping anyway" exception = (e, catch_backtrace())
+                @error "Nitro.Workers: the consumer's drain failed; stopping anyway" exception = (loggable(e), catch_backtrace())
             end
         end
     finally
@@ -803,7 +803,7 @@ function _drain!(c::ConsumerHandle)
             claim === nothing || timedwait(() -> istaskdone(claim), 5.0; pollint = 0.05)
             @info "Nitro.Workers: consumer stopped" consumer_id = c.consumer_id reason = (@atomic c.exit_reason) runs_still_renewed = (@atomic c.held_count)
         catch e
-            _is_interrupt(e) || @error "Nitro.Workers: the consumer's stop did not finish cleanly" exception = (e, catch_backtrace())
+            _is_interrupt(e) || @error "Nitro.Workers: the consumer's stop did not finish cleanly" exception = (loggable(e), catch_backtrace())
         end
         # Last, once both loops are done parking: they are what it guards. A heartbeat still
         # renewing closes it itself when it ends.
