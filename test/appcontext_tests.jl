@@ -178,6 +178,11 @@ end
 const REF_SCOPE = ScopedValue{RequestScope}(RequestScope(nothing, Ref{Int64}(0)))
 const REF_VALUE = RequestScope(nothing, Ref{Int64}(0))
 reference(req::HTTP.Request) = @with REF_SCOPE => REF_VALUE nothing
+# The reference's binding under the seed layer's own key. An insert costs more when its key's hash
+# shares a HAMT slot with a key already bound around it, and a `ScopedValue` hashes by address,
+# which differs per process. This has the seed's key and the reference's code, so a red can be
+# told apart: the layer's code, or the key's placement (#633). Printed, never asserted.
+same_key(req::HTTP.Request) = @with REQUEST_SCOPE => REF_VALUE nothing
 
 # One fresh request per call. The app context is pre-seeded so the layer's one-off `req.context`
 # insert is not measured. The minimum of 5 runs of 1000 calls (`allocs`, #511).
@@ -188,10 +193,46 @@ function allocs_per_request(f; calls = 1000, runs = 5)
     return allocs(() -> f(reqs[next[] += 1]); calls, runs)
 end
 
+# What decides #633, which is red on Julia 1.13 in some processes only: one line on every run, so a
+# green process can be compared with a red one, and the typed code on a red or with
+# `NITRO_ALLOC_DIAG=1`. Written to `ReTestItems.DEFAULT_STDOUT[]` because the item's own output is
+# dropped on a pass; `precompile_warmth_tests.jl` explains the lookup (#611).
+rti = isdefined(Main, :ReTestItems) ? getfield(Main, :ReTestItems) : nothing
+diag_io = rti isa Module && isdefined(rti, :DEFAULT_STDOUT) && isassigned(rti.DEFAULT_STDOUT) ?
+    rti.DEFAULT_STDOUT[] : stdout
+# A key's first two HAMT indices: `Base.HashState` takes 5 bits of `objectid` per level.
+slots(key) = (h = objectid(key); "$(Int(h & 0x1f))/$(Int((h >> 5) & 0x1f))")
+function bound_keys()
+    scope = Core.current_scope()
+    scope === nothing && return "none"
+    return join(("$(typeof(k))@$(slots(k))" for k in keys(scope.values)), ", ")
+end
+one_call(f::F, req) where {F} = (f(req); @allocations f(req))
+
+function scope_diag(seed, ref, same, bound, seed_layer)
+    red = !(seed.count <= ref.count + 0.5)
+    println(diag_io, "scope-diag: julia=$VERSION threads=$(Threads.nthreads()) red=$red ",
+            "seed=$(seed.count)/$(seed.bytes) ref=$(ref.count)/$(ref.bytes) ",
+            "same_key=$(same.count)/$(same.bytes) REQUEST_SCOPE@$(slots(REQUEST_SCOPE)) ",
+            "REF_SCOPE@$(slots(REF_SCOPE)) bound: $bound")
+    if red || get(ENV, "NITRO_ALLOC_DIAG", "") == "1"
+        for (name, f) in (("seed layer", seed_layer), ("reference", reference), ("same key", same_key))
+            req = HTTP.Request("GET", "/")
+            req.context[Nitro.Core.REQUEST_CONTEXT_KEY] = nothing
+            println(diag_io, "scope-diag: $name, one warmed call: $(one_call(f, req)) allocations; code_typed:")
+            foreach(ct -> (show(diag_io, MIME"text/plain"(), ct); println(diag_io)),
+                    code_typed(f, (HTTP.Request,)))
+        end
+    end
+    flush(diag_io)
+end
+
 @testset "one scope insert per request, nothing boxed" begin
     seed_layer = _app_context_seed(app)((req::HTTP.Request) -> nothing)
-    @testset let seed = allocs_per_request(seed_layer), ref = allocs_per_request(reference)
+    @testset let seed = allocs_per_request(seed_layer), ref = allocs_per_request(reference),
+                 same = allocs_per_request(same_key), bound = bound_keys()
         @test seed.count <= ref.count + 0.5
+        scope_diag(seed, ref, same, bound, seed_layer)
     end
 end
 end
