@@ -1,7 +1,7 @@
 ## `App(not_found = …, method_not_allowed = …)` — the custom 404/405 move off the router, and `Service` accepts only Nitro's own router
 
 - **Version**: Unreleased
-- **Nitro ref**: [#625](https://github.com/PingoLee/Nitro.jl/issues/625) ; `src/types.jl`, `src/context.jl`, `src/core/pipeline.jl`, `src/core/staticfiles.jl`, `src/core/registration.jl`
+- **Nitro ref**: [#625](https://github.com/PingoLee/Nitro.jl/issues/625) ; `src/types.jl`, `src/context.jl`, `src/core/pipeline.jl`, `src/core/staticfiles.jl`, `src/core/registration.jl`, `src/core/framework_middleware.jl`
 - **Recorded**: 2026-10-17
 - **Severity**: breaking. An app that passed its own `HTTP.Router` to `Service` fails at
   construction with a `MethodError`. A custom 404/405 is now a fixed response, not a handler.
@@ -27,8 +27,13 @@ it abstract too, which is what blocked compiling an app with `juliac --trim`
 What did **not** change: the custom 405 still decides the response; Nitro adds `Allow` only when
 it has none, on a copy, so the value is never mutated; static mounts (`staticfiles`, `spafiles`,
 `dynamicfiles`) answer their misses with the same two values; the defaults are still a bare `404`
-and a `405` with `Allow`. A path outside `serve(prefix = …)` still gets the prefix layer's own
-`404`, as it did before, because that layer answers before routing.
+and a `405` with `Allow`.
+
+A path outside `serve(prefix = …)` is answered with `not_found` too
+([#650](https://github.com/PingoLee/Nitro.jl/issues/650)). It used to get the prefix layer's own
+plain-text `Not Found`; with the defaults it is now the same bare `404` the router sends. That
+miss is answered before any middleware passed to `serve`, a router or a route runs, so the
+per-request middleware below does not reach it.
 
 The refusal #282 added (an `ArgumentError` for a guarded `"*"`, `STREAM` or `WEBSOCKET` route on a
 router carrying HTTP.jl-level middleware) is gone with that middleware, because no such router can

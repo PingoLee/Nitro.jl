@@ -256,17 +256,19 @@ function OriginFormMiddleware()
     end
 end
 
-function PrefixStripMiddleware(prefix::AbstractString)
+# `not_found` is the app's `App(not_found = …)` (#650): a path outside the prefix is a miss like
+# any other, so it gets the same answer the router gives one. It is returned as-is, shared by
+# every miss; the transport hands HTTP.jl a copy (`_handoff_copy`, #628).
+function PrefixStripMiddleware(prefix::AbstractString, not_found::Types.MissResponse)
     # Normalized here as well as in `serve`: `internalrequest` builds this layer straight from
     # `service.prefix[]`, so this is the one point every path to it shares.
     p = _normalize_prefix(prefix)::String
     n = ncodeunits(p)
-    NOT_FOUND = HTTP.Response(404, "Not Found")
     return function(handler)
         return function(req::HTTP.Request)
             stripped = _strip_prefix(req.target, p, n)
             # Outside the prefix is outside every route: a miss, for `route_missed` (#401).
-            stripped === nothing && (_mark_route_miss!(req); return NOT_FOUND)
+            stripped === nothing && (_mark_route_miss!(req); return not_found)
             req.target = stripped
             return handler(req)
         end

@@ -286,7 +286,7 @@ function setupmiddleware(ctx::App; middleware::Vector=[], serialize::Bool=true, 
     # top-down, and route/router lists had no such step, so they ran bottom-up.
     processed_middleware = normalize_middleware(middleware)
 
-    global_prefix_middleware = !isnothing(ctx.service.prefix[]) ? [PrefixStripMiddleware(ctx.service.prefix[])] : []
+    global_prefix_middleware = !isnothing(ctx.service.prefix[]) ? [PrefixStripMiddleware(ctx.service.prefix[], ctx.not_found)] : []
     serializer = serialize ? [DefaultSerializer(catch_errors; show_errors)] : []
     # The outer half of error handling (#256) -- see `ErrorBoundary`. Gated exactly like the
     # serializer's catch: `serialize=false` still means Nitro installs no error or format layer at
@@ -363,7 +363,8 @@ function setupmiddleware(ctx::App; middleware::Vector=[], serialize::Bool=true, 
         # `serve(security_headers = …)` (#402). Outside every layer that builds its own response
         # -- the error boundary's 500, OriginForm's 400, the prefix strip's 404 -- so an app that
         # opts in gets the headers on all of them, not only on what comes back through `compose`.
-        # The 400 and 404 are shared `const`s; `SecurityHeaders` rebuilds, never mutates.
+        # The 400 is a shared `const` and the 404 the app's shared `not_found` (#650);
+        # `SecurityHeaders` rebuilds, never mutates.
         security_layer...,
         access_log_middleware...,
         _app_context_seed(ctx),

@@ -104,7 +104,8 @@ end
     end
     @test r.status == 500
     @test json(r)["message"] == GENERIC_500
-    # ...and a miss on the prefix is still the prefix layer's own 404, untouched by the boundary.
+    # ...and a miss outside the prefix is still a 404 (the app's `not_found`, #650), untouched by
+    # the boundary.
     @test internalrequest(papp, get_("/elsewhere")).status == 404
 end
 

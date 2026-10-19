@@ -40,7 +40,7 @@ using Nitro.Core: PrefixStripMiddleware, _normalize_prefix
 function strip_through(target; prefix = "/api")
     seen = Ref{Union{String, Nothing}}(nothing)
     inner = req -> (seen[] = req.target; HTTP.Response(200))
-    res = PrefixStripMiddleware(prefix)(inner)(HTTP.Request("GET", target))
+    res = PrefixStripMiddleware(prefix, HTTP.Response(404))(inner)(HTTP.Request("GET", target))
     return (res.status, seen[])
 end
 
@@ -73,7 +73,7 @@ end
     # multi-byte prefix was cut mid-character. On the wire it is percent-encoded, and that works.
     @test strip_through("/caf%C3%A9/menu"; prefix = "/caf%C3%A9") == (200, "/menu")
     @test strip_through("/caf%C3%A9x/menu"; prefix = "/caf%C3%A9") == (404, nothing)
-    @test_throws ArgumentError PrefixStripMiddleware("/café")
+    @test_throws ArgumentError PrefixStripMiddleware("/café", HTTP.Response(404))
 end
 
 @testset "_normalize_prefix" begin
@@ -124,6 +124,57 @@ end
 
 end
 
+@testitem "Path prefix: a miss outside the prefix answers with App(not_found) (#650)" tags=[:core] setup=[NitroCommon] begin
+using Test
+using HTTP
+using Nitro
+
+# The prefix layer used to answer with its own plain-text `Not Found`, so an app with a JSON 404
+# still sent text for this one kind of miss.
+nf = Res.json(Dict("error" => "not found"); status = 404)
+app = App(mod = @__MODULE__, not_found = nf)
+urlpatterns(app, "", path("/ok", () -> "ok"))
+app.service.prefix[] = "/api"
+
+@testset "outside the prefix and inside it, one answer" begin
+    # `/apiadmin` shares the prefix's bytes but not its segment (#315); `/api/nowhere` is the
+    # router's own miss, for comparison.
+    for target in ("/elsewhere", "/apiadmin/users", "/api/nowhere")
+        req = HTTP.Request("GET", target)
+        r = internalrequest(app, req)
+        @test r.status == 404
+        @test text(r) == """{"error":"not found"}"""
+        @test route_missed(req)
+    end
+    @test text(internalrequest(app, HTTP.Request("GET", "/api/ok"))) == "ok"
+end
+
+@testset "the shared value is never changed" begin
+    # `SecurityHeaders` sits outside the prefix layer and adds its headers to a new response.
+    sh = SecurityHeaders()
+    for _ in 1:2
+        r = internalrequest(app, HTTP.Request("GET", "/elsewhere"); security_headers = sh)
+        @test r.status == 404
+        @test HTTP.header(r, "X-Content-Type-Options") == "nosniff"
+        @test text(r) == """{"error":"not found"}"""
+    end
+    @test !HTTP.hasheader(nf, "X-Content-Type-Options")
+    @test app.not_found === nf
+end
+
+@testset "the defaults: the same bare 404 the router sends" begin
+    plain = App(mod = @__MODULE__)
+    urlpatterns(plain, "", path("/ok", () -> "ok"))
+    plain.service.prefix[] = "/api"
+    for target in ("/elsewhere", "/api/nowhere")
+        r = internalrequest(plain, HTTP.Request("GET", target))
+        @test r.status == 404
+        @test isempty(text(r))
+    end
+end
+
+end
+
 @testitem "Path prefix over a live server (#315)" tags=[:core, :network] setup=[NitroCommon] begin
 using Test
 using HTTP
@@ -156,6 +207,45 @@ try
     @test r.status == 200
     @test text(r) == "ROOT"
     @test fetch_path("/admin/users").status == 404
+finally
+    terminate(app)
+end
+
+end
+
+@testitem "Path prefix: a miss outside the prefix sends App(not_found) on the wire (#650)" tags=[:core, :network] setup=[NitroCommon] begin
+using Test
+using HTTP
+using Nitro
+
+# Over a real socket the transport hands HTTP.jl a copy of the shared value (#628), so the value
+# must come out of any number of misses as it went in, with its whole body sent each time.
+nf = Res.json(Dict("error" => "not found"); status = 404)
+app = App(mod = @__MODULE__, not_found = nf)
+urlpatterns(app, "", path("/ok", () -> "ok"))
+
+port = get_free_port()
+serve(app; prefix = "/api", port, host = HOST, async = true,
+      show_errors = false, show_banner = false, access_log = nothing)
+try
+    @test timedwait(() -> isopen(app.service), 10.0) === :ok
+    url(p) = "http://$HOST:$port$p"
+    for _ in 1:2   # twice, on the client's pooled keep-alive connection
+        r = HTTP.get(url("/elsewhere"); status_exception = false,
+                     headers = ["Authorization" => "Bearer secret-token"])
+        @test r.status == 404
+        @test String(r.body) == """{"error":"not found"}"""
+        @test HTTP.header(r, "Content-Length") == string(sizeof(nf.body))
+        r = HTTP.get(url("/api/ok"); status_exception = false)
+        @test r.status == 200
+        @test String(r.body) == "ok"
+        r = HTTP.request("HEAD", url("/elsewhere"); status_exception = false)
+        @test r.status == 404
+        @test isempty(r.body)
+    end
+    # The #628 handoff, reached by this path for the first time: HTTP.jl wrote to a copy.
+    @test nf.request === nothing
+    @test !nf.close
 finally
     terminate(app)
 end
