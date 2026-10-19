@@ -183,7 +183,8 @@ idle consumer, allocating little, may not trigger for a long time. A long-lived 
   queue first. While the store keeps failing, it waits rather than exits.
 
 Past a bound it **stops claiming and waits for the runs it holds to finish**: no `:shutdown`, no
-`drain_timeout`, their leases still renewed. Then `consume!` returns, the script ends, and a
+`drain_timeout`, their leases still renewed. A callback a deadline abandoned counts as still
+running until it returns, as under `exit_when_idle`. Then `consume!` returns, the script ends, and a
 supervisor starts a fresh process. A stop request during that wait drains as above.
 `consume!(app; …, max_runs = 1, exit_when_idle = true)` is the **one-shot** consumer an external
 scheduler starts for rare heavy jobs: it runs one, or none if there is nothing to run, and exits.
@@ -326,12 +327,15 @@ function _begin_recycle!(c::ConsumerHandle, reason::Symbol)
     return nothing
 end
 
-# Called whenever a held run settles, and once when a recycle begins. Only a recycle that ran to
-# its end sets `exit_reason`, so a stop request that cut it short still reads `:stopped`.
+# Called whenever a slot frees, and once when a recycle begins. Settled, not merely nothing held:
+# a callback a deadline abandoned is no longer held, but it still runs on a thread and keeps its
+# slot, and a recycle that exited under it would end the process on top of it. The same condition
+# `exit_when_idle` reads. Only a recycle that ran to its end sets `exit_reason`, so a stop request
+# that cut it short still reads `:stopped`.
 function _finish_recycle_if_settled!(c::ConsumerHandle)
     reason = @atomic c.recycle_reason
     (reason === :none || (@atomic c.drained)) && return nothing
-    lock(() -> isempty(c.held), c.lock) || return nothing
+    _settled(c) || return nothing
     @atomic c.exit_reason = reason
     _request_stop!(c)
     return nothing
@@ -356,12 +360,15 @@ function _free_slot(c::ConsumerHandle, queue::String, k::Int)
     end
 end
 
+# Every run frees its slot here, at once or, when a deadline abandoned its callback, when that
+# callback returns: so this is where a recycle learns the consumer has settled.
 function _release_slot!(c::ConsumerHandle, queue::String)
     lock(c.lock) do
         n = Base.get(c.busy, queue, 0)
         c.busy[queue] = max(n - 1, 0)
     end
     notify(c.wake)
+    _finish_recycle_if_settled!(c)
     return nothing
 end
 
@@ -522,10 +529,11 @@ function _run_claimed!(c::ConsumerHandle, run::TaskInfo, queue::String)
         end
         # The last straggler of a drain that timed out: the heartbeat stops now, not a tick later.
         emptied && !(@atomic c.beating) && notify(c.beat)
-        # The bound first: freeing the slot wakes the claim loop, which must already see it.
+        # The bound first: freeing the slot wakes the claim loop, which must already see it. The
+        # release also finishes a recycle this run was the last of; a handed-off slot is released,
+        # and the recycle finished, when the abandoned callback returns.
         _check_rss!(c)
         _handed_off(handoff[]) || _release_slot!(c, queue)
-        emptied && _finish_recycle_if_settled!(c)
     end
     return nothing
 end
