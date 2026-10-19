@@ -3,7 +3,7 @@ using HTTP
 using Dates
 using Sockets
 using ...Core: getip, header_name_isequal, own_response_headers
-using ...Errors: is_unrecoverable
+using ...Errors: is_unrecoverable, loggable
 
 # Import top level types module
 using ...Types 
@@ -680,7 +680,7 @@ function FixedRateLimiter(;
                 # An interrupt, a stack overflow or an out-of-memory is not a limiter outcome
                 # (#254) -- the same carve-out every other middleware `catch` makes.
                 is_unrecoverable(error) && rethrow()
-                @error "Fixed Rate limiter error" exception=(error, catch_backtrace())
+                @error "Fixed Rate limiter error" exception=(loggable(error), catch_backtrace())
                 (_UNDECIDED, 0, 0)
             end
             return _respond(handle, req, outcome, remaining_requests, reset_time,
@@ -895,7 +895,7 @@ function SlidingRateLimiter(;
                 decide(req)
             catch error
                 is_unrecoverable(error) && rethrow()   # #254, as in the fixed limiter
-                @error "Sliding Window Rate limiter error" exception=(error, catch_backtrace())
+                @error "Sliding Window Rate limiter error" exception=(loggable(error), catch_backtrace())
                 (_UNDECIDED, 0, 0)
             end
             return _respond(handle, req, outcome, remaining_requests, reset_time,

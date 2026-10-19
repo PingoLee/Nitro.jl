@@ -259,8 +259,10 @@ application handlers, which Nitro cannot wrap. It does not make `showerror` valu
 exception whose own message quotes a value still prints it, there as on the console, so a fault
 that must not even name a value is replaced earlier (`ValidatorFault`, `SessionStoreFault`).
 
-Used by the error boundary (`handlerequest`) and by the `AccessLog` and `access_log_skip` hook
-warnings. Deliberately **not exported**: a log filter that dispatched on the original exception type
+Used by every log line on a request's path that carries an exception: the error boundary
+(`handlerequest`), the `AccessLog` and `access_log_skip` hook warnings, a failed `Res.sse`
+producer, a failed streamed response body, the peer-address lookup, and the rate limiters' `decide`
+(#648). The PormG stores use it for PormG's own database errors. Deliberately **not exported**: a log filter that dispatched on the original exception type
 matches on `.type` instead.
 """
 struct LoggedException <: Exception

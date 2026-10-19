@@ -138,6 +138,10 @@ function lying_response(declared::Int, chunks::Vector{Vector{UInt8}})
     return HTTP.Response(200, ["Content-Length" => string(declared)], body)
 end
 
+# Only an `Int` will do, so a call with the sentinel raises a `MethodError` that holds it (#648).
+needs_int_chunk(::Int) = 0
+const LEAK_SENTINEL = "S3NT1NEL-streamed-body"
+
 # A body declaring 2000 bytes that produces SMALL and then throws.
 function small_broken_response()
     calls = Ref(0)
@@ -176,6 +180,14 @@ function streaming_app(release::Base.Event)
         path("/empty-declared", (req::HTTP.Request) -> lying_response(100, Vector{UInt8}[])),
         path("/firstfail", (req::HTTP.Request) -> HTTP.Response(200, ["Content-Length" => "10"],
              HTTP.CallbackBody(dst -> error("cannot read the source"), () -> nothing))),
+        # An application body that throws over a value it holds (#648): the `MethodError` carries
+        # the value, and the warning must not. It fails on its SECOND read, as `/small-broken`
+        # does: a failure on the first read is answered 500 before Nitro's writer runs, unlogged.
+        path("/leaky", (req::HTTP.Request) -> HTTP.Response(200, ["Content-Length" => "2000"],
+             HTTP.CallbackBody(let calls = Ref(0)
+                 dst -> (calls[] += 1) == 1 ? (copyto!(dst, SMALL); length(SMALL)) :
+                                              needs_int_chunk(LEAK_SENTINEL)
+             end, () -> nothing))),
         path("/file",   (req::HTTP.Request) -> Res.file(req, FILE_PATH; stream = true);
              methods = ["GET", "HEAD"]),
     ])
@@ -400,6 +412,24 @@ for cap in (nothing, 4)
                 end
                 @test logged === :ok
             end
+        end
+
+        @testset "cap=$cap: a failed body's warning never carries the value it threw over (#648)" begin
+            # A sink that `show`s the record printed a `MethodError`'s arguments: here the
+            # application's own value, as a handler's would be (#613). The warning carries the
+            # console's text instead, which names the argument's type only.
+            lock(() -> empty!(logger.logs), logger.lock)
+            (; bytes, ended) = one_shot(port, "/leaky")
+            @test ended != "open"
+            @test startswith(String(copy(bytes)), "HTTP/1.1 500")
+            failed(r) = occursin("Streamed response body failed", string(r.message))
+            @test timedwait(() -> any(failed, warnings(logger)), 10.0; pollint = 0.05) === :ok
+            record = only(filter(failed, warnings(logger)))
+            ex = first(record.kwargs[:exception])
+            @test ex isa Nitro.Errors.LoggedException
+            @test occursin("no method matching needs_int_chunk(::String)", sprint(showerror, ex))
+            rendered = string(record.message, sprint(show, record.kwargs), sprint(showerror, ex))
+            @test !occursin("S3NT1NEL", rendered)
         end
     finally
         notify(release)

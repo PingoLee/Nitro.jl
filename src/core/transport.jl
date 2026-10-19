@@ -2,6 +2,11 @@
 # Peer-IP resolution, the non-consuming response write path, and the stream handlers.
 # Included into `module Core` by src/core.jl — not a submodule; see the hub for why.
 
+# Every failure this file logs happens on a request's path, and a streamed body is often the
+# application's own, so each is logged as `loggable(err)`, never the live exception (#648, the
+# #613 rule).
+using .Errors: loggable
+
 # Size of one transfer chunk, used in both directions: the streaming response writer below, and
 # the bounded request-body read in `_http_stream_request`. Peak memory for a streamed response is
 # this buffer rather than the file, which is the whole point of that writer — and on HTTP/1.1 that
@@ -230,7 +235,7 @@ function _peer_ip(lookup::F, stream)::IPAddr where {F}
                "server-stream API `_peer_ip` relies on may have changed. Recording the peer " *
                "as 0.0.0.0: no forwarded header is trusted, but EVERY request now shares one " *
                "rate-limit bucket and one audit-log address. Pin HTTP.jl and verify " *
-               "`_peer_ip`." exception=(err, catch_backtrace()) maxlog=1
+               "`_peer_ip`." exception=(loggable(err), catch_backtrace()) maxlog=1
         return _UNKNOWN_PEER
     end
 end
@@ -459,10 +464,10 @@ function _write_fixed_body!(stream::HTTP.Stream, body::HTTP.AbstractBody,
     catch err
         stream.response.close = true
         if writing
-            @debug "Streamed response cut off: writing the response failed" exception=err
+            @debug "Streamed response cut off: writing the response failed" exception=loggable(err)
         else
             @warn("Streamed response body failed; connection closed",
-                  exception = (err, catch_backtrace()), written, declared,
+                  exception = (loggable(err), catch_backtrace()), written, declared,
                   head_sent = (@atomic :acquire stream.head_committed))
         end
         rethrow()

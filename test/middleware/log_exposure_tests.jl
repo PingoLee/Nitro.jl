@@ -118,6 +118,23 @@ end
     @test occursin("no method matching needs_int", console_text(only(warned)))
 end
 
+# #648: a `Res.sse` producer is application code, the same shape as a handler. It runs on its own
+# task, which inherits the logger, so its record is waited for rather than read at once.
+@testset "a failed Res.sse producer: the value it threw over reaches no log record (#648)" begin
+    logger = Test.TestLogger(; min_level = Base.CoreLogging.Debug)
+    records() = lock(() -> copy(logger.logs), logger.lock)
+    failed(l) = occursin("the event producer failed", string(l.message))
+    Base.CoreLogging.with_logger(logger) do
+        Nitro.Res.sse(events -> needs_int(Dict("token" => "S3NT1NEL-sse")))
+    end
+    @test timedwait(() -> any(failed, records()), 10.0; pollint = 0.05) === :ok
+    logs = records()
+    @test !any(l -> leaks(rendered(l)), logs)
+    record = only(filter(failed, logs))
+    @test record.kwargs[:exception][1] isa Nitro.Errors.LoggedException
+    @test occursin("no method matching needs_int", console_text(record))
+end
+
 @testset "loggable: the type's name and the showerror text, nothing else" begin
     e = try needs_int(credentialed()) catch e; e end
     le = Nitro.Errors.loggable(e)
