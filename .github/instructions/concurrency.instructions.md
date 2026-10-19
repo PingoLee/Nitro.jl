@@ -96,8 +96,16 @@ lives in the code comment it names, and that comment is canonical.
 - **Never throw into a task that may be running** (`schedule(t, exc; error = true)`): it aborts
   the process when `t` is on another thread (#127). The one exception proves the task is parked,
   under the lock its waker takes: `_cancel_revision_wait` (`ext/NitroReviseExt.jl`).
-- **Stopping is cooperative.** The stopper sets a flag or token and the task checks it: Workers'
-  `cancel_requested`/`cancel_reason`, and #466 for requests.
+- **Stopping is cooperative.** The stopper sets a flag or token and the task checks it. One
+  generic pair serves both kinds of task: `cancel_requested`/`cancel_reason` on a Workers
+  `TaskInfo`, and on an `HTTP.Request` (#466), where it reads `:client_disconnected` or
+  `:shutdown`.
+  - **Request side:** `terminate` sets a per-run flag before its hooks; each pipeline captures
+    its run's flag in `RequestScope`. A disconnect is a lazy, throttled, non-blocking
+    `MSG_PEEK` probe on the **caller's** task (`_peer_gone`, `src/core/transport.jl`), never
+    work on the connection task (§2).
+  - **A new cause** (a deadline, a token a spawned task or job can hold, #661, #662) extends that
+    pair rather than adding a second vocabulary.
 - **The catch policy is canonical in `src/errors.jl`**, in `is_unrecoverable` and its site
   table: which catches rethrow `StackOverflowError`, `OutOfMemoryError` and `InterruptException`,
   which stay narrow on purpose, and why the worker executors record `FAILED` instead of
@@ -163,5 +171,7 @@ lives in the code comment it names, and that comment is canonical.
 
 - Ctrl-C arrives as `Base.CancellationRequest`, not `InterruptException`. `Task.queue` no longer
   names a parked task's wait queue, which `_cancel_revision_wait` relies on. Both are #459.
-- `Base.CancellationTokenSource`, `cancel!` and `@cancel_check` arrive. Design new cancellation
-  so it can be backed by them (#466). Their per-task cost is JuliaLang/julia#63416 (#468).
+- `Base.CancellationTokenSource`, `cancel!` and `@cancel_check` arrive. #466 shaped the request
+  token so it can be backed by them: a `Bool` predicate plus a reason, and no Nitro token type to
+  migrate. Backing it is #663, which needs a push-style disconnect watcher #466 deliberately
+  avoided. Their per-task cost is JuliaLang/julia#63416 (#468).

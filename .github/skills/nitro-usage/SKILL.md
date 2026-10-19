@@ -129,6 +129,7 @@ Read the request through these exported **functions** — prefer them over diggi
 | `getsession(req)` | Session dict, when `SessionMiddleware` is in the pipeline |
 | `getuser(req)` | The authenticated user, when an auth middleware ran |
 | `getip(req)` | Client IP, when `ExtractIP` is in the pipeline (`getpeerip(req)` for the socket peer) |
+| `cancel_requested(req)` / `cancel_reason(req)` | Whether a long handler should stop: `:client_disconnected`, `:shutdown`, or `:none` (§9) |
 
 The body and param accessors — `getparams`, `getquery`, `getjson`, `getform`, `getpost`,
 `getfiles`, `payload` — are **cached per request**, so reading one twice is free; don't hand-roll
@@ -452,6 +453,36 @@ call or a file is not computing; it already gives the thread back. For real comp
   holds such a timer on those versions (#598), so a running server is covered. Code that runs
   yielding loops while no server is up can hold `keepalive = Timer(typemax(Int32))` itself.
 
+**A handler that runs long should stop when nobody waits for it.** Nothing can stop a handler
+from outside, so it asks (#466). `cancel_requested(req)` turns `true` when the client closes or
+resets the connection, or when `terminate` begins the drain. `cancel_reason(req)` says which. It
+is the same function a worker callback polls as `cancel_requested(task_info)`.
+
+```julia
+function export_report(req::HTTP.Request)
+    rows = Row[]
+    for page in 1:npages
+        if cancel_requested(req)
+            cancel_reason(req) === :shutdown && return Res.status(503)   # a deploy: retry
+            return Res.status(499)                                       # the client left
+        end
+        append!(rows, fetch_page(page))
+    end
+    return Res.json(rows)
+end
+```
+
+- **Cheap enough for a hot loop.** The socket is probed at most every 10 ms. A check in between
+  is a context lookup, a clock read and two atomic loads, and allocates nothing. A handler that
+  never checks pays nothing.
+- **A check is not a yield.** It gives up no thread, so a computing loop still needs the queue or
+  `yield()` above. Check where you would yield.
+- **Call it from the handler's own task.** Each check reads `req.context`, which is not safe to
+  read while another task writes to it. Do not poll `req` from a task you spawn.
+- **It cannot see** a pipelined next request's later disconnect, or a peer that vanished without
+  a FIN or reset. A client that half-closes after sending reads as gone, as in Go. An
+  `internalrequest` has no connection, so only `:shutdown` fires.
+
 ---
 
 ## 10. Bootstrap
@@ -520,6 +551,7 @@ query parameter with no default is **required**: omitting it is a 400, not `noth
 | `login_required()` on a route that loads a record by client id | Also verify ownership — otherwise IDOR |
 | `submit_task(key, cb)` without an authority | `submit_task(key, cb, Owner(user_id))` |
 | A handler that computes for more than a few milliseconds | `submit_queued_task` to a bounded queue and answer `202`, or `yield()` every 1–2 ms — Julia cannot preempt it |
+| A long handler that runs to the end after its client left, or past a deploy's drain | Poll `cancel_requested(req)` and stop; branch on `cancel_reason(req)` (`:client_disconnected`, `:shutdown`) |
 | Polling `get_task_status(key, …)` with the key you submitted | Poll with the id `submit_task` returned, or `scoped_task_key(key, Owner(user_id))` |
 | Mutating a `Response` returned by inner middleware | `add_response_headers(resp, extra)` |
 | A global mutable config object | A typed struct passed via `serve(context=…)` |
