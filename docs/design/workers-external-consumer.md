@@ -214,7 +214,7 @@ their own. That is what makes *"the two processes cannot disagree"* true rather 
 setup_workers!(app)
 serve(app; middleware = [worker_startup(app; store)])
 
-# consumer process, started with `julia -t 4,1`: the same app code, without serve()
+# consumer process, started with `julia -t 4,2` (§14, #636): the same app code, without serve()
 setup_workers!(app)
 Workers.consume!(app; store, queues = ["heavy" => 4])    # 4 = this process's concurrency (#513's k)
 ```
@@ -268,10 +268,13 @@ Refused at `start!`/`worker_startup`/`consume!`, never later:
   `Threads.nthreads(:interactive) == 0`, and the error says to start the consumer with `-t k,1`.
   This is an exception to `concurrency.instructions.md` §3 (background tasks spawn on `:default`),
   and the PR that adds it amends that rule file with the maintainer's agreement.
+  *Superseded by §14 ([#636](https://github.com/PingoLee/Nitro.jl/issues/636)): the refusal is
+  now below two interactive threads (`-t k,2`), and the heartbeat is pinned off thread 1.*
 - **Under `-t k,1`, thread 1 is the interactive thread**, so a SIGINT can land in the heartbeat
   (`deployment.md` says thread 1 runs none of Nitro's loops; that changes for a consumer). The
   heartbeat treats an `InterruptException` as a stop request: it starts the drain (§7) and keeps
-  renewing until the drain ends, with one `@warn`, never a crash.
+  renewing until the drain ends, with one `@warn`, never a crash. *Under §14's `-t k,2` layout,
+  thread 1 runs only the main task parked in `consume!`, so a SIGINT lands there and drains.*
 - **The lease must outlast the worst stop-the-world GC pause.** A collection stops the interactive
   thread too, so a pause longer than the lease's unrenewed remainder lets `requeue_expired!` take a
   healthy run. The lease is configurable, `consume!(…; lease = Second(60))` by default, and the
@@ -645,10 +648,34 @@ two-process test, which adds SQLite.jl as a test dependency. Where it departs fr
   - A supervisor needs nothing special: systemd's and Kubernetes' default `SIGTERM` drains.
   - The probe ran on Linux; macOS CI is the evidence there. On Windows a terminate is a hard kill
     that runs no hook, so a stopped consumer's runs wait for their leases, as after a crash.
-  - The hook runs on whichever task thread 1 was running at the signal. Under `-t k,1` that is the
-    main task or the heartbeat. In the rare second case, nothing renews during the drain, and runs
-    still going when it ends keep only their remaining lease. A second signal during the drain
-    is bounded the same way: the second drain caller waits at most `drain_timeout + 10` seconds.
+  - **The hook runs on top of whatever thread 1 was doing, so thread 1 runs nothing of the
+    consumer's** ([#636](https://github.com/PingoLee/Nitro.jl/issues/636)).
+    - On `SIGTERM`, Julia's signal thread interrupts thread 1 mid-instruction and runs `exit` in
+      the interrupted task's context: `jl_exit_thread0` → `jl_exit_thread0_cb` →
+      `jl_atexit_hook` (`src/signals-unix.c`). That task never resumes. This includes a task
+      parked in `sleep` or `wait`, which stays thread 1's current task while the thread looks for
+      work. Julia's source calls a stuck exit there "unavoidable due to its async nature". The
+      answer to it is a second signal, which `raise`s at once.
+    - This section first assumed that a heartbeat hijacked this way cost only renewals. Under
+      `-t k,1` the interactive thread **is** thread 1, and the hook also inherits what the
+      heartbeat holds:
+      - **mid-compile:** the drain never started, and the process hung until killed;
+      - **inside PormG's SQLite write transaction:** the hand-back waited for the lock until
+        `drain_timeout`, and the run was left claimed.
+    - So `consume!` requires **`-t k,2`** and pins the heartbeat, and the start-up adjudication, to
+      the last interactive thread (`_spawn_pinned`, `jl_set_task_tid`). Thread 1 hosts only the
+      parked main task.
+    - The heartbeat parks on a plain `Timer`, never a `Timer(cb)`. That callback's task inherits
+      the heartbeat's stickiness and sticks to whichever thread first schedules it, which can be
+      thread 1.
+    - `test/workers_thread1_hijack_tests.jl` shows the mechanism with no consumer at all. A task
+      holding a lock across a `sleep` releases it to an `atexit` hook when pinned to thread 2, and
+      never does on thread 1.
+    - **What is left:** a `SIGTERM` during `consume!`'s own start-up, before the main task parks,
+      lands on code that is still compiling, and can hang until the supervisor's kill. Nothing is
+      claimed yet, so no run waits on it.
+  - A second signal during the drain is bounded: the second drain caller waits at most
+    `drain_timeout + 10` seconds.
   - A run that finishes during the drain is handed back too, and so runs again. A consumer cannot
     tell a job that completed from one that saw `:shutdown` and returned early, and recording the
     second as done would lose work (§7). A run the drain reaches before its task starts is handed

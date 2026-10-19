@@ -39,26 +39,41 @@ lives in the code comment it names, and that comment is canonical.
   The response is written on the request task: `stream_handler` calls `closewrite` itself
   (#453). See #462 for HTTP.jl's own share of that thread.
 - **A consumer process (`Workers.consume!`, #514) is the other layout.** It serves nothing, so
-  HTTP.jl does not hold its interactive thread, and its lease heartbeat runs there instead (§3).
-  `consume!` refuses to start without an interactive thread (`julia -t k,1`). Under `-t k,1`
-  thread 1 is that thread, so a REPL Ctrl-C can land in the heartbeat or in the task blocked in
-  `consume!`; both treat it as a stop request and drain. Outside a REPL, a SIGINT or a
-  supervisor's SIGTERM exits through `atexit`, where `consume!` registers its drain: probed on
-  1.12 and 1.13, an `atexit` hook still runs, and can still spawn and wait on tasks on other
-  threads, before the process exits.
+  HTTP.jl does not hold an interactive thread, and its lease heartbeat runs on one instead (§3).
+  `consume!` refuses to start with fewer than two (`julia -t k,2`), because **thread 1 must stay
+  idle** (#636).
+  - Outside a REPL, a SIGINT or a supervisor's SIGTERM exits through `atexit`, where `consume!`
+    registers its drain. Probed on 1.12 and 1.13: an `atexit` hook still runs, and can still
+    spawn and wait on tasks on other threads, before the process exits.
+  - But Julia runs that exit **on thread 1, on top of the task it interrupted** (`jl_exit_thread0`),
+    and that task never resumes, even one parked in `sleep`. Whatever it holds, the drain never
+    gets. A heartbeat there was caught mid-compile (the drain never started) and inside a store's
+    write transaction (the hand-backs timed out).
+  - So the heartbeat is pinned to the last interactive thread, and thread 1 hosts only the main
+    task parked in `consume!`. A REPL Ctrl-C lands there too, and the main task treats it as a
+    stop request and drains.
+  - Any new consumer-side work stays off thread 1, for the same reason.
 
 ## 3. Background tasks
 
 - **Spawn with `_spawn_detached`** (`src/Workers/execution.jl`): non-sticky, on `:default`,
   detached from the caller's scope. **Never `@async`.** A sticky task parked on thread 1 is where
   a REPL's Ctrl-C lands (#369).
-  - **One exception: a consumer's lease heartbeat runs on `:interactive`**
-    (`_spawn_detached(…; pool = :interactive)`, `src/Workers/consumer.jl`, #514). A CPU-bound job
-    holds a `:default` thread without yielding (#467), so a heartbeat there can be starved by the
-    very runs it renews, and a starved heartbeat turns a healthy run into a stolen one. It is
-    allowed there because it is one cheap store write per tick in a process that serves nothing,
-    so it competes with no connection task. Nothing else goes on `:interactive`; a new caller
-    needs the same argument and an entry here.
+  - **One exception: a consumer's lease heartbeat runs on `:interactive`, pinned**
+    (`_spawn_pinned`, `src/Workers/execution.jl`; `src/Workers/consumer.jl`, #514, #636).
+    - It is on `:interactive` because a CPU-bound job holds a `:default` thread without yielding
+      (#467). A heartbeat there can be starved by the very runs it renews, and a starved
+      heartbeat turns a healthy run into a stolen one. It is allowed there because it is one
+      cheap store write per tick in a process that serves nothing, so it competes with no
+      connection task.
+    - It is **sticky to the last interactive thread**, never thread 1, because a SIGTERM's exit
+      runs on top of whatever thread 1 is doing (§2). This is the one sticky task Nitro starts,
+      and it is the opposite of the #369 hazard: pinned *off* thread 1.
+    - It parks on a plain `Timer`, never a `Timer(cb)`: that callback task inherits the
+      stickiness and lands on whichever thread first schedules it.
+    - Without the `-t k,2` layout, which only tests and benches can request, it falls back to
+      `_spawn_detached(…; pool = :interactive)`.
+    - Nothing else goes on `:interactive`; a new caller needs the same argument and an entry here.
 - **A periodic loop goes through `_janitor`/`_janitor_loop`** (`src/middleware/janitor.jl`). It
   keeps the `try` inside the `while` (#169), uses a stop token per activation (#190), and ends
   with one `@warn` on an interrupt (#369). The Workers retention scheduler is a hand-rolled

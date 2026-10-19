@@ -62,6 +62,7 @@ const TEST_FILES = [
     "ctrl_c_child_tests.jl",
     "workers_tests.jl",
     "workers_consumer_e2e_tests.jl",
+    "workers_thread1_hijack_tests.jl",
     "reexports_tests.jl",
     "http_internals_contract_tests.jl",
     "precompilation_test.jl",

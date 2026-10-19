@@ -9,7 +9,7 @@
 # - `rss` is the CURRENT resident set (`/proc/self/statm`, Linux only);
 # - `maxrss` is `Sys.maxrss()`, the peak, which is what `max_rss_mb` compares against.
 #
-#   julia +1.12 --project=bench -t 2,1 bench/consumer/rss_recycle.jl [live_mb] [hold_seconds]
+#   julia +1.12 --project=bench -t 2,2 bench/consumer/rss_recycle.jl [live_mb] [hold_seconds]
 using Nitro, Nitro.Workers, Dates, Printf
 const W = Nitro.Workers
 

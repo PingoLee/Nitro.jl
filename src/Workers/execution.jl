@@ -48,8 +48,10 @@ end
 logger, which is carried across deliberately.
 
 Matches `Threads.@spawn` in every other respect: non-sticky, `:default` thread pool. `pool =
-:interactive` exists for one caller, a consumer process's lease heartbeat (#514), which a
-CPU-bound job on `:default` could otherwise starve; see `concurrency.instructions.md` §3. The
+:interactive` exists for one caller, a consumer's lease heartbeat (#514) started without the
+`-t k,2` layout (only tests and benches can), which a CPU-bound job on `:default` could
+otherwise starve; see `concurrency.instructions.md` §3. The deployed layout pins it instead
+(`_spawn_pinned`). The
 `:default` pool is set explicitly because a bare `Task` does **not** default to it — see the
 parity assertion in `test/workers_tests.jl`, which is what fails if `_spawn_set_thrpool` or the
 `Task.scope` setter moves. (`_detached_thunk` reaches a third Base internal,
@@ -67,8 +69,36 @@ end
 
 # There used to be a sticky `_schedule_detached` twin for `@async`-shaped callers. Its only caller
 # was the retention scheduler, which moved to `_spawn_detached` in #369 because a sticky task
-# parked on thread 1 is where a REPL's Ctrl-C lands. Nothing in Nitro wants a sticky background
-# task any more, so the twin went with it.
+# parked on thread 1 is where a REPL's Ctrl-C lands. The twin went with it. The one sticky task
+# Nitro starts now is the opposite case: pinned *off* thread 1, below.
+
+"""
+    _spawn_pinned(f, thread::Int) -> Task
+
+`_spawn_detached`, but sticky to `thread`, an **interactive** thread other than thread 1, for
+its whole life (#636). Its one caller is a consumer's lease heartbeat.
+
+Thread 1 is where Julia runs the exit path on a `SIGTERM`: its signal thread interrupts thread 1
+wherever it is and runs the `atexit` hooks on top of the task it was running, which can never
+resume. A heartbeat there was found mid-compile (the drain never started) and holding a store's
+write lock mid-transaction (the drain's hand-backs waited for it until they timed out). Pinned
+elsewhere, the heartbeat goes on running while the drain runs, and releases what it holds.
+
+`jl_set_task_tid` is the Base internal that `Threads.@threads :static` and `enq_work` pin with.
+What fails if it moves is the pinned arm of `test/workers_thread1_hijack_tests.jl`, whose child
+runs at `--threads=1,2` (Linux and macOS). The in-process check beside `_spawn_detached`'s in
+`test/workers_tests.jl` needs two interactive threads, which no CI layout has.
+"""
+function _spawn_pinned(f::Function, thread::Int)
+    thread != 1 && Threads.threadpool(thread) === :interactive ||
+        throw(ArgumentError("a pinned task needs an interactive thread other than thread 1, got thread $thread"))
+    task = Task(_detached_thunk(f))
+    task.sticky = true
+    ccall(:jl_set_task_tid, Cint, (Any, Cint), task, thread - 1)
+    task.scope = nothing
+    schedule(task)
+    return task
+end
 
 function _unwrap_exception(error)
     if error isa TaskFailedException

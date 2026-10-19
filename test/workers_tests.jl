@@ -4453,6 +4453,27 @@ end
         @test probe.sticky === reference.sticky === false
     end
 
+    @testset "_spawn_pinned stays on its thread, which is never thread 1 (#636)" begin
+        # Thread 1 is where a SIGTERM runs the exit path; `test/workers_thread1_hijack_tests.jl`
+        # proves why, and that the pin holds, in a child process. Here: the refusal, always, and
+        # the pin itself when this process has the threads for it, which CI's `-t N` layouts do not.
+        @test_throws "other than thread 1" Nitro.Workers._spawn_pinned(() -> nothing, 1)
+        default_thread = findfirst(i -> Threads.threadpool(i) === :default, 1:Threads.maxthreadid())
+        @test_throws "interactive thread" Nitro.Workers._spawn_pinned(() -> nothing, default_thread)
+        if Threads.nthreads(:interactive) >= 2
+            n = Threads.nthreads(:interactive)
+            seen = fetch(Nitro.Workers._spawn_pinned(n) do
+                s = Set{Int}()
+                for _ in 1:50
+                    push!(s, Threads.threadid())
+                    sleep(0.001)
+                end
+                s
+            end)
+            @test seen == Set([n])
+        end
+    end
+
     @testset "the LOGGER survives the detach, because it is scope-carried too" begin
         # `Base.CoreLogging.CURRENT_LOGSTATE` is a `ScopedValue`, so a blanket detach would
         # also cut a run off from any `with_logger(...)` its submitter was inside — every
@@ -6422,11 +6443,12 @@ status(store, id) = get_task_info(store, id).status
         e
     end
     @test err isa MethodError && occursin("require_interactive", sprint(showerror, err))
-    # The heartbeat's thread. A process with one starts; one without is refused, which the
-    # two-process test proves in a child started with `--threads=1,0`, since CI's own layouts
-    # (`-t N` on 1.12) always have one.
-    if Threads.nthreads(:interactive) == 0
-        @test_throws "julia -t k,1" _start_consumer(app; store, queues = ["heavy" => 1])
+    # The heartbeat's thread, which must not be thread 1 (#636). A process with two interactive
+    # threads starts; one with fewer is refused. CI's own layouts (`-t N` on 1.12) have none at
+    # N = 1 and one above, so this is the refusal there, and the two-process test, whose consumers run at
+    # `--threads=2,2`, is the start.
+    if Threads.nthreads(:interactive) < 2
+        @test_throws "julia -t k,2" _start_consumer(app; store, queues = ["heavy" => 1])
     else
         c = _start_consumer(app; store, queues = ["heavy" => 1], lease = 1.0, poll_interval = 0.05)
         _drain!(c)
