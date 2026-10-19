@@ -1463,7 +1463,10 @@ large crash backlog is worked through in bounded steps rather than loaded whole.
 and stops for this boot, keeping what it already recovered. If a *write* throws (a connection
 dropped mid-update, say), the sweep logs `"zombie recovery failed mid-sweep"` with its counts and
 rethrows, which fails `start!`: after a failed write, the sweep cannot know whether that
-transition landed.
+transition landed. That log line, like every worker log line that carries an exception, carries a
+`Nitro.Errors.LoggedException` in place of the store's error: its type name and the text the
+console shows, never the object. A database error's object can hold the server's full message, and
+on PostgreSQL a constraint violation's `DETAIL` quotes the task row.
 Startup carries on either way. A custom store that does not implement `list_running_task_refs`
 still works: the default derives it from `get_all_tasks`, at the cost of a full read of each record.
 

@@ -1,7 +1,7 @@
 ## Error log records carry a `LoggedException`, not the exception that was thrown (#613)
 
 - **Version**: Unreleased
-- **Nitro ref**: [#613](https://github.com/PingoLee/Nitro.jl/issues/613) ; `src/errors.jl`, `src/utilities/misc.jl`, `src/middleware/access_log.jl`, `src/core/framework_middleware.jl`
+- **Nitro ref**: [#613](https://github.com/PingoLee/Nitro.jl/issues/613) ; `src/errors.jl`, `src/utilities/misc.jl`, `src/middleware/access_log.jl`, `src/core/framework_middleware.jl` ; [#651](https://github.com/PingoLee/Nitro.jl/issues/651) ; `src/Workers/`, `src/types.jl`
 - **Recorded**: 2026-10-19
 - **Severity**: behavior change (logging). The client response is unchanged, and so is the console
   text, though it is no longer coloured. A log sink or filter that reads the record's `exception`
@@ -31,6 +31,16 @@ The same type replaces the exception in four other warnings:
 - `AccessLog: annotate hook errored`
 - `AccessLog: failed to capture request`
 - `AccessLog: sink failed`, plus the console line's `access_log_skip hook errored`
+
+Worker log records carry it too ([#651](https://github.com/PingoLee/Nitro.jl/issues/651)). Every
+`Nitro.Workers` log line with an `exception` kwarg now carries a `LoggedException`: zombie
+recovery, the retention scheduler, the teardown paths, and the external consumer (`consume!`). That
+includes the error a worker store rethrows, such as a `PormG.DatabaseError`. On PostgreSQL that
+object's `.cause` holds the server's full message, and a constraint violation's `DETAIL` quotes the
+task row. So do `Error in LifecycleMiddleware.on_startup` and `on_shutdown`, for **any**
+lifecycle hook that throws: the worker hook's boot sweep rethrows a store's error into them. A
+filter that matched a worker record's exception as `isa PormG.DatabaseError` now
+matches `.type`: `:IntegrityError`, `:OperationalError` or `:StatementError`.
 
 `text` is still whatever `showerror` prints. An exception whose own message quotes a value prints
 that value, on the console as before and now in every sink. A

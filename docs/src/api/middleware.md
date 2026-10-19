@@ -27,7 +27,8 @@ sink that `show`ed the record: a request's query string, a parsed body, a token.
 line on a request's path that carries an exception carries the same type: the warnings that
 `AccessLog` and `access_log_skip` log when a hook or the sink throws, a failed
 [`Res.sse`](@ref) producer, a failed streamed response body, and a rate
-limiter whose decision threw.
+limiter whose decision threw. So does every worker log line that carries an exception, off the
+request path too: see the [Workers](../tutorial/workers.md) guide.
 
 A [`Claims`](@ref) refusal is not on this list because it is not converted at all: the `401` or
 `403` its denial factory built is the route's response, served under `catch_errors=false` and

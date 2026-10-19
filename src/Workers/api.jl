@@ -149,7 +149,7 @@ function _recover_zombie_tasks!(runtime::WorkerRuntime, zombie_min_age::Union{No
                 list_running_task_refs(runtime.store; after=cursor, limit=batch_size)
             catch e
                 e isa InterruptException && rethrow()
-                @error "Nitro.Workers: zombie recovery could not read the RUNNING tasks; stopping early" _tally_kwargs(tally)... exception=(e, catch_backtrace())
+                @error "Nitro.Workers: zombie recovery could not read the RUNNING tasks; stopping early" _tally_kwargs(tally)... exception=(loggable(e), catch_backtrace())
                 return tally.recovered
             end
             try
@@ -160,7 +160,7 @@ function _recover_zombie_tasks!(runtime::WorkerRuntime, zombie_min_age::Union{No
                 # state to boot past quietly. What it no longer does is escape without the tally,
                 # so the log shows how far the sweep got.
                 e isa InterruptException && rethrow()
-                @error "Nitro.Workers: zombie recovery failed mid-sweep" _tally_kwargs(tally)... exception=(e, catch_backtrace())
+                @error "Nitro.Workers: zombie recovery failed mid-sweep" _tally_kwargs(tally)... exception=(loggable(e), catch_backtrace())
                 # The periodic sweep stops here instead (#266). The rethrow exists so a boot does
                 # not carry on quietly, and a tick carries on either way: its caller would only
                 # log this same exception a second time, on every tick of a persistent fault.
@@ -474,7 +474,7 @@ function _warn_stranded_external(runtime::WorkerRuntime, specs::Vector{Pair{Stri
                 "queued for a consumer process; only a consumer can run them" queue = queue_name stranded
         catch e
             e isa InterruptException && rethrow()
-            @error "Nitro.Workers: could not count a queue's external runs at start" queue = queue_name exception = (e, catch_backtrace())
+            @error "Nitro.Workers: could not count a queue's external runs at start" queue = queue_name exception = (loggable(e), catch_backtrace())
         end
     end
     return nothing
@@ -1236,7 +1236,7 @@ function _submit_queued_task(runtime::WorkerRuntime, queue_name::AbstractString,
             catch abandon_error
                 # Never let bookkeeping replace the caller's exception: the `put!` failure is
                 # what they must see, and a store that is also down would otherwise mask it.
-                @error "Worker task orphaned by a teardown could not be recorded" exception=(abandon_error, catch_backtrace()) task_key=key
+                @error "Worker task orphaned by a teardown could not be recorded" exception=(loggable(abandon_error), catch_backtrace()) task_key=key
             end
             rethrow()
         end
@@ -1777,7 +1777,7 @@ function _cleanup_scheduler_loop(runtime::WorkerRuntime, stop_signal::Channel{No
                     _recover_zombie_tasks!(runtime, zombie_min_age, ZOMBIE_SWEEP_BATCH; periodic=true)
                 catch e
                     e isa InterruptException && rethrow()
-                    @error "Nitro.Workers: periodic zombie sweep failed" exception=(e, catch_backtrace())
+                    @error "Nitro.Workers: periodic zombie sweep failed" exception=(loggable(e), catch_backtrace())
                 end
             end
             # Expired leases next, in their own `try` too (#514): the fallback adjudicator for an
@@ -1787,7 +1787,7 @@ function _cleanup_scheduler_loop(runtime::WorkerRuntime, stop_signal::Channel{No
                 _requeue_expired_tick!(runtime)
             catch e
                 e isa InterruptException && rethrow()
-                @error "Nitro.Workers: periodic lease adjudication failed" exception=(e, catch_backtrace())
+                @error "Nitro.Workers: periodic lease adjudication failed" exception=(loggable(e), catch_backtrace())
             end
             try
                 deleted = cleanup_old_tasks(retain_days; runtime=runtime)
@@ -1807,7 +1807,7 @@ function _cleanup_scheduler_loop(runtime::WorkerRuntime, stop_signal::Channel{No
                 # src/middleware/janitor.jl: a catch-all that eats `InterruptException` makes
                 # Ctrl-C during a sweep a no-op.
                 e isa InterruptException && rethrow()
-                @error "Nitro.Workers: task retention sweep failed" exception=(e, catch_backtrace())
+                @error "Nitro.Workers: task retention sweep failed" exception=(loggable(e), catch_backtrace())
             end
         end
     catch e
@@ -1870,7 +1870,7 @@ function stop_cleanup_scheduler!(scheduler::CleanupScheduler)
         wait(scheduler.task)
     catch e
         e isa TaskFailedException || rethrow()
-        @error "Nitro.Workers: the retention scheduler had already died; teardown continues" exception=(e, catch_backtrace())
+        @error "Nitro.Workers: the retention scheduler had already died; teardown continues" exception=(loggable(e), catch_backtrace())
     end
     return nothing
 end

@@ -1038,7 +1038,7 @@ function shutdown!(runtime::WorkerRuntime; drain_timeout::Real = WORKER_DRAIN_TI
                 try
                     _abandon_queued_item!(runtime, item)
                 catch error
-                    @error "Worker queued task abandoned but not recorded during teardown" exception=(error, catch_backtrace()) task_key=item.task_key
+                    @error "Worker queued task abandoned but not recorded during teardown" exception=(loggable(error), catch_backtrace()) task_key=item.task_key
                 end
                 # After the `catch`, so a store failure above cannot skip it: the run will never
                 # start, so its owner's reservation (#324) ends here either way.

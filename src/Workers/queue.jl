@@ -525,7 +525,7 @@ function _spawn_queue_processor(runtime::WorkerRuntime, queue::WorkerQueue, queu
                     try
                         _abandon_queued_item!(runtime, item)
                     catch error
-                        @error "Worker queue item abandoned but not recorded during teardown" exception=(error, catch_backtrace()) queue_name=queue_name task_key=item.task_key
+                        @error "Worker queue item abandoned but not recorded during teardown" exception=(loggable(error), catch_backtrace()) queue_name=queue_name task_key=item.task_key
                     end
                     _release_run!(runtime, item.run_id)    # after the `catch`: never skipped
                     continue
@@ -541,7 +541,7 @@ function _spawn_queue_processor(runtime::WorkerRuntime, queue::WorkerQueue, queu
                     # failures are already converted to FAILED inside _execute_queued_task;
                     # reaching here means the *store* threw — a failed metadata read, say. Log it,
                     # drop the item, keep draining.
-                    @error "Worker queue item aborted outside task execution" exception=(error, catch_backtrace()) queue_name=queue_name task_key=item.task_key
+                    @error "Worker queue item aborted outside task execution" exception=(loggable(error), catch_backtrace()) queue_name=queue_name task_key=item.task_key
                 finally
                     _mark_queue_task_finished!(runtime, queue, item.task_key)
                 end

@@ -13,6 +13,10 @@ using ..Core.Errors: implements_contract_method, store_contract_error
 # The per-attempt catch in the two executors treats these as terminal (#367); see the site
 # table in `is_unrecoverable`'s docstring.
 using ..Core.Errors: is_unrecoverable
+# Every log record in this module that carries an exception carries `loggable(e)`, never `e`
+# (#651). A store rethrows its own database error, and on PostgreSQL that object's `.cause` holds
+# the server's DETAIL, which can quote a task row; a sink that `show`s the record would print it.
+using ..Core.Errors: loggable
 # Named jobs (#514): arguments are written through the store's JSON path and bound back with the
 # binder `Json{T}` uses, minus the request field cap: they are stored data, not a request body.
 using ..Core.Util.BodyParsers: _json_for_storage, interns_client_strings, MAX_JSON_DEPTH
