@@ -6,7 +6,7 @@
 # (`_start_consumer`, the heartbeat on `:interactive`) over an in-process claim-capable store,
 # runs `k` jobs that allocate as hard as they can, and records every successful renewal.
 #
-#   julia +1.12 --project=bench -t 4,1 bench/consumer/heartbeat_lateness.jl [seconds] [k] [live_mb] [mode] [store]
+#   julia +1.12 --project=bench -t 4,2 bench/consumer/heartbeat_lateness.jl [seconds] [k] [live_mb] [mode] [store]
 #
 # `live_mb` is the long-lived heap each job keeps (a ring of small objects), which is what makes a
 # full collection's mark phase, and so its pause, long. `mode = spin` runs CPU-bound jobs that

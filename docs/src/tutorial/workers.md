@@ -246,11 +246,16 @@ relies on it should shorten the interval.
 ### Running A Consumer
 
 The consumer process loads the same app, calls the same setup function, and runs `consume!`
-instead of `serve`. Start it with an **interactive thread** (`-t k,1`): its lease heartbeat runs
-there, where the jobs it renews cannot starve it, and `consume!` refuses to start without one.
+instead of `serve`. Start it with **two interactive threads** (`-t k,2`), and `consume!` refuses
+to start with fewer:
+
+- **The second runs the lease heartbeat**, where the jobs it renews cannot starve it.
+- **The first, thread 1, stays idle.** When a supervisor sends `SIGTERM`, Julia runs the
+  consumer's drain on top of whatever thread 1 is doing at that instant. A heartbeat caught there
+  in the middle of a renewal or a compile could hang the drain, or leave its run claimed.
 
 ```julia
-# consumer.jl, started with `julia -t 4,1 --project consumer.jl`
+# consumer.jl, started with `julia -t 4,2 --project consumer.jl`
 using MyApp, Nitro, Nitro.Workers
 app = MyApp.build_app()
 MyApp.setup_workers!(app)
@@ -374,7 +379,7 @@ Description=MyApp one-shot consumer for the heavy queue
 [Service]
 Type=oneshot
 WorkingDirectory=/srv/myapp
-ExecStart=/usr/bin/julia -t 4,1 --project=. consumer_oneshot.jl
+ExecStart=/usr/bin/julia -t 4,2 --project=. consumer_oneshot.jl
 # A heavy run may take hours: no start timeout. A stop drains, so allow drain_timeout and more.
 TimeoutStartSec=infinity
 TimeoutStopSec=60
@@ -414,7 +419,7 @@ spec:
           containers:
             - name: consumer
               image: registry.example.com/myapp:latest
-              command: ["julia", "-t", "4,1", "--project=/app", "/app/consumer_oneshot.jl"]
+              command: ["julia", "-t", "4,2", "--project=/app", "/app/consumer_oneshot.jl"]
 ```
 
 If the cluster runs KEDA, a `ScaledJob` on the queue's pending count does the same thing without a

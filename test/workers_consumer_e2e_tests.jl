@@ -2,7 +2,7 @@
 
 # The design record's §9 end-to-end test, on a real SQLite file shared by two processes: this one
 # is the web side (it submits, and runs an in-process queue), and a child started with
-# `--threads=2,1` is the consumer. Every claim, renewal, hand-back and expiry crosses the process
+# `--threads=2,2` is the consumer. Every claim, renewal, hand-back and expiry crosses the process
 # boundary through the database, which is what no in-process test can show.
 #
 # `NITRO_E2E_POSTGRES` set to a libpq conninfo (`host=… port=… dbname=…`) runs it against that
@@ -63,7 +63,7 @@ function start_consumer(name)
     log = joinpath(dir, "$name.log")
     push!(logs, log)
     io = open(log, "w")
-    cmd = `$(Base.julia_cmd()) --code-coverage=none --threads=2,1 --startup-file=no
+    cmd = `$(Base.julia_cmd()) --code-coverage=none --threads=2,2 --startup-file=no
            --project=$(Base.active_project()) $child $dbspec $outdir $name $LEASE`
     cmd = addenv(cmd, "JULIA_DEBUG" => "Nitro")
     return run(pipeline(ignorestatus(cmd); stdout = io, stderr = io); wait = false), io
@@ -174,22 +174,28 @@ try
         # A drain that timed out also exits and also writes that line, with the run still going
         # (#623): only the count tells it from a drain that handed the run back.
         @test occursin(r"runs_still_renewed = 0\b", blog)
+        # The heartbeat never ran on thread 1, where the SIGTERM ran the drain (#636). A heartbeat
+        # there was hijacked mid-renewal holding the store's write lock, or mid-compile, and this
+        # scenario then hung or left the run claimed.
+        beat_threads = [m[1] for m in eachmatch(r"\bthread = (\d+)", blog)]
+        @test !isempty(beat_threads) && all(==("2"), beat_threads)
         or_dump(r5.status == PENDING && r5.claimed_by === nothing && occursin(r"runs_still_renewed = 0\b", blog))
         # It left through the `atexit` drain, never back through `consume!`'s wait.
         @test !isfile(joinpath(outdir, "B.returned"))
     end
 
-    @testset "a consumer with no interactive thread refuses to start" begin
-        # The heartbeat would share the jobs' threads, and a CPU-bound job could starve it.
+    @testset "a consumer with one interactive thread refuses to start" begin
+        # The heartbeat would share thread 1 with the main task, and a SIGTERM runs the drain on
+        # top of whatever thread 1 is doing (#636). With none, it would share the jobs' threads.
         out = IOBuffer()
-        cmd = `$(Base.julia_cmd()) --code-coverage=none --threads=1,0 --startup-file=no
+        cmd = `$(Base.julia_cmd()) --code-coverage=none --threads=1,1 --startup-file=no
                --project=$(Base.active_project()) $child $dbspec $outdir refused $LEASE`
         p = run(pipeline(ignorestatus(cmd); stdout = out, stderr = out); wait = false)
         @test waitfor(() -> !process_running(p), "the refused consumer to exit")
         process_running(p) && kill(p, Base.SIGKILL)
         wait(p)
         @test p.exitcode != 0
-        @test occursin("julia -t k,1", String(take!(out)))
+        @test occursin("julia -t k,2", String(take!(out)))
         @test !isfile(joinpath(outdir, "refused.returned"))
     end
 

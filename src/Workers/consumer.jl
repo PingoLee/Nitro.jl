@@ -15,7 +15,9 @@
 # * the HEARTBEAT (`:interactive`): one `renew_leases!` per tick for every run the process holds,
 #   then `requeue_expired!`. On the interactive thread because a CPU-bound job holds a `:default`
 #   thread without yielding (#467), and a starved heartbeat turns a healthy run into a stolen one.
-#   It is the one Nitro loop placed there on purpose (concurrency §3).
+#   It is the one Nitro loop placed there on purpose (concurrency §3), and it is pinned to an
+#   interactive thread other than thread 1, where a SIGTERM runs the drain on top of whatever
+#   thread 1 is doing (#636, `_heartbeat_thread`).
 #
 # Nothing here runs the unleased zombie sweep. Every row a web process runs in-process has no
 # `claimed_by` and no handle in THIS process, so the sweep would fail the web's live jobs (§3).
@@ -58,7 +60,13 @@ mutable struct ConsumerHandle{S <: AbstractWorkerStore}
     @atomic held_count::Int          # `length(held)`, readable without the lock by the drain's wait
 
     const wake::Base.Event            # the claim loop's park: its timer, a freed slot, a stop
-    const beat::Base.Event            # the heartbeat's park: its timer, the end of the drain, the last straggler
+    # The heartbeat's park: it waits on `beat_timer` itself, which `_wake_heartbeat!` closes for
+    # the end of the drain and the last straggler, and `beat_wake` latches a wake that lands
+    # between two parks. Not an `Event` woken by a `Timer(cb)`, as the claim loop is: that
+    # callback task inherits the heartbeat's stickiness and sticks to whichever thread first
+    # schedules it, often thread 1, which the heartbeat is pinned off (#636).
+    @atomic beat_wake::Bool
+    @atomic beat_timer::Union{Nothing, Timer}
     const stop_requested::Base.Event  # what `consume!` waits on
     @atomic stopping::Bool            # no more claims
     # The drain clears it when it ends. The heartbeat then runs on until the last held run settles
@@ -116,7 +124,7 @@ Run `app`'s `External(…)` queues in **this** process, until it is told to stop
 same app code as the web process, the same setup function, and no `serve`.
 
 ```julia
-# consumer.jl, started with `julia -t 4,1 --project consumer.jl`
+# consumer.jl, started with `julia -t 4,2 --project consumer.jl`
 using MyApp, Nitro, Nitro.Workers
 app = MyApp.build_app()
 MyApp.setup_workers!(app)                  # declare_queues! + register_job!, as the web process does
@@ -163,8 +171,11 @@ their leases to expire, as after a crash.
 
 **Refused before anything starts** (`ArgumentError`): no `queues`; a queue `app` does not declare
 `External(…)`; a store without the claim capability or one no other process can read
-(`InMemoryWorkerStore`); and **a process with no interactive thread**: start it with
-`julia -t k,1`, so the heartbeat has a thread a job cannot take.
+(`InMemoryWorkerStore`); and **a process with fewer than two interactive threads**: start it
+with `julia -t k,2`. The heartbeat runs on the second, where a job cannot take its thread. The
+first, thread 1, must stay idle: on a `SIGTERM`, Julia runs the drain on top of whatever thread 1
+is doing at that instant, and a heartbeat caught there mid-compile or mid-renewal hung the drain
+([#636](https://github.com/PingoLee/Nitro.jl/issues/636)).
 
 **Recycling** ([#514](https://github.com/PingoLee/Nitro.jl/issues/514), step 4). A process's
 memory rises to its heaviest run's peak and stays there until a full collection runs, which an
@@ -250,11 +261,12 @@ function _start_consumer(app::App; store::AbstractWorkerStore, queues::AbstractV
         placements[name] = placement
     end
     _check_external_store(store, Pair{String, External}[name => p for (name, p) in placements])
-    if require_interactive && Threads.nthreads(:interactive) == 0
+    if require_interactive && Threads.nthreads(:interactive) < 2
         throw(ArgumentError(
-            "consume! needs an interactive thread for its lease heartbeat, which a CPU-bound job " *
-            "would otherwise starve until healthy runs lose their leases: start the consumer " *
-            "with `julia -t k,1`"))
+            "consume! needs two interactive threads: start the consumer with `julia -t k,2`. Its " *
+            "lease heartbeat needs one of its own, which a CPU-bound job would otherwise starve " *
+            "until healthy runs lose their leases, and thread 1 must stay idle, because a SIGTERM " *
+            "runs the drain on top of whatever thread 1 is doing, which can hang it"))
     end
     drain_timeout >= 0 || throw(ArgumentError("`drain_timeout` must be >= 0, got $drain_timeout"))
     lease_seconds = _positive_seconds(lease, "lease")
@@ -278,23 +290,37 @@ function _start_consumer(app::App; store::AbstractWorkerStore, queues::AbstractV
                        max_runs === nothing ? nothing : Int(max_runs),
                        max_rss_mb === nothing ? nothing : Float64(max_rss_mb), exit_when_idle,
                        ReentrantLock(), Dict{UUID, _HeldRun}(), Dict{String, Int}(), Set{String}(), 0,
-                       Base.Event(true), Base.Event(true), Base.Event(),
+                       Base.Event(true), false, nothing, Base.Event(),
                        false, true, false, false, 0, false, :none, :stopped, nothing, nothing,
                        _consumer_wake_guard())
 
     # Every start has a stop on every path (#427): a claim loop that fails to start must not
     # leave the heartbeat it started renewing nothing for ever, nor the guard open.
     try
+        thread = _heartbeat_thread()
         # Before the first claim, so a consumer that finds nothing to do still adjudicates its
-        # crashed predecessor's run (§3).
-        _consumer_requeue!(c)
+        # crashed predecessor's run (§3). On the heartbeat's thread, not this one: this task runs
+        # on thread 1, which a SIGTERM's exit path takes over wherever it is (#636), and a first
+        # store call compiles and takes the store's locks.
+        if thread === nothing
+            _consumer_requeue!(c)
+        else
+            # Unwrapped, so a failure reads as the inline call's would (only an interrupt a store
+            # wrapped gets past `_consumer_requeue!`'s own catch).
+            try
+                wait(_spawn_pinned(() -> _consumer_requeue!(c), thread))
+            catch e
+                throw(_unwrap_exception(e))
+            end
+        end
 
-        pool = Threads.nthreads(:interactive) > 0 ? :interactive : :default
-        c.heartbeat_task = errormonitor(_spawn_detached(() -> _heartbeat_loop(c); pool))
+        c.heartbeat_task = errormonitor(thread === nothing ?
+            _spawn_detached(() -> _heartbeat_loop(c); pool = Threads.nthreads(:interactive) > 0 ? :interactive : :default) :
+            _spawn_pinned(() -> _heartbeat_loop(c), thread))
         c.claim_task = errormonitor(_spawn_detached(() -> _claim_loop(c)))
     catch
         @atomic c.beating = false
-        notify(c.beat)
+        _wake_heartbeat!(c)
         c.wake_guard === nothing || close(c.wake_guard)
         rethrow()
     end
@@ -528,7 +554,7 @@ function _run_claimed!(c::ConsumerHandle, run::TaskInfo, queue::String)
             isempty(c.held)
         end
         # The last straggler of a drain that timed out: the heartbeat stops now, not a tick later.
-        emptied && !(@atomic c.beating) && notify(c.beat)
+        emptied && !(@atomic c.beating) && _wake_heartbeat!(c)
         # The bound first: freeing the slot wakes the claim loop, which must already see it. The
         # release also finishes a recycle this run was the last of; a handed-off slot is released,
         # and the recycle finished, when the abandoned callback returns.
@@ -545,23 +571,58 @@ end
 # another consumer would run them again while they still run here.
 _keeps_beating(c::ConsumerHandle) = (@atomic c.beating) || (@atomic c.held_count) > 0
 
+# Where the heartbeat runs: the last interactive thread, pinned (#636). Thread 1 is where a
+# SIGTERM runs the `atexit` drain, on top of whatever task thread 1 was running, and that task
+# never resumes. A heartbeat there was found compiling, so the drain never started, and holding
+# the store's write lock mid-renewal, so the drain's hand-backs waited for it until they timed
+# out. `nothing` without a second interactive thread, which only `require_interactive = false`
+# reaches: the tests and the benches.
+_heartbeat_thread() = (n = Threads.nthreads(:interactive)) >= 2 ? n : nothing
+
+# Wakes the heartbeat early: latched, then the park's timer closed. The two sides order
+# themselves through the atomics, so a wake is never lost: either this sees the timer the
+# heartbeat parks on and closes it, or the heartbeat, publishing that timer first, sees the latch.
+function _wake_heartbeat!(c::ConsumerHandle)
+    @atomic c.beat_wake = true
+    timer = @atomic c.beat_timer
+    timer === nothing || close(timer)
+    return nothing
+end
+
+# One park: until the tick's timer fires or `_wake_heartbeat!` closes it. The task waits on the
+# `Timer` itself, so its wake is scheduled straight onto the heartbeat's own thread; no callback
+# task exists to land on thread 1.
+function _heartbeat_park!(c::ConsumerHandle)
+    timer = Timer(c.lease_seconds / 3)
+    @atomic c.beat_timer = timer
+    try
+        (@atomicswap c.beat_wake = false) && return nothing
+        _keeps_beating(c) || return nothing
+        try
+            wait(timer)
+        catch e
+            # A closed timer is a wake, not an error.
+            e isa EOFError || rethrow()
+        end
+    finally
+        close(timer)
+    end
+    return nothing
+end
+
 function _heartbeat_loop(c::ConsumerHandle)
     interrupted = false
     while _keeps_beating(c)
         try
-            timer = Timer(_ -> notify(c.beat), c.lease_seconds / 3)
-            try
-                _keeps_beating(c) && wait(c.beat)
-            finally
-                close(timer)
-            end
+            _heartbeat_park!(c)
             _keeps_beating(c) || break
             _heartbeat_tick!(c)
         catch e
             if _is_interrupt(e)
-                # Under `-t k,1` thread 1 is the interactive thread, so a REPL's Ctrl-C can land
-                # here. It is a stop request: start the drain and keep renewing until it ends,
-                # since the drain is what needs the leases alive (§6).
+                # A Ctrl-C lands on thread 1, which a pinned heartbeat never runs on (#636), but
+                # an unpinned one can (`require_interactive = false`), and a store can hand one
+                # back wrapped. It is a stop request: start the drain and keep renewing until it
+                # ends, since the drain is what needs the leases alive (§6).
                 interrupted || @warn "Nitro.Workers: an interrupt (Ctrl-C) reached the consumer's " *
                                      "lease heartbeat; draining. Runs that stop are handed back to their queues"
                 interrupted = true
@@ -600,7 +661,7 @@ function _heartbeat_tick!(c::ConsumerHandle)
     # which the two-process test's child turns on; otherwise it reads 0.
     renew_compile_s = 0.0
     kept_count = -1
-    @debug "Nitro.Workers: consumer heartbeat tick begins" consumer_id = c.consumer_id held = length(held) at = Dates.now(Dates.UTC)
+    @debug "Nitro.Workers: consumer heartbeat tick begins" consumer_id = c.consumer_id held = length(held) thread = Threads.threadid() at = Dates.now(Dates.UTC)
     # Each step on its own, as in the drain (#608): a failed renewal, or one run's failed lookup,
     # must not hold back the other runs' signals nor this tick's adjudication.
     if !isempty(held)
@@ -639,7 +700,7 @@ function _heartbeat_tick!(c::ConsumerHandle)
     # consumer that returned claims nothing and adjudicates nothing.
     t0 = time()
     (@atomic c.beating) && _consumer_requeue!(c, now)
-    @debug "Nitro.Workers: consumer heartbeat tick" consumer_id = c.consumer_id held = length(held) kept = kept_count renew_s = round(renew_s; digits = 3) renew_compile_s = round(renew_compile_s; digits = 3) requeue_s = round(time() - t0; digits = 3) tick_s = round(time() - tick_start; digits = 3) at = Dates.now(Dates.UTC)
+    @debug "Nitro.Workers: consumer heartbeat tick" consumer_id = c.consumer_id held = length(held) thread = Threads.threadid() kept = kept_count renew_s = round(renew_s; digits = 3) renew_compile_s = round(renew_compile_s; digits = 3) requeue_s = round(time() - t0; digits = 3) tick_s = round(time() - tick_start; digits = 3) at = Dates.now(Dates.UTC)
     return nothing
 end
 
@@ -732,7 +793,7 @@ function _drain!(c::ConsumerHandle)
     finally
         # Each step on its own, so none of them can keep the next from running.
         @atomic c.beating = false
-        notify(c.beat)
+        _wake_heartbeat!(c)
         notify(c.wake)
         hb = c.heartbeat_task
         try
