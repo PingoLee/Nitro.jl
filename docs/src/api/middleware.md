@@ -18,6 +18,14 @@ an `App` with no worker runtime installed) is a `503`, logged at `@warn` without
 `WorkerCapacityError` (a worker limit reached) is a `503`, or a `429` for a per-owner quota,
 logged at `@debug`. The access log records the status either way. An `InterruptException` is not converted; it propagates.
 
+**What the error log record carries.** Its `exception` is `(e, backtrace)`, where `e` is a
+`Nitro.Errors.LoggedException` and not the exception that was thrown. It has two fields: `type`,
+the original's type name (`:MethodError`), and `text`, what `showerror` printed for it. Its `show`
+prints the same `text`, without colour. So a JSON or structured log sink records exactly what the console shows,
+and never the arguments of a `MethodError` or the value in a `TypeError`. Those used to reach any
+sink that `show`ed the record: a request's query string, a parsed body, a token. The warnings that
+`AccessLog` and `access_log_skip` log when a hook or the sink throws carry the same type.
+
 A [`Claims`](@ref) refusal is not on this list because it is not converted at all: the `401` or
 `403` its denial factory built is the route's response, served under `catch_errors=false` and
 `serialize=false` too, the way a guard's `403` is.

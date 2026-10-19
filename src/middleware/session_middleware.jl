@@ -6,7 +6,7 @@ using JSON
 using UUIDs
 using ...Types: AbstractSessionStore, MemoryStore, SessionPayload, Nullable, is_expired,
     update_session!, delete_session!, session_store_full, SESSION_AUTH_HASH_KEY,
-    _session_auth_hash_current, _session_auth_hash_of
+    _session_auth_hash_current, _session_auth_hash_of, _store_call, _store_bool
 using ...Types: CookieConfig, LifecycleMiddleware
 using ..JanitorMiddleware: _janitor
 using ...Cookies: get_cookie, set_cookie!, storesession!, prunesessions!, regenerate_session!,
@@ -536,9 +536,10 @@ function SessionMiddleware(;
             if is_new && (rotated || forced || !isempty(current_session))
                 anonymous = _auth_marker(current_session, final_session_id, auth_key,
                                          validator) === nothing
-                # `::Bool`: an optional contract method a custom store implements, asserted like
-                # `update_session!` below so a wrong return fails by name.
-                if anonymous && session_store_full(store)::Bool
+                # An optional contract method a custom store implements, checked like
+                # `update_session!` below so a wrong return fails by name -- and without a value
+                # in the error (#612).
+                if anonymous && _store_bool(session_store_full, _store_call(session_store_full, store))
                     _warn_store_full(last_full_warning, full_warning_every, store)
                     session_written = false
                 else
@@ -564,10 +565,11 @@ function SessionMiddleware(;
                 _save_session(store, final_session_id, current_session, ttl)
                 session_written = true
             elseif !is_new && (rotated || forced || current_session != original_session)
-                # `::Bool`: the contract's return type, asserted so inference does not carry `Any`
-                # (`current_session` comes out of `req.context`) into the branch below.
-                session_written = update_session!(store, final_session_id, current_session;
-                                                  ttl = ttl)::Bool
+                # The contract's `Bool`, checked so inference does not carry `Any`
+                # (`current_session` comes out of `req.context`) into the branch below, and so a
+                # wrong return fails by name without the value in the error (#612).
+                session_written = _store_bool(update_session!,
+                    _store_call(update_session!, store, final_session_id, current_session; ttl = ttl))
             else
                 session_written = false
             end
@@ -620,7 +622,7 @@ function _load_session(store::AbstractSessionStore{String, Dict{String,Any}}, se
         return Dict{String,Any}(), true, now, false
     end
 
-    payload = Base.get(store, session_id, nothing)
+    payload = _store_call(Base.get, store, session_id, nothing)
     if isnothing(payload)
         return Dict{String,Any}(), true, now, false
     end
@@ -869,7 +871,7 @@ function _auth_marker_changed(original_auth_marker, current_auth_marker)
 end
 
 function _save_session(store::AbstractSessionStore{String, Dict{String,Any}}, session_id::String, data::Dict{String,Any}, max_age::Int)
-    storesession!(store, session_id, data; ttl=max_age)
+    _store_call(storesession!, store, session_id, data; ttl=max_age)
 end
 
 end # module SessionMiddleware_

@@ -28,6 +28,7 @@ using HTTP
 using Dates
 using ...Core: getip, route_missed, LifecycleMiddleware
 using ...Util: _log_target_path, _check_access_log_skip
+using ...Errors: loggable
 using ..JanitorMiddleware: _janitor
 
 export AccessLog, AccessRecord
@@ -115,12 +116,16 @@ end
 # `skip` runs AFTER the handler and sees the response (#401): `resp` is the `HTTP.Response`, or
 # `nothing` when the handler threw. A pre-handler `req -> Bool` could not tell a scanner's
 # unmatched 404 from a real request, which is the one distinction a probe filter needs.
+#
+# Every warning in this file logs `loggable(err)`, never `err` (#613). The hooks are handed `req`,
+# whose target carries the query string, and the sink the records, with client IPs and user agents.
+# A `MethodError` over either put them in the record, where a sink that `show`s it printed them.
 function _skips(skip, req, resp)::Bool
     skip === nothing && return false
     try
         return skip(req, resp) === true
     catch err
-        @warn "AccessLog: skip hook errored (logging request anyway)" exception=err
+        @warn "AccessLog: skip hook errored (logging request anyway)" exception=loggable(err)
         return false
     end
 end
@@ -133,7 +138,7 @@ function _annotate(annotate, req)::Dict{Symbol, Any}
                v isa AbstractDict ? Dict{Symbol, Any}(Symbol(k) => val for (k, val) in v) :
                _EMPTY_CONTEXT
     catch err
-        @warn "AccessLog: annotate hook errored" exception=err
+        @warn "AccessLog: annotate hook errored" exception=loggable(err)
         return _EMPTY_CONTEXT
     end
 end
@@ -229,7 +234,7 @@ function _capture!(r::_Run, req::HTTP.Request, resp, t0::UInt64, annotate, log_q
                            ip, user_agent, _annotate(annotate, req))
         _enqueue!(r, rec)
     catch err
-        @warn "AccessLog: failed to capture request" exception=err
+        @warn "AccessLog: failed to capture request" exception=loggable(err)
     end
     return nothing
 end
@@ -284,7 +289,7 @@ function _flush!(sink, batch::Vector{AccessRecord})
     try
         sink(batch)
     catch err
-        @warn "AccessLog: sink failed; dropping $(length(batch)) record(s)" exception=(err, catch_backtrace())
+        @warn "AccessLog: sink failed; dropping $(length(batch)) record(s)" exception=(loggable(err), catch_backtrace())
     end
     return nothing
 end

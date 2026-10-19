@@ -3,7 +3,7 @@ using JSON
 using Dates
 
 using ..Errors: ValidationError, UnsupportedMediaTypeError, AuthorizationError, WorkerUnavailableError,
-    WorkerCapacityError, is_unrecoverable
+    WorkerCapacityError, is_unrecoverable, loggable
 using .BodyParsers: _parse_json_bounded
 
 export recursive_merge, parseparam, parsebody, parseparam_checked,
@@ -108,16 +108,22 @@ function handlerequest(getresponse::Function, catch_errors::Bool; show_errors::B
                 # request at exactly the moment the server is busiest. `kind` only -- no message.
                 show_errors && @debug "Request refused: worker capacity" kind=error.kind
             elseif show_errors && !isa(error, InterruptException)
-                # `showerror` of whatever the handler or a middleware threw, so nothing keeps a value
-                # out of this line but the thrower. Validator input is kept out upstream: an
-                # extractor's validator is handed the bound value, and `try_validate`
-                # (src/extractors.jl) replaces anything it throws but a `ValidationError` with a
-                # value-free `ValidatorFault`, raised outside the `catch` so the original is not
-                # left on the exception stack either (#595). `SessionMiddleware` does the same for
-                # its `validator` and `session_auth_hash` hooks, which are handed the session id and
-                # data (#602). Never "improve" this line by logging `current_exceptions()`, or a
-                # cause chain.
-                @error "ERROR: " exception=(error, catch_backtrace())
+                # `showerror` of whatever the handler or a middleware threw, and ONLY that: the
+                # record carries a `LoggedException` (src/errors.jl), never the live exception. A
+                # sink that `show`s the record (a JSON or structured logger) printed a `MethodError`'s
+                # arguments and a `TypeError`'s value, so a handler or a guard that threw over a
+                # parsed body, a token or `req` (its query string) wrote them to the log (#613). This
+                # is the one place that covers handlers too, which Nitro cannot wrap.
+                #
+                # Beyond that, nothing keeps a value out of this line but the thrower. Validator
+                # input is kept out upstream: an extractor's validator is handed the bound value, and
+                # `try_validate` (src/extractors.jl) replaces anything it throws but a
+                # `ValidationError` with a value-free `ValidatorFault`, raised outside the `catch` so
+                # the original is not left on the exception stack either (#595). `SessionMiddleware`
+                # does the same for its `validator` and `session_auth_hash` hooks (#602), and for the
+                # session store with `SessionStoreFault` (#612). Never "improve" this line by logging
+                # `current_exceptions()`, a cause chain, or the original exception.
+                @error "ERROR: " exception=(loggable(error), catch_backtrace())
             end
             return handle_error(error)
         end
@@ -472,7 +478,11 @@ end
 const TAKES_REQUEST = TypeMemo()
 __init__() = reset!(TAKES_REQUEST)
 _takes_request(f::F) where {F} = memoized(_ -> _has_two_arg_method(f), TAKES_REQUEST, F)
-_has_two_arg_method(f) = any(method -> length(method.sig.parameters) - 1 == 2, Base.methods(f))
+# `unwrap_unionall`: a method written with a `where` clause has a `UnionAll` signature, which has no
+# `parameters` field. Reading it threw a `FieldError` on every request, which the auth middleware's
+# catch turned into a silent 401 for a validator that was never called (#627).
+_has_two_arg_method(f) =
+    any(method -> length(Base.unwrap_unionall(method.sig).parameters) - 1 == 2, Base.methods(f))
 
 # Fail closed. A factory returning `nothing` would turn a denial into an admission, and one
 # returning a `Dict` it meant to serialize would reach `GuardMiddleware` as a malformed guard

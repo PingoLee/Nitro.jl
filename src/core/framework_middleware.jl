@@ -6,6 +6,7 @@
 # `AccessLog`, which is included before this file, can share them (#320). Imported by name so
 # they stay reachable as `Nitro.Core._log_target_path`, which the security tests pin.
 using .Util: _log_target_path, _log_escape, _check_access_log_skip
+using .Errors: loggable
 
 # A buggy hook must never cost the request, nor silently the line: warn and log anyway, the
 # structured `AccessLog`'s `_skips` rule.
@@ -14,7 +15,7 @@ function _console_skips(skip, req, resp)::Bool
     try
         return skip(req, resp) === true
     catch err
-        @warn "access_log_skip hook errored (logging request anyway)" exception=err
+        @warn "access_log_skip hook errored (logging request anyway)" exception=loggable(err)
         return false
     end
 end
