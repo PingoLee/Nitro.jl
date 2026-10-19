@@ -5900,7 +5900,9 @@ end
             record = get_task_info(rt.store, id)
             @test (record.job_name, record.job_args) == ("slow", "{\"dataset_id\":1}")
         end
-        @test runs[] == 2                     # one per key, not one per submit
+        # One per key, not one per submit. Waited for: the record reads RUNNING before the
+        # callback's first line runs, so the second run's increment can land after the loop (#640).
+        @test wait_for(() -> runs[] == 2) == :ok
         notify(release)
         q_id = scoped_task_key("shared", Owner("u"))
         a_id = scoped_task_key("shared-async", Owner("u"))
