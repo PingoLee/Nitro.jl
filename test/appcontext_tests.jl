@@ -138,7 +138,7 @@ end
 using Test
 using HTTP
 using Nitro
-using Base.ScopedValues: ScopedValue, @with
+using Base.ScopedValues: @with
 using Nitro.Core: serving_app, _app_context_seed
 using Nitro.Core.Constants: REQUEST_SCOPE, RequestScope, request_max_fields, DEFAULT_MAX_FIELDS
 
@@ -175,9 +175,14 @@ end
 # possible binding -- one `@with` of a prebuilt `RequestScope` -- rather than a constant, so the
 # bound tracks the Julia version's `PersistentDict` cost. A second `ScopedValue`, or a value that is
 # boxed on insert, makes the seed layer strictly more expensive than the reference.
-const REF_SCOPE = ScopedValue{RequestScope}(RequestScope(nothing, Ref{Int64}(0)))
+#
+# The reference binds the seed layer's OWN key. An insert costs more when its key shares a HAMT slot
+# with a key already bound around it, and a `ScopedValue` hashes by address, which differs per
+# process. On 1.13, where Test binds its testset stack in ScopedValues, a reference under a key of
+# its own read 6 while `REQUEST_SCOPE` collided and read 9 or 13 (#633); the same key gives both
+# sides the same placement.
 const REF_VALUE = RequestScope(nothing, Ref{Int64}(0))
-reference(req::HTTP.Request) = @with REF_SCOPE => REF_VALUE nothing
+reference(req::HTTP.Request) = @with REQUEST_SCOPE => REF_VALUE nothing
 
 # One fresh request per call. The app context is pre-seeded so the layer's one-off `req.context`
 # insert is not measured. The minimum of 5 runs of 1000 calls (`allocs`, #511).
