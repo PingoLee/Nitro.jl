@@ -60,9 +60,14 @@ function request_input(req::HTTP.Request) :: Dict{String,Any}
     end
     merged = Dict{String,Any}()
     merge_request_input!(merged, Types.queryvars(req))
-    merge_request_input!(merged, getjson(req))
-    merge_request_input!(merged, getform(req))
-    merge_request_input!(merged, getpost(req))
+    # Only the parsers the `Content-Type` admits (#553). Each accessor applies the same check to
+    # the same header and answers `nothing` or an empty `Dict` when it fails, so skipping them
+    # changes nothing in the merge -- it saves building, and caching, the empty answers.
+    content_type = HTTP.header(req, "Content-Type", "")
+    Util.BodyParsers.is_json_media_type(content_type) && merge_request_input!(merged, getjson(req))
+    Util.BodyParsers.is_form_media_type(content_type) && merge_request_input!(merged, getform(req))
+    Util.BodyParsers.is_multipart_form_media_type(content_type) &&
+        merge_request_input!(merged, getpost(req))
     merge_request_input!(merged, params)
     ctx[REQUEST_INPUT_CACHE_KEY] = merged
     params === nothing || (ctx[REQUEST_INPUT_ROUTED_KEY] = true)
@@ -426,6 +431,10 @@ end
 
 Returns a merged dictionary containing the JSON body, form data, multipart text
 fields, and query parameters from the incoming request.
+
+Only the body parser the request's `Content-Type` admits is read (#553): [`getjson`](@ref) for
+JSON, [`getform`](@ref) for a urlencoded or untyped body, [`getpost`](@ref) for
+`multipart/form-data`. The others would answer `nothing` or an empty `Dict` for that type.
 """
 function payload(req::HTTP.Request)::Dict{String, Any}
     return request_input(req)
