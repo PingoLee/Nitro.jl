@@ -341,6 +341,8 @@ end
         stream = Stream{false, Request{Core.HTTP.EmptyBody}}
         precompile(listener, (stream,))
         precompile(request_handler, (stream,))
+        # What the spawn runs: a `@spawn` closure's body is not compiled with the listener.
+        precompile(Core._handle_reporting, (typeof(request_handler), stream))
         precompile(Core._write_response_body!, (stream, String))
         precompile(Core._write_response_body!, (stream, Vector{UInt8}))
     end

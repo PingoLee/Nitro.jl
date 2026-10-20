@@ -197,9 +197,9 @@ _response_started(stream::HTTP.Stream)::Bool = (@atomic :acquire stream.response
 
 # ── Has the client gone? (#466) ──────────────────────────────────────────────────────────────────
 #
-# HTTP.jl 2.9 cannot tell a server: on HTTP/1.1 nothing reads the socket while the handler runs,
-# and every `isopen` it offers reports only this side's own closes. So `cancel_reason(req)` asks
-# the kernel, on the caller's own task, only when a handler asks:
+# HTTP.jl (2.9 through 2.11) cannot tell a server: on HTTP/1.1 nothing reads the socket while the
+# handler runs, and every `isopen` it offers reports only this side's own closes. So
+# `cancel_reason(req)` asks the kernel, on the caller's own task, only when a handler asks:
 #
 #   recv(fd, 1 byte, MSG_PEEK) on the already non-blocking socket
 #     0                          → the peer sent FIN                  → gone
@@ -530,13 +530,13 @@ Write a body with a declared length as it is read (#377), through HTTP.jl's publ
 read. HTTP holds the first 4 KiB so a small body goes out with its head in one write, and sends
 everything past that as it is written; `stream_handler`'s `closewrite` flushes what is held.
 
-HTTP enforces the declared length too, but Nitro checks it first, for two reasons:
-
-1. **The status.** HTTP throws `HTTP.ProtocolError` on a mismatch, and maps a `ProtocolError` to
-   **400**, which blames the client for the server's own wrong `Content-Length`. Nitro throws a
-   plain `ErrorException`, which HTTP answers with 500 while the head is still unsent.
-2. **The log.** HTTP logs nothing, and a client only ever sees a status or a cut connection, so the
-   server side is the one place a failure can be noticed.
+HTTP enforces the declared length too, but Nitro checks it first, for the log. A client only ever
+sees a status or a cut connection, so the server side is the one place a failure can be noticed —
+and HTTP's own line for it would carry the live exception and the query string, so Nitro writes it
+and marks the error reported (`_mark_reported!`). (There used to be a second reason, the status:
+through 2.9 HTTP answered its own length `ProtocolError` with **400**, blaming the client for the
+server's `Content-Length`. Since 2.10 that error is a 500 (JuliaWeb/HTTP.jl#1404), and HTTP, like
+Nitro, refuses an overrun before writing it and a short body before sending its held head.)
 
 Each chunk is checked BEFORE it is written: an overrun would desynchronise the next response on a
 keep-alive connection. A short body is refused at EOF, before `closewrite` could send the head of a
@@ -585,6 +585,7 @@ function _write_fixed_body!(stream::HTTP.Stream, body::HTTP.AbstractBody,
             @warn("Streamed response body failed; connection closed",
                   exception = (loggable(err), catch_backtrace()), written, declared,
                   head_sent = (@atomic :acquire stream.head_committed))
+            _mark_reported!(stream, err)
         end
         rethrow()
     end
@@ -1341,19 +1342,73 @@ end
 # in (#316). HTTP's stream path answers a handler error with a status it derives from the
 # exception's TYPE (`_server_error_status`): a `DeadlineExceededError` is a 408, a `ParseError` from
 # a malformed chunked body a 400, anything it does not recognize a 500. The wrapper made all of them
-# a 500, so a `read_timeout` expiring mid-body told the client the server had crashed. Nothing is
-# lost by unwrapping: HTTP's stream path turns the error into a status and never logs it, and every
-# handler error Nitro reports is caught and logged inside the middleware chain long before here.
+# a 500, so a `read_timeout` expiring mid-body told the client the server had crashed.
+#
+# Since HTTP.jl 2.11 (JuliaWeb/HTTP.jl#1425) that path also LOGS every error but the one it recorded
+# itself, and it logs the live exception with `request.target` — query string included. Nitro keeps
+# both out of its logs (#613; `access_log_query = false`), so nothing unreported reaches HTTP: the
+# request's task reports what it throws itself (`_handle_reporting`), and an interrupted `wait` is
+# marked here.
 function parallel_stream_handler(handle_stream::Function)
     function(stream::HTTP.Stream)
-        task = Threads.@spawn handle_stream(stream)
+        task = Threads.@spawn _handle_reporting(handle_stream, stream)
         try
             wait(task)
         catch err
             err isa TaskFailedException && throw(err.task.result)
+            # The `wait` itself was interrupted (Ctrl-C): not the request's failure, so not logged,
+            # but marked, or HTTP would log it with the target.
+            _mark_reported!(stream, err)
             rethrow()
         end
     end
+end
+
+# The request's task: `handle_stream`, and on failure Nitro's report of it, made inside the `catch`
+# so the record carries the failure's own `catch_backtrace()`. Marked whatever happens while it is
+# logged. Bare `catch`, interrupts included: an error thrown there — a logger that fails, `loggable`
+# rethrowing what `showerror` raised — would replace `err` and reach HTTP unmarked, target and all.
+function _handle_reporting(handle_stream::F, stream::HTTP.Stream) where {F}
+    try
+        handle_stream(stream)
+    catch err
+        try
+            _report_escaped!(stream, err)
+        catch
+        end
+        _mark_reported!(stream, err)
+        rethrow()
+    end
+end
+
+# `stream.io_error` is HTTP's record of the error its own socket read or write raised. HTTP's stream
+# loop neither logs that one nor answers it 500 unconditionally: it derives the status from the
+# exception's type, the behavior every error got through 2.9 and `parallel_stream_handler` relies on
+# (#316). Recording an error there — one Nitro has logged, or decided not to — tells HTTP the same
+# thing: reported, derive the status. It is the only signal HTTP reads, and it keys on identity
+# (`err === stream.io_error`). An internal field; canaried in test/http_internals_contract_tests.jl.
+#
+# So a reported error keeps 2.9's status, not 2.11's flat 500: a handler that throws an
+# `HTTP.ParseError` under `serve(catch_errors = false)` is still answered 400, as it was.
+_mark_reported!(stream::HTTP.Stream, err)::Nothing = (stream.io_error = err; nothing)
+
+# Log an error that left the request's task without being reported: one raised outside the
+# middleware chain's error boundary — a body producer failing on the chunked path, which no write
+# path logs; a layer the boundary does not wrap — or the handler's own when there is no boundary
+# (`serve(catch_errors = false)` or `serialize = false`). Logged once, as `loggable(err)` and
+# without the request target; `_handle_reporting` then marks it, so HTTP does not log it again.
+# Not logged: a peer's failure, already HTTP's `io_error`; a WebSocket close, which HTTP does not
+# log either; and an interrupt, which is not a failure of the request. Marking those changes
+# nothing HTTP sends: their status is the 500 or the type-derived one either way.
+#
+# Called from inside a `catch`, which is what makes `catch_backtrace()` the failure's.
+function _report_escaped!(stream::HTTP.Stream, err)::Nothing
+    (err === stream.io_error || err isa HTTP.WebSockets.WebSocketError ||
+     err isa InterruptException) && return nothing
+    @error("Request failed outside the error handler",
+           exception = (loggable(err), catch_backtrace()),
+           head_sent = (@atomic :acquire stream.head_committed))
+    return nothing
 end
 
 # ── The header deadline bounds the head, not the body (#316) ────────────────────────────────────

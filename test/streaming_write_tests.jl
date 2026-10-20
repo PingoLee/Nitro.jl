@@ -188,6 +188,13 @@ function streaming_app(release::Base.Event)
                  dst -> (calls[] += 1) == 1 ? (copyto!(dst, SMALL); length(SMALL)) :
                                               needs_int_chunk(LEAK_SENTINEL)
              end, () -> nothing))),
+        # The same failure on the chunked path, which declares no length: nothing in the write
+        # path logs it, so it reaches `parallel_stream_handler` unreported (HTTP.jl 2.11).
+        path("/chunked-leaky", (req::HTTP.Request) -> HTTP.Response(200,
+             HTTP.CallbackBody(let calls = Ref(0)
+                 dst -> (calls[] += 1) == 1 ? (copyto!(dst, SMALL); length(SMALL)) :
+                                              needs_int_chunk(LEAK_SENTINEL)
+             end, () -> nothing))),
         path("/file",   (req::HTTP.Request) -> Res.file(req, FILE_PATH; stream = true);
              methods = ["GET", "HEAD"]),
     ])
@@ -196,6 +203,22 @@ end
 
 "The `Warn` records `logger` has captured so far — read under its lock, since the server logs from its own tasks."
 warnings(logger) = lock(() -> filter(r -> r.level == Base.CoreLogging.Warn, copy(logger.logs)), logger.lock)
+
+"Every record `logger` has captured so far, at any level it keeps."
+records(logger) = lock(() -> copy(logger.logs), logger.lock)
+
+"""
+What a sink that `show`s a record would print: the message, the keywords, and the exception's
+`showerror`. HTTP.jl logs `(exception, backtrace)`; Nitro logs a `LoggedException`, alone or so.
+"""
+function rendered(r)
+    ex = get(r.kwargs, :exception, nothing)
+    ex isa Tuple && (ex = first(ex))
+    return string(r.message, sprint(show, r.kwargs), ex === nothing ? "" : sprint(showerror, ex))
+end
+
+# A query value a request carries; no log line may print it (#613, `access_log_query = false`).
+const QUERY_SENTINEL = "Q5ECRET-query"
 
 """
 Send one request on a fresh connection and return everything the server sends before it ends the
@@ -419,7 +442,7 @@ for cap in (nothing, 4)
             # application's own value, as a handler's would be (#613). The warning carries the
             # console's text instead, which names the argument's type only.
             lock(() -> empty!(logger.logs), logger.lock)
-            (; bytes, ended) = one_shot(port, "/leaky")
+            (; bytes, ended) = one_shot(port, "/leaky?token=$QUERY_SENTINEL")
             @test ended != "open"
             @test startswith(String(copy(bytes)), "HTTP/1.1 500")
             failed(r) = occursin("Streamed response body failed", string(r.message))
@@ -428,8 +451,37 @@ for cap in (nothing, 4)
             ex = first(record.kwargs[:exception])
             @test ex isa Nitro.Errors.LoggedException
             @test occursin("no method matching needs_int_chunk(::String)", sprint(showerror, ex))
-            rendered = string(record.message, sprint(show, record.kwargs), sprint(showerror, ex))
-            @test !occursin("S3NT1NEL", rendered)
+            # The ONLY record, at every level kept. HTTP.jl 2.11 logs a stream handler's error itself,
+            # with the live exception and the whole target (JuliaWeb/HTTP.jl#1425), so this one used
+            # to be followed by an HTTP `@error` that printed both sentinels. HTTP logs before it
+            # answers, so by the time the connection ended above its record would be here.
+            @test only(records(logger)) === record
+            @test !any(r -> occursin("S3NT1NEL", rendered(r)), records(logger))
+            @test !any(r -> occursin(QUERY_SENTINEL, rendered(r)), records(logger))
+        end
+
+        @testset "cap=$cap: a failure no write path reports is logged once, by Nitro (HTTP 2.11)" begin
+            # A chunked body that throws after its head: nothing in the write path logs it, so it
+            # leaves the request's task unreported. `_report_escaped!` logs it as a
+            # `LoggedException`, without the target, and marks it so HTTP does not log it again.
+            lock(() -> empty!(logger.logs), logger.lock)
+            (; bytes, ended) = one_shot(port, "/chunked-leaky?token=$QUERY_SENTINEL")
+            @test ended != "open"
+            text = String(copy(bytes))
+            @test startswith(text, "HTTP/1.1 200")
+            @test !endswith(text, "0\r\n\r\n")   # no last chunk: the client can tell it was cut
+            escaped(r) = r.message == "Request failed outside the error handler"
+            @test timedwait(() -> any(escaped, records(logger)), 10.0; pollint = 0.05) === :ok
+            record = only(records(logger))
+            @test escaped(record)
+            @test record.level == Base.CoreLogging.Error
+            @test record._module === Nitro.Core
+            @test record.kwargs[:head_sent] === true
+            ex = first(record.kwargs[:exception])
+            @test ex isa Nitro.Errors.LoggedException
+            @test occursin("no method matching needs_int_chunk(::String)", sprint(showerror, ex))
+            @test !occursin("S3NT1NEL", rendered(record))
+            @test !occursin(QUERY_SENTINEL, rendered(record))
         end
     finally
         notify(release)

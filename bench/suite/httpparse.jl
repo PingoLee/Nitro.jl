@@ -25,7 +25,7 @@
 # `_fill_conn_reader!` is never reached and the socket is never read. `unsafe_string` copies, so
 # reusing the buffer is safe.
 #
-# `HTTP._ConnReader(buf, next, stop, conn)` is internal and pinned to HTTP 2.9.0 (`~2.9` in
+# `HTTP._ConnReader(buf, next, stop, conn)` is internal and pinned to HTTP 2.11.0 (`~2.11` in
 # Project.toml); `read_request` and `canonical_header_key` are public. If the struct changes
 # shape, this file is what breaks, which is the intent.
 SUITE["httpparse"] = BenchmarkGroup()

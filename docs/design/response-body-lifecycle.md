@@ -91,7 +91,7 @@ onto the shared object, and would race other request threads. See §3 (P2, Guard
 
 The **object** is the part the body fix did not cover, and until #628 nothing did. HTTP.jl
 writes to the response it is handed in place: Nitro's own `stream_handler` sets `.request`,
-and HTTP 2.9 sets `.close` on a failed write, a write-deadline expiry or an undrained body,
+and HTTP (2.9 through 2.11) sets `.close` on a failed write, a write-deadline expiry or an undrained body,
 back-fills `.content_length`, and on its error path calls `setstatus` and `removeheader` on
 `.headers`. Handed a shared value as-is, every request it answered left the previous request
 (its `Authorization` and `Cookie` headers, and its body) reachable through `res.request`, and a

@@ -221,3 +221,47 @@ finally
 end
 
 end
+
+@testitem "Without the boundary, a handler's error is logged once, by Nitro (HTTP 2.11)" tags=[:core, :middleware, :network] setup=[NitroCommon] begin
+
+using Test
+using HTTP
+using Nitro
+const Logging = Base.CoreLogging
+
+# `serve(catch_errors = false)` hands a handler's exception to HTTP.jl. Since 2.11 HTTP's stream loop
+# logs it itself (JuliaWeb/HTTP.jl#1425): the live exception, so a `MethodError`'s arguments, and the
+# whole target, so the query string. `parallel_stream_handler` logs it first, as a
+# `LoggedException` without the target, and marks it reported, so HTTP only answers it.
+
+needs_int(::Int) = 0
+app = App(mod = @__MODULE__)
+urlpatterns(app, "", path("/boom", (req::HTTP.Request) -> needs_int("V4LSECRET")))
+
+logger = Test.TestLogger(min_level = Logging.Warn)
+port = get_free_port()
+Logging.with_logger(logger) do
+    serve(app; host = HOST, port = port, async = true, show_banner = false, access_log = nothing,
+          catch_errors = false)
+end
+records() = lock(() -> copy(logger.logs), logger.lock)
+# Whatever `serve` logged starting up (a `NITRO_ENV = prod` GC-target warning) is not this test's.
+lock(() -> empty!(logger.logs), logger.lock)
+try
+    r = HTTP.get("http://$HOST:$port/boom?token=Q5ECRET"; status_exception = false, retry = false)
+    @test r.status == 500
+    @test timedwait(() -> !isempty(records()), 10.0; pollint = 0.05) === :ok
+    record = only(records())
+    @test record.message == "Request failed outside the error handler"
+    @test record._module === Nitro.Core
+    ex = first(record.kwargs[:exception])
+    @test ex isa Nitro.Errors.LoggedException
+    @test occursin("no method matching", sprint(showerror, ex))
+    text = string(record.message, sprint(show, record.kwargs), sprint(showerror, ex))
+    @test !occursin("V4LSECRET", text)
+    @test !occursin("Q5ECRET", text)
+finally
+    terminate(app)
+end
+
+end
