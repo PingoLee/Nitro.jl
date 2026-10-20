@@ -1163,3 +1163,101 @@ end
     end
 end
 end
+
+@testitem "Body parsers -- media-type checks compare in place, with the old answers (#556)" tags=[:core, :security] setup=[NitroCommon] begin
+using Test
+using Random
+using Nitro.Core.Util.BodyParsers: is_json_media_type, is_form_media_type,
+    is_multipart_form_media_type, _media_type_is, _multipart_boundary
+
+# The implementation #556 replaced, kept verbatim as the oracle: these checks are the #327 gate
+# that decides whether a body may be read as JSON or a form at all, so the in-place compare must
+# answer exactly what the allocating one did, malformed bytes included.
+function old_media_type(content_type::AbstractString) :: String
+    bytes = codeunits(content_type)
+    stop = something(findfirst(==(UInt8(';')), bytes), length(bytes) + 1) - 1
+    first_ = findfirst(b -> b != UInt8(' ') && b != UInt8('\t'), view(bytes, 1:stop))
+    first_ === nothing && return ""
+    last_ = findlast(b -> b != UInt8(' ') && b != UInt8('\t'), view(bytes, 1:stop))
+    out = Vector{UInt8}(undef, last_ - first_ + 1)
+    for (k, b) in enumerate(view(bytes, first_:last_))
+        out[k] = UInt8('A') <= b <= UInt8('Z') ? b + 0x20 : b
+    end
+    return String(out)
+end
+old_is_json(ct) = (mt = old_media_type(ct);
+    mt == "application/json" || (startswith(mt, "application/") && endswith(mt, "+json")))
+old_is_form(ct) = (mt = old_media_type(ct); isempty(mt) || mt == "application/x-www-form-urlencoded")
+old_is_multipart(ct) = old_media_type(ct) == "multipart/form-data"
+
+const PADS = ("", " ", "\t", " \t ")
+const TYPES = ("application/json", "APPLICATION/JSON", "Application/Json", "application/problem+json",
+    "application/vnd.api+JSON", "application/+json", "application/json+", "application/jsonx",
+    "xapplication/json", "application/jso", "application/", "+json", "application/x+jsonx",
+    "application/x-www-form-urlencoded", "APPLICATION/X-WWW-FORM-URLENCODED",
+    "application/x-www-form-urlencodedx", "multipart/form-data", "Multipart/Form-Data",
+    "multipart/form-datax", "multipart/form data", "text/plain", "boundary", "BOUNDARY", "",
+    "application/json\x80", "\xffapplication/json", "applicati\xc3\xb3n/json", "application/\xff+json",
+    "application\tjson", "application /json", "\x00application/json")
+const PARAMS = ("", ";", ";;", "; charset=utf-8", " ; boundary=x", ";boundary=\"a b\"", "\xff")
+
+corpus = String[]
+for p1 in PADS, t in TYPES, p2 in PADS, q in PARAMS
+    push!(corpus, string(p1, t, p2, q))
+end
+# Byte soup around the literals: random mixes of their letters in both cases, separators and bytes
+# outside ASCII. Seeded so a red reproduces.
+rng = Random.Xoshiro(556)
+alphabet = collect(codeunits("applicationJSONjson/+-xwformurlencodedmultipartdataboundary; \t=\"")) ∪ UInt8[0x00, 0x7f, 0x80, 0xc3, 0xff]
+for _ in 1:20_000
+    push!(corpus, String(rand(rng, alphabet, rand(rng, 0:40))))
+end
+for lit in ("application/json", "multipart/form-data", "application/x-www-form-urlencoded")
+    for _ in 1:2_000   # one byte of a literal changed, or its case flipped
+        b = Vector{UInt8}(lit)
+        k = rand(rng, eachindex(b))
+        b[k] = rand(rng, Bool) ? rand(rng, alphabet) : (b[k] ⊻ 0x20)
+        push!(corpus, String(b))
+    end
+end
+
+@testset "every check answers as the old one did" begin
+    mismatches = String[]
+    # A header value arrives as a `SubString` as often as a `String`. Only a valid string can be
+    # cut at its own bounds, so the invalid ones are checked as `String`s alone.
+    wrapped(ct) = (w = string("x", ct, "y"); SubString(w, 2, prevind(w, ncodeunits(w))))
+    for ct in corpus, s in (isvalid(ct) ? (ct, wrapped(ct)) : (ct,))
+        is_json_media_type(s) == old_is_json(s) || push!(mismatches, "json: $(repr(ct))")
+        is_form_media_type(s) == old_is_form(s) || push!(mismatches, "form: $(repr(ct))")
+        is_multipart_form_media_type(s) == old_is_multipart(s) || push!(mismatches, "multipart: $(repr(ct))")
+        _media_type_is(s, "boundary") == (old_media_type(s) == "boundary") || push!(mismatches, "boundary: $(repr(ct))")
+    end
+    @test isempty(mismatches)
+    # The corpus reaches both answers of every check, so a constant could not pass it.
+    @test any(is_json_media_type, corpus) && !all(is_json_media_type, corpus)
+    @test any(ct -> is_form_media_type(ct) && occursin("urlencoded", ct), corpus)
+    @test !all(is_form_media_type, corpus)
+    @test any(is_multipart_form_media_type, corpus)
+end
+
+@testset "a check allocates nothing" begin
+    for ct in ("application/json; charset=utf-8", "application/problem+json", "Multipart/Form-Data; boundary=x",
+               "application/x-www-form-urlencoded", "text/plain", "")
+        @testset let ct = ct, json = allocs(() -> is_json_media_type(ct); calls = 1000),
+                     form = allocs(() -> is_form_media_type(ct); calls = 1000),
+                     multipart = allocs(() -> is_multipart_form_media_type(ct); calls = 1000)
+            @test json.count == 0 && form.count == 0 && multipart.count == 0
+        end
+    end
+    # Positive control: the probe sees what the old compare allocated.
+    @testset let old = allocs(() -> old_is_json("application/json; charset=utf-8"); calls = 1000)
+        @test old.count >= 1
+    end
+    # A non-multipart type is refused for free; a boundary read measured 3 (it was 9).
+    @testset let ok = allocs(() -> _multipart_boundary("multipart/form-data; boundary=x"); calls = 1000),
+                 none = allocs(() -> _multipart_boundary("application/json"); calls = 1000)
+        @test none.count == 0
+        @test ok.count <= 5
+    end
+end
+end

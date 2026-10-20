@@ -2156,3 +2156,94 @@ end
     @test r.status == 500
 end
 end
+
+@testitem "Files and MultipartForm share the request's one multipart parse (#539)" tags=[:core] setup=[NitroCommon] begin
+using Test
+using HTTP
+using Nitro
+using Nitro: App, Files, MultipartForm, FormFile
+
+const B539 = "----Boundary539"
+function upload(target; filebytes = 16)
+    io = IOBuffer()
+    write(io, "--$B539\r\nContent-Disposition: form-data; name=\"title\"\r\n\r\nhello\r\n")
+    for (name, fname) in (("a", "a.bin"), ("b", "b.bin"), ("c", "c1.bin"), ("c", "c2.bin"))
+        write(io, "--$B539\r\nContent-Disposition: form-data; name=\"$name\"; filename=\"$fname\"\r\n",
+              "Content-Type: application/octet-stream\r\n\r\n")
+        write(io, fill(UInt8(name[1]), filebytes))
+        write(io, "\r\n")
+    end
+    write(io, "--$B539--\r\n")
+    return HTTP.Request("POST", target, ["Content-Type" => "multipart/form-data; boundary=$B539"], take!(io))
+end
+
+struct Up539
+    title::String
+    c::Vector{FormFile}
+end
+struct Tags539
+    tags::Vector{String}
+end
+
+app = App(mod = @__MODULE__)
+urlpatterns(app, "",
+    path("/shared", function (req, a::Files{FormFile}, b::Files{FormFile}, u::MultipartForm{Up539})
+        files = getfiles(req)
+        # One parse: every reader holds the same bytes, not a copy of them.
+        same = a.payload.data === files["a"].data && b.payload.data === files["b"].data &&
+               u.payload.c[1].data === files["c"][1].data && u.payload.title == "hello"
+        # But the containers handed out are each reader's own: what the parameter was bound with
+        # is the upload's two files, and a `push!` into it reaches neither the parse nor `getfiles`.
+        bound = length(u.payload.c)
+        push!(u.payload.c, a.payload)
+        parsed = Nitro.Core.Types.multipartbody(req)["c"]
+        private = bound == 2 && length(parsed) == 2 && !any(f -> f === a.payload, files["c"])
+        return string(same, " ", private)
+    end; method = "POST"),
+    path("/two", (req, a::Files{FormFile}, b::Files{FormFile}) -> Res.status(204); method = "POST"),
+    # Positive control for the byte bound: one extractor plus a second, uncached parse.
+    path("/reparse", (req, a::Files{FormFile}) -> (multipart(req); Res.status(204)); method = "POST"),
+)
+
+@testset "every reader sees the one parse" begin
+    r = internalrequest(app, upload("/shared"))
+    @test (r.status, Nitro.text(r)) == (200, "true true")
+end
+
+@testset "a middleware's push! into getfiles does not reach a later parameter" begin
+    meddle = handler -> function (req)
+        files = getfiles(req)
+        push!(files["c"], FormFile("c", "extra.bin", "application/octet-stream", UInt8[0x01]))
+        return handler(req)
+    end
+    r = internalrequest(app, upload("/shared"); middleware = [meddle])
+    @test (r.status, Nitro.text(r)) == (200, "true true")
+end
+
+@testset "nor does one into getpost or payload" begin
+    tags_app = App(mod = @__MODULE__)
+    urlpatterns(tags_app, "",
+        path("/tags", (req, t::MultipartForm{Tags539}) -> join(t.payload.tags, ","); method = "POST"))
+    body = "--$B539\r\nContent-Disposition: form-data; name=\"tags\"\r\n\r\nt1\r\n" *
+           "--$B539\r\nContent-Disposition: form-data; name=\"tags\"\r\n\r\nt2\r\n--$B539--\r\n"
+    tagged() = HTTP.Request("POST", "/tags", ["Content-Type" => "multipart/form-data; boundary=$B539"], body)
+    via_post = handler -> (req -> (push!(getpost(req)["tags"], "x"); handler(req)))
+    via_payload = handler -> (req -> (push!(payload(req)["tags"], "y"); handler(req)))
+    for mw in (via_post, via_payload)
+        r = internalrequest(tags_app, tagged(); middleware = [mw])
+        @test (r.status, Nitro.text(r)) == (200, "t1,t2")
+    end
+end
+
+@testset "a second file parameter does not copy the upload again" begin
+    # 4 × 256 KiB of file parts. Before #539 two `Files` parameters cost about twice that.
+    body = length(upload("/two"; filebytes = 256 * 1024).body)
+    @testset let body = body,
+                 base = allocs(() -> upload("/two"; filebytes = 256 * 1024); runs = 3),
+                 two = allocs(() -> internalrequest(app, upload("/two"; filebytes = 256 * 1024)); runs = 3),
+                 reparse = allocs(() -> internalrequest(app, upload("/reparse"; filebytes = 256 * 1024)); runs = 3)
+        @test two.bytes - base.bytes < 1.5 * body
+        @test reparse.bytes - base.bytes > 1.5 * body
+    end
+end
+end

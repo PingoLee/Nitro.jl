@@ -215,3 +215,72 @@ const JSON_CT = ["Content-Type" => "application/json"]
 end
 
 end
+
+@testitem "payload(req) reads only the parser its Content-Type admits (#553)" tags=[:core] setup=[NitroCommon] begin
+using Test
+using HTTP
+using Nitro
+using Nitro: App
+
+# The merge `payload` did before #553, through the public accessors: every parser, in order. A
+# skipped parser must be one whose answer contributed nothing.
+oracle(req) = (m = Dict{String, Any}();
+    for src in (getquery(req), getjson(req), getform(req), getpost(req), getparams(req))
+        src isa AbstractDict && for (k, v) in src; m[string(k)] = v; end
+    end; m)
+
+const MP = "--b\r\nContent-Disposition: form-data; name=\"shared\"\r\n\r\nmultipart\r\n" *
+           "--b\r\nContent-Disposition: form-data; name=\"mp\"\r\n\r\nm\r\n--b--\r\n"
+const JSONBODY = "{\"shared\":\"json\",\"j\":1}"
+const FORMBODY = "shared=form&f=2"
+cases = Tuple{Union{Nothing, String}, String}[]
+for ct in ("application/json", "application/problem+json", "APPLICATION/JSON; charset=utf-8",
+           "application/x-www-form-urlencoded", "Application/X-WWW-Form-Urlencoded; charset=UTF-8",
+           "multipart/form-data; boundary=b", "Multipart/Form-Data; boundary=b", "multipart/form-data",
+           "text/plain", "application/xml", "", nothing),
+    body in (JSONBODY, FORMBODY, MP, "")
+    push!(cases, (ct, body))
+end
+mkreq(target, ct, body) = HTTP.Request("POST", target, isnothing(ct) ? [] : ["Content-Type" => ct], body)
+
+@testset "the merge is the old one for every body and type" begin
+    for (ct, body) in cases, target in ("/p/7", "/p/7?shared=query&q=1")
+        req = mkreq(target, ct, body)
+        got = payload(req)
+        @test got == oracle(req)
+    end
+    # Each source still reaches the merge under its own type (a constant answer could not pass).
+    @test payload(mkreq("/p", "application/json", JSONBODY))["j"] == 1
+    @test payload(mkreq("/p", "application/x-www-form-urlencoded", FORMBODY))["f"] == "2"
+    @test payload(mkreq("/p", nothing, FORMBODY))["f"] == "2"
+    @test payload(mkreq("/p", "multipart/form-data; boundary=b", MP))["mp"] == "m"
+end
+
+@testset "and through the router, path params included" begin
+    app = App(mod = @__MODULE__)
+    urlpatterns(app, "", path("/p/<str:id>", function (req, id::String)
+        got = payload(req)
+        return got == oracle(req) && got["id"] == id ? "same" : "differs: $(got) vs $(oracle(req))"
+    end; method = "POST"))
+    for (ct, body) in cases
+        r = internalrequest(app, mkreq("/p/7?shared=query&q=1", ct, body))
+        @test (r.status, Nitro.text(r)) == (200, "same")
+    end
+end
+
+@testset "a JSON POST no longer pays for the form and multipart parsers" begin
+    hdrs() = Pair{String, String}["Host" => "example.test", "Accept" => "application/json",
+        "Content-Length" => "7", "Content-Type" => "application/json"]
+    fresh() = HTTP.Request("POST", "/x", hdrs(), "{\"a\":1}")
+    # Every measurement builds the same fresh request, so differences of totals cancel it out.
+    @testset let json = allocs(() -> getjson(fresh()); calls = 200),
+                 merged = allocs(() -> payload(fresh()); calls = 200),
+                 # Positive control: the old merge, which ran the form and multipart parsers too.
+                 old = allocs(() -> oracle(fresh()); calls = 200)
+        # Beyond `getjson`, `payload` owns the query parse, the merged `Dict` and its cache slot:
+        # measured 9 on 1.13.2, where the old merge cost 20. Bound at the target, not the value.
+        @test merged.count - json.count <= 12
+        @test old.count - json.count > 12
+    end
+end
+end

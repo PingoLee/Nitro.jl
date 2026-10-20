@@ -1184,7 +1184,9 @@ function multipart_bind(field::String, ::Type{Vector{FormFile}}, parsed::Abstrac
     value = get(parsed, field, nothing)
     isnothing(value) && throw(ValidationError("Missing file field '$field'"))
     value isa FormFile && return FormFile[value]
-    value isa Vector{FormFile} && return value
+    # A copy: the parse is the request's shared cache (#539), so handing out its vector would let
+    # one handler's `push!` show up in `getfiles(req)` and in every other extractor.
+    value isa Vector{FormFile} && return copy(value)
     throw(ValidationError("Field '$field' is not a file upload"))
 end
 

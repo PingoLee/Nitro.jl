@@ -217,24 +217,48 @@ end
 
 ### Media types
 
-# The media type of a `Content-Type` value: everything before the first `;`, trimmed and
-# lowercased (RFC 9110 §8.3.1: type and subtype are case-insensitive; parameters follow `;`).
+# The media type of a `Content-Type` value is everything before the first `;`, trimmed of SP and
+# HTAB and compared case-insensitively (RFC 9110 §8.3.1: type and subtype are case-insensitive;
+# parameters follow `;`).
 #
-# Byte by byte, lowercasing ASCII only. A header value may carry obs-text (bytes >= 0x80) that is
-# not valid UTF-8, and `lowercase(::String)` throws `InvalidCharError` on such a string -- a 500
-# with a logged backtrace from every JSON accessor, for one malformed header. No valid media type
-# has a byte outside ASCII, so any such byte simply fails to match.
-function _media_type(content_type::AbstractString) :: String
-    bytes = codeunits(content_type)
+# Compared in place, byte by byte, folding ASCII only (#556): building the lowercased media type as
+# a `String` cost 3 allocations per check, and a body-bearing request runs several. A header value
+# may carry obs-text (bytes >= 0x80) that is not valid UTF-8, and `lowercase(::String)` throws
+# `InvalidCharError` on such a string -- a 500 with a logged backtrace from every JSON accessor, for
+# one malformed header. Every literal compared against is lowercase ASCII, so such a byte simply
+# fails to match.
+
+# The byte range of the media type within `bytes`: empty when the value names none.
+@inline function _media_type_span(bytes::AbstractVector{UInt8}) :: UnitRange{Int}
     stop = something(findfirst(==(UInt8(';')), bytes), length(bytes) + 1) - 1
-    first_ = findfirst(b -> b != UInt8(' ') && b != UInt8('\t'), view(bytes, 1:stop))
-    first_ === nothing && return ""
-    last_ = findlast(b -> b != UInt8(' ') && b != UInt8('\t'), view(bytes, 1:stop))
-    out = Vector{UInt8}(undef, last_ - first_ + 1)
-    for (k, b) in enumerate(view(bytes, first_:last_))
-        out[k] = UInt8('A') <= b <= UInt8('Z') ? b + 0x20 : b
+    first_ = 1
+    while first_ <= stop && (bytes[first_] == UInt8(' ') || bytes[first_] == UInt8('\t'))
+        first_ += 1
     end
-    return String(out)
+    last_ = stop
+    while last_ >= first_ && (bytes[last_] == UInt8(' ') || bytes[last_] == UInt8('\t'))
+        last_ -= 1
+    end
+    return first_:last_
+end
+
+# Whether `bytes[from:from+ncodeunits(lit)-1]` equals the lowercase ASCII `lit`, folding A-Z only.
+# Callers check that the range lies inside the media-type span first. Bounds stay checked anyway:
+# on a `SubString`'s code units an unchecked read past the span would read the parent string.
+@inline function _ascii_folds_to(bytes::AbstractVector{UInt8}, from::Int, lit::String) :: Bool
+    lb = codeunits(lit)
+    for k in eachindex(lb)
+        b = bytes[from + k - 1]
+        (UInt8('A') <= b <= UInt8('Z') ? b + 0x20 : b) == lb[k] || return false
+    end
+    return true
+end
+
+# Whether the media type of `content_type` is exactly `lit` (lowercase ASCII).
+function _media_type_is(content_type::AbstractString, lit::String) :: Bool
+    bytes = codeunits(content_type)
+    span = _media_type_span(bytes)
+    return length(span) == ncodeunits(lit) && _ascii_folds_to(bytes, first(span), lit)
 end
 
 """
@@ -245,8 +269,14 @@ Whether a `Content-Type` value names JSON: `application/json`, or any `applicati
 parameters such as `charset` ignored. An empty value -- no `Content-Type` -- is not JSON (#327).
 """
 function is_json_media_type(content_type::AbstractString) :: Bool
-    mt = _media_type(content_type)
-    return mt == "application/json" || (startswith(mt, "application/") && endswith(mt, "+json"))
+    bytes = codeunits(content_type)
+    span = _media_type_span(bytes)
+    n = length(span)
+    n == 16 && return _ascii_folds_to(bytes, first(span), "application/json")
+    # `application/*+json`. The prefix ends in `/` and the suffix starts with `+`, so the two can
+    # never overlap: a match is at least their 17 bytes long.
+    return n >= 17 && _ascii_folds_to(bytes, first(span), "application/") &&
+           _ascii_folds_to(bytes, last(span) - 4, "+json")
 end
 
 """
@@ -256,7 +286,7 @@ Whether a `Content-Type` value is `multipart/form-data`, compared case-insensiti
 `boundary` and other parameters ignored.
 """
 is_multipart_form_media_type(content_type::AbstractString) :: Bool =
-    _media_type(content_type) == "multipart/form-data"
+    _media_type_is(content_type, "multipart/form-data")
 
 """
     is_form_media_type(content_type) :: Bool
@@ -267,8 +297,10 @@ all (#345). The absent case keeps hand-built `HTTP.Request`s and untyped clients
 declared type other than a form -- `text/plain`, XML, HTML, JSON, multipart -- is not a form.
 """
 function is_form_media_type(content_type::AbstractString) :: Bool
-    mt = _media_type(content_type)
-    return isempty(mt) || mt == "application/x-www-form-urlencoded"
+    bytes = codeunits(content_type)
+    span = _media_type_span(bytes)
+    lit = "application/x-www-form-urlencoded"
+    return isempty(span) || (length(span) == ncodeunits(lit) && _ascii_folds_to(bytes, first(span), lit))
 end
 
 """
@@ -289,9 +321,9 @@ function _multipart_boundary(content_type::AbstractString) :: Union{String, Noth
         eq = findfirst('=', param)
         eq === nothing && continue
         name = SubString(param, firstindex(param), prevind(param, eq))
-        # `_media_type` trims and lowercases ASCII only, so a name that is not valid UTF-8 cannot
+        # `_media_type_is` trims and folds ASCII only, so a name that is not valid UTF-8 cannot
         # throw here; `name` holds no `;`, so it is the whole name.
-        _media_type(name) == "boundary" || continue
+        _media_type_is(name, "boundary") || continue
         value = strip(SubString(param, nextind(param, eq)))
         if startswith(value, '"')
             # An unterminated quote -- or one cut short by a `;`, which no boundary may contain
