@@ -40,21 +40,77 @@ rec(id) = get_task_info(store, id)
 # The children's logs, printed when a wait times out or a scenario's outcome is wrong. Each child
 # flushes every record and logs each heartbeat tick at `@debug` (#623), so the tail shows whether
 # its heartbeat ticked and how long each renewal took.
+#
+# The tail alone opens long after a run that went wrong early has gone (#666), so a dump first
+# prints, from the start of each log, every record naming the scenario's runs (`focus!`), and which
+# of their marker files exist: both are gone once the temp dir is.
 logs = String[]
+const FOCUS_IDS = String[]
+const FOCUS_TAGS = String[]
+function focus!(runs::Pair{String, String}...)
+    empty!(FOCUS_IDS); empty!(FOCUS_TAGS)
+    for (id, tag) in runs
+        push!(FOCUS_IDS, id); push!(FOCUS_TAGS, tag)
+    end
+end
+# A child's log as SimpleLogger records (`┌ …` to `└ …`), each other line a record of its own, so
+# a record's `task_id = …` line brings its message and its time along.
+function log_records(lines)
+    records = Vector{String}[]
+    inside = false
+    for line in lines
+        if inside
+            push!(records[end], line)
+            inside = !startswith(line, "└")
+        else
+            push!(records, [line])
+            inside = startswith(line, "┌")
+        end
+    end
+    return records
+end
 function dump_logs()
+    for tag in FOCUS_TAGS
+        names = sort!(filter(n -> startswith(n, "$tag."), readdir(outdir)))
+        println("── markers of $tag: ", isempty(names) ? "none" : join(names, ", "))
+        isfile(marker(tag, "reason")) && println("   $tag.reason = ", read(marker(tag, "reason"), String))
+    end
     for log in logs
         isfile(log) || continue
-        println("── $(basename(log)) (last 300 lines) ──")
-        foreach(println, last(readlines(log), 300))
+        lines = readlines(log)
+        # A child that died before writing leaves an empty log, which the parent already opened.
+        isempty(lines) && (println("── $(basename(log)) is empty ──"); continue)
+        if !isempty(FOCUS_IDS)
+            named = filter(r -> any(id -> any(l -> occursin(id, l), r), FOCUS_IDS), log_records(lines))
+            println("── $(basename(log)): every record naming $(join(FOCUS_IDS, ", ")) ($(length(named))) ──")
+            foreach(r -> foreach(println, r), named)
+        end
+        # From a hang-time stack dump on, whatever its length (`info_dump`), else the last 300.
+        info = findfirst(contains("Information request received"), lines)
+        from = min(something(info, length(lines)), max(length(lines) - 299, 1))
+        println("── $(basename(log)) (from line $from of $(length(lines))) ──")
+        foreach(println, @view lines[from:end])
     end
 end
 # After a scenario's `@test`s, which keep their own evaluated output: the logs when it went wrong.
 or_dump(ok::Bool) = ok || (dump_logs(); false)
-function waitfor(f, what; timeout = 120)
+function waitfor(f, what; timeout = 120, before_dump = () -> nothing)
     timedwait(f, timeout; pollint = 0.1) === :ok && return true
     @warn "timed out waiting for $what"
+    before_dump()
     dump_logs()
     return false
+end
+# A hung child's stacks, at the hang rather than at the signal that began it (#677): SIGUSR1 on
+# Linux, SIGINFO on macOS and the BSDs, makes Julia print every thread's backtrace and go on
+# running. Probed on 1.12.7 and 1.13.2 with an `atexit` hook hung after a SIGTERM: a second
+# SIGTERM ends the process with no dump, and SIGQUIT prints nothing.
+function info_dump(p, log)
+    process_running(p) || return nothing
+    before = filesize(log)
+    kill(p, Sys.isbsd() ? 29 : 10)
+    timedwait(() -> filesize(log) > before && occursin("Profile collected", read(log, String)), 15; pollint = 0.2)
+    return nothing
 end
 waitfile(path; kw...) = waitfor(() -> isfile(path), basename(path); kw...)
 waitstatus(id, status; kw...) = waitfor(() -> rec(id).status == status, "$id to be $status"; kw...)
@@ -94,6 +150,7 @@ try
     push!(children, (pA, ioA))
 
     @testset "a consumer process claims, runs and renews" begin
+        focus!(s1 => "s1", s2 => "s2")
         @test waitfile(joinpath(outdir, "A.ready"))
         @test waitfile(marker("s1", "started.1"))
         @test waitfile(marker("s2", "started.1"))
@@ -108,6 +165,7 @@ try
 
     @testset "a user cancel reaches the consumer's job as :user" begin
         s3 = submit("requeue", "s3")
+        focus!(s3 => "s3")
         @test waitfile(marker("s3", "started.1"))
         cancel_task(s3, owner; runtime)
         @test waitfile(marker("s3", "reason"); timeout = 30)
@@ -117,6 +175,7 @@ try
 
     @testset "a lease taken back reaches the job as :lease_lost, and the run happens again" begin
         s4 = submit("requeue", "s4")
+        focus!(s4 => "s4")
         @test waitfile(marker("s4", "started.1"))
         # Taken back from outside, under a fresh run of the same submission.
         @test release_claim!(store, s4, rec(s4).run_id; policy = LeasePolicy(:requeue))
@@ -134,6 +193,7 @@ try
     end
 
     @testset "a consumer killed mid-run: its leases expire, and each queue's policy decides" begin
+        focus!(s1 => "s1", s2 => "s2")
         kill(pA, Base.SIGKILL)
         wait(pA)
         @test rec(s1).status == RUNNING && rec(s2).status == RUNNING     # nothing knows yet
@@ -150,6 +210,7 @@ try
     push!(children, (pB, ioB))
 
     @testset "the next consumer runs the re-queued run" begin
+        focus!(s1 => "s1")
         @test waitstatus(s1, COMPLETED)
         @test isfile(marker("s1", "started.2"))
         @test rec(s1).result == "done-on-attempt-2"
@@ -160,9 +221,11 @@ try
     # leases expire (the scenario above).
     Sys.iswindows() || @testset "a SIGTERM drains the consumer, which hands its run back" begin
         s5 = submit("requeue", "s5")
+        focus!(s5 => "s5")
         @test waitfile(marker("s5", "started.1"))
         kill(pB, Base.SIGTERM)
-        @test waitfor(() -> !process_running(pB), "consumer B to exit"; timeout = 60)
+        @test waitfor(() -> !process_running(pB), "consumer B to exit"; timeout = 60,
+                      before_dump = () -> info_dump(pB, joinpath(dir, "B.log")))
         @test read(marker("s5", "reason"), String) == "shutdown"
         r5 = rec(s5)
         @test r5.status == PENDING
