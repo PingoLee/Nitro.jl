@@ -1944,3 +1944,29 @@ end
     @test name_in(set_cookie_line(SessionMiddleware(store = store(), cookie_name = "nitro_session"))) == "nitro_session"
 end
 end
+
+# #680: a cookie name is an RFC 9110 `token` (RFC 6265bis §4.1.1), and a token is ASCII. The
+# character check was built on Julia's Unicode-aware `isletter`, so a non-ASCII letter
+# went out in a `Set-Cookie` that browsers handle inconsistently instead of being refused.
+@testitem "Cookie names are ASCII tokens (#680)" tags=[:core, :security] setup=[NitroCommon] begin
+using Nitro
+using HTTP
+using Test
+const Cookies = Nitro.Cookies
+
+@testset "a non-ASCII name is an ArgumentError, like any other non-tchar" begin
+    # Fullwidth A; and an Arabic-Indic digit, which `isdigit` already refused -- kept out.
+    for name in ("café", "Ａ", "名前", "a٣")
+        @test_throws ArgumentError Cookies.format_cookie(name, "v")
+        @test_throws ArgumentError Cookies.set_cookie!(HTTP.Response(200), name, "v"; encrypted = false)
+    end
+end
+
+@testset "every ASCII tchar is still a legal name" begin
+    name = "aZ09!#\$%&'*+-.^_`|~"
+    @test startswith(Cookies.format_cookie(name, "v"), "$name=v")
+    res = HTTP.Response(200)
+    Cookies.set_cookie!(res, name, "v"; encrypted = false)
+    @test startswith(HTTP.header(res, "Set-Cookie"), "$name=v")
+end
+end

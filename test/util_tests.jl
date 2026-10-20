@@ -568,6 +568,28 @@ end
     for c in ("\xff"[1], "\xc0\x80"[1], "\xe2\x82"[1])
         @test !U._is_pchar(c)
     end
+end
+
+@testset "tchar is an ASCII byte table shared by Cookies and ExtractIP (#680)" begin
+    # RFC 9110 §5.6.2, spelled independently of `_TCHAR_PUNCT`: the oracle is the RFC's list.
+    U = Nitro.Core.Util
+    marks = "!#\$%&'*+-.^_`|~"
+    oracle(b::UInt8) = b < 0x80 && (Char(b) in 'A':'Z' || Char(b) in 'a':'z' ||
+                                    Char(b) in '0':'9' || Char(b) in marks)
+    for b in 0x00:0xff
+        @test U._is_tchar(b) == oracle(b)
+        b < 0x80 && @test U._is_tchar(Char(b)) == oracle(b)
+    end
+    @test count(U._is_tchar, 0x00:0xff) == 77       # 52 letters, 10 digits, 15 marks
+    # The #680 defect: `isletter` is Unicode-aware and true for every letter here. `'٣'` (an
+    # Arabic-Indic digit) never got through -- `isdigit` is ASCII-only -- and must stay out.
+    for c in ('Ａ', 'é', '٣', 'ß', '名')
+        @test !U._is_tchar(c)
+    end
+    # A `Forwarded` name is client bytes, so a malformed `Char` reaches it: refused, not thrown.
+    for c in ("\xff"[1], "\xc0\x80"[1], "\xe2\x82"[1])
+        @test !U._is_tchar(c)
+    end
 
     # `_is_canonical_path` is the per-request fast path; its contract is "the path is already what
     # `_canonical_path` would return". Checked exhaustively over every raw byte and every escape,

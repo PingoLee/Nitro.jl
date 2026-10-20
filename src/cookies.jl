@@ -6,6 +6,7 @@ using UUIDs
 using ..Types
 using ..Types: _normalize_domain, _store_call, _store_bool
 using ..Errors
+using ..Util: _is_tchar
 
 using ..Crypto: encrypt_payload, decrypt_payload, secure_uuid4, SecretString, _cookie_secret
 
@@ -104,11 +105,9 @@ function _validate_cookie_name(name::String) :: String
     isempty(name) && throw(ArgumentError("cookie name cannot be empty"))
     _has_ctl_chars(name) && throw(ArgumentError("cookie name contains control characters"))
 
+    # A cookie name is an RFC 9110 `token` (RFC 6265bis §4.1.1): ASCII only (#680).
     for ch in name
-        if isletter(ch) || isdigit(ch) || ch in ('!', '#', '\$', '%', '&', '\'', '*', '+', '-', '.', '^', '_', '`', '|', '~')
-            continue
-        end
-        throw(ArgumentError("cookie name contains invalid character: '$ch'"))
+        _is_tchar(ch) || throw(ArgumentError("cookie name contains invalid character: '$ch'"))
     end
 
     return name
