@@ -378,6 +378,12 @@ const MAX_JSON_DEPTH = 512
 @noinline _throw_json_too_deep() =
     throw(ArgumentError("JSON nesting exceeds the maximum depth of $MAX_JSON_DEPTH"))
 
+# What `pointer` reaches as one contiguous run of bytes, which `_check_json_depth` scans 32 at a
+# time. Every caller's input is one of these: a request body is a `Vector{UInt8}`, and the query,
+# path, cookie and stored-row inputs are a `String` or `SubString{String}`.
+const _ContiguousBytes = Union{Vector{UInt8}, Base.CodeUnits{UInt8, String},
+                               Base.CodeUnits{UInt8, SubString{String}}}
+
 """
     _check_json_depth(bytes) -> nothing
 
@@ -401,13 +407,31 @@ With `max_keys > 0` the same pass also counts object keys -- every `:` outside a
 JSON separates a key from its value and appears nowhere else -- and throws a `ValidationError`
 past `max_keys` (#327). A key cap is not "malformed JSON" but a refused request, so it is a 400
 everywhere rather than the "not JSON" answer the depth bound gives.
+
+Bytes in contiguous memory -- a `Vector{UInt8}` body, or a `String`'s code units -- are scanned
+32 at a time (#683); see `_json_scan_blocks`. The answer is the byte loop's, block by block, and
+`test/bodyparser_tests.jl` pins the two against each other.
 """
 function _check_json_depth(bytes::AbstractVector{UInt8}, max_keys::Int = 0)
-    depth = 0
-    keys = 0
-    instring = false
-    escaped = false
-    for b in bytes
+    _json_scan_bytes(bytes, firstindex(bytes), lastindex(bytes), 0, 0, false, false, max_keys)
+    return nothing
+end
+
+function _check_json_depth(bytes::_ContiguousBytes, max_keys::Int = 0)
+    _json_scan_blocks(bytes, max_keys)
+    return nothing
+end
+
+_check_json_depth(s::AbstractString, max_keys::Int = 0) = _check_json_depth(codeunits(s), max_keys)
+
+# The scan's reference definition: one byte at a time over `bytes[lo:hi]`, from the state a
+# previous stretch left, returning the state it leaves. It is the whole scan for any other
+# `AbstractVector{UInt8}`, and the exact path for every block `_json_scan_blocks` cannot settle
+# in bulk.
+@inline function _json_scan_bytes(bytes::AbstractVector{UInt8}, lo::Int, hi::Int, depth::Int,
+                                  keys::Int, instring::Bool, escaped::Bool, max_keys::Int)
+    @inbounds for i in lo:hi
+        b = bytes[i]
         if instring
             if escaped
                 escaped = false
@@ -428,10 +452,100 @@ function _check_json_depth(bytes::AbstractVector{UInt8}, max_keys::Int = 0)
             keys > max_keys && _throw_too_many_fields("The JSON document", max_keys)
         end
     end
-    return nothing
+    return depth, keys, instring, escaped
 end
 
-_check_json_depth(s::AbstractString, max_keys::Int = 0) = _check_json_depth(codeunits(s), max_keys)
+const _Bytes32 = NTuple{32, VecElement{UInt8}}
+
+# Bit `k` set where byte `k` of `v` equals `c`: one vector compare and a movemask. Little-endian
+# (every Julia target), so bit 0 is the block's first byte.
+@inline function _eqmask32(v::_Bytes32, c::UInt8)
+    return Base.llvmcall(("""
+        define i32 @entry(<32 x i8> %v, i8 %c) #0 {
+          %h = insertelement <32 x i8> poison, i8 %c, i32 0
+          %s = shufflevector <32 x i8> %h, <32 x i8> poison, <32 x i32> zeroinitializer
+          %m = icmp eq <32 x i8> %v, %s
+          %r = bitcast <32 x i1> %m to i32
+          ret i32 %r
+        }
+        attributes #0 = { alwaysinline }""", "entry"), UInt32, Tuple{_Bytes32, UInt8}, v, c)
+end
+
+# `v` with every byte OR-ed with `c`: with 0x20, `[`/`{` both read `{` and `]`/`}` both read `}`,
+# and no other byte reads either.
+@inline function _ormask32(v::_Bytes32, c::UInt8)
+    return Base.llvmcall(("""
+        define <32 x i8> @entry(<32 x i8> %v, i8 %c) #0 {
+          %h = insertelement <32 x i8> poison, i8 %c, i32 0
+          %s = shufflevector <32 x i8> %h, <32 x i8> poison, <32 x i32> zeroinitializer
+          %r = or <32 x i8> %v, %s
+          ret <32 x i8> %r
+        }
+        attributes #0 = { alwaysinline }""", "entry"), _Bytes32, Tuple{_Bytes32, UInt8}, v, c)
+end
+
+# Inclusive prefix XOR: bit `k` is the parity of the set bits at or below `k`.
+@inline function _prefix_xor32(x::UInt32)
+    x ⊻= x << 1
+    x ⊻= x << 2
+    x ⊻= x << 4
+    x ⊻= x << 8
+    x ⊻= x << 16
+    return x
+end
+
+# The scan, 32 bytes at a time (#683). The byte loop costs about 1 ns a byte, mostly in branches
+# that depend on the data; #540 measured it at 18% of an untyped `JSON.parse`.
+#
+# A block with no `\` and no escape carried into it is settled in bulk. With no escapes, every `"`
+# toggles the string state, so the prefix XOR of the quote mask, flipped when the block starts
+# inside a string, marks the bytes inside strings. Masking those out leaves the openers `o`, the
+# closers `c` and the colons outside strings. Taken in any order, from a depth `d >= c` the count
+# never reaches zero, so the clamp at zero never fires, and from `d + o <= MAX_JSON_DEPTH` it never
+# passes the bound. Keys only grow. So when both hold and the key count stays within its cap, the
+# byte loop would end the block at `d + o - c` without throwing, and that is the answer.
+#
+# Any other block -- one holding a `\`, one entered mid-escape, one where the count could touch
+# zero or either bound -- runs the byte loop. That keeps the exact answer, including which bound a
+# block crossing both throws for first. The tail under 32 bytes runs the byte loop too.
+#
+# The 32 bytes are read with `unsafe_load`, which asks for no alignment (Base passes 1), under
+# `GC.@preserve`. Only whole blocks inside `firstindex:lastindex` are loaded.
+function _json_scan_blocks(bytes::_ContiguousBytes, max_keys::Int)
+    depth = 0
+    keys = 0
+    instring = false
+    escaped = false
+    key_cap = max_keys > 0 ? max_keys : typemax(Int)
+    i = firstindex(bytes)
+    n = lastindex(bytes)
+    GC.@preserve bytes begin
+        p = Ptr{_Bytes32}(pointer(bytes))
+        while i + 31 <= n
+            v = unsafe_load(p + (i - 1))
+            if !escaped && _eqmask32(v, UInt8('\\')) == 0
+                quoted = _prefix_xor32(_eqmask32(v, UInt8('"'))) ⊻ (instring ? typemax(UInt32) : UInt32(0))
+                outside = ~quoted
+                folded = _ormask32(v, 0x20)
+                o = count_ones(_eqmask32(folded, UInt8('{')) & outside)
+                c = count_ones(_eqmask32(folded, UInt8('}')) & outside)
+                k = max_keys > 0 ? keys + count_ones(_eqmask32(v, UInt8(':')) & outside) : keys
+                if depth >= c && depth + o <= MAX_JSON_DEPTH && k <= key_cap
+                    depth += o - c
+                    keys = k
+                    instring = (quoted >> 31) != 0
+                    i += 32
+                    continue
+                end
+            end
+            depth, keys, instring, escaped =
+                _json_scan_bytes(bytes, i, i + 31, depth, keys, instring, escaped, max_keys)
+            i += 32
+        end
+    end
+    _json_scan_bytes(bytes, i, n, depth, keys, instring, escaped, max_keys)
+    return nothing
+end
 
 # The values `JSON.json` writes without recursing, tested in the order its writer (`JSON.json!`)
 # tests them, ahead of the container test. `Bool <: Number`. A `JSONText` is written verbatim, so
