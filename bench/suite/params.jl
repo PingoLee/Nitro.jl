@@ -7,6 +7,8 @@ SUITE["params"] = BenchmarkGroup()
 
 SUITE["params"]["parseparam_int"] = @benchmarkable Nitro.Core.Util.parseparam(Int, "42")
 SUITE["params"]["parseparam_union"] = @benchmarkable Nitro.Core.Util.parseparam(Union{Int,String}, "42")
+# A float went through a runtime `invoke` lookup: 5.4 µs and 19 allocations against `Int`'s ≈100 ns (#631).
+SUITE["params"]["parseparam_float"] = @benchmarkable Nitro.Core.Util.parseparam(Float64, "1.5")
 
 SUITE["params"]["full_pipeline_int_param"] = @benchmarkable run_bench_request(req) setup=(
     req = bench_request("GET", "/bench/items/42")) evals=1
