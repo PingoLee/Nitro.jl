@@ -25,10 +25,31 @@
 #       decides to sleep while a slot is full: the C runtime re-checks it after publishing
 #       `sleeping` (scheduler.c's `jl_task_get_next`), and `enq_work` wakes a thread after every
 #       insert. A slot is a 128-byte struct whose task field is only ever swapped atomically.
+#   E<K>  stock's order with a bounded wait: 16 heaps, random insert and the two-choice pop exactly
+#       as stock, but every K-th successful pop a thread makes is a *periodic* pop that takes the
+#       OLDEST queued task of the two heaps it sampled (the one whose oldest entry is older), where
+#       a normal pop takes the newest. Go's `findRunnable` takes from the global run queue every 61
+#       ticks "to ensure fairness" (runtime/proc.go), tokio's `global_queue_interval` is the same
+#       budget; E61 is K = 61, E-inf has no periodic pop and is the structure-cost control.
+#       Each heap keeps both orders over the same entries without a heap at all: one ring deque per
+#       priority, in a bucket vector sorted by priority (one bucket in practice; nothing in Base
+#       sets a task priority). A normal pop is the min-priority bucket's back, a periodic pop its
+#       front, an insert a push at the back with an rdtsc stamp: all O(1), no stale entries, no
+#       `taken` flags, no compaction. (A newest-first heap and an oldest-first heap over shared
+#       entries with lazy deletion was the first design; under a LIFO steady state every normally
+#       popped task stays in the oldest-first heap as a stale entry younger than the live old ones,
+#       so that heap grows without bound and retains garbage until a compaction pass. The deque
+#       has no such cost, which is what the E-inf control is there to show.) Stock's order among
+#       equal priorities is "the root, then newest first"; E's normal pop is newest first exactly.
+#       The stamp orders the oldest entries of two heaps against each other; it is the TSC, which
+#       Linux chose as the clocksource on this box (constant, nonstop), so it is comparable across
+#       cores. `multiq_check_empty` reads each heap's live count. `yield()`, pinned tasks and
+#       `:interactive` inserts go the stock way. The per-thread pop counter lives in a padded
+#       128-byte struct; the K-th successful pop resets it.
 #
 # A0 and B are taken from the build's own `base/partr.jl` as parsed at load time, so they cannot
-# drift from it. C is a hand copy, so it refuses to load on a build whose `partr.jl` it was not
-# copied from (`PARTR_CRC`).
+# drift from it. C and E are hand copies, so they refuse to load on a build whose `partr.jl` they
+# were not copied from (`PARTR_CRC`).
 #
 # World age: the C runtime calls `trypoptask` and `checktaskempty` in the world of the task that
 # is waiting. An idle thread waits in a task made before the redefinition, so in the old world: its
@@ -40,18 +61,26 @@
 #
 # VALIDATE=1 compiles a per-thread call counter into the new code, and under C and D an assert,
 # under the heap's lock, that every pop takes the (priority, sequence) minimum of its heap; under D
-# also per-thread counts of slot pops, steals, budget flushes, displaced and bounced tasks. All are
-# spliced in only then: the timed code is the build's plus the variant's change and nothing else.
-# `multiq_watchdog` arms an `alarm()` for a validated run: a lost wakeup leaves every thread
-# asleep, so the process is killed (exit status 142) instead of hanging.
+# also per-thread counts of slot pops, steals, budget flushes, displaced and bounced tasks; under E
+# a shadow vector per bucket that every pop is checked against (the back is the newest entry, the
+# front the oldest), per-thread counts of pops and periodic pops (periodic == pops ÷ K exactly, by
+# construction), and two probes of `multiq_check_empty`. All are spliced in only then: the timed
+# code is the build's plus the variant's change and nothing else. `multiq_watchdog` arms an
+# `alarm()` for a validated run: a lost wakeup leaves every thread asleep, so the process is killed
+# (exit status 142) instead of hanging.
 
 const MULTIQ_VARIANT = get(ENV, "VARIANT", "A")
 const _D_MATCH = match(r"^D([0-9]+|-inf)$", MULTIQ_VARIANT)
-MULTIQ_VARIANT in ("A", "A0", "B", "C") || _D_MATCH !== nothing ||
-    error("VARIANT must be A, A0, B, C, D<K> or D-inf, not $(MULTIQ_VARIANT)")
+const _E_MATCH = match(r"^E([0-9]+|-inf)$", MULTIQ_VARIANT)
+MULTIQ_VARIANT in ("A", "A0", "B", "C") || _D_MATCH !== nothing || _E_MATCH !== nothing ||
+    error("VARIANT must be A, A0, B, C, D<K>, D-inf, E<K> or E-inf, not $(MULTIQ_VARIANT)")
 # D's slot budget, or nothing for every other variant.
 const SLOT_BUDGET = _D_MATCH === nothing ? nothing :
                     _D_MATCH[1] == "-inf" ? typemax(Int) : parse(Int, _D_MATCH[1])
+# E's pop budget (every K-th successful pop is periodic), or nothing for every other variant.
+const PERIODIC_K = _E_MATCH === nothing ? nothing :
+                   _E_MATCH[1] == "-inf" ? typemax(Int) : parse(Int, _E_MATCH[1])
+PERIODIC_K === nothing || PERIODIC_K >= 2 || error("E's K must be at least 2")
 # C's heaps: C, and D behind its slots.
 const MULTIQ_SEQ_HEAPS = MULTIQ_VARIANT == "C" || SLOT_BUDGET !== nothing
 const MULTIQ_VALIDATE = get(ENV, "VALIDATE", "0") == "1"
@@ -102,6 +131,25 @@ function _count_calls!(block::Expr)
     return block
 end
 
+# Where the builds differ: 1.13 added the `nt == 0` guard to `multiq_size` and the wake-up of a
+# sticky task's owner to `multiq_deletemin`; the nightly also restructured the retry loop and
+# renamed `_unsetindex!`. Shared by C (and D over it) and E.
+const _NT_GUARD = VERSION >= v"1.13-" ? :(if nt == 0; nt = UInt32(1); end) : nothing
+const _UNSET = VERSION >= v"1.14-" ? :(Base.unsetindex!) : :(Base._unsetindex!)
+const _WAKE_OWNER = quote
+    # This task is sticky to a different thread, so we can't run it.
+    # Wake that thread so it can come pick up its own work, then keep
+    # looking for something we are allowed to run.
+    task_tid = ccall(:jl_get_task_tid, Int16, (Any,), task)
+    unlock(heap.lock)
+    if task_tid != Int16(-1)
+        ccall(:jl_wakeup_thread, Cint, (Int16,), task_tid)
+    end
+end
+_check_partr_crc() = get(PARTR_CRC, VERSION, nothing) == Base._crc32c(read(PARTR_FILE)) ||
+    error("VARIANT=$(MULTIQ_VARIANT) was copied from the partr.jl of $(join(keys(PARTR_CRC), ", ")); ",
+          "this build's ($VERSION) differs")
+
 if MULTIQ_VARIANT == "A0"
     Core.eval(Base.Partr, _count_calls!(_partr_function(:multiq_sift_down)))
 elseif MULTIQ_VARIANT == "B"
@@ -111,12 +159,7 @@ elseif MULTIQ_VARIANT == "B"
         Core.eval(Base.Partr, _count_calls!(f))
     end
 elseif MULTIQ_SEQ_HEAPS
-    get(PARTR_CRC, VERSION, nothing) == Base._crc32c(read(PARTR_FILE)) ||
-        error("VARIANT=$(MULTIQ_VARIANT) uses C, which was copied from the partr.jl of $(join(keys(PARTR_CRC), ", ")); ",
-              "this build's ($VERSION) differs")
-    # Where the builds differ: 1.13 added the `nt == 0` guard to `multiq_size` and the wake-up of a
-    # sticky task's owner to `multiq_deletemin`; the nightly also restructured the retry loop.
-    const _NT_GUARD = VERSION >= v"1.13-" ? :(if nt == 0; nt = UInt32(1); end) : nothing
+    _check_partr_crc()
     # Under D, C's three entry points keep their code under other names, and D's wrap them.
     const _C_INSERT = SLOT_BUDGET === nothing ? :multiq_insert : :seq_multiq_insert
     const _C_DELETEMIN = SLOT_BUDGET === nothing ? :multiq_deletemin : :seq_multiq_deletemin
@@ -320,16 +363,6 @@ elseif MULTIQ_SEQ_HEAPS
 
         @assert @isdefined(rn1) "Assertion to tell the compiler about the definedness of this variable"
     end
-    const _WAKE_OWNER = quote
-        # This task is sticky to a different thread, so we can't run it.
-        # Wake that thread so it can come pick up its own work, then keep
-        # looking for something we are allowed to run.
-        task_tid = ccall(:jl_get_task_tid, Int16, (Any,), task)
-        unlock(heap.lock)
-        if task_tid != Int16(-1)
-            ccall(:jl_wakeup_thread, Cint, (Int16,), task_tid)
-        end
-    end
     if VERSION >= v"1.14-"
         @eval Base.Partr function $_C_DELETEMIN()
             local rn1::UInt32
@@ -488,6 +521,394 @@ if SLOT_BUDGET !== nothing
     end
 end
 
+if PERIODIC_K !== nothing
+    _check_partr_crc()
+    _ecount(field) = MULTIQ_VALIDATE ? :(s.$field += 1) : nothing
+    # VALIDATE only: the two negative controls for the `multiq_check_empty` probes. `lengths` reads
+    # a ring's capacity instead of the live count (never empty: a thread would never sleep);
+    # `firstbucket` reads only the first bucket (empty while a task of another priority waits: a
+    # lost wake-up).
+    const _E_NEGATIVE = MULTIQ_VALIDATE ? get(ENV, "E_NEGATIVE", "") : ""
+    _E_NEGATIVE in ("", "lengths", "firstbucket") || error("E_NEGATIVE must be lengths or firstbucket")
+    const _E_EMPTY = _E_NEGATIVE == "lengths" ? :(length(hs[i].buckets[1].tasks) == 0) :
+                     _E_NEGATIVE == "firstbucket" ? :(hs[i].buckets[1].n == 0) :
+                     :((@atomic :monotonic hs[i].ntasks) == 0)
+    @eval Base.Partr begin
+        # E: one ring deque per priority. `head` is the ring index of the oldest entry; the ring's
+        # capacity is a power of two, so the k-th oldest is at `e_idx(b, k)`. `shadow` is the same
+        # entries in insertion order, VALIDATE only (empty otherwise).
+        mutable struct ebucket
+            const priority::UInt16
+            tasks::Vector{Task}
+            stamps::Vector{UInt64}
+            head::Int
+            n::Int
+            const shadow::Vector{Task}
+            ebucket(priority::UInt16) = new(priority, Vector{Task}(undef, 256), Vector{UInt64}(undef, 256), 1, 0, Task[])
+        end
+
+        mutable struct eheap
+            const lock::SpinLock
+            const buckets::Vector{ebucket}   # sorted by priority; read and written under `lock`
+            @atomic ntasks::Int32            # live entries over all buckets
+            @atomic priority::UInt16         # the lowest priority with a live entry, typemax if none
+            @atomic oldest::UInt64           # that bucket's oldest stamp, typemax if none
+            eheap() = new(SpinLock(), [ebucket(zero(UInt16))], zero(Int32), typemax(UInt16), typemax(UInt64))
+        end
+
+        const e_heaps = [Vector{eheap}(undef, 0), Vector{eheap}(undef, 0)]
+        const e_heaps_lock = [SpinLock(), SpinLock()]
+        const e_budget = $PERIODIC_K
+
+        # One per thread, 128 bytes: the pop counter, then VALIDATE-only counts and the pool and
+        # heap of this thread's last insert (for the probe).
+        mutable struct epopstate
+            count::Int      # successful pops since the last periodic one
+            pops::Int       # successful pops, periodic ones included
+            periodic::Int   # periodic pops
+            older::Int      # periodic pops that went to the second sampled heap, whose oldest was older
+            last_tp::Int
+            last_heap::Int
+            retries::Int    # sticky retries since the last successful pop
+            fallbacks::Int  # pops that took this thread's own task at the other end, the asked-for end being pinned
+            pad::NTuple{8,Int}
+            epopstate() = new(0, 0, 0, 0, 0, 0, 0, 0, ntuple(_ -> 0, 8))
+        end
+        const e_states = [epopstate() for _ in 1:Threads.maxthreadid()]
+
+        # The insertion stamp: rdtsc. Comparable across cores where the TSC is invariant, which is
+        # the case where Linux uses it as the clocksource (checked at load, below).
+        @inline e_stamp() = Base.llvmcall(("""
+            declare i64 @llvm.readcyclecounter()
+            define i64 @e_stamp() #0 {
+              %t = call i64 @llvm.readcyclecounter()
+              ret i64 %t
+            }
+            attributes #0 = { alwaysinline }
+            """, "e_stamp"), UInt64, Tuple{})
+
+        @inline e_idx(b::ebucket, k::Int) = ((b.head - 1 + k - 1) & (length(b.tasks) - 1)) + 1
+
+        # VALIDATE only: an assert that fires inside the scheduler must not throw there (an
+        # exception in a thread's scheduler task kills that task and the process hangs), so it
+        # prints without buffering and aborts (exit status 134).
+        @noinline function e_fail(msg::String)
+            ccall(:jl_safe_printf, Cvoid, (Cstring, Cstring), "%s\n", msg)
+            ccall(:abort, Cvoid, ())
+        end
+
+        # The bucket for `priority`, made if absent; the vector stays sorted.
+        function e_bucket!(heap::eheap, priority::UInt16)
+            bs = heap.buckets
+            for i in 1:length(bs)
+                p = bs[i].priority
+                p == priority && return bs[i]
+                if p > priority
+                    b = ebucket(priority)
+                    insert!(bs, i, b)
+                    return b
+                end
+            end
+            b = ebucket(priority)
+            push!(bs, b)
+            return b
+        end
+
+        # The index of the lowest-priority bucket with a live entry, 0 if none.
+        @inline function e_min_index(heap::eheap)
+            bs = heap.buckets
+            for i in 1:length(bs)
+                bs[i].n > 0 && return i
+            end
+            return 0
+        end
+
+        function e_grow!(b::ebucket)
+            cap = length(b.tasks)
+            tasks = Vector{Task}(undef, 2 * cap)
+            stamps = Vector{UInt64}(undef, 2 * cap)
+            for k in 1:b.n
+                i = e_idx(b, k)
+                tasks[k] = b.tasks[i]
+                stamps[k] = b.stamps[i]
+            end
+            b.tasks = tasks
+            b.stamps = stamps
+            b.head = 1
+            return nothing
+        end
+
+        @inline function e_push_back!(b::ebucket, task::Task, stamp::UInt64)
+            b.n == length(b.tasks) && e_grow!(b)
+            b.n += 1
+            i = e_idx(b, b.n)
+            b.tasks[i] = task
+            b.stamps[i] = stamp
+            $(MULTIQ_VALIDATE ? :(push!(b.shadow, task)) : nothing)
+            return nothing
+        end
+
+        @inline e_back(b::ebucket) = b.tasks[e_idx(b, b.n)]
+        @inline e_front(b::ebucket) = b.tasks[b.head]
+
+        @inline function e_remove_back!(b::ebucket)
+            i = e_idx(b, b.n)
+            $(MULTIQ_VALIDATE ? :(pop!(b.shadow) === b.tasks[i] || e_fail("E: the back of the ring is not the newest entry")) : nothing)
+            $_UNSET(b.tasks, i)
+            b.n -= 1
+            return nothing
+        end
+
+        @inline function e_remove_front!(b::ebucket)
+            i = b.head
+            $(MULTIQ_VALIDATE ? :(popfirst!(b.shadow) === b.tasks[i] || e_fail("E: the front of the ring is not the oldest entry")) : nothing)
+            $_UNSET(b.tasks, i)
+            b.head = (i & (length(b.tasks) - 1)) + 1
+            b.n -= 1
+            return nothing
+        end
+
+        # After a change, under the lock: publish the live count, the lowest live priority and
+        # that bucket's oldest stamp (what the two-choice pop and the periodic choice read).
+        @inline function e_publish!(heap::eheap, ntasks::Int32)
+            @atomic :monotonic heap.ntasks = ntasks
+            bi = e_min_index(heap)
+            if bi == 0
+                @atomic :monotonic heap.priority = typemax(UInt16)
+                @atomic :monotonic heap.oldest = typemax(UInt64)
+            else
+                b = heap.buckets[bi]
+                @atomic :monotonic heap.priority = b.priority
+                @atomic :monotonic heap.oldest = b.stamps[b.head]
+            end
+            return nothing
+        end
+
+        # The build's `multiq_size`, over E's heaps.
+        function e_multiq_size(tpid::Int8)
+            nt = UInt32(Threads._nthreads_in_pool(tpid))
+            $_NT_GUARD
+            tp = tpid + 1
+            tpheaps = e_heaps[tp]
+            heap_c = UInt32(2)
+            heap_p = UInt32(length(tpheaps))
+
+            if heap_c * nt <= heap_p
+                return heap_p
+            end
+
+            @lock e_heaps_lock[tp] begin
+                tpheaps = e_heaps[tp]
+                heap_p = UInt32(length(tpheaps))
+                nt = UInt32(Threads._nthreads_in_pool(tpid))
+                $_NT_GUARD
+                if heap_c * nt <= heap_p
+                    return heap_p
+                end
+
+                heap_p += heap_c * nt
+                newheaps = Vector{eheap}(undef, heap_p)
+                copyto!(newheaps, tpheaps)
+                for i = (1 + length(tpheaps)):heap_p
+                    newheaps[i] = eheap()
+                end
+                e_heaps[tp] = newheaps
+            end
+
+            return heap_p
+        end
+
+        # The build's `multiq_insert`, with a push at the back of the priority's deque where the
+        # build sifts up.
+        function multiq_insert(task::Task, priority::UInt16)
+            tpid = ccall(:jl_get_task_threadpoolid, Int8, (Any,), task)
+            @assert tpid > -1 "invalid tpid"
+            heap_p = e_multiq_size(tpid)
+            tp = tpid + 1
+
+            task.priority = priority
+
+            rn = cong(heap_p)
+            tpheaps = e_heaps[tp]
+            while !trylock(tpheaps[rn].lock)
+                rn = cong(heap_p)
+            end
+
+            heap = tpheaps[rn]
+            b = e_bucket!(heap, priority)
+            e_push_back!(b, task, e_stamp())
+            e_publish!(heap, heap.ntasks + Int32(1))
+            $(MULTIQ_VALIDATE ? :(let s = e_states[Threads.threadid()]; s.last_tp = Int(tp); s.last_heap = Int(rn); end) : nothing)
+            unlock(heap.lock)
+
+            return true
+        end
+
+        # The build's `multiq_check_empty`, reading the live counts.
+        function multiq_check_empty()
+            tid = Threads.threadid()
+            tp = ccall(:jl_threadpoolid, Int8, (Int16,), tid-1) + 1
+            if tp == 0 # Foreign thread
+                return true
+            end
+            hs = e_heaps[tp]
+            for i = UInt32(1):length(hs)
+                $_E_EMPTY || return false
+            end
+            return true
+        end
+    end
+
+    # `multiq_deletemin`, per build: the build's two-choice loop, then the deque's back or front.
+    # `periodic` is fixed before the loop from this thread's counter, so a sticky retry keeps it.
+    const _E_CHOOSE = quote
+        heap_p = UInt32(length(tpheaps))
+        for i = UInt32(0):heap_p
+            if i == heap_p
+                return nothing
+            end
+            rn1 = cong(heap_p)
+            rn2 = cong(heap_p)
+            prio1 = tpheaps[rn1].priority
+            prio2 = tpheaps[rn2].priority
+            if prio1 > prio2
+                prio1 = prio2
+                rn1 = rn2
+            elseif prio1 == prio2
+                if prio1 == typemax(UInt16)
+                    continue
+                elseif periodic && rn1 != rn2 &&
+                        (@atomic :monotonic tpheaps[rn2].oldest) < (@atomic :monotonic tpheaps[rn1].oldest)
+                    rn1 = rn2   # E: of the two, the heap whose oldest entry is older
+                    $(_ecount(:older))
+                end
+            end
+            if trylock(tpheaps[rn1].lock)
+                if prio1 == tpheaps[rn1].priority
+                    break
+                end
+                unlock(tpheaps[rn1].lock)
+            end
+        end
+
+        @assert @isdefined(rn1) "Assertion to tell the compiler about the definedness of this variable"
+        heap = tpheaps[rn1]
+        bi = e_min_index(heap)
+        @assert bi != 0 "E: a heap with a live priority has no live bucket"
+        b = heap.buckets[bi]
+        # The end this pop serves. If that entry is pinned to another thread and the OTHER end is
+        # this thread's own task, take that instead (`fallbacks`). A task re-enqueued by `notify`
+        # before its own thread switched out keeps that thread's tid until then; stock serves one
+        # position, the root, so such a task is always reachable by its owner on the owner's next
+        # pop of that heap, and the retry resolves. E serves two ends: a thread in normal mode
+        # whose own task sits at a front, or in periodic mode whose own task sits at a back, could
+        # never take it, and with every other end pinned to a thread in the same state all threads
+        # spun (seen in a warm-up cell within seconds: 10^6 sticky retries on a front whose owner
+        # was stuck on a back). Taking one's own task is what stock does in that case too (the
+        # switch to the current task is a no-op), so the order is otherwise unchanged.
+        front = periodic
+        task = front ? e_front(b) : e_back(b)
+        ok = ccall(:jl_set_task_tid, Cint, (Any, Cint), task, tid-1) != 0
+        if !ok && b.n > 1
+            other = front ? e_back(b) : e_front(b)
+            if ccall(:jl_get_task_tid, Int16, (Any,), other) == tid - 1
+                front = !front
+                task = other
+                ok = true
+                $(_ecount(:fallbacks))
+            end
+        end
+    end
+    # VALIDATE only, on a sticky retry: a task nobody can run (pinned to a thread that never pops
+    # this pool's heaps) would make every thread spin here forever; say which task after 10^6.
+    const _E_STICKY = MULTIQ_VALIDATE ? quote
+        s.retries += 1
+        if s.retries == 1_000_000
+            e_fail(string("E: 10^6 sticky retries in a row on tid ", tid, " (periodic ", periodic, "): the task at the ",
+                          front ? "front" : "back", " has tid ", ccall(:jl_get_task_tid, Int16, (Any,), task),
+                          ", sticky ", task.sticky, ", pool ", ccall(:jl_get_task_threadpoolid, Int8, (Any,), task),
+                          ", state ", task._state, ", heap ", rn1, " of pool ", tp, " with ", heap.ntasks, " live"))
+        end
+    end : nothing
+    # A front pop resets the counter whichever mode asked for it; a periodic pop that fell back
+    # to the back leaves the counter at the budget, so the next pop is periodic again.
+    const _E_POP = quote
+        $(MULTIQ_VALIDATE ? :(s.retries = 0) : nothing)
+        if front
+            e_remove_front!(b)
+            s.count = 0
+            $(_ecount(:periodic))
+        else
+            e_remove_back!(b)
+            s.count += 1
+        end
+        e_publish!(heap, heap.ntasks - Int32(1))
+        $(_ecount(:pops))
+        $_COUNT
+        unlock(heap.lock)
+
+        return task
+    end
+    if VERSION >= v"1.14-"
+        @eval Base.Partr function multiq_deletemin()
+            local rn1::UInt32
+            local heap, task, b, front::Bool, ok::Bool   # assigned in the loop, used after it
+
+            tid = Threads.threadid()
+            tp = ccall(:jl_threadpoolid, Int8, (Int16,), tid-1) + 1
+            if tp == 0 # Foreign thread
+                return nothing
+            end
+            tpheaps = e_heaps[tp]
+            s = e_states[tid]
+            periodic = s.count >= e_budget - 1
+
+            while true
+                GC.safepoint()
+                $_E_CHOOSE
+                if !ok
+                    $_E_STICKY
+                    $_WAKE_OWNER
+                    continue
+                end
+                break
+            end
+            $_E_POP
+        end
+    else
+        @eval Base.Partr function multiq_deletemin()
+            local rn1::UInt32
+
+            tid = Threads.threadid()
+            tp = ccall(:jl_threadpoolid, Int8, (Int16,), tid-1) + 1
+            if tp == 0 # Foreign thread
+                return nothing
+            end
+            tpheaps = e_heaps[tp]
+            s = e_states[tid]
+            periodic = s.count >= e_budget - 1
+
+            @label retry
+            GC.safepoint()
+            $_E_CHOOSE
+            if !ok
+                $_E_STICKY
+                $(VERSION >= v"1.13-" ? _WAKE_OWNER : :(unlock(heap.lock)))
+                @goto retry
+            end
+            $_E_POP
+        end
+    end
+    let cs = "/sys/devices/system/clocksource/clocksource0/current_clocksource"
+        isfile(cs) && strip(read(cs, String)) == "tsc" ||
+            error("E stamps entries with rdtsc, which is only an order across cores where the TSC is the clocksource")
+    end
+end
+
+# The heap list the variant runs on: what nested.jl counts as "in heaps".
+const MULTIQ_HEAP_LISTS = PERIODIC_K !== nothing ? Base.Partr.e_heaps :
+                          MULTIQ_SEQ_HEAPS ? Base.Partr.seq_heaps : Base.Partr.heaps
+
 # Runs pinned to one thread, in the current world. From 1.13 a thread idles in a long-lived
 # scheduler task of its own (`Base.get_sched_task`, a `OncePerThread` running `wait_forever`), which
 # a finished task yields to when there is nothing else to run. One made before the redefinition
@@ -535,24 +956,34 @@ foreach(wait, [Threads.@spawn :interactive _burst() for _ in 1:8])
 foreach(wait, [Threads.@spawn :default _burst() for _ in 1:8])
 
 println(stderr, "multiq_variant: VARIANT=", MULTIQ_VARIANT, MULTIQ_VALIDATE ? " (VALIDATE)" : "",
-        MULTIQ_SEQ_HEAPS ? ", partr.jl crc matches $(VERSION)" : "",
-        SLOT_BUDGET === nothing ? "" : ", slot budget $(SLOT_BUDGET == typemax(Int) ? "none" : SLOT_BUDGET)")
+        MULTIQ_SEQ_HEAPS || PERIODIC_K !== nothing ? ", partr.jl crc matches $(VERSION)" : "",
+        SLOT_BUDGET === nothing ? "" : ", slot budget $(SLOT_BUDGET == typemax(Int) ? "none" : SLOT_BUDGET)",
+        PERIODIC_K === nothing ? "" : ", periodic pop every $(PERIODIC_K == typemax(Int) ? "never" : PERIODIC_K)",
+        PERIODIC_K !== nothing && !isempty(_E_NEGATIVE) ? ", NEGATIVE CONTROL $(_E_NEGATIVE)" : "")
 
 # Calls into the new code, per thread (validation only).
 multiq_variant_calls() = [Base.Partr.variant_calls[64 * (tid - 1) + 1] for tid in 1:Threads.maxthreadid()]
 
-# End of a process: under C, nothing ever went into the build's own heaps, and C's are empty.
+# End of a process: under C and E, nothing ever went into the build's own heaps, and the
+# variant's are empty (under E: every live count 0 and every bucket's ring and shadow empty).
 function multiq_variant_check()
-    MULTIQ_SEQ_HEAPS || return nothing
+    MULTIQ_SEQ_HEAPS || PERIODIC_K !== nothing || return nothing
     for tp in 1:2
         n_old = sum((h.ntasks for h in Base.Partr.heaps[tp]); init = 0)
-        n_new = sum((h.ntasks for h in Base.Partr.seq_heaps[tp]); init = 0)
-        n_old == 0 || error("C: $n_old tasks in the build's own heaps of pool $tp")
-        n_new == 0 || error("C: $n_new tasks left in seq_heaps of pool $tp")
+        n_new = sum((h.ntasks for h in MULTIQ_HEAP_LISTS[tp]); init = 0)
+        n_old == 0 || error("$MULTIQ_VARIANT: $n_old tasks in the build's own heaps of pool $tp")
+        n_new == 0 || error("$MULTIQ_VARIANT: $n_new tasks left in the variant's heaps of pool $tp")
     end
     if SLOT_BUDGET !== nothing
         full = [tid for tid in 1:Threads.maxthreadid() if (@atomic Base.Partr.slots[tid].task) !== nothing]
         isempty(full) || error("D: tasks left in the slots of tids $full")
+    end
+    if PERIODIC_K !== nothing
+        for tp in 1:2, h in Base.Partr.e_heaps[tp], b in h.buckets
+            b.n == 0 || error("E: bucket $(b.priority) of a pool-$tp heap holds $(b.n) entries at exit")
+            isempty(b.shadow) || error("E: bucket $(b.priority) of a pool-$tp heap has $(length(b.shadow)) shadow entries at exit")
+            h.priority == typemax(UInt16) || error("E: a pool-$tp heap publishes priority $(h.priority) while empty")
+        end
     end
     return nothing
 end
@@ -641,6 +1072,100 @@ function _slot_probe(reps::Int = 20, hold_ms::Float64 = 200.0)
             "full slot ", checked, " of ", reps, " times (the rest were taken first); ", reps, " tasks left in a ",
             "busy thread's slot, ", stolen, " slot steals, the slowest started after ",
             round(worst; digits = 2), " ms of a ", hold_ms, " ms hold")
+    return nothing
+end
+
+# E, VALIDATE only: per tid, the counts kept in its pop state.
+function multiq_budget_counts()
+    PERIODIC_K === nothing && return nothing
+    es = Base.Partr.e_states
+    tids = 1:Threads.maxthreadid()
+    return (tids = tids, pops = [es[t].pops for t in tids], periodic = [es[t].periodic for t in tids],
+            older = [es[t].older for t in tids], fallbacks = [es[t].fallbacks for t in tids])
+end
+
+# E, VALIDATE only: print the pop counts since `before` (a `multiq_budget_counts()`) and check
+# the budget: per tid, periodic pops equal pops ÷ K to within one (the counter is mid-cycle at
+# either end of the window), none at all under E-inf, and under E<K> some on every `:default` tid
+# when `everywhere` says the workload keeps every thread popping, else some somewhere.
+function multiq_budget_check(label, before; everywhere::Bool = false)
+    PERIODIC_K === nothing && return nothing
+    now = multiq_budget_counts()
+    d(k) = getfield(now, k) .- getfield(before, k)
+    pops, periodic, older, fb = d(:pops), d(:periodic), d(:older), d(:fallbacks)
+    tids = Threads.threadpooltids(:default)
+    println(stderr, "validate: E pops, ", label, ": pops ", pops, ", periodic ", periodic, ", older ", older,
+            ", fallbacks ", fb)
+    if PERIODIC_K == typemax(Int)
+        # Under E-inf a front is taken only as a fallback from a pinned back, and counts as one.
+        all(periodic .== fb) || error("E-inf: $label: periodic pops ", periodic, " beyond the fallbacks ", fb)
+    else
+        # A fallback moves one pop to the other end: a front taken in normal mode adds a periodic
+        # pop and restarts the cycle, a back taken in periodic mode delays one.
+        for t in now.tids
+            (pops[t] - fb[t]) ÷ PERIODIC_K - 1 <= periodic[t] <= pops[t] ÷ PERIODIC_K + 1 + fb[t] ||
+                error("E: $label: tid $t made $(periodic[t]) periodic pops of $(pops[t]) with $(fb[t]) fallbacks, K = $PERIODIC_K")
+        end
+        if everywhere
+            all(t -> periodic[t] > 0, tids) || error("E: $label: no periodic pops on some :default tid: ", periodic[tids])
+        else
+            sum(periodic[tids]) > 0 || error("E: $label: no periodic pops on any :default tid")
+        end
+    end
+    return nothing
+end
+
+# E, VALIDATE only, two probes of `multiq_check_empty`, the check a thread about to sleep makes
+# after publishing `sleeping` (scheduler.c, `jl_task_get_next`).
+# 1. Every heap drained: it must say empty (`E_NEGATIVE=lengths` fails it: a thread that never
+#    sleeps). First, because under that control no thread sleeps and the second probe's dummy is
+#    taken before the check runs.
+# 2. A task in a heap, no wake-up sent, in bucket 0 and in a bucket the insert has to make: it
+#    must say non-empty (`E_NEGATIVE=firstbucket` fails the second: a lost wake-up). The dummy is
+#    taken back out through the same bucket, under the heap's lock.
+function _e_probe(reps::Int = 20)
+    P = Base.Partr
+    seen_empty = false
+    for _ in 1:reps
+        sleep(0.05)
+        seen_empty = fetch(Threads.@spawn :default P.multiq_check_empty())
+        seen_empty && break
+    end
+    seen_empty || error("E: multiq_check_empty() said non-empty $reps times with every heap drained")
+    println(stderr, "multiq_variant: E probe 1: multiq_check_empty() says empty with the heaps drained")
+    for prio in (0x0000, 0x0007)
+        checked = 0
+        for _ in 1:reps
+            sleep(0.05)   # every other thread goes back to sleep
+            empty, got = fetch(Threads.@spawn :default begin
+                t0 = time_ns()   # hold without yielding until the threads this spawn woke are asleep again
+                while time_ns() - t0 < 5_000_000
+                    GC.safepoint()
+                end
+                dummy = Task(() -> nothing)
+                Threads._spawn_set_thrpool(dummy, :default)
+                P.multiq_insert(dummy, prio)
+                e = P.multiq_check_empty()
+                s = P.e_states[Threads.threadid()]
+                heap = P.e_heaps[s.last_tp][s.last_heap]
+                lock(heap.lock)
+                b = P.e_bucket!(heap, prio)
+                back = b.n > 0 && P.e_back(b) === dummy
+                if back
+                    P.e_remove_back!(b)
+                    P.e_publish!(heap, heap.ntasks - Int32(1))
+                end
+                unlock(heap.lock)
+                (e, back)
+            end)
+            got || continue   # a spinning thread popped it (and ran a no-op): no verdict this time
+            empty && error("E: multiq_check_empty() says empty while a heap holds a task of priority $prio")
+            checked += 1
+        end
+        checked >= reps ÷ 2 || error("E: only $checked of $reps check_empty probes kept their task (priority $prio)")
+        println(stderr, "multiq_variant: E probe 2 (priority ", prio, "): multiq_check_empty() saw a queued task ",
+                checked, " of ", reps, " times (the rest were taken first)")
+    end
     return nothing
 end
 
@@ -733,7 +1258,135 @@ function _drain_ns(n::Int)
     return (time_ns() - t0) / n
 end
 
+# ── E's single-heap asserts: one `eheap` driven by E's own bucket operations ─────────────────
+
+_e_newheap() = Base.Partr.eheap()
+
+function _e_push!(h, t::Task, prio::UInt16 = 0x0000)
+    t.priority = prio
+    b = Base.Partr.e_bucket!(h, prio)
+    Base.Partr.e_push_back!(b, t, Base.Partr.e_stamp())
+    Base.Partr.e_publish!(h, h.ntasks + Int32(1))
+end
+
+# A normal pop (the newest of the lowest live priority) or a periodic one (the oldest of it).
+function _e_pop!(h, periodic::Bool)
+    b = h.buckets[Base.Partr.e_min_index(h)]
+    t = periodic ? Base.Partr.e_front(b) : Base.Partr.e_back(b)
+    periodic ? Base.Partr.e_remove_front!(b) : Base.Partr.e_remove_back!(b)
+    Base.Partr.e_publish!(h, h.ntasks - Int32(1))
+    return t
+end
+
+# Fill N, then drain one way: the pop order, as insertion indices.
+function _e_fill_drain(n::Int, periodic::Bool)
+    h, ids = _e_newheap(), IdDict{Task,Int}()
+    foreach(i -> _e_push!(h, _dummy(ids, i)), 1:n)
+    return [ids[_e_pop!(h, periodic)] for _ in 1:n]
+end
+
+# Random pushes, normal pops and periodic pops against a plain vector in insertion order, which
+# a normal pop takes the end of and a periodic pop the start of; also grows past the ring's
+# initial capacity. Returns the number of mismatches (0) and the number of pops made.
+function _e_interleaved(n::Int)
+    h, ids = _e_newheap(), IdDict{Task,Int}()
+    ref = Int[]
+    pushed, pops, bad = 0, 0, 0
+    state = UInt64(0x9e3779b97f4a7c15)
+    while pops < n
+        state = state * 0x5851f42d4c957f2d + 1
+        r = (state >> 33) % 5
+        if pushed < n && (isempty(ref) || r < 3)
+            pushed += 1
+            _e_push!(h, _dummy(ids, pushed))
+            push!(ref, pushed)
+        elseif r == 3
+            pops += 1
+            ids[_e_pop!(h, true)] == popfirst!(ref) || (bad += 1)
+        else
+            pops += 1
+            ids[_e_pop!(h, false)] == pop!(ref) || (bad += 1)
+        end
+        length(ref) == h.ntasks || (bad += 1)
+    end
+    return bad, pops
+end
+
+# Keep N in the heap, pop one and push one M times, with every K-th pop periodic: the most pops
+# any served task waited, and the most any task still in the heap has waited.
+function _e_steady(n::Int, m::Int, k::Int)
+    h, born = _e_newheap(), IdDict{Task,Int}()
+    foreach(i -> _e_push!(h, _dummy(born, 0)), 1:n)
+    worst = 0
+    for step in 1:m
+        t = _e_pop!(h, k != typemax(Int) && step % k == 0)
+        worst = max(worst, step - born[t])
+        delete!(born, t)
+        _e_push!(h, _dummy(born, step))
+    end
+    return worst, maximum(m .- values(born))
+end
+
+# Priorities: a lower priority comes first in both orders, whatever its age.
+function _e_priorities()
+    h, ids = _e_newheap(), IdDict{Task,Int}()
+    for (i, p) in enumerate((0x0003, 0x0000, 0x0005, 0x0000, 0x0003))
+        _e_push!(h, _dummy(ids, i), p)
+    end
+    length(h.buckets) == 3 || error("E: $(length(h.buckets)) buckets for priorities 0, 3, 5")
+    h.priority == 0x0000 || error("E: published priority $(h.priority), expected 0")
+    newest = [ids[_e_pop!(h, false)] for _ in 1:5]
+    for (i, p) in enumerate((0x0003, 0x0000, 0x0005, 0x0000, 0x0003))
+        _e_push!(h, _dummy(ids, i), p)
+    end
+    oldest = [ids[_e_pop!(h, true)] for _ in 1:5]
+    h.priority == typemax(UInt16) || error("E: published priority $(h.priority) while empty")
+    return newest, oldest
+end
+
+# Fill N, then time a drain by normal pops: ns per pop, on one heap with no scheduler.
+function _e_drain_ns(n::Int)
+    h, ids = _e_newheap(), IdDict{Task,Int}()
+    foreach(i -> _e_push!(h, _dummy(ids, i)), 1:n)
+    t0 = time_ns()
+    for _ in 1:n
+        _e_pop!(h, false)
+    end
+    return (time_ns() - t0) / n
+end
+
+function _e_unit_asserts()
+    n, m = 30, 3000
+    newest, oldest = _e_fill_drain(20, false), _e_fill_drain(20, true)
+    newest == collect(20:-1:1) || error("E: a drain by normal pops gave $newest")
+    oldest == collect(1:20) || error("E: a drain by periodic pops gave $oldest")
+    bad, pops = _e_interleaved(2000)
+    bad == 0 || error("E: $bad of $pops interleaved pops disagreed with the reference deque")
+    worst, waiting = _e_steady(n, m, PERIODIC_K)
+    if PERIODIC_K == typemax(Int)
+        waiting == m || error("E-inf: in steady state the oldest has waited $waiting of $m pops, expected all")
+    else
+        worst <= n * PERIODIC_K || error("E: steady state served a task after $worst pops, N × K = $(n * PERIODIC_K)")
+        waiting <= n * PERIODIC_K || error("E: steady state oldest waiting $waiting pops, N × K = $(n * PERIODIC_K)")
+    end
+    pn, po = _e_priorities()
+    pn == [4, 2, 5, 1, 3] || error("E: normal pops over priorities (3,0,5,0,3) gave $pn")
+    po == [2, 4, 1, 5, 3] || error("E: periodic pops over priorities (3,0,5,0,3) gave $po")
+    multiq_watchdog(60); _e_probe(); multiq_watchdog(0)
+    println(stderr, "multiq_variant: single-heap asserts passed for ", MULTIQ_VARIANT,
+            ": normal pops drain 20 as ", newest, ", periodic pops as ", oldest, "; ", pops,
+            " interleaved pops match the reference deque; steady state N = ", n, ", K = ",
+            PERIODIC_K == typemax(Int) ? "inf" : PERIODIC_K, ": worst served after ", worst,
+            " pops, oldest waiting ", waiting, " of ", m, "; priorities (3,0,5,0,3): newest-first ",
+            pn, ", oldest-first ", po)
+    _e_drain_ns(1000)
+    println(stderr, "multiq_variant: single-heap drain by normal pops, ns per pop (best of 3): ",
+            join(("n = $n: $(round(minimum(_e_drain_ns(n) for _ in 1:3); digits = 1))" for n in (1000, 10_000)), ", "))
+    return nothing
+end
+
 function multiq_unit_asserts()
+    PERIODIC_K === nothing || return _e_unit_asserts()
     n, m = 30, 3000
     fd, (worst, waiting), il = _fill_drain(20), _steady(n, m), _interleaved(2000)
     if MULTIQ_VARIANT in ("A", "A0")
