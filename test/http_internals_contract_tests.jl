@@ -31,6 +31,8 @@ import Sockets
 #       `stream.tracked.conn isa TLS.Conn`, and classifies a refused handshake by
 #       `WebSocketError.message.code`. `_write_fixed_body!` (#377, #529) streams a known-length
 #       body through the public `startwrite` + `write`, and reads two `Stream` state fields.
+#       `_mark_reported!` writes `stream.io_error`, the field HTTP 2.11's stream loop reads to
+#       decide whether to log an error itself (JuliaWeb/HTTP.jl#1425).
 #   • src/core/lifecycle.jl — refuses cleartext HTTP/2 (#375) with `listen!`'s `allow_h2c = false`.
 #       Public since HTTP.jl 2.9, so no longer an internal; pinned anyway because it is the whole
 #       of the refusal (it replaced an override of the private `_probe_h2_preface!`).
@@ -46,7 +48,7 @@ import Sockets
 #
 # None of these are part of HTTP's public, SemVer-guaranteed API, so a 2.x bump
 # can rename or remove them WITHOUT a breaking-version signal. The compat pin
-# (`HTTP = "~2.9"`) caps that exposure to 2.9 patch releases; this testset is the
+# (`HTTP = "~2.11"`) caps that exposure to 2.11 patch releases; this testset is the
 # canary — if an upgrade moves the ground, it fails HERE, loud and naming the
 # missing symbol, instead of deep inside request handling.
 #
@@ -457,6 +459,14 @@ end
     end
 end
 
+@testset "reported-error surface (src/core/transport.jl `_mark_reported!`)" begin
+    # Nitro WRITES `stream.io_error` for an error it has already logged, so HTTP.jl 2.11's stream loop
+    # neither logs it again -- with the live exception and the query string -- nor overrides its status
+    # (JuliaWeb/HTTP.jl#1425). `Any`, because Nitro stores whatever it caught. The behavior HTTP keys
+    # on it is pinned on a live listener in the last item of this file.
+    @test fieldtype(HTTP.Stream, :io_error) === Any
+end
+
 @testset "WebSocket Origin policy surface (src/core/transport.jl `_upgrade_websocket!`)" begin
     # #374: Nitro passes `upgrade` a `check_origin` that runs HTTP's own same-origin rule with the
     # scheme a trusted proxy reported, instead of the transport's. It calls the PRIVATE default
@@ -637,7 +647,7 @@ end
 
 @testset "HTTP's SSE body contract, which Res.sse is built on (#160)" begin
     # `Res.sse` hands the transport an `HTTP.SSEStream` and nothing else. Three properties of that
-    # type are load-bearing for Nitro, and `HTTP = "~2.9"` is a deliberately tight pin, so they are
+    # type are load-bearing for Nitro, and `HTTP = "~2.11"` is a deliberately tight pin, so they are
     # pinned here next to the rest of the HTTP contract.
 
     # 1. It is an `AbstractBody`, so it dispatches to the STREAMING method of
@@ -772,6 +782,63 @@ try
         @test seen.adopts
     finally
         close(sock)
+    end
+finally
+    close(server)
+end
+end
+
+@testitem "HTTP logs a stream handler's error unless it is `stream.io_error` (HTTP 2.11)" tags=[:core, :network] setup=[NitroCommon] begin
+using Test
+import HTTP
+import Sockets
+const Logging = Base.CoreLogging
+
+# Since HTTP.jl 2.11 (JuliaWeb/HTTP.jl#1425) the stream loop logs every error a stream handler
+# throws at `@error`, with the live exception and `request.target` -- the query string included --
+# except the one it recorded itself as `stream.io_error`, which it treats as the peer's. Nitro's
+# `_mark_reported!` (src/core/transport.jl) relies on exactly that: it records an error Nitro has
+# already logged there, so HTTP derives the status and logs nothing. This pins HTTP's half on a raw
+# listener, with no Nitro in the path: if HTTP stops keying on identity, or keys on another field,
+# the unmarked cases below still log and the marked ones start to.
+#
+# The status is the other half. Unmarked, 2.11 answers every handler error 500; marked, it derives
+# the status from the type, as every error got through 2.9 -- which is what keeps a `ParseError` a
+# 400 under Nitro (`parallel_stream_handler`'s comment, #316).
+function handler(stream::HTTP.Stream)
+    HTTP.startread(stream)
+    target = stream.message.target
+    err = occursin("kind=parse", target) ? HTTP.ParseError("bad input") : ErrorException("handler failed")
+    occursin("marked=1", target) && (stream.io_error = err)
+    throw(err)
+end
+
+logger = Test.TestLogger(min_level = Logging.Warn)
+port = get_free_port()
+server = Logging.with_logger(() -> HTTP.listen!(handler, HOST, port), logger)
+http_records() = lock(() -> filter(r -> r._module === HTTP, copy(logger.logs)), logger.lock)
+try
+    for (marked, kind, status, logs) in ((false, "error", 500, true), (true, "error", 500, false),
+                                         (false, "parse", 500, true), (true, "parse", 400, false))
+        lock(() -> empty!(logger.logs), logger.lock)
+        sock = Sockets.connect(HOST, port)
+        try
+            write(sock, "GET /x?token=Q5ECRET&kind=$kind&marked=$(Int(marked)) HTTP/1.1\r\nHost: x\r\n\r\n")
+            reader = @async String(read(sock))
+            @test timedwait(() -> istaskdone(reader), 10.0) === :ok
+            @test startswith(fetch(reader), "HTTP/1.1 $status")
+        finally
+            close(sock)
+        end
+        # HTTP logs before it answers, so by now a record that will exist does.
+        if logs
+            record = only(http_records())
+            @test record.message == "server handler error"
+            # Why Nitro must not let an unreported error through: the target is logged whole.
+            @test occursin("Q5ECRET", string(record.kwargs[:target]))
+        else
+            @test isempty(http_records())
+        end
     end
 finally
     close(server)

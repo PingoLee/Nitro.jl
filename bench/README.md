@@ -76,7 +76,7 @@ header (git SHA, Julia version, thread count, CPU model — no hostname or paths
   `connreader_*_socket` is what a keep-alive server actually runs: the buffer starts empty, the
   head arrives over the socket, and the request line takes `_readline_crlf`'s slow path, so the
   fill syscall is part of the number. `HTTP._ConnReader`'s layout is internal and pinned to
-  HTTP 2.9.0, so a `[compat]` bump that breaks this file is doing its job.
+  HTTP 2.11.0, so a `[compat]` bump that breaks this file is doing its job.
 - `ratelimiter/*_contended` is the exception to that last point: it fans 64 tasks over **distinct**
   client keys and measures wall time for the batch, so it does reflect lock contention. Run it with
   `--threads=4` or more, or it measures nothing. Two sibling groups are deliberately different
