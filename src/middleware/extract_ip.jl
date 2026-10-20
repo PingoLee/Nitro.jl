@@ -8,7 +8,7 @@ using ...Core: getip, setip!, getpeerip, header_name_isequal
 using ...Types: Nullable, REQUEST_FORWARDED_PROTO_KEY
 using ...Errors: is_unrecoverable
 # Byte-safe header-value helpers: malformed UTF-8 must not turn into a 500 (see their comment).
-using ...Util: _ows_strip, _ascii_lower_eq
+using ...Util: _ows_strip, _ascii_lower_eq, _is_tchar
 
 export ExtractIP, extract_ip
 
@@ -516,10 +516,6 @@ function _forwarded_value(v::AbstractString)::Nullable{SubString{String}}
     occursin('"', v) && return nothing
     return SubString(String(v))
 end
-
-# RFC 9110 §5.6.2 tchar.
-_is_tchar(c::AbstractChar) =
-    isascii(c) && (isletter(c) || isdigit(c) || c in "!#\$%&'*+-.^_`|~")
 
 # Resolve a header to a single value, in one pass.
 #

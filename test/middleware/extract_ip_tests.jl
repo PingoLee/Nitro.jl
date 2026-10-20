@@ -247,7 +247,9 @@ end
                  "for=$SPOOF;for=$CLIENT",           # a parameter MUST NOT repeat (§4)
                  "for=$CLIENT;proto=https;proto=http",
                  "garbage", "=$CLIENT", "f r=$CLIENT", "for=\"$CLIENT",
-                 "for=\"$CLIENT\"x", "for=$CLIENT\"", "for=\"$CLIENT\\\"")
+                 "for=\"$CLIENT\"x", "for=$CLIENT\"", "for=\"$CLIENT\\\"",
+                 # A parameter name is a token too: pins the shared `_is_tchar`'s ASCII guard (#680).
+                 "fór=$CLIENT", "ｆor=$CLIENT", "\xff=$CLIENT")
         @test fwd("for=$SPOOF, $stop") == PROXY
     end
     # ...and only once the walk reaches it: an unreadable element LEFT of the client is never

@@ -430,6 +430,25 @@ header_name_isequal(a::AbstractString, b::AbstractString) = lowercase(a) == lowe
 _ows_strip(s::AbstractString) = strip(c -> c == ' ' || c == '\t', s)
 _ascii_lower_eq(s::AbstractString, lower::String) = all(isascii, s) && lowercase(s) == lower
 
+# RFC 9110 §5.6.2 `tchar`, the alphabet of a `token`: ASCII letters, digits and these 15 marks.
+# One predicate for both readers of that grammar -- `ExtractIP` (a `Forwarded` parameter name)
+# and `Cookies` (a cookie name, which RFC 6265bis makes a `token`).
+#
+# The letter range is spelled out as ASCII because Julia's `isletter` is Unicode-aware (`isdigit`
+# is not): `isletter('Ａ')` (fullwidth A) is `true`, and a cookie-name check built on it once
+# accepted `café` (#680). A 128-entry table, as `_is_pchar` is (#536), rather than
+# `isletter`, which is a `utf8proc` ccall even for ASCII. `isascii` comes before `UInt8(c)`,
+# which would throw on a malformed `Char`.
+const _TCHAR_PUNCT = ('!', '#', '$', '%', '&', '\'', '*', '+', '-', '.', '^', '_', '`', '|', '~')
+
+const _TCHAR_TABLE = ntuple(128) do i
+    c = Char(i - 1)
+    'A' <= c <= 'Z' || 'a' <= c <= 'z' || '0' <= c <= '9' || c in _TCHAR_PUNCT
+end
+
+_is_tchar(b::UInt8) = b < 0x80 && @inbounds _TCHAR_TABLE[b + 1]
+_is_tchar(c::AbstractChar) = isascii(c) && _is_tchar(UInt8(c))
+
 # Code unit by code unit, folding only A-Z: any other byte, including every byte of a multibyte
 # or malformed character, must match exactly. Unlike `_ascii_lower_eq` it compares two arbitrary
 # strings, so an app-configured scheme need not be lowercase, or even ASCII.
