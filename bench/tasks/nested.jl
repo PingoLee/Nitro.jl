@@ -12,8 +12,9 @@
 #   fanout  the control with no nesting: tasks.jl's FanOut, N tiny tasks spawned by one task and
 #           then waited on, repeated R times per run (FANOUT, "N:R")
 #
-# VARIANT=A|A0|B|C|D<K>|D-inf picks the multiqueue order (multiq_variant.jl, included first,
-# before any task exists). The root of every workload is spawned on `:default`, so it starts there in both layouts.
+# VARIANT=A|A0|B|C|D<K>|D-inf|E<K>|E-inf picks the multiqueue order (multiq_variant.jl, included
+# first, before any task exists). The root of every workload is spawned on `:default`, so it starts
+# there in both layouts.
 #
 # Each workload runs two passes in one process:
 #   clean   no instrumentation: wall time, bytes allocated, GC time, GC pauses and full sweeps, and
@@ -52,8 +53,10 @@
 # live assert in every pop that it takes its heap's minimum, calls into the new code on every
 # `:default` thread, and nothing left in the heaps at exit; under D also the slot probe, slot pops
 # and steals in every workload (slot pops on every `:default` thread in fine-grain fib) and nothing
-# left in the slots at exit (the fan-out needs steals only). Each validated run is under
-# `multiq_watchdog`: a stall kills it.
+# left in the slots at exit (the fan-out needs steals only); under E the check_empty probes, the
+# pop counts of every workload (periodic pops on every `:default` thread in fine-grain fib, none
+# under E-inf) and empty deques at exit. Each validated run is under `multiq_watchdog`: a stall
+# kills it.
 #
 # GUARD=1 (the default) holds one never-firing `Timer`, as spawn_order.jl does: on 1.13.0-rc3..1.13.2
 # a process with no live timer can miss wake-ups (JuliaLang/julia#63882), a different bug.
@@ -83,7 +86,7 @@ const SPAWNED, STARTED, FINISHED, PEAK_QUEUED, PEAK_LIVE, PEAK_HEAPS = 1, 2, 3, 
 end
 @inline _peak!(tid::Int, k::Int, x::Int) = x > _get(tid, k) && _set!(tid, k, x)
 
-const HEAP_LISTS = MULTIQ_SEQ_HEAPS ? Base.Partr.seq_heaps : Base.Partr.heaps
+const HEAP_LISTS = MULTIQ_HEAP_LISTS
 
 function _in_heaps()
     tp = ccall(:jl_threadpoolid, Int8, (Int16,), Threads.threadid() - 1) + 1
@@ -341,12 +344,16 @@ function measure()
     get(ENV, "NOHEADER", "0") == "1" || println(join(COLUMNS, '\t'))
     for w in ws
         slots0 = multiq_slot_counts()
+        budget0 = multiq_budget_counts()
         clean, digest = clean_runs(w, runs, min_runs, budget)
         cnt = counted_runs(w, counted, budget, digest)
         w.check(digest)
         # The fan-out's one spawner fills its own slot and the idle threads steal it: steals, few pops.
         VALIDATE && multiq_slot_check(w.name, slots0; pops = w.name != "fanout", steals = true,
                                       pops_everywhere = w.name == "fib_fine")
+        # Under E only fine-grain fib keeps every `:default` thread popping for long enough that
+        # each makes a periodic pop; the others need one somewhere.
+        VALIDATE && multiq_budget_check(w.name, budget0; everywhere = w.name == "fib_fine")
         v(k) = [getfield(r, k) for r in clean]
         c(k) = [getfield(r, k) for r in cnt]
         r(x) = round(x; sigdigits = 4)
