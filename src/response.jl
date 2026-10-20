@@ -522,6 +522,10 @@ path("/events", ticks; method = "GET")
 The argument-less form hands the response back with the stream still open, for a caller that wants
 to own the producing task itself. Closing it is then **your** responsibility.
 
+A response that carries no body — a `HEAD` request, or a `status` of 1xx, 204 or 304 — sends the
+head only. Nitro closes the stream without reading it, so a producer that checks `isopen(events)`
+stops at its next check.
+
 # Why this is a `Res` builder and not a `STREAM` route
 
 A `method = "STREAM"` handler writes on the raw `HTTP.Stream`, which sets `response_started` — so

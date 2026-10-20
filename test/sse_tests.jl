@@ -122,24 +122,43 @@ end
 # GUARDED path too under multithreading -- which would make the pass and fail values overlap and
 # the assertion meaningless. At 10ms a tick the release always wins by orders of magnitude, while an
 # unguarded drain still needs the full ~2s to consume them all: a slow failure, never a hang.
+#
+# One set of counters PER ROUTE (#671). They used to be shared, and a case's GET follow-up leaves
+# its own producer running until it notices the client hung up -- writing into the same count and
+# setting the same "stopped" flag the NEXT case asserts on. A drained body could then pass, because
+# the flag it waited for had been set by somebody else's producer.
 const HEAD_EVENTS = 200
-const HEAD_WROTE = Threads.Atomic{Int}(0)
-const HEAD_STOPPED = Threads.Atomic{Bool}(false)
+const PROBES = Dict(route => (wrote = Threads.Atomic{Int}(0), stopped = Threads.Atomic{Bool}(false))
+                    for route in ("/events/head", "/events/head-auto", "/events/status/204",
+                                  "/events/status/304", "/events/pin"))
 
-function head_probe(req::HTTP.Request)
-    return Res.sse() do events
+function paced_probe(route::String; status::Int = 200, n::Int = HEAD_EVENTS)
+    probe = PROBES[route]
+    return Res.sse(; status = status) do events
         try
-            for _ in 1:HEAD_EVENTS
+            for _ in 1:n
                 isopen(events) || break
                 write(events, SSEEvent("x"))
-                Threads.atomic_add!(HEAD_WROTE, 1)
+                Threads.atomic_add!(probe.wrote, 1)
                 sleep(0.01)
             end
         finally
-            HEAD_STOPPED[] = true
+            probe.stopped[] = true
         end
     end
 end
+
+head_probe(req::HTTP.Request) = paced_probe("/events/head")
+head_auto_probe(req::HTTP.Request) = paced_probe("/events/head-auto")
+
+# A bodyless STATUS is the same hazard as HEAD (#671). HTTP's `startwrite` sets `ignore_writes` for
+# 1xx, 204 and 304 as well, so a drain of these consumes the producer exactly as HEAD's used to --
+# and `Res.sse(; status)` hands the status straight to `HTTP.sse_stream`, so nothing stops a handler
+# asking for one. 1xx is not exercised over the wire: a client reads it as an interim response and
+# waits for the final one. The predicate's agreement with HTTP's rule for every status, 1xx
+# included, is pinned in test/http_internals_contract_tests.jl.
+status_204(req::HTTP.Request) = paced_probe("/events/status/204"; status = 204)
+status_304(req::HTTP.Request) = paced_probe("/events/status/304"; status = 304)
 
 health(req::HTTP.Request) = Res.send("alive")
 
@@ -153,7 +172,9 @@ urlpatterns(ctx, "", Nitro.RouteDefinition[
     path("/events/forever", forever),
     path("/events/head", head_probe, methods = ["GET", "HEAD"]),
     # GET-only: its HEAD is the auto-HEAD (#277), which must not drain the body either.
-    path("/events/head-auto", head_probe),
+    path("/events/head-auto", head_auto_probe),
+    path("/events/status/204", status_204),
+    path("/events/status/304", status_304),
     path("/health", health),
 ])
 
@@ -266,11 +287,16 @@ try
 
         @test HTTP.get("$localhost/health").status == 200
     end
-    # Explicit HEAD route, then the auto-HEAD of a GET-only route (#277). One at a time: they
-    # share the probe's counters.
-    @testset "HEAD does not drain an SSE body (#160): $route" for route in ("/events/head", "/events/head-auto")
-        HEAD_WROTE[] = 0
-        HEAD_STOPPED[] = false
+    # Explicit HEAD route, then the auto-HEAD of a GET-only route (#277), then a GET whose STATUS
+    # forbids a body (#671). Each route counts into its own `PROBES` entry.
+    @testset "a bodyless response does not drain an SSE body (#160, #671): $method $route" for (method, route, status) in (
+            ("HEAD", "/events/head", 200),
+            ("HEAD", "/events/head-auto", 200),
+            ("GET", "/events/status/204", 204),
+            ("GET", "/events/status/304", 304))
+        probe = PROBES[route]
+        probe.wrote[] = 0
+        probe.stopped[] = false
 
         # Response and error land in `Ref`s rather than being `fetch`ed, for the same reason
         # `collect_sse` does it: a `fetch` after a failed `timedwait` is an UNBOUNDED wait, which
@@ -283,7 +309,8 @@ try
         # is steadily streaming -- which is the exact failure this test guards.
         task = Threads.@spawn begin
             try
-                resp[] = HTTP.head("$localhost$route"; request_timeout = 15, retry = false)
+                resp[] = HTTP.request(method, "$localhost$route"; request_timeout = 15,
+                                      retry = false, status_exception = false)
             catch err
                 failure[] = err
             end
@@ -294,11 +321,11 @@ try
         r = resp[]
         @test r !== nothing
         if r !== nothing
-            @test r.status == 200
+            @test r.status == status
             @test isempty(r.body)
             # `Res.sse` declares no length, so HEAD must not invent one.
             @test !HTTP.hasheader(r, "Content-Length")
-            @test HTTP.header(r, "Content-Type") == "text/event-stream"
+            method == "HEAD" && @test HTTP.header(r, "Content-Type") == "text/event-stream"
         end
 
         # The heart of it: the body was RELEASED, not consumed. `_release_response_body!` closes
@@ -311,18 +338,70 @@ try
         # check, up to one 10ms tick later. Read once, the flag lost that race on loaded CI runners.
         # Wait for it with a bound, as the PRODUCER_STOPPED check above does. A drained body still
         # fails, on the count below, which the wait also makes final.
-        @test timedwait(() -> HEAD_STOPPED[], 5.0; pollint = 0.01) === :ok
-        @test HEAD_WROTE[] < HEAD_EVENTS
+        @test timedwait(() -> probe.stopped[], 5.0; pollint = 0.01) === :ok
+        @test probe.wrote[] < HEAD_EVENTS
 
-        # And the same route still streams normally over GET, so the guard is method-scoped.
-        got = collect_sse("$localhost$route"; want = 3)
-        @test got.finished === :ok
-        @test length(got.events) == 3
+        # And a HEAD route still streams normally over GET, so the guard is scoped to what makes a
+        # response bodyless -- the method or the status -- and not to the route.
+        if method == "HEAD"
+            got = collect_sse("$localhost$route"; want = 3)
+            @test got.finished === :ok
+            @test length(got.events) == 3
+        end
 
         @test HTTP.get("$localhost/health").status == 200
     end
 finally
     terminate(ctx)
+end
+
+# What the pin costs at shutdown (#160, #671). A drain HTTP is ignoring never touches the socket, so
+# the connection task waits on it, the graceful close cannot finish, and `terminate` falls through
+# to its force-close -- which cannot unblock it either, so the producer outlives the server.
+# `terminate` itself is bounded by `shutdown_timeout` whatever happens, so "does not hang" is
+# asserted as what it actually means: the graceful drain finishes and no force-close is needed.
+#
+# The producer is bounded at 30s of pacing -- far past every wait here, so an unguarded drain is
+# still running when they expire, yet a regression is a slow failure, never a hang.
+pin_probe(req::HTTP.Request) = paced_probe("/events/pin"; status = 204, n = 3000)
+
+@testset "a bodyless SSE response leaves terminate a graceful drain (#671)" begin
+    probe = PROBES["/events/pin"]
+    probe.stopped[] = false
+    pin_app = App()
+    urlpatterns(pin_app, "", Nitro.RouteDefinition[path("/events/pin", pin_probe)])
+    pin_port = get_free_port()
+    serve(pin_app; host = HOST, port = pin_port, async = true, show_banner = false,
+          show_errors = false, access_log = nothing, shutdown_timeout = 5)
+    @test timedwait(() -> Base.isopen(pin_app.service), 10.0) === :ok
+
+    stopping = nothing
+    logger = Test.TestLogger(min_level = Base.CoreLogging.Warn)
+    try
+        # `Ref`s and a bounded `timedwait`, as everywhere in this file -- never a bare request.
+        resp = Ref{Union{Nothing,HTTP.Response}}(nothing)
+        failure = Ref{Any}(nothing)
+        task = Threads.@spawn begin
+            try
+                resp[] = HTTP.get("http://$HOST:$pin_port/events/pin"; request_timeout = 15,
+                                  retry = false, status_exception = false)
+            catch err
+                failure[] = err
+            end
+        end
+        @test timedwait(() -> istaskdone(task), 25.0; pollint = 0.05) === :ok
+        @test failure[] === nothing
+        @test resp[] !== nothing && resp[].status == 204
+        @test timedwait(() -> probe.stopped[], 5.0; pollint = 0.01) === :ok
+    finally
+        # Spawned and waited on with a bound, so a `terminate` that did block could not park the item.
+        stopping = Threads.@spawn Base.CoreLogging.with_logger(() -> terminate(pin_app), logger)
+        @test timedwait(() -> istaskdone(stopping), 20.0; pollint = 0.05) === :ok
+    end
+    forced = lock(logger.lock) do
+        any(rec -> occursin("did not drain", string(rec.message)), logger.logs)
+    end
+    @test !forced
 end
 
 end
