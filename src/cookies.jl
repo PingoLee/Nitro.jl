@@ -6,7 +6,7 @@ using UUIDs
 using ..Types
 using ..Types: _normalize_domain, _store_call, _store_bool
 using ..Errors
-using ..Util: _is_tchar
+using ..Util: _is_tchar, _ascii_casefold_eq
 
 using ..Crypto: encrypt_payload, decrypt_payload, secure_uuid4, SecretString, _cookie_secret
 
@@ -229,7 +229,7 @@ function parse_cookies(headers::Union{Dict, Vector{Pair{String, String}}, HTTP.H
         _parse_cookie_header!(cookies, cookie_header)
     else
         for (k, v) in headers
-            lowercase(k) == "cookie" && _parse_cookie_header!(cookies, v)
+            _ascii_casefold_eq(k, "cookie") && _parse_cookie_header!(cookies, v)
         end
     end
 
@@ -272,7 +272,7 @@ function parse_cookies(res::HTTP.Response)
     # Set-Cookie is different as it can have name=value; attr1=val1; ...
     cookies = Dict{SubString{String}, SubString{String}}()
     for (k, v) in res.headers
-        if lowercase(k) == "set-cookie"
+        if _ascii_casefold_eq(k, "set-cookie")
             # find the first ';' which separates the cookie-pair from attributes
             semi_idx = findfirst(';', v)
             pair_view = isnothing(semi_idx) ? SubString(v) : @view v[begin:prevind(v, semi_idx)]
@@ -419,6 +419,10 @@ only; `set_cookie = true` -- a Response -- reads `Set-Cookie` only (#329). A `Se
 REQUEST is not a cookie the client holds, but it used to be read as one, so any client could
 supply a "cookie" by sending the wrong header. Names match exactly, as in
 `_extract_value_from_header`.
+
+Header names compare by ASCII case-folding, never `lowercase(k)`: that built a fresh String per
+header (7 allocations each), so a 15-header request paid ~90 allocations per `get_cookie` before
+the cookie was found -- and session, CSRF and auth each call it (#543, #542).
 """
 function _get_cookie_lazy(headers::Any, target_name::String; set_cookie::Bool = false) :: Union{SubString{String}, Nothing}
     # A Dict is never a Response's headers, so it is only ever read as a request's.
@@ -428,15 +432,11 @@ function _get_cookie_lazy(headers::Any, target_name::String; set_cookie::Bool = 
     end
 
     # Iterate through headers (Vector{Pair} or HTTP.Headers)
+    wanted = set_cookie ? "set-cookie" : "cookie"
     for (k, v) in headers
-        kl = lowercase(k)
-        res = if !set_cookie && kl == "cookie"
-            _extract_value_from_header(v, target_name)
-        elseif set_cookie && kl == "set-cookie"
-            _set_cookie_value(v, target_name)
-        else
-            nothing
-        end
+        _ascii_casefold_eq(k, wanted) || continue
+        res = set_cookie ? _set_cookie_value(v, target_name) :
+                           _extract_value_from_header(v, target_name)
         !isnothing(res) && return res
     end
     return nothing

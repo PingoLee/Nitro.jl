@@ -445,16 +445,15 @@ What actually makes re-issuing on a rejection safe is *not* this check — it is
 token is bound to **the requester's own session** and delivered only in **their own** response, so
 it conveys nothing a `GET` would not have already given them. What stops an attacker using it to
 churn a third party's cookie is the cookie's own configuration: `__Host-` means they cannot plant
-one, and `SameSite=Lax` means a cross-site unsafe request does not carry one — so `get_cookie`
-below returns `nothing` and this returns `false` at its first line. (Note the binding is *not*
+one, and `SameSite=Lax` means a cross-site unsafe request does not carry one — so the
+`cookie_value` the middleware read is `nothing` and this returns `false` at its first line. (Note the binding is *not*
 `nothing` in that case: `SessionMiddleware` mints a fresh session id whenever the presented cookie
 is absent or unknown, so an unauthenticated stranger still has one. The request is refused because
 the token does not verify, not because there is nothing to bind to.) An app that opts out of
 **both** — an unprefixed `cookie_name` *and* `samesite="None"` — re-opens a token-churn nuisance
 against its own users.
 """
-function _client_echoed_own_cookie(req::HTTP.Request, cookie_name::String, header_name::String, form_field::String)
-    cookie_value = get_cookie(req, cookie_name, nothing; encrypted=false)
+function _client_echoed_own_cookie(req::HTTP.Request, cookie_value::Nullable{String}, header_name::String, form_field::String)
     cookie_value === nothing && return false
     raw_token, _ = _parse_signed_token(cookie_value)
     raw_token === nothing && return false
@@ -498,16 +497,24 @@ function validate_csrf_token(req::HTTP.Request, secret::String; cookie_name::Str
     # not only on the ones that happen to carry a cookie.
     _check_csrf_secret(secret)
     binding === nothing && return false
-
     cookie_value = get_cookie(req, cookie_name, nothing; encrypted=false)
-    cookie_value === nothing && return false
+    return _validate_presented(req, secret, cookie_value, binding, header_name, form_field) !== nothing
+end
+
+# `validate_csrf_token` over a cookie value the caller already read: the middleware reads it once
+# per request and hands it to every check, rather than each one walking the headers again (#543).
+# The verified raw token on success, so a caller can reuse it; `nothing` on any failure.
+function _validate_presented(req::HTTP.Request, secret::String, cookie_value::Nullable{String},
+                             binding::Nullable{String}, header_name::String,
+                             form_field::String)::Nullable{String}
+    (binding === nothing || cookie_value === nothing) && return nothing
 
     raw_token = _verify_signed_token(secret, cookie_value, binding)
-    raw_token === nothing && return false
+    raw_token === nothing && return nothing
 
     presented = _presented_token(req, header_name, form_field)
-    presented === nothing && return false
-    return _presented_matches(presented, raw_token, cookie_value)
+    presented === nothing && return nothing
+    return _presented_matches(presented, raw_token, cookie_value) ? raw_token : nothing
 end
 
 """
@@ -602,12 +609,14 @@ function CSRFMiddleware(key::Union{AbstractString, SecretString}; cookie_name::S
             secret = reveal(sealed)
             method = uppercase(String(req.method))
             binding = _binding(req)
+            # Read once: every check below and the post-handler re-issue use this value (#543).
+            cookie_value = get_cookie(req, cookie_name, nothing; encrypted=false)
 
             # A bearer-only request has no ambient credential to forge (#438): it skips the
             # check, but not the rest -- a handler can still ask it for a token.
             if !(method in SAFE_METHODS) && !(exempt_bearer && _bearer_only(req))
                 binding === nothing && _warn_unbound()
-                if !validate_csrf_token(req, secret; cookie_name, header_name, form_field, binding)
+                if _validate_presented(req, secret, cookie_value, binding, header_name, form_field) === nothing
                     rejection = json(Dict("error" => "Invalid CSRF token"); status=403)
                     # Hand a stale-but-genuine client a working token back, or a login is a
                     # lockout: `SessionMiddleware`'s `rotate_on_auth` rotates the session id
@@ -621,7 +630,7 @@ function CSRFMiddleware(key::Union{AbstractString, SecretString}; cookie_name::S
                     # `own_response_headers` because a module-level `const` error response is an
                     # endorsed Nitro pattern, and this one must not become a shared object we
                     # mutate per request.
-                    if binding !== nothing && _client_echoed_own_cookie(req, cookie_name, header_name, form_field)
+                    if binding !== nothing && _client_echoed_own_cookie(req, cookie_value, header_name, form_field)
                         rejection = own_response_headers(rejection)
                         issue_csrf_token!(rejection, secret; binding, cookie_name, ttl, config)
                         _keep_session!(req)
@@ -632,7 +641,6 @@ function CSRFMiddleware(key::Union{AbstractString, SecretString}; cookie_name::S
             # The client's verified token, or `nothing`, for the handler to read -- on an unsafe
             # request too, which has just proved it holds one, so a handler re-rendering a form
             # after a POST hands back the same token (under a new mask, #436).
-            cookie_value = get_cookie(req, cookie_name, nothing; encrypted=false)
             _set_context_token!(req, (binding === nothing || cookie_value === nothing) ?
                 nothing : _verify_signed_token(secret, cookie_value, binding))
             req.context[_ACTIVE_KEY] = true
