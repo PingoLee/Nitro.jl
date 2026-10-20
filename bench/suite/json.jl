@@ -66,6 +66,11 @@ const _json_bind = Nitro.Core.Extractors.json_bind
 for (size, bytes, T, KwT) in (("small", Vector{UInt8}(SMALL_JSON), BenchItem, BenchKwItem),
                               ("10kb", Vector{UInt8}(BIG_JSON), BenchRows, BenchKwRows))
     SUITE["json"]["parse_dict_$size"] = @benchmarkable _BP._parse_json_bounded($bytes) evals=1
+    # The depth and key-count pass alone, with the key cap `_parse_json_bounded` applies, so its
+    # share of `parse_dict_*` stays tracked. The bound itself stays (#314); what it costs against
+    # the parse, at larger bodies than these two, is in the #540 measurement comment.
+    SUITE["json"]["depth_only_$size"] = @benchmarkable _BP._check_json_depth(
+        $bytes, _BP.request_max_fields()) evals=1
     SUITE["json"]["parse_typed_$size"] = @benchmarkable _json_bind($T, $bytes) evals=1
     SUITE["json"]["parse_kwdef_$size"] = @benchmarkable _json_bind($KwT, $bytes) evals=1
     # `write_*` serializes what the matching parse produced.
