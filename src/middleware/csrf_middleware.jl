@@ -10,11 +10,18 @@ using ...Crypto: secure_random_bytes, _empty_hmac_key, _hmac_sha256, SecretStrin
 using ...Errors: is_unrecoverable
 using ...Res: json
 using ...Core: own_response_headers, getjson, getform, header_name_isequal
-using ...Util: _mark_private!, _auth_credential
+using ...Util: _mark_private!, _auth_credential, _ascii_casefold_eq
 
 export CSRFMiddleware, csrf_token!, issue_csrf_token!, validate_csrf_token
 
 const SAFE_METHODS = Set(("GET", "HEAD", "OPTIONS", "TRACE"))
+
+# Is `method` in `SAFE_METHODS`, case-insensitively? HTTP.jl stores the request-line method as
+# sent -- `get` stays `get` -- so the fold is needed, but `uppercase(String(method))` built a
+# String on every request to answer it (#562). Only A-Z fold: a method is an ASCII token on the
+# wire, and a non-ASCII spelling that Unicode uppercasing would have admitted -- `optıons`, with a
+# dotless `ı`, uppercases to `OPTIONS` -- is unsafe.
+_is_safe_method(method::AbstractString)::Bool = any(m -> _ascii_casefold_eq(method, m), SAFE_METHODS)
 
 # `__Host-` by default: the cookie is deliberately readable by JS (the SPA has to echo the
 # token), so the browser-enforced prefix is what stops a sibling subdomain from writing a
@@ -611,7 +618,6 @@ function CSRFMiddleware(key::Union{AbstractString, SecretString}; cookie_name::S
     return function(handle::Function)
         return function(req::HTTP.Request)
             secret = reveal(sealed)
-            method = uppercase(String(req.method))
             binding = _binding(req)
             # Read once: every check below and the post-handler re-issue use this value (#543).
             cookie_value = get_cookie(req, cookie_name, nothing; encrypted=false)
@@ -622,7 +628,7 @@ function CSRFMiddleware(key::Union{AbstractString, SecretString}; cookie_name::S
 
             # A bearer-only request has no ambient credential to forge (#438): it skips the
             # check, but not the rest -- a handler can still ask it for a token.
-            if !(method in SAFE_METHODS) && !(exempt_bearer && _bearer_only(req))
+            if !_is_safe_method(req.method) && !(exempt_bearer && _bearer_only(req))
                 binding === nothing && _warn_unbound()
                 if !_validate_presented(req, verified, cookie_value, header_name, form_field)
                     rejection = json(Dict("error" => "Invalid CSRF token"); status=403)

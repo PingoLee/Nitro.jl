@@ -6,7 +6,7 @@ using ...Types: _parse_origin
 using ...Res: json
 using ...Core: header_name_isequal
 using ...Util: _ows_strip
-using ..CSRFMiddleware_: SAFE_METHODS
+using ..CSRFMiddleware_: _is_safe_method
 using ..RateLimiterMiddleware: _is_exempt
 
 export CrossOriginProtection
@@ -102,7 +102,7 @@ end
 # possibly malformed UTF-8: they are compared byte-for-byte or through `_parse_origin`, which
 # refuses non-ASCII before it case-folds anything, never through `lowercase`.
 function _allowed(req::HTTP.Request, trusted::Set{String}, exempt::Vector{String})::Bool
-    uppercase(String(req.method)) in SAFE_METHODS && return true
+    _is_safe_method(req.method) && return true
     fetch_site = _single_header(req, "Sec-Fetch-Site")
     if fetch_site !== nothing && !isempty(fetch_site)
         (fetch_site == "same-origin" || fetch_site == "none") && return true
@@ -133,6 +133,12 @@ function _same_host(origin::String, host::Union{Nothing, String})::Bool
     host === nothing && return false
     parsed = first(_parse_origin(origin))
     parsed === nothing && return false
+    # When the Origin's authority IS the Host, byte for byte, the second parse would read the
+    # Origin's own bytes under its own scheme (whose case the parser folds), so it could only
+    # return `parsed`: skip it (#562). Any other spelling -- case, a default port, an IPv6 form --
+    # still goes through the parser below.
+    sep = findfirst("://", origin)
+    sep !== nothing && SubString(origin, nextind(origin, last(sep))) == host && return true
     scheme = parsed[1:first(findfirst("://", parsed))-1]
     return first(_parse_origin(string(scheme, "://", host))) == parsed
 end

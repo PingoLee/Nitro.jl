@@ -129,6 +129,13 @@ end
     @test !("PUT" in CSRF.SAFE_METHODS)
     @test !("PATCH" in CSRF.SAFE_METHODS)
     @test !("DELETE" in CSRF.SAFE_METHODS)
+    # The per-request check folds ASCII case only (#562): HTTP.jl keeps `get` as `get`.
+    for m in ("GET", "get", "Head", "options", "TRACE")
+        @test CSRF._is_safe_method(m)
+    end
+    for m in ("POST", "post", "PUT", "patch", "DELETE", "", "GETX", "optıons")
+        @test !CSRF._is_safe_method(m)
+    end
 end
 
 @testset "_binding reads the session id, and only a string one" begin
@@ -1138,8 +1145,8 @@ end
 @testset "the cookie's signature is verified once per request (#544)" begin
     # It was verified before the handler and again after it, under the same binding: an HMAC and
     # ~15 allocations that re-derived what the first one proved; a POST paid two extra. The GET
-    # bound sits below "one more verification", which the positive control prices. Measured 43-45
-    # (GET) and 64-67 (POST) across `--check-bounds` settings; 60 and 97 before.
+    # bound sits below "one more verification", which the positive control prices. Measured 36
+    # (GET) and 57 (POST) once the method check stopped allocating (#562); 60 and 97 before both.
     minted = HTTP.Response(200, "ok")
     masked = issue_csrf_token!(minted, SECRET; binding = SESSION_A)
     cookie = cookie_value(minted, "__Host-csrf_token")
@@ -1157,10 +1164,10 @@ end
     @testset let get = allocs(() -> layer(gets[next_get[] += 1])),
                  post = allocs(() -> layer(posts[next_post[] += 1])),
                  verify = allocs(() -> CSRF._verify_signed_token(SECRET, cookie, SESSION_A))
-        @test get.count <= 52
-        @test post.count <= 75
+        @test get.count <= 45
+        @test post.count <= 65
         # A second verification would break the GET bound on its own.
-        @test get.count + verify.count > 52
+        @test get.count + verify.count > 45
     end
 end
 

@@ -4,6 +4,8 @@ using HTTP
 using Nitro
 using Nitro: CrossOriginProtection
 using Nitro.Core: internalrequest
+using Nitro.Core.Middleware.CrossOriginProtectionMiddleware: _allowed, _same_host
+using Nitro.Core.Types: _parse_origin
 import Nitro: App, path, text
 
 # Go 1.25's `net/http.CrossOriginProtection`, check for check: `Sec-Fetch-Site` first, then the
@@ -66,6 +68,44 @@ end
     @test status(l, req("POST", H, "Origin" => "null")) == 403                          # sandboxed frame
     @test status(l, req("POST", "Origin" => "https://api.example.com")) == 403              # no Host to match
     @test status(l, req("POST", "Host" => "api.example.com/x", "Origin" => "https://api.example.com")) == 403
+    # Byte-equal to the Host, but no origin a browser sends: the Origin is still parsed first (#562).
+    @test status(l, req("POST", "Host" => "api..example.com", "Origin" => "https://api..example.com")) == 403
+    @test status(l, req("POST", "Host" => "API.EXAMPLE.COM", "Origin" => "HTTPS://API.EXAMPLE.COM")) == 200
+end
+
+@testset "the method is matched case-insensitively, ASCII only (#562)" begin
+    # HTTP.jl keeps the request-line method as sent, so `post` reaches the layer as `post`.
+    l = layer()
+    cross = ("Sec-Fetch-Site" => "cross-site", "Origin" => "https://evil.example")
+    @test status(l, req("get", H, cross...)) == 200
+    @test status(l, req("Head", H, cross...)) == 200
+    @test status(l, req("post", H, cross...)) == 403
+    # `uppercase` folded the dotless `ı` to `I`; a method is an ASCII token, so this is unsafe.
+    @test status(l, req("optıons", H, cross...)) == 403
+end
+
+@testset "the checks themselves allocate only for the Origin parse (#562)" begin
+    # Locals, not testitem globals: a closure over an untyped global allocates on its own.
+    @testset let get_req = req("GET", H, "Origin" => "https://api.example.com"),
+                 safe = let r = get_req, t = Set{String}(), e = String[]
+                     allocs(() -> _allowed(r, t, e))
+                 end,
+                 upper = let r = get_req
+                     allocs(() -> uppercase(String(r.method)))
+                 end
+        @test safe.count == 0
+        @test upper.count >= 1          # what the method check used to build per request
+    end
+    # Equal authorities need one parse, not two.
+    # The positive control is the old path itself: parse the Origin, then the synthesized one.
+    @testset let same = allocs(() -> _same_host("https://api.example.com", "api.example.com")),
+                 parse = allocs(() -> _parse_origin("https://api.example.com")),
+                 two_parses = let o = "https://api.example.com", h = "api.example.com"
+                     allocs(() -> (_parse_origin(o); _parse_origin(string("https", "://", h))))
+                 end
+        @test same.count <= parse.count + 2
+        @test two_parses.count > parse.count + 2
+    end
 end
 
 @testset "neither header: a non-browser client passes" begin

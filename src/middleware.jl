@@ -12,7 +12,7 @@ include("middleware/auth_middleware.jl"); @reexport using .AuthMiddleware
 include("middleware/cors_middleware.jl"); @reexport using .CORSMiddleware
 include("middleware/security_headers.jl"); @reexport using .SecurityHeadersMiddleware
 include("middleware/csrf_middleware.jl"); @reexport using .CSRFMiddleware_
-# After CSRF and the rate limiter: it reuses their `SAFE_METHODS` and `_is_exempt` (#437).
+# After CSRF and the rate limiter: it reuses their `_is_safe_method` and `_is_exempt` (#437).
 include("middleware/cross_origin_protection.jl"); @reexport using .CrossOriginProtectionMiddleware
 include("middleware/session_middleware.jl"); @reexport using .SessionMiddleware_
 include("middleware/guards.jl"); @reexport using .GuardsMiddleware
