@@ -197,3 +197,142 @@ end
 end
 
 end
+
+@testitem "The body read keeps every byte and allocates by the body, not by the chunk (#535)" tags=[:core, :network] setup=[NitroCommon] begin
+using Test
+using HTTP
+using Random
+using Sockets
+using Nitro
+
+# `_http_stream_request` driven directly, under a raw HTTP.jl stream server, so what is measured is
+# the body read alone -- no router, no middleware, no response building.
+const Core_ = Nitro.Core
+const CRLF = "\r\n"
+const LIMIT = Int64(5000)
+const SEEN = Channel{Any}(Inf)
+
+function reader(limit::Int64)
+    return function (stream::HTTP.Stream)
+        req = nothing
+        err = nothing
+        # A throw is REPORTED, not left to HTTP's loop: the test would otherwise wait on `SEEN`
+        # forever instead of failing.
+        bytes = @allocated try
+            req = Core_._http_stream_request(stream, limit)
+        catch e
+            err = e
+        end
+        rejected = req isa Core_._BodyRejected
+        body = req isa HTTP.Request ? (req.body isa HTTP.EmptyBody ? UInt8[] : copy(req.body.data)) : nothing
+        put!(SEEN, (; body, rejected, bytes, err))
+        err === nothing || return nothing
+        HTTP.setstatus(stream, rejected ? 413 : 200)
+        HTTP.setheader(stream, "Content-Length" => "0")
+        rejected && HTTP.setheader(stream, "Connection" => "close")
+        HTTP.startwrite(stream)
+        return nothing
+    end
+end
+
+head(framing) = string("POST /b HTTP/1.1", CRLF, "Host: x", CRLF, framing, CRLF, CRLF)
+fixed(body) = vcat(Vector{UInt8}(head("Content-Length: $(length(body))")), body)
+function chunked(chunks)
+    io = IOBuffer()
+    write(io, head("Transfer-Encoding: chunked"))
+    for c in chunks
+        write(io, string(length(c), base = 16), CRLF, c, CRLF)
+    end
+    write(io, "0", CRLF, CRLF)
+    return take!(io)
+end
+
+function await_seen()
+    timedwait(() -> isready(SEEN), 30.0; pollint = 0.01) === :ok || error("the handler reported nothing in 30 s")
+    return take!(SEEN)
+end
+
+function send(port, payload)
+    sock = Sockets.connect(HOST, port)
+    try
+        write(sock, payload)
+        return await_seen()
+    finally
+        close(sock)
+    end
+end
+
+port = get_free_port()
+server = HTTP.listen!(reader(Int64(64 << 20)), HOST, port)
+try
+    @testset "fixed length, every size around the read boundaries" begin
+        for n in (1, 200, 1023, 1024, 1025, 65535, 65536, 65537, 200_000)
+            body = rand(Random.RandomDevice(), UInt8, n)
+            seen = send(port, fixed(body))
+            @test !seen.rejected
+            @test seen.body == body
+        end
+    end
+
+    @testset "chunked, chunks smaller than, equal to and larger than a read" begin
+        for sizes in ([200], [1], [1024], [1025], [1024, 1024], [1, 1023, 1025, 4096],
+                      [65536], [70_000], [16384 for _ in 1:20], [1000, 70_000, 3, 65536, 2])
+            chunks = [rand(Random.RandomDevice(), UInt8, s) for s in sizes]
+            seen = send(port, chunked(chunks))
+            @test !seen.rejected
+            @test seen.body == reduce(vcat, chunks)
+        end
+    end
+
+    @testset "a small chunked body allocates less than one transfer chunk" begin
+        # Before #535 every chunked body cost at least two `_STREAM_CHUNK_BYTES` allocations --
+        # a 64 KiB scratch, and 64 KiB inside HTTP.jl per read -- however few bytes it carried.
+        # The bound is that shape, not a byte count: the read is now sized by the body.
+        payload = chunked([rand(Random.RandomDevice(), UInt8, 200)])
+        bytes = minimum(send(port, payload).bytes for _ in 1:5)
+        @test bytes < Core_._STREAM_CHUNK_BYTES
+    end
+finally
+    close(server)
+end
+
+port = get_free_port()
+server = HTTP.listen!(reader(LIMIT), HOST, port)
+try
+    @testset "the ceiling, exactly, under every framing" begin
+        at = rand(Random.RandomDevice(), UInt8, LIMIT)
+        @test send(port, fixed(at)).body == at
+        @test send(port, chunked([at[1:1], at[2:end]])).body == at
+        @test send(port, chunked([at])).body == at
+        @test send(port, chunked([at, UInt8[0x01]])).rejected
+        @test send(port, chunked([at[1:2500], vcat(at[2501:end], 0x01)])).rejected
+        @test send(port, chunked([UInt8[0x01] for _ in 1:(LIMIT + 1)])).rejected
+    end
+finally
+    close(server)
+end
+
+port = get_free_port()
+server = HTTP.listen!(reader(Int64(0)), HOST, port)   # `max_body_bytes = nothing`: no ceiling
+try
+    @testset "a Content-Length claim reserves nothing before its bytes arrive" begin
+        # 256 MiB claimed, 300 bytes sent, then the client hangs up. With no ceiling nothing
+        # refuses the claim up front, so the only defence is that the buffer grows with bytes
+        # RECEIVED. Sizing the first read, or the body's growth, from `declared` would allocate
+        # the claim here.
+        # The minimum of three, as above: `@allocated` counts the whole process, and a first run
+        # that compiled the read would count the JIT too.
+        claimed = 256 << 20
+        runs = map(1:3) do _
+            sock = Sockets.connect(HOST, port)
+            write(sock, head("Content-Length: $claimed"), rand(Random.RandomDevice(), UInt8, 300))
+            close(sock)
+            return await_seen()
+        end
+        @test all(s -> s.err isa HTTP.ParseError, runs)   # truncated, and the read says so
+        @test minimum(s -> s.bytes, runs) < 4 * Core_._STREAM_CHUNK_BYTES
+    end
+finally
+    close(server)
+end
+end
