@@ -2,6 +2,10 @@ module JanitorMiddleware
 
 using Dates
 using ...Types: require_fixed_period
+# A tick runs work the caller supplied -- a session store's prune, `AccessLog`'s retention
+# `prune` -- and a database error keeps the row in a field `showerror` leaves out. So a failed
+# tick logs `loggable(e)`, never `e` (#658).
+using ...Errors: loggable
 
 # ── The one background-janitor discipline (#190) ───────────────────────────────────────────
 #
@@ -93,7 +97,7 @@ function _janitor_loop(work::Function, token::Ref{Bool}, interval::Period,
                 # It now lands in the outer handler below (#369), which stops the loop rather than
                 # looping on -- before #190 only one of the three copies had this guard at all.
                 e isa InterruptException && rethrow()
-                @error "Nitro.$label: $what failed" exception=(e, catch_backtrace())
+                @error "Nitro.$label: $what failed" exception=(loggable(e), catch_backtrace())
             end
         end
     catch e

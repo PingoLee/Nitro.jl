@@ -9,6 +9,9 @@ using ..Types
 using ..Types: CopyOnWriteDict, RouteMiddleware, NamedRoute, NitroRouter, nitro_router,
     MissResponse, miss_response
 using ..Constants: SHUTDOWN_TIMEOUT_SECONDS, DEFAULT_MAX_FIELDS, AbstractApp
+# The serve task, a shutdown and a Revise hook log what they caught as `loggable(e)`, never `e`:
+# each logs whatever reached it, and the rule holds everywhere in `src/` (#658).
+using ..Errors: loggable
 
 export App, EagerReviseService, Service, wait, close, isopen
 export set_extension!, get_extension, delete_extension!, has_extension
@@ -62,7 +65,7 @@ function _try_cancel(cancel::Function, task::Task)::Union{Bool,Nothing}
         return Base.invokelatest(cancel, task)::Bool
     catch e
         e isa InterruptException && rethrow()
-        @error "Nitro: cancelling the eager-Revise watcher's wait failed" exception=(e, catch_backtrace())
+        @error "Nitro: cancelling the eager-Revise watcher's wait failed" exception=(loggable(e), catch_backtrace())
         return nothing
     end
 end
@@ -283,7 +286,7 @@ function _shutdown_server(server::Server; timeout::Real)::Bool
     # `async=true` this is the first and only place it gets reported. `maxlog=1` keeps a
     # repeatedly-terminated broken server from flooding.
     _report(err, what) =
-        @warn "Nitro: $what ran against a serve task that had already failed" exception=err maxlog=1
+        @warn "Nitro: $what ran against a serve task that had already failed" exception=loggable(err) maxlog=1
 
     # Documented opt-out of the graceful phase.
     if iszero(timeout)
@@ -305,7 +308,7 @@ function _shutdown_server(server::Server; timeout::Real)::Bool
             if _expected(err)
                 _report(err, "graceful shutdown")
             else
-                @error "Nitro: graceful server shutdown failed unexpectedly" exception=(err, catch_backtrace())
+                @error "Nitro: graceful server shutdown failed unexpectedly" exception=(loggable(err), catch_backtrace())
             end
         end
     end

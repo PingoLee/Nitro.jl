@@ -259,20 +259,18 @@ application handlers, which Nitro cannot wrap. It does not make `showerror` valu
 exception whose own message quotes a value still prints it, there as on the console, so a fault
 that must not even name a value is replaced earlier (`ValidatorFault`, `SessionStoreFault`).
 
-Used by every log line on a request's path that carries an exception: the error boundary
-(`handlerequest`), the `AccessLog` and `access_log_skip` hook warnings, a failed `Res.sse`
-producer, a failed streamed response body, the peer-address lookup, and the rate limiters' `decide`
-(#648). The PormG stores use it for PormG's own database errors.
-
-Every worker log line that carries an exception uses it too (#651): zombie recovery, at boot and on
-the retention tick; the retention scheduler's sweeps and its "had already died" line; the teardown
-paths that could not record an abandoned task; the start-time count of a queue's external runs; and
-the external consumer's claim, heartbeat, lease-renewal, adjudication, hand-back, drain and stop
-lines. A store rethrows its own database error after logging it, so these callers are where it
-would otherwise reach the log as the live object. They use it everywhere, not only where a store
-call is in the `try`, so the rule holds without reading each site. `LifecycleMiddleware`'s
-`startup` and `shutdown` use it for a hook that threw: the worker hook's boot sweep rethrows a
-store's error into `startup`.
+Every Nitro log record that carries an exception carries one of these, everywhere in `src/` (#658).
+That covers the error boundary (`handlerequest`), the `AccessLog` and `access_log_skip` hook
+warnings, a failed `Res.sse` producer, a failed streamed response body, the peer-address lookup and
+the rate limiters' `decide` (#648). It covers every worker log line (#651): zombie recovery, the
+retention scheduler, the teardown paths, the external consumer, and `LifecycleMiddleware`'s
+`startup` and `shutdown`, into which the worker hook's boot sweep rethrows a store's error. And it
+covers the lines off the request path (#658): a periodic janitor's failed tick (the session prune
+and `AccessLog`'s retention prune, both of which can run an app's own store code, and the rate
+limiter's sweep), the serve task's failure, a shutdown or force-close that threw, the eager-Revise
+hooks, and `mountable_files` skipping an unreadable directory. The source scan in
+`test/middleware/log_exposure_tests.jl` enforces the rule, so a new site that logs the live object
+fails there. The PormG stores use it for PormG's own database errors.
 
 Deliberately **not exported**: a log filter that dispatched on the original exception type
 matches on `.type` instead.

@@ -24,11 +24,15 @@ the original's type name (`:MethodError`), and `text`, what `showerror` printed 
 prints the same `text`, without colour. So a JSON or structured log sink records exactly what the console shows,
 and never the arguments of a `MethodError` or the value in a `TypeError`. Those used to reach any
 sink that `show`ed the record: a request's query string, a parsed body, a token. Every other log
-line on a request's path that carries an exception carries the same type: the warnings that
-`AccessLog` and `access_log_skip` log when a hook or the sink throws, a failed
-[`Res.sse`](@ref) producer, a failed streamed response body, and a rate
-limiter whose decision threw. So does every worker log line that carries an exception, off the
-request path too: see the [Workers](../tutorial/workers.md) guide.
+line Nitro writes with an exception carries the same type. On a request's path, that means the
+warnings that `AccessLog` and `access_log_skip` log when a hook or the sink throws, a failed
+[`Res.sse`](@ref) producer, a failed streamed response body, and a rate limiter whose decision
+threw. Off it, it means a background janitor's failed tick (the session prune of
+[`SessionMiddleware`](@ref) or [`SessionPruner`](@ref), the rate limiter's sweep, `AccessLog`'s
+retention prune), the serve task's failure, a shutdown that threw, and the eager-Revise hooks. A
+prune that runs your own store's code can throw an error whose fields hold a session id; the log
+gets its `showerror` text, not those fields. Every worker log line is covered too: see the
+[Workers](../tutorial/workers.md) guide.
 
 A [`Claims`](@ref) refusal is not on this list because it is not converted at all: the `401` or
 `403` its denial factory built is the route's response, served under `catch_errors=false` and
