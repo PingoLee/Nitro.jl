@@ -237,6 +237,7 @@ they **shadow** the same-named functions `using .Core` brings in. An `(app, …)
 | `test/` | `ReTestItems` suite driven by the explicit ordered list in `test/runtests.jl` |
 | `docs/src/` | User documentation (Documenter) |
 | `docs/design/` | Design records — accepted rationale and open proposals that are not user docs |
+| `examples/` | Standalone example projects, each with its own `Project.toml` whose `[sources]` point Nitro at this checkout. `test/examples_tests.jl` instantiates and tests them in a child process, so an example that drifts from the API fails the suite. A new example owes a test item there |
 | `upgrading/` | The change log `upgrade_guide` reads — **one file per breaking/behavior entry**, `YYYY-MM-DD-<slug>.md`. Every `.md` here is an entry; nothing else belongs in it |
 
 ## Verification
