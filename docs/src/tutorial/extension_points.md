@@ -26,11 +26,11 @@ Three functions divide the work, and keeping them straight is what makes a packa
 |---|---|---|
 | `path(pattern, handler; method)` | one `RouteDefinition` | none — pure value |
 | `include_routes(prefix, routes)` | a **new** `Vector{RouteDefinition}` | none — prefixes copies |
-| `urlpatterns(prefix, routes)` | `nothing` | **registers** the routes on the context |
+| `urlpatterns(app, prefix, routes)` | `nothing` | **registers** the routes on `app` |
 
-Only `urlpatterns()` touches global state. A reusable package should therefore stop at
-`include_routes` and hand the vector back — **let the host application decide the prefix and the
-moment of registration.** A package that calls `urlpatterns()` itself has taken that choice away
+Only `urlpatterns()` changes anything: it is the one call that writes to the app. A reusable
+package should therefore stop at `include_routes` and hand the vector back — **let the host
+application decide the prefix and the moment of registration.** A package that calls `urlpatterns()` itself has taken that choice away
 and can only ever be mounted once, in one place.
 
 ### A reusable app package
@@ -66,16 +66,32 @@ end # module
 The host application mounts it:
 
 ```julia
-# src/App.jl
+# src/MyHost.jl
+module MyHost
+
 using Nitro
 using CatalogApp
 
-urlpatterns("/api", CatalogApp.routes(prefix = "/products"))
-serve()
+const app = App(mod = @__MODULE__)
+
+function main(; kwargs...)
+    urlpatterns(app, "/api", CatalogApp.routes(prefix = "/products"))
+    serve(app; kwargs...)
+end
+
+end # module
 ```
 
 That registers `/api/products/` and `/api/products/<int:id>`. The host chose `/api`, the package
-chose `/products`, and neither had to know the other's decision.
+chose `/products`, and neither had to know the other's decision. Registration happens in
+`main()`, not in the module body, because a module body runs at precompile time and never again.
+
+!!! tip "A complete, tested version"
+    [`examples/reusable_package`](https://github.com/PingoLee/Nitro.jl/tree/main/examples/reusable_package)
+    in the repository builds this out as two projects: a catalog package with namespaced route
+    names, state passed in by the host and an API-key middleware factory, and a host that mounts
+    it. Nitro's test suite instantiates and tests both, so the example stays in step with the
+    framework.
 
 ### Composing several packages
 
@@ -83,20 +99,22 @@ chose `/products`, and neither had to know the other's decision.
 in a plain `[...]` builds a vector *of vectors*, which `urlpatterns()` does not accept.
 
 ```julia
-using Nitro
-using CatalogApp, BillingApp
-
-urlpatterns("/api", vcat(
-    CatalogApp.routes(prefix = "/products"),
-    BillingApp.routes(prefix = "/invoices"),
-))
-serve()
+function main(; kwargs...)
+    urlpatterns(app, "/api", vcat(
+        CatalogApp.routes(prefix = "/products"),
+        BillingApp.routes(prefix = "/invoices"),
+    ))
+    serve(app; kwargs...)
+end
 ```
 
 !!! tip "Route names must stay unique"
     Passing `name=` to `path()` registers a reverse-lookup name for [`url`](@ref). Two packages
     mounted under different prefixes still share one name table, so prefix your package's route
-    names (`"catalog.product_detail"`) rather than claiming a bare `"detail"`.
+    names (`"catalog.product_detail"`) rather than claiming a bare `"detail"`. Registering a name
+    twice for different paths is an `ArgumentError`. To let one host mount your package more than
+    once, take the name prefix as a keyword (`routes(; namespace = "catalog")`), as the example
+    package does.
 
 ---
 
@@ -143,17 +161,20 @@ wrapped = SessionMiddleware(store = store).middleware(handler)  # composing by h
 
 
 ```julia
-function RequireApiKey(; header::String = "X-Api-Key", key::String)
+function RequireApiKey(; header::String = "X-Api-Key", key::SecretString)
+    # A missing header reads as "", so an empty key would let every request through.
+    isempty(reveal(key)) && throw(ArgumentError("RequireApiKey: `key` must not be empty"))
     return function(handler)                       # the middleware
         return function(req::HTTP.Request)         # the handler it produces
-            HTTP.header(req, header, "") == key ||
+            # `==` on a SecretString is constant-time; on two Strings it is not.
+            key == HTTP.header(req, header, "") ||
                 return Res.json(Dict("error" => "unauthorized"); status = 401)
             return handler(req)
         end
     end
 end
 
-serve(middleware = [RequireApiKey(key = ENV["API_KEY"])])
+serve(app; middleware = [RequireApiKey(key = SecretString(ENV["API_KEY"]))])
 ```
 
 Write one of these for a credential Nitro has no middleware for. If what you want is the
