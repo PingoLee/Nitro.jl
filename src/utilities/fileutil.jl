@@ -1,4 +1,5 @@
 using HTTP
+using ..Errors: loggable    # a log record never carries the live exception (#658)
 
 export readfile, mountfolder, mountable_files
 
@@ -517,7 +518,7 @@ function mountable_files(root::String;
 
     # Default is `onerror=throw`, which makes one unreadable subdirectory anywhere under the mount
     # abort `serve()`. Logging and continuing fails closed — fewer files get served, never more.
-    onerror = e -> @debug "mountable_files: skipping unreadable directory" exception=e
+    onerror = e -> @debug "mountable_files: skipping unreadable directory" exception=loggable(e)
 
     for (dir, _, names) in walkdir(root; follow_symlinks=false, onerror=onerror)
         reldir     = relpath(dir, root)

@@ -154,3 +154,194 @@ end
 end
 
 end
+
+# #658: the rule holds in all of `src/`, not only on a request's path and in `src/Workers` (#651). A
+# background janitor runs work the APP supplied -- a custom session store's prune, `AccessLog`'s
+# retention `prune(cutoff)` -- and logged whatever it threw. A database error keeps the server's
+# DETAIL line in a field (the #646 shape: `Key (session_key)=(<the id>)`), which `showerror` leaves
+# out and a structured sink's `show` or `dump` prints.
+@testitem "background and lifecycle logs never carry the live exception (#658)" tags=[:middleware, :security] setup=[NitroCommon] begin
+using Test
+using Dates
+using Nitro
+using Nitro.Core: startup, shutdown
+using Nitro.Core.Middleware.JanitorMiddleware: _janitor_loop
+using Nitro.Core.AppContext: _try_cancel
+
+# Renders like a database error: a value-free message, and the row in a field.
+struct StoreBoom <: Exception
+    detail::String
+end
+Base.showerror(io::IO, ::StoreBoom) = print(io, "StoreBoom: the prune DELETE hit a foreign key")
+boom() = StoreBoom("DETAIL:  Key (session_key)=(S3NT1NEL-sid) is still referenced.")
+leaks(s) = occursin("S3NT1NEL", s)
+
+# Everything a sink could write: the message, the kwargs as `show`n, and the exception under
+# `showerror` and `dump`.
+function rendered(l)
+    out = string(l.message, sprint(show, l.kwargs))
+    ex = get(l.kwargs, :exception, nothing)
+    ex isa Tuple && (ex = ex[1])
+    ex isa Exception && (out *= sprint(showerror, ex) * sprint(dump, ex))
+    return out
+end
+
+records(logger) = lock(() -> copy(logger.logs), logger.lock)
+
+# The record named `message` exists and carries a `LoggedException` of the original's type name, the
+# console text is kept, and no record quotes the row.
+function check(logs, message)
+    hits = filter(l -> occursin(message, string(l.message)), logs)
+    @test !isempty(hits)
+    for record in hits
+        ex = record.kwargs[:exception]
+        logged = ex isa Tuple ? ex[1] : ex
+        @test logged isa Nitro.Errors.LoggedException
+        logged isa Nitro.Errors.LoggedException || continue
+        @test logged.type === :StoreBoom
+        @test occursin("foreign key", logged.text)
+    end
+    @test !any(l -> leaks(rendered(l)), logs)
+end
+
+@testset "the live error does carry the row (positive control)" begin
+    @test leaks(sprint(dump, boom()))
+    @test !leaks(sprint(showerror, boom()))
+end
+
+@testset "the janitor loop: a failed tick" begin
+    token = Ref(true)
+    ticks = Ref(0)
+    work = function ()
+        ticks[] += 1
+        ticks[] >= 2 && (token[] = false)
+        throw(boom())
+    end
+    logger = Test.TestLogger(; min_level = Base.CoreLogging.Info)
+    Base.CoreLogging.with_logger(logger) do
+        _janitor_loop(() -> work(), token, Millisecond(1), "JanitorTest", "prune")
+    end
+    @test ticks[] == 2
+    check(records(logger), "Nitro.JanitorTest: prune failed")
+end
+
+# A store whose prune fails the way a database DELETE does; nothing else is ever called.
+struct FailingPruneStore <: Nitro.Core.Types.AbstractSessionStore{String,Dict{String,Any}}
+    calls::Threads.Atomic{Int}
+end
+function Nitro.Core.Types.cleanup_expired_sessions!(s::FailingPruneStore)
+    Threads.atomic_add!(s.calls, 1)
+    throw(boom())
+end
+
+@testset "a served SessionPruner over an app's own store" begin
+    store = FailingPruneStore(Threads.Atomic{Int}(0))
+    pruner = SessionPruner(store; interval = Millisecond(20))
+    logger = Test.TestLogger(; min_level = Base.CoreLogging.Info)
+    try
+        # Started under the logger, so the janitor's spawned task inherits it.
+        Base.CoreLogging.with_logger(() -> startup(pruner), logger)
+        @test timedwait(() -> store.calls[] >= 2, 10.0; pollint = 0.05) === :ok
+    finally
+        shutdown(pruner)
+    end
+    check(records(logger), "Nitro.SessionPruner: session prune failed")
+end
+
+@testset "the eager-Revise watcher: a cancel that threw" begin
+    logger = Test.TestLogger(; min_level = Base.CoreLogging.Info)
+    t = @async nothing
+    wait(t)
+    @test Base.CoreLogging.with_logger(() -> _try_cancel(_ -> throw(boom()), t), logger) === nothing
+    check(records(logger), "cancelling the eager-Revise watcher's wait failed")
+end
+
+# The rule is uniform across `src/`, not limited to the sites above. Read from the parsed source, so
+# a docstring or comment that quotes `exception=e` is not a site and a call split over several lines
+# still is. Two rules, for every logging macro call:
+#
+# - an `exception` argument is `loggable(e)` or `(loggable(e), catch_backtrace())`, nothing else;
+# - no argument, the message included, names a `catch` variable in scope except inside `loggable`,
+#   `typeof` or `nameof`, or through a field. That catches `@warn "m" e` (logged under the key `e`),
+#   `err = e`, and `"$e"`, which prints through `show`.
+@testset "every exception= in src/ goes through loggable" begin
+    logmacros = Symbol.(("@error", "@warn", "@info", "@debug", "@logmsg"))
+    macroname(m::Symbol) = m
+    macroname(m::GlobalRef) = m.name
+    macroname(m::Expr) = m.head === :. ? macroname(m.args[end]) : nothing
+    macroname(m::QuoteNode) = m.value
+    macroname(_) = nothing
+    isloggable(v) = v isa Expr && v.head === :call && v.args[1] === :loggable && length(v.args) == 2
+    isbacktrace(v) = v isa Expr && v.head === :call && v.args[1] === :catch_backtrace
+    safe(v) = isloggable(v) ||
+              (v isa Expr && v.head === :tuple && length(v.args) == 2 &&
+               isloggable(v.args[1]) && isbacktrace(v.args[2]))
+    # Whether `ex` names `v` other than through `loggable`/`typeof`/`nameof` or a field access.
+    names_live(ex, v) = ex === v ||
+        (ex isa Expr && ex.head !== :. &&
+         !(ex.head === :call && ex.args[1] in (:loggable, :typeof, :nameof)) &&
+         any(a -> names_live(a, v), ex.args))
+    # `@error("m"; exception = e)` puts its keywords in a `:parameters` block.
+    logargs(ex) = mapreduce(a -> a isa Expr && a.head === :parameters ? a.args : Any[a], vcat,
+                            ex.args[3:end]; init = Any[])
+
+    sites = Ref(0)
+    function walk(ex, file, vars, out)
+        ex isa Expr || return out
+        if ex.head === :try && ex.args[2] isa Symbol
+            walk(ex.args[1], file, vars, out)
+            walk(ex.args[3], file, [vars; ex.args[2]], out)
+            foreach(a -> walk(a, file, vars, out), ex.args[4:end])
+            return out
+        end
+        if ex.head === :macrocall && macroname(ex.args[1]) in logmacros
+            at = "$(relpath(file, pkgdir(Nitro))):$(ex.args[2] isa LineNumberNode ? ex.args[2].line : 0)"
+            for a in logargs(ex)
+                if a isa Expr && a.head in (:(=), :kw) && a.args[1] === :exception
+                    sites[] += 1
+                    safe(a.args[2]) || push!(out, at)
+                end
+                any(v -> names_live(a, v), vars) && push!(out, at)
+            end
+        end
+        foreach(a -> walk(a, file, vars, out), ex.args)
+        return out
+    end
+    scan(code) = walk(Meta.parseall(code), joinpath(pkgdir(Nitro), "probe.jl"), Symbol[], String[])
+
+    # The scan flags the forms it claims to, and passes the ones Nitro writes. A lambda binds no
+    # `catch` variable, so only the `exception=` rule can flag the forms written as one.
+    for code in ("try f() catch e; @error \"m\" exception=(e, catch_backtrace()) end",
+                 "g = e -> @error(\"m\"; exception = e)",
+                 "g = e -> @warn \"m\" exception=(loggable(e), e)",
+                 "try f() catch e; @warn \"m\" e end",
+                 "try f() catch e; @warn \"m\" err = e end",
+                 "try f() catch e; @warn \"failed: \$e\" end",
+                 "g = e -> @debug \"m\" exception=e")
+        @test !isempty(scan(code))
+    end
+    for code in ("try f() catch e; @error \"m\" exception=(loggable(e), catch_backtrace()) end",
+                 "try f() catch e; @warn(\"m\"; exception = loggable(e)) end",
+                 "try f() catch e; @warn \"m\" exception_type=nameof(typeof(e)) message=e.msg end")
+        @test isempty(scan(code))
+    end
+    sites[] = 0
+
+    offenders = String[]
+    unparsed = String[]
+    for (dir, _, names) in walkdir(joinpath(pkgdir(Nitro), "src")), name in names
+        endswith(name, ".jl") || continue
+        file = joinpath(dir, name)
+        parsed = Meta.parseall(read(file, String); filename = file)
+        # `parseall` does not throw: a syntax error ends the file in an `:error` node, and the
+        # walk would then pass whatever followed it unread.
+        any(a -> a isa Expr && a.head in (:error, :incomplete), parsed.args) && push!(unparsed, file)
+        walk(parsed, file, Symbol[], offenders)
+    end
+    @test isempty(unparsed)
+    @test sites[] >= 40                   # the scan is seeing the sites, not a moved tree
+    @test isempty(offenders)
+    isempty(offenders) || @info "log calls that can carry a live exception" offenders
+end
+
+end

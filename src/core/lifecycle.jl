@@ -1,6 +1,9 @@
 # ── Server lifecycle ────────────────────────────────────────────────────────────
 # `serve`/`terminate`/`startserver`, the startup banner, and the Revise wiring.
 # Included into `module Core` by src/core.jl — not a submodule; see the hub for why.
+#
+# What the serve task, a force-close or an eager revision threw is logged as `loggable(e)`, never
+# the live exception (#658). `loggable` is in scope through src/core/transport.jl's import.
 
 # ── What the process was started with (#299) ──────────────────────────────────────────────────────
 #
@@ -493,7 +496,7 @@ function _eager_revise_loop(done::Threads.Atomic{Bool}, hooks = revise_hooks())
                 # Rethrow guard, per the idiom in src/utilities/misc.jl: it routes an interrupt
                 # that lands mid-revision to the handler below rather than looping on.
                 e isa InterruptException && rethrow()
-                @error "Nitro: eager revision failed" exception=(e, catch_backtrace())
+                @error "Nitro: eager revision failed" exception=(loggable(e), catch_backtrace())
             end
         end
     catch e
@@ -558,7 +561,7 @@ function _close_deferring_interrupt(service, timeout::Real,
                 @warn "Nitro: a second interrupt during the force-close — the server handle may \
                        still be set and the listener may still be open. Check before re-serving."
             else
-                @error "Nitro: force-close after an interrupted drain failed" exception=(forced, catch_backtrace())
+                @error "Nitro: force-close after an interrupted drain failed" exception=(loggable(forced), catch_backtrace())
             end
         end
         return something(interrupt, e)
@@ -687,7 +690,7 @@ function startserver(ctx::App; host, port, show_banner=false, async=false, kwarg
         try
             wait(ctx.service)
         catch error
-            !isa(error, InterruptException) && @error "ERROR: " exception=(error, catch_backtrace())
+            !isa(error, InterruptException) && @error "ERROR: " exception=(loggable(error), catch_backtrace())
         finally
             println()
             # Ctrl-C out of the blocking wait is THE documented way to stop a blocking `serve` —

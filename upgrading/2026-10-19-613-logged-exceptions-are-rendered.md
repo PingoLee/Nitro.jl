@@ -1,7 +1,7 @@
 ## Error log records carry a `LoggedException`, not the exception that was thrown (#613)
 
 - **Version**: Unreleased
-- **Nitro ref**: [#613](https://github.com/PingoLee/Nitro.jl/issues/613) ; `src/errors.jl`, `src/utilities/misc.jl`, `src/middleware/access_log.jl`, `src/core/framework_middleware.jl` ; [#651](https://github.com/PingoLee/Nitro.jl/issues/651) ; `src/Workers/`, `src/types.jl`
+- **Nitro ref**: [#613](https://github.com/PingoLee/Nitro.jl/issues/613) ; `src/errors.jl`, `src/utilities/misc.jl`, `src/middleware/access_log.jl`, `src/core/framework_middleware.jl` ; [#651](https://github.com/PingoLee/Nitro.jl/issues/651) ; `src/Workers/`, `src/types.jl` ; [#658](https://github.com/PingoLee/Nitro.jl/issues/658) ; `src/middleware/janitor.jl`, `src/core/lifecycle.jl`, `src/context.jl`, `src/utilities/fileutil.jl`
 - **Recorded**: 2026-10-19
 - **Severity**: behavior change (logging). The client response is unchanged, and so is the console
   text, though it is no longer coloured. A log sink or filter that reads the record's `exception`
@@ -41,6 +41,20 @@ task row. So do `Error in LifecycleMiddleware.on_startup` and `on_shutdown`, for
 lifecycle hook that throws: the worker hook's boot sweep rethrows a store's error into them. A
 filter that matched a worker record's exception as `isa PormG.DatabaseError` now
 matches `.type`: `:IntegrityError`, `:OperationalError` or `:StatementError`.
+
+The rest of Nitro follows the same rule ([#658](https://github.com/PingoLee/Nitro.jl/issues/658)),
+so every Nitro log line with an `exception` kwarg now carries a `LoggedException`. The new ones are
+off the request path:
+
+- `Nitro.<label>: <work> failed`, a background janitor's failed tick. This is the session prune of
+  `SessionMiddleware` and `SessionPruner`, the rate limiter's sweep, and `AccessLog`'s retention
+  prune. The prunes run your own code (a custom session store's `cleanup_expired_sessions!`, the
+  `prune` you passed), and a database error there can hold a session id in a field.
+- `ERROR: ` from a blocking `serve` whose server task failed.
+- `Nitro: … ran against a serve task that had already failed`, `Nitro: graceful server shutdown
+  failed unexpectedly` and `Nitro: force-close after an interrupted drain failed`.
+- `Nitro: eager revision failed` and `Nitro: cancelling the eager-Revise watcher's wait failed`.
+- `mountable_files: skipping unreadable directory`, at `@debug`.
 
 `text` is still whatever `showerror` prints. An exception whose own message quotes a value prints
 that value, on the console as before and now in every sink. A

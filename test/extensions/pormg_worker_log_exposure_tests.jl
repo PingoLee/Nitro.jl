@@ -206,29 +206,7 @@ end
     end
 end
 
-# The rule is uniform across `src/Workers`, not limited to the sites above (#651): every log
-# record there that carries an exception carries `loggable(...)`. A new catch that logs the live
-# object fails here, whichever path it is on.
-@testset "every exception= in src/Workers goes through loggable" begin
-    src = joinpath(pkgdir(Nitro), "src")
-    files = [joinpath(src, "Workers.jl");
-             [joinpath(src, "Workers", f) for f in readdir(joinpath(src, "Workers")) if endswith(f, ".jl")]]
-    offenders = String[]
-    sites = 0
-    for file in files
-        # Over the whole text, not line by line, so a value on the line after `exception =` is
-        # still read. A match on a comment line is prose, not a log call.
-        text = read(file, String)
-        lines = split(text, '\n')
-        for m in eachmatch(r"(?<!`)\bexception\s*=\s*\(?\s*(\w+)", text)
-            n = count(==('\n'), SubString(text, 1, m.offset)) + 1
-            startswith(lstrip(lines[n]), "#") && continue
-            sites += 1
-            m.captures[1] == "loggable" || push!(offenders, "$(basename(file)):$n")
-        end
-    end
-    @test sites >= 21                     # the scan is seeing the sites, not a moved tree
-    @test isempty(offenders)
-end
+# The source scan that every `exception=` in `src/` goes through `loggable` is in
+# test/middleware/log_exposure_tests.jl (#658): it needs no PormG, and it covers all of `src/`.
 
 end
