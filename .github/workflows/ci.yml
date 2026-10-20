@@ -150,9 +150,21 @@ jobs:
       # coverage, not who runs under it. `ci_workflow_tests.jl` asserts the three
       # conditions stay identical; the coverage-vs-worker trade-off is explained in
       # `test/runtests.jl`, above `covering`.
+      #
+      # `optimize: '0'` runs the suite at `-O0` (#667). Most of a leg's item time is JIT
+      # compilation of code that then runs once, and LLVM's optimization passes are a large
+      # share of that compile for no benefit to a test. The action passes `--optimize=0` to its
+      # own julia; `Pkg.test`'s child and the ReTestItems worker are both spawned from
+      # `Base.julia_cmd()`, which carries `-O0` on, so the items really run at `-O0`.
+      #
+      # What `-O0` can turn red is a probe that measures `-O2` code rather than Nitro: an
+      # allocation count that relies on LLVM eliding a box, or an `@elapsed` bound over a
+      # pure-Julia hot loop. If one flips, the answer is to drop this line, not to loosen the
+      # probe. Reproduce a CI red locally with `julia -O0`.
       - uses: julia-actions/julia-runtest@6e050c8013b833b1195105ff2fce9cd802f53271 # v1.12.0
         with:
           coverage: ${{ matrix.os == 'ubuntu-latest' && matrix.threads == '1' && matrix.version == '~1.13.0-0' }}
+          optimize: '0'
       - uses: julia-actions/julia-processcoverage@03114f09f119417c3242a9fb6e0b722676aedf38 # v1.2.2
         if: matrix.os == 'ubuntu-latest' && matrix.threads == '1' && matrix.version == '~1.13.0-0'
       - uses: coverallsapp/github-action@8d6379e14d29928660c4ba802d8e85393440b329 # v2.3.8

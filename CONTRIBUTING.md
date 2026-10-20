@@ -289,6 +289,8 @@ julia --project=docs docs/make.jl
 ```
 
 - **CI runs the suite on Julia 1.13 across Linux/macOS/Windows at `JULIA_NUM_THREADS` 1 **and** 2.** (1.12 left the matrix by decision on #526, ahead of the floor moving to `^1.13`.)
+  It runs them at **`-O0`** (#667), so reproduce a CI red with `julia -O0`: an allocation probe can
+  read differently at the default `-O2`.
   A change that only passes single-threaded is not green.
 - **`PormG` is a git-pinned source dependency** (`[sources] PormG = {url = …, rev = <sha>}`) and a
   hard test dependency: Pkg fetches that exact commit into the depot, so `Pkg.test()` resolves with
