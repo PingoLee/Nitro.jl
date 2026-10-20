@@ -24,9 +24,13 @@
 
 # One run this process holds. `info` is the claimed run's own object: its cancel token is how the
 # heartbeat and the drain reach the job, and its `progress` is what the heartbeat persists.
-struct _HeldRun
-    info::TaskInfo
-    queue::String
+# `lease_until` is the expiry this process last wrote, at the claim and then at each renewal the
+# store kept. Only the heartbeat reads or moves it, to say how late a renewal was (#666).
+mutable struct _HeldRun
+    const info::TaskInfo
+    const queue::String
+    const claimed_at::Float64          # `time()` when the claim returned
+    lease_until::DateTime
 end
 
 mutable struct ConsumerHandle{S <: AbstractWorkerStore}
@@ -58,6 +62,12 @@ mutable struct ConsumerHandle{S <: AbstractWorkerStore}
     const busy::Dict{String, Int}
     const poisoned::Set{String}
     @atomic held_count::Int          # `length(held)`, readable without the lock by the drain's wait
+
+    # A clock no later than the one a claim in flight stamps its lease from, published before the
+    # store is called and cleared once the run is in `held`. Until then no heartbeat snapshot has
+    # the run, while its row is already RUNNING under that lease, so the tick's adjudication must
+    # not read a clock past it (#666, `_heartbeat_tick!`). Only the claim loop writes it.
+    @atomic claim_clock::Union{Nothing, DateTime}
 
     const wake::Base.Event            # the claim loop's park: its timer, a freed slot, a stop
     # The heartbeat's park: it waits on `beat_timer` itself, which `_wake_heartbeat!` closes for
@@ -143,7 +153,8 @@ What it does:
 - **Keeps the leases alive** from a heartbeat on the interactive thread, every third of the lease,
   and persists each run's `update_progress!` with it. A healthy run whose heartbeat is late by
   more than the lease, for instance through a garbage-collection pause that long, can be taken
-  back and run again: **the lease must exceed the worst pause your jobs cause**.
+  back and run again: **the lease must exceed the worst pause your jobs cause**, and a fresh
+  process's first claim, which compiles its whole path and can take seconds on a loaded host.
 - **Use the LibPQ driver for a consumer.** The heartbeat's renewal stays on the interactive thread
   only with LibPQ. On SQLite and Postgres.jl, PormG runs the statement on a `:default` task
   ([PormG#1280](https://github.com/PingoLee/PormG.jl/issues/1280)), so CPU-bound jobs that fill every
@@ -290,7 +301,7 @@ function _start_consumer(app::App; store::AbstractWorkerStore, queues::AbstractV
                        max_runs === nothing ? nothing : Int(max_runs),
                        max_rss_mb === nothing ? nothing : Float64(max_rss_mb), exit_when_idle,
                        ReentrantLock(), Dict{UUID, _HeldRun}(), Dict{String, Int}(), Set{String}(), 0,
-                       Base.Event(true), false, nothing, Base.Event(),
+                       nothing, Base.Event(true), false, nothing, Base.Event(),
                        false, true, false, false, 0, false, :none, :stopped, nothing, nothing,
                        _consumer_wake_guard())
 
@@ -412,11 +423,16 @@ function _claim_loop(c::ConsumerHandle)
             for (queue, k) in c.queues
                 (@atomic c.stopping) && break
                 _free_slot(c, queue, k) || continue
-                run, ok = _claim_one(c, queue)
+                run, ok = try
+                    run, ok, claim_s = _claim_one(c, queue)
+                    run === nothing || _start_run!(c, run, queue; claim_s)
+                    run, ok
+                finally
+                    # `_start_run!` cleared it with the run registered; this is every other path.
+                    @atomic c.claim_clock = nothing
+                end
                 answered &= ok
-                run === nothing && continue
-                claimed = true
-                _start_run!(c, run, queue)
+                claimed |= run !== nothing
             end
             # Claimed something: look again at once, there may be more. Otherwise park until a
             # slot frees, the poll interval passes, or a stop.
@@ -462,11 +478,21 @@ function _claim_loop(c::ConsumerHandle)
     return nothing
 end
 
-# The claimed run, or `nothing`; and whether the store answered. A claim that threw says nothing
-# about whether the queue is empty, so `exit_when_idle` must not read it as idle.
-function _claim_one(c::ConsumerHandle, queue::String)::Tuple{Union{Nothing, TaskInfo}, Bool}
+# The claimed run, or `nothing`; whether the store answered; and how long the call took, for
+# `_start_run!`'s log. A claim that threw says nothing about whether the queue is empty, so
+# `exit_when_idle` must not read it as idle. Before the store is called, a clock no later than the
+# one the lease is stamped from is published in `claim_clock`, for the heartbeat.
+function _claim_one(c::ConsumerHandle, queue::String)::Tuple{Union{Nothing, TaskInfo}, Bool, Float64}
+    # Published first, read second, so the clock the lease is stamped from is never earlier than
+    # the one a heartbeat can see (`_heartbeat_tick!`).
+    published = current_time_utc()
+    @atomic c.claim_clock = published
+    # `max`: a wall clock stepped back between the two reads must not stamp an earlier lease.
+    clock = max(current_time_utc(), published)
+    t0 = time()
     try
-        return (claim_next!(c.runtime.store, queue, c.consumer_id; lease_seconds = c.lease_seconds), true)
+        run = claim_next!(c.runtime.store, queue, c.consumer_id; lease_seconds = c.lease_seconds, now = clock)
+        return (run, true, time() - t0)
     catch e
         _is_interrupt(e) && throw(InterruptException())
         if e isa ClaimPoisonedError
@@ -478,24 +504,32 @@ function _claim_one(c::ConsumerHandle, queue::String)::Tuple{Union{Nothing, Task
                    "Inspect them before restarting the consumer" queue consumer_id = c.consumer_id exception_type = e.exception_type
             # The queue leaves the claim rotation, so this refusal does not keep the consumer
             # from being idle.
-            return (nothing, true)
+            return (nothing, true, time() - t0)
         else
             @error "Nitro.Workers: a claim failed; retrying on the next poll" queue exception = (loggable(e), catch_backtrace())
         end
-        return (nothing, false)
+        return (nothing, false, time() - t0)
     end
 end
 
-function _start_run!(c::ConsumerHandle, run::TaskInfo, queue::String)
+function _start_run!(c::ConsumerHandle, run::TaskInfo, queue::String; claim_s::Float64 = 0.0)
+    lease_until = something(run.lease_expires_at, current_time_utc() + _lease_period(c.lease_seconds))
     # Under the same lock the drain snapshots `held` with, and checking `stopping` there: a run
-    # claimed while the drain began is either in the snapshot, or given straight back here.
+    # claimed while the drain began is either in the snapshot, or given straight back here. The
+    # claim's clock is cleared under it too, so a heartbeat that read no clock in flight before
+    # its snapshot finds this run in that snapshot (`_heartbeat_tick!`).
     accepted = lock(c.lock) do
+        # A run given back keeps the bound until its hand-back is done: the claim loop's
+        # `finally` clears it then.
         (@atomic c.stopping) && return false
-        c.held[run.run_id] = _HeldRun(run, queue)
+        @atomic c.claim_clock = nothing
+        c.held[run.run_id] = _HeldRun(run, queue, time(), lease_until)
         @atomic c.held_count = length(c.held)
         c.busy[queue] = Base.get(c.busy, queue, 0) + 1
         return true
     end
+    # When the claim returned past its own lease (#666), `claim_s` against the lease says so.
+    @debug "Nitro.Workers: consumer claimed a run" consumer_id = c.consumer_id task_id = run.id run_id = run.run_id queue lease_until claim_s = round(claim_s; digits = 3) accepted at = Dates.now(Dates.UTC)
     accepted || return (_hand_back!(c, run, queue); nothing)
     errormonitor(_spawn_detached(() -> _run_claimed!(c, run, queue)))
     # Counted once the run is held, so the recycle it begins waits for it.
@@ -526,6 +560,7 @@ end
 function _run_claimed!(c::ConsumerHandle, run::TaskInfo, queue::String)
     placement = c.placements[queue]
     handoff = Ref(_RunHandoff(() -> _release_slot!(c, queue)))
+    t0 = time()
     try
         if _gives_back(run)
             # The drain reached this run before its task started: give it back without running it.
@@ -548,6 +583,9 @@ function _run_claimed!(c::ConsumerHandle, run::TaskInfo, queue::String)
         # `requeue_expired!` then decides the run by its queue's policy.
         @error "Nitro.Workers: a consumer run ended without a recorded outcome; its lease will expire" task_id = run.id exception = (loggable(e), catch_backtrace())
     finally
+        # Whether the job saw a stop, and why: a drain that hangs after it began (#677) shows here
+        # whether its run ever returned.
+        @debug "Nitro.Workers: consumer run ended" consumer_id = c.consumer_id task_id = run.id cancel_reason = cancel_reason(run) elapsed_s = round(time() - t0; digits = 3) at = Dates.now(Dates.UTC)
         emptied = lock(c.lock) do
             delete!(c.held, run.run_id)
             @atomic c.held_count = length(c.held)
@@ -640,21 +678,38 @@ end
 
 function _heartbeat_tick!(c::ConsumerHandle)
     store = c.runtime.store
+    # The tick's adjudication reads the clock HERE, before the renewal (#623). A renewal stamps
+    # its leases from the time it was called, and a slow one, a first call that compiles under
+    # load or a store waiting on a lock, can return after the lease it wrote has already run out.
+    # Adjudicating against a reading taken after it then took back this process's own runs while
+    # they still ran. Against this earlier one, a lease this tick renewed is never expired yet.
+    # The renewal keeps its own, later reading, so its lease is as long as it can be: what a slow
+    # renewal still risks is another process's adjudicator, the case the lease length exists for.
+    now = current_time_utc()
+    # Then a claim in flight, then the snapshot, in that order (#666). A claim's row is RUNNING
+    # under its lease before the run is in `held`, and a first claim that compiles, or one
+    # waiting on the store, can return after that lease has run out: a tick whose snapshot missed
+    # the run took it back from this very process while it was still claiming it. Each run in no
+    # snapshot is one of three: in flight at this read (claiming, or being handed back after a
+    # claim the drain refused), so `claiming` is at or before the clock its lease was stamped
+    # from and bounds the adjudication below; registered before it, which
+    # `_start_run!` does under the lock that clears the clock, so it IS in the snapshot; or
+    # published after it, so its lease was stamped from a clock read after `now` (`_claim_one`
+    # publishes first and reads its clock second) and cannot be expired at `now`.
+    claiming = @atomic c.claim_clock
     held = lock(() -> collect(values(c.held)), c.lock)
     # Two lines per tick when debug logging is on for Nitro (#623): one as it begins, and one with
     # how many runs it renewed, how many the store kept and how long each store call took. That
     # tells a heartbeat that never ticked from a renewal that blocked on the store, which shows as
     # a begin with no end.
     tick_start = time()
-    # The tick's adjudication reads the clock HERE, before the renewal (#623). A renewal stamps
-    # its leases from the time it was called, and a slow one, a first call that compiles under
-    # load or a store waiting on a lock, can return after the lease it wrote has already run out.
-    # Adjudicating against a reading taken after it then took back this process's own runs while
-    # they still ran. Against this earlier one, a lease this tick renewed, or a run claimed since,
-    # is never expired yet. The renewal keeps its own, later reading, so its lease is as long as
-    # it can be: what a slow renewal still risks is another process's adjudicator, the case the
-    # lease length exists for.
-    now = current_time_utc()
+    # A claim in flight bounds it only once the claim has outlasted its own lease: the lease it
+    # stamped, `claiming + lease` at the earliest, is not expired at that instant (an expiry is
+    # strictly before the adjudication's clock), and every other expired lease is still taken.
+    # A millisecond less, so a store that rounds the stored expiry down cannot tie it.
+    adjudicate_at = claiming === nothing ? now :
+        min(now, claiming + _lease_period(c.lease_seconds) - Dates.Millisecond(1))
+    claiming_s = claiming === nothing ? 0.0 : Dates.value(now - claiming) / 1000
     renew_s = 0.0
     # How much of the renewal was the JIT: tells a first call compiling from a store waiting on a
     # lock. Process-wide, and it counts only while `Base.cumulative_compile_timing(true)` is on,
@@ -665,14 +720,23 @@ function _heartbeat_tick!(c::ConsumerHandle)
     # Each step on its own, as in the drain (#608): a failed renewal, or one run's failed lookup,
     # must not hold back the other runs' signals nor this tick's adjudication.
     if !isempty(held)
+        # A renewal that comes after the lease this process last wrote has run out: another
+        # process's adjudicator may already have taken the run back (#623, #666).
+        for h in held
+            h.lease_until < now || continue
+            @debug "Nitro.Workers: consumer renewal is late" consumer_id = c.consumer_id task_id = h.info.id late_s = Dates.value(now - h.lease_until) / 1000 since_claim_s = round(time() - h.claimed_at; digits = 3) at = Dates.now(Dates.UTC)
+        end
         renewals = LeaseRenewal[LeaseRenewal((h.info.id, h.info.run_id, Float64(@atomic h.info.progress)))
                                 for h in held]
         # Renew first, adjudicate second: a heartbeat that was itself late must not take back its
         # own leases before it renews them. The adjudication reads `now`, for the reason above.
+        # The renewal's own clock is read here and handed to the store, so a kept lease's expiry
+        # is known exactly.
+        renewed_at = current_time_utc()
         kept = try
             t0 = time()
             ct0 = first(Base.cumulative_compile_time_ns())
-            k = Set{UUID}(renew_leases!(store, c.consumer_id, renewals; lease_seconds = c.lease_seconds))
+            k = Set{UUID}(renew_leases!(store, c.consumer_id, renewals; lease_seconds = c.lease_seconds, now = renewed_at))
             renew_s = time() - t0
             renew_compile_s = (first(Base.cumulative_compile_time_ns()) - ct0) / 1e9
             kept_count = length(k)
@@ -684,10 +748,16 @@ function _heartbeat_tick!(c::ConsumerHandle)
         end
         # A failed renewal says nothing about which runs were lost, so nothing is looked up.
         if kept !== nothing
+            lease_until = renewed_at + _lease_period(c.lease_seconds)
             for h in held
-                h.info.run_id in kept && continue
+                if h.info.run_id in kept
+                    h.lease_until = lease_until
+                    continue
+                end
                 try
                     reason = _lost_claim_reason(store, h.info)
+                    # The take-back itself (#666), which otherwise shows only as `held` falling.
+                    @debug "Nitro.Workers: a run this consumer holds is no longer its own" consumer_id = c.consumer_id task_id = h.info.id reason late_s = Dates.value(now - h.lease_until) / 1000 since_claim_s = round(time() - h.claimed_at; digits = 3) at = Dates.now(Dates.UTC)
                     reason === nothing || _request_cancel!(h.info, reason)
                 catch e
                     _is_interrupt(e) && throw(InterruptException())
@@ -699,8 +769,8 @@ function _heartbeat_tick!(c::ConsumerHandle)
     # Once the drain has ended, the heartbeat only keeps the runs it left going alive (#607): a
     # consumer that returned claims nothing and adjudicates nothing.
     t0 = time()
-    (@atomic c.beating) && _consumer_requeue!(c, now)
-    @debug "Nitro.Workers: consumer heartbeat tick" consumer_id = c.consumer_id held = length(held) thread = Threads.threadid() kept = kept_count renew_s = round(renew_s; digits = 3) renew_compile_s = round(renew_compile_s; digits = 3) requeue_s = round(time() - t0; digits = 3) tick_s = round(time() - tick_start; digits = 3) at = Dates.now(Dates.UTC)
+    (@atomic c.beating) && _consumer_requeue!(c, adjudicate_at)
+    @debug "Nitro.Workers: consumer heartbeat tick" consumer_id = c.consumer_id held = length(held) thread = Threads.threadid() kept = kept_count renew_s = round(renew_s; digits = 3) renew_compile_s = round(renew_compile_s; digits = 3) requeue_s = round(time() - t0; digits = 3) claiming_s = round(claiming_s; digits = 3) tick_s = round(time() - tick_start; digits = 3) at = Dates.now(Dates.UTC)
     return nothing
 end
 
@@ -772,6 +842,9 @@ function _drain!(c::ConsumerHandle)
             @debug "Nitro.Workers: consumer drain begins" consumer_id = c.consumer_id runs = length(snapshot) task = string(current_task()) at = Dates.now(Dates.UTC)
             for h in snapshot
                 _request_cancel!(h.info, :shutdown)
+                # One per run, after its token is set: a drain that hangs after "begins" (#677)
+                # shows here whether it got as far as its wait.
+                @debug "Nitro.Workers: consumer drain: shutdown requested" consumer_id = c.consumer_id task_id = h.info.id at = Dates.now(Dates.UTC)
             end
             # The predicate reads an atomic, never the lock: it runs on a timer, and a run task
             # holds the lock to deregister itself, which is how it settles.
