@@ -117,22 +117,32 @@ const _PCHAR_PUNCT = ('-', '.', '_', '~',                                       
                       '!', '$', '&', '\'', '(', ')', '*', '+', ',', ';', '=',      # sub-delims
                       ':', '@')
 
+const _PCHAR_TABLE = ntuple(128) do i
+    c = Char(i - 1)
+    'A' <= c <= 'Z' || 'a' <= c <= 'z' || '0' <= c <= '9' || c in _PCHAR_PUNCT
+end
+
 """
+    _is_pchar(b::UInt8) -> Bool
     _is_pchar(c::Char) -> Bool
 
-Whether `c` may stand unencoded in a URL path segment: RFC 3986's `pchar` minus `pct-encoded`, i.e.
-`unreserved / sub-delims / ":" / "@"`.
+Whether a byte or character may stand unencoded in a URL path segment: RFC 3986's `pchar` minus
+`pct-encoded`, i.e. `unreserved / sub-delims / ":" / "@"`.
 
-The `isascii` guard is load-bearing, not defensive. Julia's `isletter` and friends are
-Unicode-aware, so `isletter('Ａ')` — the fullwidth `A` — is `true`, and without the guard a
-non-ASCII segment would be accepted as a literal route. A *conforming* client percent-encodes it and
+Only ASCII qualifies, and that is load-bearing, not defensive. Julia's `isletter` is
+Unicode-aware, so `isletter('Ａ')` — the fullwidth `A` — is `true`, and a predicate built on it
+would accept a non-ASCII segment as a literal route. A *conforming* client percent-encodes it and
 the router compares raw path segments, so the two never meet; a client that sends raw bytes does
 reach such a route, which is why refusing it is a deliberate trade rather than a free win — see
-`mount_segments`. `isdigit` and `isxdigit` are already ASCII-only in Julia, so only the
-letter test needs the guard; applying it to the whole predicate keeps that from being a detail a
-reader has to know.
+`mount_segments`. The letter and digit ranges are spelled out as ASCII for that reason.
+
+The answer is a lookup in a 128-entry table rather than `isletter`/`isdigit`, because the byte
+method runs on every byte of every request path (`_is_canonical_path`, under
+`OriginFormMiddleware`) and `isletter` is a `utf8proc` ccall even for ASCII
+([#536](https://github.com/PingoLee/Nitro.jl/issues/536)).
 """
-_is_pchar(c::Char) = isascii(c) && (isletter(c) || isdigit(c) || c in _PCHAR_PUNCT)
+_is_pchar(b::UInt8) = b < 0x80 && @inbounds _PCHAR_TABLE[b + 1]
+_is_pchar(c::Char) = isascii(c) && _is_pchar(UInt8(c))
 
 """
     _first_unroutable(segment::AbstractString) -> Char or nothing
@@ -239,11 +249,11 @@ name that is not valid UTF-8, where `codepoint` on a malformed `Char` would thro
 """
 function _route_encode(name::AbstractString)
     bytes = codeunits(name)
-    all(b -> b < 0x80 && _is_pchar(Char(b)), bytes) && return String(name)
+    all(_is_pchar, bytes) && return String(name)
 
     io = IOBuffer()
     for b in bytes
-        if b < 0x80 && _is_pchar(Char(b))
+        if _is_pchar(b)
             write(io, b)
         else
             print(io, '%', uppercase(string(b; base = 16, pad = 2)))
@@ -286,7 +296,7 @@ refusing it is the caller's job.
 """
 function _canonical_segment(segment::AbstractString)::Union{String,Nothing}
     bytes = codeunits(segment)
-    all(b -> b < 0x80 && _is_pchar(Char(b)), bytes) && return String(segment)
+    all(_is_pchar, bytes) && return String(segment)
 
     io = IOBuffer(; sizehint = length(bytes) + 8)
     n = length(bytes)
@@ -303,7 +313,7 @@ function _canonical_segment(segment::AbstractString)::Union{String,Nothing}
         else
             i += 1
         end
-        if b < 0x80 && _is_pchar(Char(b))
+        if _is_pchar(b)
             write(io, b)
         else
             write(io, UInt8('%'), _HEX_UPPER[(b >> 4) + 1], _HEX_UPPER[(b & 0x0f) + 1])
@@ -342,11 +352,11 @@ function _is_canonical_path(path::AbstractString)::Bool
             # Uppercase only: `_hexval` accepts both cases, so test the byte, not the value.
             (_is_upper_hex(hi) && _is_upper_hex(lo)) || return false
             d = UInt8(_hexval(hi) << 4 | _hexval(lo))
-            (d < 0x80 && _is_pchar(Char(d))) && return false    # would be decoded
+            _is_pchar(d) && return false    # would be decoded
             len += 1
             i += 3
         else
-            (b < 0x80 && _is_pchar(Char(b))) || return false
+            _is_pchar(b) || return false
             len += 1
             b == UInt8('.') && (dots += 1)
             i += 1

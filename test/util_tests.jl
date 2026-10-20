@@ -443,8 +443,8 @@ end
         @test_throws ArgumentError mount_segments(md)
     end
     # Non-ASCII is refused even where Julia's character predicates say "letter" or "digit":
-    # `isletter('Ａ')` is true for the fullwidth form, so without the `isascii` guard in `_is_pchar`
-    # it would be accepted. Like `café` above, these are in the reachable-but-refused half -- a
+    # `isletter('Ａ')` is true for the fullwidth form, so a `_is_pchar` built on it rather than on
+    # ASCII-only ranges would accept it. Like `café` above, these are in the reachable-but-refused half -- a
     # raw-byte client does reach them; no conforming one does.
     for md in ("Ａ", "٣", "naïve")
         @test_throws ArgumentError mount_segments(md)
@@ -516,8 +516,8 @@ end
     @test _route_encode("a\"b.txt")     == "a%22b.txt"
     @test _route_encode("a\tb.txt")     == "a%09b.txt"          # control character
 
-    # Non-ASCII that Julia's Unicode-aware `isletter` would accept -- the `isascii` guard in
-    # `_is_pchar` is what keeps these out of the safe set (see its docstring).
+    # Non-ASCII that Julia's Unicode-aware `isletter` would accept -- `_is_pchar`'s ASCII-only
+    # ranges are what keep these out of the safe set (see its docstring).
     @test _route_encode("Ａ.txt") == "%EF%BC%A1.txt"             # fullwidth A
     @test _route_encode("٣.txt")  == "%D9%A3.txt"               # Arabic-Indic digit three
 
@@ -546,6 +546,51 @@ end
     @test _route_encode(_route_encode("café.txt")) == "caf%25C3%25A9.txt"
 
     @test _route_encode("") == ""
+end
+
+@testset "pchar is a byte table; the canonical-path check agrees with _canonical_path (#536)" begin
+    # `_is_pchar` is a table lookup because it runs on every byte of every request path. These pin
+    # that the table did not move the set: they pass against the old `isletter` definition too, by
+    # design -- the speedup is measured in #536, not asserted here.
+    U = Nitro.Core.Util
+    oracle(b::UInt8) = b < 0x80 &&
+        (isletter(Char(b)) || isdigit(Char(b)) || Char(b) in U._PCHAR_PUNCT)
+    for b in 0x00:0xff
+        @test U._is_pchar(b) == oracle(b)
+        b < 0x80 && @test U._is_pchar(Char(b)) == oracle(b)
+    end
+    @test count(U._is_pchar, 0x00:0xff) == 79       # 52 letters, 10 digits, 17 punctuation
+    for c in ('Ａ', 'é', '٣', 'ß')
+        @test !U._is_pchar(c)
+    end
+    # Malformed `Char`s, which `_first_unroutable` can be handed from a non-UTF-8 mountdir: the
+    # `isascii` test must come before `UInt8(c)`, which would throw on them.
+    for c in ("\xff"[1], "\xc0\x80"[1], "\xe2\x82"[1])
+        @test !U._is_pchar(c)
+    end
+
+    # `_is_canonical_path` is the per-request fast path; its contract is "the path is already what
+    # `_canonical_path` would return". Checked exhaustively over every raw byte and every escape,
+    # in both hex cases, so no table entry can drift from what the slow path does.
+    canonical_fixpoint(s) =
+        try
+            U._canonical_path(s) == s
+        catch e
+            e isa ValidationError || rethrow()
+            false
+        end
+    shapes = String[]
+    for b in 0x00:0xff
+        push!(shapes, String(UInt8[0x2f, 0x61, b, 0x62]))      # "/a" * byte * "b"
+        push!(shapes, String(UInt8[0x2f, b]))                  # "/" * byte
+        hex = string(b; base = 16, pad = 2)
+        push!(shapes, "/%" * uppercase(hex), "/%" * lowercase(hex), "/a%" * uppercase(hex) * "b")
+    end
+    append!(shapes, ["/", "", "/.", "/..", "/...", "/a/./b", "/a/../b", "/%2E", "/%2E%2E", "/.a",
+                     "/a.", "/a/", "/%", "/%4", "/%G1", "/caf%C3%A9", "/x/%2F/y"])
+    for s in shapes
+        @test U._is_canonical_path(s) == canonical_fixpoint(s)
+    end
 end
 
 @testset "mount_route joins segments" begin
