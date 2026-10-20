@@ -50,15 +50,20 @@ lives in the code comment it names, and that comment is canonical.
     gets. A heartbeat there was caught mid-compile (the drain never started) and inside a store's
     write transaction (the hand-backs timed out).
   - So the heartbeat is pinned to the last interactive thread, and thread 1 hosts only the main
-    task parked in `consume!`. A REPL Ctrl-C lands there too, and the main task treats it as a
-    stop request and drains.
+    task waiting in `consume!`. Outside Windows, that wait holds thread 1 outside the scheduler
+    (§3, #677): thread 1 runs no task until `consume!` returns, and libuv's loop runs on a thread
+    of its own. A REPL Ctrl-C still lands there as an `InterruptException`, and the main task
+    treats it as a stop request and drains.
+  - What that leaves open: after a normal stop (a recycle, `exit_when_idle`), the drain runs on
+    thread 1 inside the scheduler, so a SIGTERM during that drain can still land where #677's did.
   - Any new consumer-side work stays off thread 1, for the same reason.
 
 ## 3. Background tasks
 
 - **Spawn with `_spawn_detached`** (`src/Workers/execution.jl`): non-sticky, on `:default`,
   detached from the caller's scope. **Never `@async`.** A sticky task parked on thread 1 is where
-  a REPL's Ctrl-C lands (#369).
+  a REPL's Ctrl-C lands (#369). In a consumer it is worse: a task stuck to thread 1 does not run
+  at all while `consume!` waits (#677).
   - **One exception: a consumer's lease heartbeat runs on `:interactive`, pinned**
     (`_spawn_pinned`, `src/Workers/execution.jl`; `src/Workers/consumer.jl`, #514, #636).
     - It is on `:interactive` because a CPU-bound job holds a `:default` thread without yielding
@@ -88,6 +93,14 @@ lives in the code comment it names, and that comment is canonical.
 - **A long idle wait parks; it does not poll.** A task that idles between ticks or until stopped
   parks once on a `Base.Event`, woken by a `Timer` and by the stop path (#369, #371). A short
   `timedwait` with a deadline is fine for a bounded wait during shutdown or a drain.
+  - **One exception: `consume!`'s main task on thread 1 polls, outside the scheduler**
+    (`_park_until_stop!`, `src/Workers/consumer.jl`, #677). A park leaves thread 1 inside the
+    scheduler, which is exactly where a SIGTERM's exit hung the drain: inside a libuv timer
+    callback it holds the loop's lock and that `Timer`'s lock, and inside the scheduler's sleep it
+    can block in `pthread_cond_wait`. So the main task sleeps in a GC-safe `usleep` and reads a
+    flag, and libuv's loop first moves to a thread of its own (`Base.Experimental.make_io_thread`).
+    Without that move, parking thread 1 stops every timer in the process.
+  - Nothing else polls. A new caller needs the same argument and an entry here.
 - **Every start has a stop on every path**, including a failed start, and never overwrites the
   only handle to a running task (#427).
 
