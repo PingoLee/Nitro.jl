@@ -239,6 +239,31 @@ using .bounds2_pb: Point, Line, Drawing, Tag, Labeled, Row, Table, Bag, Box
         @test_throws ArgumentError(MERGES) ProtoBuf.Codecs.decode!(d, r, Val{:group})
     end
 
+    @testset "ProtoBuf.jl behavior the required-field decode relies on (#685)" begin
+        PBC = ProtoBuf.Codecs
+        # Upstream tells a repeat from a first occurrence with `isassigned`, and an inline
+        # pointer-free `T`'s ref reads assigned before any write. If the first flips to `false`,
+        # upstream stopped merging first occurrences into unwritten memory and `filled` may be
+        # unnecessary; if the second flips to `true`, `isassigned` is no longer a sound repeat
+        # test for the pointer types `_untracked` leaves to it.
+        @test isassigned(Ref{Labeled}())
+        @test !isassigned(Ref{Bag}())
+        # `_untracked`'s predicate, both halves. `Bag` holds a `Vector`, so it is still inline
+        # and only `datatype_pointerfree` sends it to `isassigned`. If either value flips, a type
+        # goes to the wrong side of the split: an inline type to `isassigned` reads unwritten
+        # memory again, and a pointer type to `filled` loses nothing but grows the record.
+        @test Base.allocatedinline(Labeled) && Base.datatype_pointerfree(Labeled)
+        @test Base.allocatedinline(Bag) && !Base.datatype_pointerfree(Bag)
+        # The methods the ext's `invoke`s name are upstream's, in its own `decode.jl`. If a bump
+        # moves or renames them, the `invoke` resolves elsewhere or fails, and the repeat path no
+        # longer merges the way `_repeat` assumes -- this fails first, by name.
+        for sig in (Tuple{PBC.AbstractProtoDecoder, Base.RefValue{Labeled}},
+                    Tuple{PBC.AbstractProtoDecoder, Base.RefValue{Labeled}, Type{Val{:group}}})
+            m = which(PBC.decode!, sig)
+            @test m.module === PBC && basename(string(m.file)) == "decode.jl"
+        end
+    end
+
     @testset "first occurrences are recorded per message, not per body (#685)" begin
         # One live record per row would hold every row's buffer until the body ends; leaving each
         # row's message drops what it recorded.
