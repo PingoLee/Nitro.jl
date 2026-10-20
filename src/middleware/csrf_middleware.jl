@@ -498,23 +498,27 @@ function validate_csrf_token(req::HTTP.Request, secret::String; cookie_name::Str
     _check_csrf_secret(secret)
     binding === nothing && return false
     cookie_value = get_cookie(req, cookie_name, nothing; encrypted=false)
-    return _validate_presented(req, secret, cookie_value, binding, header_name, form_field) !== nothing
+    return _validate_presented(req, _verified_token(secret, cookie_value, binding), cookie_value,
+                               header_name, form_field)
 end
 
-# `validate_csrf_token` over a cookie value the caller already read: the middleware reads it once
-# per request and hands it to every check, rather than each one walking the headers again (#543).
-# The verified raw token on success, so a caller can reuse it; `nothing` on any failure.
-function _validate_presented(req::HTTP.Request, secret::String, cookie_value::Nullable{String},
-                             binding::Nullable{String}, header_name::String,
-                             form_field::String)::Nullable{String}
-    (binding === nothing || cookie_value === nothing) && return nothing
+# The cookie's raw token if its signature verifies under `binding`, else `nothing` -- including
+# when there is no cookie or nothing to bind to. The middleware computes it once per request and
+# every check reuses it: an HMAC per call, and it used to run twice on every GET (#544).
+_verified_token(secret::String, cookie_value::Nullable{String}, binding::Nullable{String}) =
+    (binding === nothing || cookie_value === nothing) ? nothing :
+        _verify_signed_token(secret, cookie_value, binding)
 
-    raw_token = _verify_signed_token(secret, cookie_value, binding)
-    raw_token === nothing && return nothing
-
+# `validate_csrf_token` over what the caller already has: the cookie value it read once (#543) and
+# the token it verified once (#544). `raw_token === nothing` covers no cookie, no binding and a
+# bad signature alike.
+function _validate_presented(req::HTTP.Request, raw_token::Nullable{String},
+                             cookie_value::Nullable{String}, header_name::String,
+                             form_field::String)::Bool
+    (raw_token === nothing || cookie_value === nothing) && return false
     presented = _presented_token(req, header_name, form_field)
-    presented === nothing && return nothing
-    return _presented_matches(presented, raw_token, cookie_value) ? raw_token : nothing
+    presented === nothing && return false
+    return _presented_matches(presented, raw_token, cookie_value)
 end
 
 """
@@ -611,12 +615,16 @@ function CSRFMiddleware(key::Union{AbstractString, SecretString}; cookie_name::S
             binding = _binding(req)
             # Read once: every check below and the post-handler re-issue use this value (#543).
             cookie_value = get_cookie(req, cookie_name, nothing; encrypted=false)
+            # Verified once, likewise (#544): the HMAC is a function of (secret, cookie, binding),
+            # and only the binding can change before the post-handler check, which re-verifies
+            # when it did.
+            verified = _verified_token(secret, cookie_value, binding)
 
             # A bearer-only request has no ambient credential to forge (#438): it skips the
             # check, but not the rest -- a handler can still ask it for a token.
             if !(method in SAFE_METHODS) && !(exempt_bearer && _bearer_only(req))
                 binding === nothing && _warn_unbound()
-                if _validate_presented(req, secret, cookie_value, binding, header_name, form_field) === nothing
+                if !_validate_presented(req, verified, cookie_value, header_name, form_field)
                     rejection = json(Dict("error" => "Invalid CSRF token"); status=403)
                     # Hand a stale-but-genuine client a working token back, or a login is a
                     # lockout: `SessionMiddleware`'s `rotate_on_auth` rotates the session id
@@ -641,8 +649,11 @@ function CSRFMiddleware(key::Union{AbstractString, SecretString}; cookie_name::S
             # The client's verified token, or `nothing`, for the handler to read -- on an unsafe
             # request too, which has just proved it holds one, so a handler re-rendering a form
             # after a POST hands back the same token (under a new mask, #436).
-            _set_context_token!(req, (binding === nothing || cookie_value === nothing) ?
-                nothing : _verify_signed_token(secret, cookie_value, binding))
+            #
+            # The mask is drawn here, before anyone knows whether the handler reads it: `:csrf_token`
+            # is a plain context value documented as set before the handler runs (#431, #436), and
+            # `RequestContext` has no lazy getter to defer it behind.
+            _set_context_token!(req, verified)
             req.context[_ACTIVE_KEY] = true
             req.context[_BINDING_KEY] = binding
             binding_before = binding
@@ -663,8 +674,11 @@ function CSRFMiddleware(key::Union{AbstractString, SecretString}; cookie_name::S
                 return response
             end
 
-            needs_token = cookie_value === nothing ||
-                          _verify_signed_token(secret, cookie_value, binding) === nothing
+            # Under an unchanged binding the answer is the one computed before the handler; a
+            # rotation (or a binding that first appeared) re-verifies under the new one.
+            still_valid = binding == binding_before ? verified :
+                          _verified_token(secret, cookie_value, binding)
+            needs_token = still_valid === nothing
             handler_minted = _response_sets_cookie(response, cookie_name)
             if handler_minted
                 _keep_session!(req)
