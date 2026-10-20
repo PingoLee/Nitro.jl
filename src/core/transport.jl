@@ -513,14 +513,24 @@ _declares_length(resp::HTTP.Response)::Bool =
 # is for. On HTTP/1.1 every other framing puts the head on the wire at `startwrite`, so it is the
 # head's state, not the `Content-Length` header, that says which one HTTP chose. A header is not
 # enough: with `Transfer-Encoding: chunked` as well HTTP frames the body CHUNKED, and holding that
-# body to a length would refuse a valid response. A bodyless response (HEAD, 304: `ignore_writes`,
-# whose writes HTTP discards) also gets its head at `startwrite`; it is named anyway, since there
-# is no length to hold it to. FIXED framing always leaves `content_length` parsed, so requiring it
-# costs nothing here and keeps a stream whose head is held for another reason (a buffered HTTP/2
-# stream — Nitro's listeners have none, #375) on the plain loop rather than held to a length of -1.
+# body to a length would refuse a valid response. A bodyless response (HEAD, 1xx, 204, 304:
+# `ignore_writes`, whose writes HTTP discards) never gets here from `stream_handler`, which skips
+# the drain for it (#671); it is excluded anyway, since there is no length to hold it to. FIXED
+# framing always leaves `content_length` parsed, so requiring it costs nothing here and keeps a
+# stream whose head is held for another reason (a buffered HTTP/2 stream — Nitro's listeners have
+# none, #375) on the plain loop rather than held to a length of -1.
 _holds_fixed_head(stream::HTTP.Stream)::Bool =
     !stream.ignore_writes && stream.response.content_length >= 0 &&
     !(@atomic :acquire stream.head_committed)
+
+# Whether the response on `stream` may carry a body: `false` exactly where HTTP's `startwrite` sets
+# `ignore_writes`, so a body written to it is discarded — a `HEAD`, or a status RFC 9110 gives no
+# content (1xx §15.2, 204 §15.3.5, 304 §15.4.5). `stream_handler` skips the drain on `false`
+# (#160, #671); it asks BEFORE `startwrite`, which is why this restates HTTP's rule instead of
+# reading the flag. test/http_internals_contract_tests.jl pins the status half to HTTP's.
+_status_allows_body(status::Integer)::Bool = !(100 <= status < 200 || status == 204 || status == 304)
+_allows_body(stream::HTTP.Stream)::Bool =
+    stream.message.method != "HEAD" && _status_allows_body(stream.response.status)
 
 """
     _write_fixed_body!(stream, body, buffer, n)
@@ -596,15 +606,16 @@ end
 #
 # `_write_response_body!` closes what it drains, but it only runs when a body is actually written.
 # Three paths produce a streaming body and never drain it: a handler that already called
-# `startwrite` (`_response_started`), a `HEAD` — which `stream_handler` now skips outright (#160) —
-# and any middleware that replaces or discards the response after it was built. Each of those leaks
-# an open file descriptor, and `HEAD` is one of the *cheap* requests a warm client makes constantly.
+# `startwrite` (`_response_started`), a bodyless response — a `HEAD`, or a 1xx/204/304 status, which
+# `stream_handler` skips outright (#160, #671) — and any middleware that replaces or discards the
+# response after it was built. Each of those leaks an open file descriptor, and `HEAD` is one of the
+# *cheap* requests a warm client makes constantly.
 #
-# A `304` is NOT on that list, and the wording here used to say it was. HTTP suppresses its body at
-# the socket (`ignore_writes`), but the drain still ran and still consumed the cursor to completion,
-# so the handle was released by `_write_response_body!`'s own `finally` rather than by this net. The
-# distinction matters now that `HEAD` genuinely does skip the drain: for `HEAD` this net is the
-# owner, not the backstop.
+# For a bodyless response this net is the owner, not the backstop. Until #671 only `HEAD` skipped the
+# drain: a `304` still ran it, HTTP discarded every write at the socket (`ignore_writes`), and the
+# cursor was consumed to completion and released by `_write_response_body!`'s own `finally`. That
+# was harmless for a file and a pin for an open-ended `SSEStream`, so a bodyless status now skips
+# the drain as `HEAD` does, and its streaming body is released here.
 #
 # **This is where every comparable framework puts it: on the response lifecycle, not on the write.**
 # Go's `serveFile` uses `defer f.Close()` in the handler, so it runs on every return path; Express's
@@ -1221,25 +1232,33 @@ function stream_handler(middleware::Function; max_body_bytes::Int64 = DEFAULT_MA
                     resp === produced && (resp = _handoff_copy(resp))
                     resp.request = req
                     stream.response = resp
-                    # `HEAD` gets the head and no body, so there is nothing to drain — and draining it
-                    # anyway is not merely wasted work, it can pin the process (#160). HTTP's
-                    # `startwrite` sets `ignore_writes` for a bodyless response and `_server_write`
-                    # then returns without touching the socket, so for an open-ended body — an
-                    # `HTTP.SSEStream` whose producer is still running — this loop consumes events
-                    # forever. Because it never touches the socket, `terminate`'s force-close cannot
-                    # unblock it either: the request task, the connection task (`parallel_stream_handler`
-                    # waits on it) and the producer task are all pinned for the life of the process.
-                    # One `curl -I` against a route registered for HEAD is enough.
+                    # A bodyless response — a `HEAD`, or a 1xx, 204 or 304 status — gets the head and
+                    # no body, so there is nothing to drain. Draining it anyway is not merely wasted
+                    # work: it can pin the process (#160, #671). HTTP's `startwrite` sets
+                    # `ignore_writes` for exactly these and `_server_write` then returns without
+                    # touching the socket, so for an open-ended body — an `HTTP.SSEStream` whose
+                    # producer is still running — this loop consumes events forever. Because it never
+                    # touches the socket, `terminate`'s force-close cannot unblock it either: the
+                    # request task, the connection task (`parallel_stream_handler` waits on it) and the
+                    # producer task are all pinned for the life of the process. One `curl -I` against a
+                    # route registered for HEAD is enough, and so is one GET of a
+                    # `Res.sse(f; status = 204)` — `Res.sse` hands its status straight to
+                    # `HTTP.sse_stream`, so nothing stops a handler choosing a bodyless one. HTTP.jl
+                    # 2.11 closes such a body unread in its own writer (JuliaWeb/HTTP.jl#1409), but
+                    # Nitro does not write through that one (nitro-core §4), so it needs this check.
                     #
                     # Skipping the drain is equivalent for every buffered body — those writes were
                     # already being discarded — and the `finally` below still releases a streaming one,
                     # which is what lets an SSE producer notice and unwind. The response head is
-                    # unaffected: the `closewrite` below calls `startwrite` regardless.
+                    # unaffected: the `closewrite` below calls `startwrite` regardless. The head a
+                    # `HEAD` gets is `_with_head_content_length`'s business, above (#146).
                     #
-                    # Deliberately narrow: `HEAD` only, keyed on the request method. Status-based
-                    # suppression (204/304) is the same class of hazard, but `Res.sse` cannot produce
-                    # those statuses. The response head a `HEAD` gets is `_with_head_content_length`'s
-                    # business, above (#146).
+                    # `_allows_body` restates HTTP's rule rather than reading `ignore_writes`, which
+                    # only `startwrite` sets. Calling `startwrite` here to find out would change the
+                    # write it is asked about: an explicitly started FIXED body past 4 KiB goes out in
+                    # pieces as it is written (#529), where a buffered one now reaches the socket whole,
+                    # head included, at the `closewrite` below (#453).
+                    # test/http_internals_contract_tests.jl holds the restatement to HTTP's own set.
                     #
                     # `stream.message.method`, NOT `req.method`. They are equal at entry and are two
                     # different mutable objects: `_http_stream_request` builds a fresh `Request` from
@@ -1250,7 +1269,7 @@ function stream_handler(middleware::Function; max_body_bytes::Int64 = DEFAULT_MA
                     # the pin this guard exists to remove comes back. Reading the value HTTP itself
                     # branches on makes that unrepresentable. `_reject_oversized_body!` above already
                     # reads it the same way.
-                    if stream.message.method != "HEAD"
+                    if _allows_body(stream)
                         # A streaming body with no declared length hands its permit back here,
                         # before a write that can last as long as the client stays connected
                         # (#298; see `_releases_slot_early` and above `stream_handler`).

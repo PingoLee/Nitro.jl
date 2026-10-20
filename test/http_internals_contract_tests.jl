@@ -449,7 +449,7 @@ end
     # test/streaming_write_tests.jl's job, the only check that sees WHEN bytes reach the wire.
     @test Base.ispublic(HTTP, :startwrite)
     # Still read directly, by `_holds_fixed_head`. `ignore_writes` marks a bodyless response (HEAD,
-    # 304); `head_committed` still false after `startwrite` is how Nitro tells HTTP chose FIXED
+    # 1xx, 204, 304); `head_committed` still false after `startwrite` is how Nitro tells HTTP chose FIXED
     # framing and is holding the head. It is also logged when a body fails, and is what makes HTTP's
     # error path close the connection after the head instead of appending a raw 500.
     # `response_started` is read by `_response_started` in src/core/transport.jl.
@@ -457,6 +457,19 @@ end
     for f in (:head_committed, :response_started)
         @test fieldtype(HTTP.Stream, f) === Bool
     end
+end
+
+@testset "Nitro's bodyless-status rule is HTTP's (src/core/transport.jl `_status_allows_body`, #671)" begin
+    # `stream_handler` must skip the drain for exactly the responses whose writes HTTP's
+    # `startwrite` discards (`ignore_writes`): drain one of those and an open-ended body pins the
+    # request, connection and producer tasks (#160). Nitro cannot read `ignore_writes` at the point
+    # it decides — `startwrite` has not run, and running it early would change framing on every
+    # response — so it restates HTTP's rule. This holds the restatement to the original: if a `~`
+    # bump ever widens HTTP's set, a bodyless status would be drained again with nothing failing,
+    # and this is what fails instead. The method half (`HEAD`) is test/sse_tests.jl's to cover.
+    @test isdefined(HTTP, :_body_allowed_for_status)
+    # Past 100..599 too: `Res.sse(; status::Int)` takes any `Int`, and both rules answer there.
+    @test all(s -> Nitro.Core._status_allows_body(s) == HTTP._body_allowed_for_status(s), 0:999)
 end
 
 @testset "reported-error surface (src/core/transport.jl `_mark_reported!`)" begin
