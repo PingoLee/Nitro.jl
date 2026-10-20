@@ -839,6 +839,164 @@ Base.parse(::Type{DepthBoom}, ::String) = throw(OutOfMemoryError())
 end
 end
 
+# The scan settles a 32-byte block in bulk where it can and runs the byte loop where it cannot
+# (#683). These pin that it answers exactly as the byte loop always did, so they pass on the
+# byte-loop-only scanner by design: they guard the invariance, not the speed.
+@testitem "Body parsers -- the 32-byte depth scan answers as the byte loop did (#683)" tags=[:core, :security] setup=[NitroCommon] begin
+using Nitro, JSON, Random
+
+const BP = Nitro.Core.Util.BodyParsers
+
+# The scanner as it stood before #683, verbatim but for what it returns.
+function byte_loop(bytes, max_keys)
+    depth = 0; keys = 0; instring = false; escaped = false
+    for b in bytes
+        if instring
+            if escaped
+                escaped = false
+            elseif b == UInt8('\\')
+                escaped = true
+            elseif b == UInt8('"')
+                instring = false
+            end
+        elseif b == UInt8('"')
+            instring = true
+        elseif b == UInt8('[') || b == UInt8('{')
+            depth += 1
+            depth > BP.MAX_JSON_DEPTH && return :deep
+        elseif (b == UInt8(']') || b == UInt8('}')) && depth > 0
+            depth -= 1
+        elseif b == UInt8(':') && max_keys > 0
+            keys += 1
+            keys > max_keys && return :keys
+        end
+    end
+    return :ok
+end
+
+verdict(x, max_keys) = try
+    BP._check_json_depth(x, max_keys)
+    :ok
+catch e
+    e isa ArgumentError ? :deep : e isa Nitro.ValidationError ? :keys : rethrow()
+end
+
+# Every input shape a caller hands the scanner: the 32-byte path takes the first three, the
+# `SubString` at an offset that leaves its blocks unaligned; a view takes the byte loop.
+function agree(bytes::Vector{UInt8}, max_keys)
+    want = byte_loop(bytes, max_keys)
+    s = String(copy(bytes))
+    pad = "\t" ^ (length(bytes) % 31 + 1)
+    full = pad * s * " "
+    # `prevind`: the last byte may sit inside a malformed character, which ends there all the same.
+    sub = SubString(full, ncodeunits(pad) + 1, prevind(full, ncodeunits(pad) + ncodeunits(s) + 1))
+    codeunits(sub) == bytes || error("the SubString does not hold the document")
+    return verdict(bytes, max_keys) === want && verdict(s, max_keys) === want &&
+           verdict(sub, max_keys) === want && verdict(@view(bytes[1:end]), max_keys) === want
+end
+
+const Q = UInt8('"'); const B = UInt8('\\')
+const SOUP = [collect(codeunits("[]{}\":,\\\\\\ ab1")); collect(codeunits("é漢🙂")); 0xff; 0x80]
+# No backslash, so most 32-byte blocks are settled in bulk; with the bytes one bit away from a
+# delimiter, `| 0x20` included (`;` `\x1a` and `\xdb` `\xdd` `\xfb` `\xfd` are `{`/`}`/`:` but for
+# one bit), and multi-byte UTF-8.
+const NEAR = [collect(codeunits("[]{}\":, ab1;\x1a")); collect(codeunits("é漢🙂"));
+              0xdb; 0xdd; 0xfb; 0xfd; 0x7f; 0xff; 0x80]
+
+function document(rng)
+    buf = UInt8[]
+    mode = rand(rng, 1:5)
+    if mode == 1                      # any byte a delimiter can be confused with
+        append!(buf, rand(rng, SOUP, rand(rng, 0:300)))
+    elseif mode == 5                  # the same, with nothing to send a block to the byte loop
+        append!(buf, rand(rng, NEAR, rand(rng, 0:300)))
+    elseif mode == 2                  # nesting around the bound, escaped strings, stray closers
+        rand(rng, Bool) && append!(buf, codeunits("]}"^rand(rng, 0:20)))
+        for _ in 1:rand(rng, 480:560)
+            push!(buf, rand(rng, (UInt8('['), UInt8('{'))))
+            if rand(rng) < 0.03
+                push!(buf, Q)
+                r = rand(rng, 0:5)
+                append!(buf, fill(B, r))
+                isodd(r) && push!(buf, rand(rng, (Q, UInt8('['), UInt8('n'))))
+                append!(buf, codeunits("["^rand(rng, 0:5)))
+                rand(rng) < 0.99 && push!(buf, Q)
+            end
+            rand(rng) < 0.02 && append!(buf, codeunits("[]{}"[rand(rng, 1:4):end]))
+            rand(rng) < 0.05 && push!(buf, UInt8(':'))
+            rand(rng) < 0.005 && push!(buf, rand(rng, (UInt8(']'), UInt8('}'))))
+        end
+    elseif mode == 3                  # strings: runs of backslashes before quotes, unterminated
+        for _ in 1:rand(rng, 1:30)
+            push!(buf, Q)
+            for _ in 1:rand(rng, 0:3)
+                append!(buf, rand(rng, SOUP, rand(rng, 0:40)))
+                append!(buf, fill(B, rand(rng, 0:5)))
+                push!(buf, Q)
+            end
+            append!(buf, rand(rng, codeunits("[{:]}, "), rand(rng, 0:10)))
+        end
+    else                              # real JSON with escaped keys
+        v = Dict("k$i\\\"" => [Dict("a\"[" => "x\\"^rand(rng, 0:3)) for _ in 1:rand(rng, 0:3)]
+                 for i in 1:rand(rng, 0:20))
+        append!(buf, codeunits(JSON.json(v)))
+    end
+    return buf
+end
+
+@testset "a generated corpus" begin
+    rng = Xoshiro(683)
+    seen = Dict(:ok => 0, :deep => 0, :keys => 0)
+    disagreed = Tuple{String, Int}[]
+    for _ in 1:4000, max_keys in (0, 1, 3, 40)
+        bytes = document(rng)
+        seen[byte_loop(bytes, max_keys)] += 1
+        agree(bytes, max_keys) || push!(disagreed, (String(copy(bytes)), max_keys))
+    end
+    @test isempty(disagreed)
+    # The corpus reaches every answer, or agreeing on it would prove little.
+    @test all(>(500), values(seen))
+end
+
+# Shapes placed on the 32-byte block boundary, where the bulk path hands over to the byte loop.
+@testset "block boundaries" begin
+    at(k, s) = Vector{UInt8}(" "^k * s)
+    for k in 0:40
+        # An escape run straddling the boundary: an odd run escapes the quote, an even one does not.
+        for r in 0:4
+            doc = at(k, "[\"" * "\\"^r * "\"" * "["^600 * "\"]")
+            @test agree(doc, 0)
+        end
+        # A string opening in one block and closing in the next, hiding brackets across it.
+        @test agree(at(k, "[\"" * "{"^60 * "\"," * "["^512), 0)
+        # Stray closers at depth zero in a block, then a run of openers.
+        @test agree(at(k, "]"^40 * "["^513), 0)
+        # Both bounds crossed inside one block: whichever comes first in the bytes wins.
+        deep_first = "["^511 * " " ^ k * "[[{\"a\":1,\"b\":2}"
+        keys_first = "["^510 * " " ^ k * "{\"a\":{\"b\":{\"c\":["
+        for max_keys in (0, 1, 2, 3)
+            @test agree(Vector{UInt8}(deep_first), max_keys)
+            @test agree(Vector{UInt8}(keys_first), max_keys)
+        end
+    end
+    # Exactly 512 and 513 in whole blocks, with no tail for the byte loop to finish.
+    @test agree(Vector{UInt8}("["^512 * "]"^512), 0) && verdict("["^512 * "]"^512, 0) === :ok
+    @test verdict("["^544, 0) === :deep
+    # A backslash as the last byte of a block and of the input.
+    @test agree(Vector{UInt8}("\"" * " "^30 * "\\"), 0)
+    @test agree(Vector{UInt8}("\"" * " "^30 * "\\\"" * "["^600), 0)
+end
+
+@testset "the 32-byte scan allocates nothing" begin
+    body = Vector{UInt8}(JSON.json([Dict("i" => i, "l" => "row-$i", "v" => 1.5i) for i in 1:200]))
+    s = String(copy(body))
+    @testset let bytes = allocs(() -> BP._check_json_depth(body, 1000); calls = 100),
+                 str = allocs(() -> BP._check_json_depth(s, 1000); calls = 100)
+        @test bytes.count == 0 && str.count == 0
+    end
+end
+end
+
 # Every JSON parse of request data has to go through the bound, and the easiest way to lose
 # that is a new call site written as plain `JSON.parse`. So count them, by AST rather than by
 # regex -- a regex matches docstring prose and misses a file that starts with a BOM.
