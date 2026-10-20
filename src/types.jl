@@ -1294,6 +1294,7 @@ end
 const REQUEST_PATHPARAMS_CACHE_KEY = :__nitro_request_pathparams
 const REQUEST_QUERY_CACHE_KEY      = :__nitro_request_query
 const REQUEST_HEADERS_CACHE_KEY    = :__nitro_request_headers
+const REQUEST_MULTIPART_CACHE_KEY  = :__nitro_request_multipart
 
 @inline function request_cache!(builder::Function, req::HTTP.Request, key::Symbol)
     ctx = getfield(req, :context)
@@ -1450,7 +1451,15 @@ headers(req::HTTP.Request) =
 jsonbody(req::HTTP.Request; kwargs...) = json(req; kwargs...)
 formbody(req::HTTP.Request)           = formdata(req)
 textbody(req::HTTP.Request)           = text(req)
-multipartbody(req::HTTP.Request)      = multipart(req)
+# Parsed once per request (#539) and shared by every reader: `getfiles`, `getpost`, `payload`,
+# and the `Files{…}` and `MultipartForm{T}` extractors -- so a handler binding two of them reads
+# and copies the upload once, not once per parameter. The parts' bytes are therefore shared
+# too; a binder, `getfiles` or `getpost` hands out its own containers, never the cached ones. `multipart(req)` stays
+# the uncached parser.
+multipartbody(req::HTTP.Request) =
+    request_cache!(req, REQUEST_MULTIPART_CACHE_KEY) do
+        multipart(req)
+    end :: Dict{String, Union{FormFile, Vector{FormFile}, String, Vector{String}}}
 
 pathparams(request::LazyRequest) = pathparams(request.req)
 queryvars(request::LazyRequest) = queryvars(request.req)

@@ -24,19 +24,6 @@ function merge_request_input!(merged::Dict{String,Any}, source)
     return merged
 end
 
-const REQUEST_MULTIPART_CACHE_KEY = :__nitro_request_multipart
-
-"""
-Parse the `multipart/form-data` body once per request and cache the raw result, so that
-[`getfiles`](@ref) and [`getpost`](@ref) can both read it without re-parsing (and
-re-reading) the body.
-"""
-function request_multipart(req::HTTP.Request)
-    return request_cache!(req, REQUEST_MULTIPART_CACHE_KEY) do
-        Types.multipartbody(req)
-    end
-end
-
 # `getparams(req)` is `nothing` until the router populates it, and `merge_request_input!` above
 # silently skips a non-`AbstractDict` source — so a merge performed before the router ran
 # produces an input map with the path params missing, and caching that unconditionally hands
@@ -155,15 +142,19 @@ Returns the **file parts** of a `multipart/form-data` body — Django's `request
 fields are excluded; read those with [`getpost`](@ref).
 
 Returns an empty `Dict` for a non-multipart or unparseable body. The body is parsed once per
-request and shared with `getpost`, so reading both costs one parse.
+request and shared with `getpost`, `payload` and the `Files`/`MultipartForm` extractors, so
+reading any of them costs one parse (#539) -- and they share the parts' bytes, so treat a
+`FormFile`'s `data` as read-only.
 
 Note this is a *filtered view*: [`multipart(req)`](@ref) returns files and text fields
 together, so it is not a drop-in substitute.
 """
 getfiles(req::HTTP.Request) = request_cache!(req, REQUEST_FILES_CACHE_KEY) do
-    parsed = request_multipart(req)
+    parsed = Types.multipartbody(req)
+    # Its own vectors, not the parse's (#539): the `Files`/`MultipartForm` extractors read that
+    # parse too, so a `push!` here must not show up in a parameter bound after it.
     Dict{String, Union{FormFile, Vector{FormFile}}}(
-        k => v for (k, v) in parsed
+        k => (v isa Vector{FormFile} ? copy(v) : v) for (k, v) in parsed
         if v isa FormFile || v isa Vector{FormFile}
     )
 end
@@ -175,15 +166,18 @@ Returns the **text fields** of a `multipart/form-data` body — Django's `reques
 parts are excluded; read those with [`getfiles`](@ref).
 
 Returns an empty `Dict` for a non-multipart or unparseable body. The body is parsed once per
-request and shared with `getfiles`, so reading both costs one parse.
+request and shared with `getfiles`, `payload` and the `Files`/`MultipartForm` extractors, so
+reading any of them costs one parse (#539).
 
 Note this is a *filtered view*: [`multipart(req)`](@ref) returns files and text fields
 together, so it is not a drop-in substitute.
 """
 getpost(req::HTTP.Request) = request_cache!(req, REQUEST_POST_CACHE_KEY) do
-    parsed = request_multipart(req)
+    parsed = Types.multipartbody(req)
+    # Its own vectors, as in `getfiles` (#539): `payload` merges these values, and a `push!`
+    # through either must not reach a `MultipartForm{T}` field bound after it.
     Dict{String, Union{String, Vector{String}}}(
-        k => v for (k, v) in parsed
+        k => (v isa Vector{String} ? copy(v) : v) for (k, v) in parsed
         if v isa String || v isa Vector{String}
     )
 end

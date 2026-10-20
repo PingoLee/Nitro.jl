@@ -53,7 +53,14 @@ Smaller intermediate step: extend `Form{T}` text extractors for multipart text f
 
 For `MultipartForm{T}`:
 
-1. Parse the body once via the existing multipart parser.
+1. Parse the body once via the existing multipart parser. "Once" holds per **request**, not per
+   parameter ([#539](https://github.com/PingoLee/Nitro.jl/issues/539)): `Types.multipartbody`
+   caches the parse in the request context, and `MultipartForm{T}`, every `Files{…}` parameter,
+   `getfiles`, `getpost` and `payload` all read that one parse. Before #539 each extractor
+   re-parsed and re-copied the whole upload, so `MultipartForm{T}` plus one `Files{FormFile}` cost
+   twice the body's bytes. The parts' bytes are shared as a result, and a binder copies any
+   container it hands out (`Vector{FormFile}`), so one handler parameter cannot change what
+   another reads.
 2. Per field type:
    - `FormFile` → single file by field name
    - `Vector{FormFile}` → all files under that name
