@@ -112,20 +112,26 @@ function info_dump(p, log)
     timedwait(() -> filesize(log) > before && occursin("Profile collected", read(log, String)), 15; pollint = 0.2)
     return nothing
 end
+# Whether a child logged that `consume!` waits outside the scheduler (#677), which only a debug
+# record shows: the park and a `wait` look the same from outside.
+parked_off_scheduler(log) =
+    any(r -> any(contains("consumer parks"), r) && any(contains("off_scheduler = true"), r),
+        log_records(readlines(log)))
 waitfile(path; kw...) = waitfor(() -> isfile(path), basename(path); kw...)
 waitstatus(id, status; kw...) = waitfor(() -> rec(id).status == status, "$id to be $status"; kw...)
 
-function start_consumer(name)
+function start_consumer(name; mode = "")
     log = joinpath(dir, "$name.log")
     push!(logs, log)
     io = open(log, "w")
     cmd = `$(Base.julia_cmd()) --code-coverage=none --threads=2,2 --startup-file=no
-           --project=$(Base.active_project()) $child $dbspec $outdir $name $LEASE`
+           --project=$(Base.active_project()) $child $dbspec $outdir $name $LEASE $(isempty(mode) ? String[] : [mode])`
     cmd = addenv(cmd, "JULIA_DEBUG" => "Nitro")
     return run(pipeline(ignorestatus(cmd); stdout = io, stderr = io); wait = false), io
 end
 
 children = Any[]
+s5_id = Ref{Any}(nothing)     # the run s5 hands back, for the one-shot consumer
 try
     @testset "the submitter count matches ids literally on a real database" begin
         # `@startswith` is a LIKE: an id holding `_`, `%` or `\` must match only itself.
@@ -221,8 +227,12 @@ try
     # leases expire (the scenario above).
     Sys.iswindows() || @testset "a SIGTERM drains the consumer, which hands its run back" begin
         s5 = submit("requeue", "s5")
+        s5_id[] = s5
         focus!(s5 => "s5")
         @test waitfile(marker("s5", "started.1"))
+        # Thread 1 waits outside the scheduler, where a SIGTERM holds nothing the drain needs
+        # (#677): a signal caught inside a libuv callback there hung the drain.
+        @test waitfor(() -> parked_off_scheduler(joinpath(dir, "B.log")), "consumer B to park")
         kill(pB, Base.SIGTERM)
         @test waitfor(() -> !process_running(pB), "consumer B to exit"; timeout = 60,
                       before_dump = () -> info_dump(pB, joinpath(dir, "B.log")))
@@ -245,6 +255,48 @@ try
         or_dump(r5.status == PENDING && r5.claimed_by === nothing && occursin(r"runs_still_renewed = 0\b", blog))
         # It left through the `atexit` drain, never back through `consume!`'s wait.
         @test !isfile(joinpath(outdir, "B.returned"))
+    end
+
+    # `consume!` waits with thread 1 outside the scheduler (#677), so a stop must reach it from
+    # another thread: here the recycle that ends a one-shot consumer, which then returns normally.
+    @testset "a one-shot consumer runs the handed-back run and returns" begin
+        s5 = s5_id[]
+        s5 === nothing || focus!(s5 => "s5")
+        pC, ioC = start_consumer("C"; mode = "oneshot")
+        push!(children, (pC, ioC))
+        @test waitfor(() -> !process_running(pC), "the one-shot consumer to return"; timeout = 60,
+                      before_dump = () -> info_dump(pC, joinpath(dir, "C.log")))
+        @test pC.exitcode == 0
+        # The park outside the scheduler engaged, everywhere but Windows, and the stop reached it.
+        @test parked_off_scheduler(joinpath(dir, "C.log")) == !Sys.iswindows()
+        # s5's run when the SIGTERM scenario handed it back, else nothing to claim.
+        expected = s5 === nothing ? "idle" : "max_runs"
+        @test isfile(joinpath(outdir, "C.returned")) &&
+              read(joinpath(outdir, "C.returned"), String) == expected
+        if s5 !== nothing
+            @test rec(s5).status == COMPLETED
+            @test rec(s5).result == "done-on-attempt-2"
+        end
+    end
+
+    # A REPL's Ctrl-C is an `InterruptException` delivered to thread 1's task, which the park
+    # holds outside the scheduler (#677). It must still arrive there, and drain.
+    Sys.iswindows() || @testset "an interrupt reaches the parked consumer, which drains" begin
+        focus!()
+        pD, ioD = start_consumer("D"; mode = "interrupt")
+        push!(children, (pD, ioD))
+        dlog = joinpath(dir, "D.log")
+        # Signalled once it is in the park, which it logs as it enters.
+        @test waitfor(() -> parked_off_scheduler(dlog), "consumer D to park outside the scheduler")
+        kill(pD, Base.SIGINT)
+        @test waitfor(() -> !process_running(pD), "consumer D to exit"; timeout = 60,
+                      before_dump = () -> info_dump(pD, dlog))
+        flush(ioD)
+        txt = read(dlog, String)
+        @test occursin("consumer stopped", txt)
+        @test occursin("InterruptException", txt)
+        @test pD.exitcode != 0
+        @test !isfile(joinpath(outdir, "D.returned"))
     end
 
     @testset "a consumer with one interactive thread refuses to start" begin

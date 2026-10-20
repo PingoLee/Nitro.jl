@@ -78,6 +78,11 @@ mutable struct ConsumerHandle{S <: AbstractWorkerStore}
     @atomic beat_wake::Bool
     @atomic beat_timer::Union{Nothing, Timer}
     const stop_requested::Base.Event  # what `consume!` waits on
+    @atomic stop_flag::Bool           # set with it, for the park that never enters the scheduler
+    # `consume!`'s main task waits for a stop outside the scheduler (`_park_until_stop!`, #677).
+    # Off for `require_interactive = false`, which is the tests' and the benches' path, on Windows,
+    # and when libuv's loop could not be moved off thread 1 (`_start_io_thread!`).
+    const parks_off_scheduler::Bool
     @atomic stopping::Bool            # no more claims
     # The drain clears it when it ends. The heartbeat then runs on until the last held run settles
     # (`_keeps_beating`), so a run a timed-out drain left going keeps its lease in a live process.
@@ -186,7 +191,12 @@ their leases to expire, as after a crash.
 with `julia -t k,2`. The heartbeat runs on the second, where a job cannot take its thread. The
 first, thread 1, must stay idle: on a `SIGTERM`, Julia runs the drain on top of whatever thread 1
 is doing at that instant, and a heartbeat caught there mid-compile or mid-renewal hung the drain
-([#636](https://github.com/PingoLee/Nitro.jl/issues/636)).
+([#636](https://github.com/PingoLee/Nitro.jl/issues/636)). So, outside Windows, `consume!` holds
+thread 1 outside Julia's scheduler while it waits, and moves libuv's event loop, for the rest of
+the process, to a thread of its own (`Base.Experimental.make_io_thread`): a signal caught inside the
+scheduler hung the drain too ([#677](https://github.com/PingoLee/Nitro.jl/issues/677)). **Thread 1 runs no task until
+`consume!` returns**, so start the app's own background tasks with `Threads.@spawn`, never `@async`
+or `Timer(callback)` from the script's top level, which are tied to thread 1 and would not run.
 
 **Recycling** ([#514](https://github.com/PingoLee/Nitro.jl/issues/514), step 4). A process's
 memory rises to its heaviest run's peak and stays there until a full collection runs, which an
@@ -242,11 +252,89 @@ end
 # request, drain, and say why it ended. Separate so the in-process tests run the same path.
 function _await_consumer!(c::ConsumerHandle)
     try
-        wait(c.stop_requested)
+        _park_until_stop!(c)
     finally
         _drain!(c)
     end
     return @atomic c.exit_reason
+end
+
+# How often the park below looks at the stop flag: the most a stop request waits to be seen.
+const _PARK_POLL_MICROSECONDS = UInt32(50_000)
+
+# Where `consume!`'s main task waits for a stop (#677). A SIGTERM runs the `atexit` drain on thread
+# 1, at whatever instruction thread 1 is on (#636). A main task parked in `wait` leaves thread 1 in
+# the scheduler, and thread 1 is the one thread that runs libuv's loop. A signal that lands while
+# that loop runs a timer callback (the jobs' `sleep`, the claim loop's poll) starts the drain
+# holding the libuv lock and that `Timer`'s lock. The drain's first `timedwait` then runs the loop
+# again, which takes that `Timer`'s lock and spins for ever. Every other thread waits on the libuv
+# lock behind it, so no timer fires again, and the drain and its runs both stop: the drain logged
+# that it began, then nothing. Thread 1 asleep in the scheduler is not safe either: a probe that
+# moved the loop off it, but still parked in `wait`, hung inside `pthread_cond_wait`.
+#
+# So thread 1 never enters the scheduler while it waits: it sleeps in the OS, in a GC-safe call, and
+# reads a flag, while the loop runs on a thread of its own (`_start_io_thread!`). It polls, against
+# the "park, do not poll" rule (concurrency §3), because a park is the hazard. A SIGTERM then always
+# lands in `usleep`, holding nothing, and a Ctrl-C still arrives as an `InterruptException` when the
+# call returns (probed on 1.12.7 and 1.13.2). A bare-Julia probe in the consumer's shape hung 8
+# times in 300 parked in `wait`, and 0 in 300 parked as here. The cost is that thread 1 runs no task
+# while `consume!` waits, so a task sticky to it, an `@async` or a `Timer(cb)` started from the main
+# task, waits until `consume!` returns. Thread 1 is an interactive thread, so a non-sticky
+# `:interactive` task now shares the heartbeat's thread rather than landing on an idle thread 1.
+#
+# What it does not cover: after a normal stop (a recycle, `exit_when_idle`), the drain runs on
+# thread 1 inside the scheduler, so a SIGTERM during that drain can still land where this one did.
+function _park_until_stop!(c::ConsumerHandle)
+    # Only on thread 1, the thread a signal's exit takes over. Anywhere else the scheduler is safe,
+    # and a park outside it would hold a thread the tasks need.
+    off = c.parks_off_scheduler && Threads.threadid() == 1
+    # The park and a `wait` look the same from outside; the two-process test reads this record.
+    @debug "Nitro.Workers: consumer parks" consumer_id = c.consumer_id off_scheduler = off
+    if !off
+        wait(c.stop_requested)
+        return nothing
+    end
+    while !(@atomic c.stop_flag)
+        @ccall gc_safe = true usleep(_PARK_POLL_MICROSECONDS::UInt32)::Cint
+    end
+    return nothing
+end
+
+# Outside a threaded region, only thread 1 runs libuv's blocking loop: parked outside the scheduler,
+# it would leave every `Timer`, `sleep` and socket wait in the process unwoken. The park above is
+# safe only with the loop on another thread, which `Base.Experimental.make_io_thread` starts (1.12
+# and 1.13): an adopted thread in the `:foreign` pool, which runs no task and changes no pool's
+# thread count. Once per process, since the loop moves for good: a second caller gets the first
+# one's answer. `false` when the thread cannot be started, or has not joined within a few seconds,
+# and the consumer then waits in the scheduler as before. Parking with the loop still on thread 1
+# would stop every timer in the process, the heartbeat's included.
+const _IO_THREAD_LOCK = ReentrantLock()
+const _IO_THREAD_STATE = Ref{Union{Nothing, Bool}}(nothing)   # `nothing` until it is tried
+
+function _start_io_thread!()
+    @lock _IO_THREAD_LOCK begin
+        state = _IO_THREAD_STATE[]
+        state === nothing || return state
+        return _IO_THREAD_STATE[] = _try_io_thread()
+    end
+end
+
+function _try_io_thread()
+    isdefined(Base.Experimental, :make_io_thread) || return false
+    try
+        before = Threads.maxthreadid()
+        Base.Experimental.make_io_thread()
+        # It returns before the thread exists. Joining is all that can be observed: the thread
+        # takes the loop (`jl_set_io_loop_tid`) as its next step, and the main task parks only
+        # after the first claim pass, long after.
+        timedwait(() -> Threads.maxthreadid() > before, 5.0; pollint = 0.01) === :ok && return true
+        @warn "Nitro.Workers: libuv's loop had not moved off thread 1 within 5 s, so the consumer " *
+              "waits in the scheduler, where a SIGTERM can hang its drain (#677)"
+    catch e
+        @warn "Nitro.Workers: could not move libuv's loop off thread 1, so the consumer waits in the " *
+              "scheduler, where a SIGTERM can hang its drain (#677)" exception = (loggable(e), catch_backtrace())
+    end
+    return false
 end
 
 function _start_consumer(app::App; store::AbstractWorkerStore, queues::AbstractVector,
@@ -301,7 +389,9 @@ function _start_consumer(app::App; store::AbstractWorkerStore, queues::AbstractV
                        max_runs === nothing ? nothing : Int(max_runs),
                        max_rss_mb === nothing ? nothing : Float64(max_rss_mb), exit_when_idle,
                        ReentrantLock(), Dict{UUID, _HeldRun}(), Dict{String, Int}(), Set{String}(), 0,
-                       nothing, Base.Event(true), false, nothing, Base.Event(),
+                       nothing, Base.Event(true), false, nothing, Base.Event(), false,
+                       # The loop moves before the first claim, long before the main task parks.
+                       require_interactive && !Sys.iswindows() && _start_io_thread!(),
                        false, true, false, false, 0, false, :none, :stopped, nothing, nothing,
                        _consumer_wake_guard())
 
@@ -341,7 +431,11 @@ end
 
 # -- Claiming --
 
-_request_stop!(c::ConsumerHandle) = (notify(c.stop_requested); nothing)
+function _request_stop!(c::ConsumerHandle)
+    @atomic c.stop_flag = true
+    notify(c.stop_requested)
+    return nothing
+end
 
 # -- Recycling (§7) --
 #

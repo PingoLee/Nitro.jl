@@ -253,6 +253,12 @@ to start with fewer:
 - **The first, thread 1, stays idle.** When a supervisor sends `SIGTERM`, Julia runs the
   consumer's drain on top of whatever thread 1 is doing at that instant. A heartbeat caught there
   in the middle of a renewal or a compile could hang the drain, or leave its run claimed.
+- **While `consume!` waits, thread 1 runs no task at all.** Outside Windows, `consume!` holds it
+  outside Julia's scheduler, because a `SIGTERM` that caught the scheduler itself mid-step hung
+  the drain too, and moves libuv's event loop to an extra thread of its own, for the rest of the
+  process. Start the consumer's own background tasks with `Threads.@spawn`. An `@async` or
+  a `Timer(callback)` created by the script's top level is tied to thread 1, and does not run
+  until `consume!` returns.
 
 ```julia
 # consumer.jl, started with `julia -t 4,2 --project consumer.jl`
