@@ -75,7 +75,9 @@ reason. See #70.
 Returns the **same `Dict` for the lifetime of the request** — it is decoded once and cached
 (#38), so the result is a live handle, not a snapshot. Mutating it *does* change what a later
 call returns, and is visible to [`payload`](@ref) and to every parameter binding that has not
-run yet. Treat it as read-only; pass values down a request through `req.context` instead.
+run yet. Treat it as read-only; pass values down a request through `req.context` instead. When
+no value needed decoding it is the router's own map, the one `HTTP.getparams(req)` returns, so a
+mutation shows there too (#558).
 
 This matches [`getjson`](@ref) and [`getform`](@ref), which have always been memoized this
 way. It used to return a fresh `Dict` per call, which meant a handler with N path parameters

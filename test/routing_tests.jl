@@ -1312,3 +1312,53 @@ end
     end
 end
 end
+
+@testitem "Path params with nothing to decode reuse the router's map (#558)" tags=[:core] setup=[NitroCommon] begin
+using Test
+using HTTP
+using Nitro
+using Nitro.Core: App, internalrequest
+using Nitro.Core.Routing: urlpatterns
+
+# The handler hands back the request the router populated, so the accessor is measured on the
+# exact `:params` a served request carries.
+captured = Ref{Any}(nothing)
+ctx = App()
+urlpatterns(ctx, "", Nitro.RouteDefinition[
+    Nitro.path("/a/<int:x>/<str:y>", function (req, x::Int, y::String)
+        captured[] = req
+        Res.json(Dict("x" => x, "y" => y))
+    end, method = "GET"),
+])
+function routed(target)
+    captured[] = nothing
+    res = internalrequest(ctx, HTTP.Request("GET", target))
+    @test res.status == 200
+    return captured[]::HTTP.Request
+end
+
+plain = routed("/a/1/hello")
+escaped = routed("/a/1/h%20i")
+
+# A value with no `%` decodes to itself, so the decoded map is the router's own, not a second
+# `Dict` filled pair by pair. The escaped request is the positive control: it still copies.
+@test getparams(plain) == Dict("x" => "1", "y" => "hello")
+@test getparams(plain) === HTTP.getparams(plain)
+@test getparams(escaped) == Dict("x" => "1", "y" => "h i")
+@test getparams(escaped) !== HTTP.getparams(escaped)
+@test allocs(() -> Nitro.Types._pathparams_uncached(escaped)).count >= 3
+@test allocs(() -> Nitro.Types._pathparams_uncached(plain)).count == 0
+
+# Reusing the map must not admit what the copy refused: a raw byte >= 0x80 is not an escape,
+# so it never reached `unescapeuri`, and it is still invalid UTF-8.
+raw8 = HTTP.Request("GET", "/raw/x")
+raw8.context[:params] = Dict("v" => "caf\xe9")
+@test_throws "Invalid UTF-8 in path parameter 'v'" getparams(raw8)
+
+# An empty map is never handed out as the live handle: an exact route's params are the shared
+# `EMPTY_PARAMS`, and an app writing into it would write into every later request.
+exact = HTTP.Request("GET", "/raw/x")
+exact.context[:params] = Nitro.Core.RouterHOF.EMPTY_PARAMS
+@test isempty(getparams(exact))
+@test getparams(exact) !== Nitro.Core.RouterHOF.EMPTY_PARAMS
+end
