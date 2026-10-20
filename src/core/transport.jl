@@ -158,11 +158,21 @@ function _http_stream_request(stream::HTTP.Stream, max_body_bytes::Int64)::Union
     end
 
     body = isempty(body_bytes) ? HTTP.EmptyBody() : HTTP.BytesBody(body_bytes)
+    # The headers are COPIED and must stay so: `head` is what HTTP.jl itself checks after the
+    # pipeline has run, and the WebSocket handshake's Origin check reads it. With the vector
+    # shared, a middleware that rewrote `req`'s `Origin` in place would rewrite the head too and
+    # widen what the handshake admits — the property test/websocket_tests.jl's `/ws/rewritten`
+    # route pins (#374). The trailers are ADOPTED (#533): nothing in HTTP's server reads the
+    # head's, and on this path they are always empty (HTTP keeps a chunked request's trailers on
+    # its `ChunkedBody`, not on the head), so the default copy bought two allocations per request
+    # and no isolation. `copyheaders = false` applies to both, which is why the
+    # headers are copied by hand.
     return HTTP.Request(
         head.method,
         head.target;
-        headers        = head.headers,
+        headers        = copy(head.headers),
         trailers       = head.trailers,
+        copyheaders    = false,
         body           = body,
         host           = head.host,
         content_length = length(body_bytes),

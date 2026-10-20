@@ -721,3 +721,59 @@ end
         terminate(app)
     end
 end
+
+@testitem "The rebuilt request owns its headers and adopts its trailers (#533)" tags=[:core, :network] setup=[NitroCommon] begin
+using Test
+import HTTP
+import Nitro
+import Sockets
+
+# `_http_stream_request` rebuilds the head HTTP.jl parsed into the `Request` the pipeline sees.
+# The HEADERS must be a separate vector: HTTP.jl reads the head after the pipeline has run (the
+# WebSocket handshake's Origin check among others), so a middleware rewriting `req`'s headers in
+# place must not reach it (#374). The TRAILERS are adopted: nothing reads the head's copy once the
+# body is read, so copying them cost two allocations per request for no isolation.
+
+# HTTP's half of the contract: `copyheaders = false` stores the given `Headers` as-is.
+h = HTTP.Headers(["A" => "1"])
+t = HTTP.Headers()
+adopted = HTTP.Request("GET", "/"; headers = h, trailers = t, copyheaders = false)
+@test adopted.headers === h
+@test adopted.trailers === t
+@test HTTP.Request("GET", "/"; headers = h, trailers = t).headers !== h
+
+const SEEN = Channel{Any}(1)
+function handler(stream::HTTP.Stream)
+    head = HTTP.startread(stream)
+    req = Nitro.Core._http_stream_request(stream, Int64(1 << 20))
+    HTTP.setheader(req, "Origin" => "https://rewritten.example")
+    put!(SEEN, (; owns = req.headers !== head.headers,
+                  head_origin = HTTP.header(head, "Origin", ""),
+                  same_text = HTTP.header(req, "X-Probe", "") == HTTP.header(head, "X-Probe", ""),
+                  adopts = req.trailers === head.trailers))
+    HTTP.setstatus(stream, 204)
+    HTTP.startwrite(stream)
+    return nothing
+end
+
+port = get_free_port()
+server = HTTP.listen!(handler, HOST, port)
+try
+    sock = Sockets.connect(HOST, port)
+    try
+        write(sock, "POST /x HTTP/1.1\r\nHost: x\r\nOrigin: https://app.example\r\nX-Probe: p\r\n" *
+                    "Content-Length: 2\r\n\r\nhi")
+        # Timed, so a handler that throws fails this item instead of hanging it.
+        timedwait(() -> isready(SEEN), 30.0; pollint = 0.01) === :ok || error("the handler reported nothing in 30 s")
+        seen = take!(SEEN)
+        @test seen.owns
+        @test seen.head_origin == "https://app.example"   # the rewrite stayed on `req`
+        @test seen.same_text
+        @test seen.adopts
+    finally
+        close(sock)
+    end
+finally
+    close(server)
+end
+end
