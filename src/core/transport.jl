@@ -17,6 +17,12 @@ using .Errors: loggable
 # pathological number of writes.
 const _STREAM_CHUNK_BYTES = 64 * 1024
 
+# The first read of a chunked request body, which declares no length (#535). Small, because every
+# `readbytes!` allocates its whole request inside HTTP.jl whatever the chunk holds, and most
+# chunked API bodies are a few hundred bytes; `_http_stream_request` doubles it, up to
+# `_STREAM_CHUNK_BYTES`, while reads come back full.
+const _CHUNKED_FIRST_READ = 1024
+
 # ── HTTP.jl v2 compatibility shim ───────────────────────────────────────────────
 # The HTTP private/undocumented *functions* Nitro's request layer reaches into are
 # wrapped here, so an HTTP upgrade that renames one is a single-line fix instead of
@@ -32,10 +38,11 @@ const _STREAM_CHUNK_BYTES = 64 * 1024
 # `HTTP._buffered_stream_request`; what is wrapped here is that function's *shape*, rebuilt
 # over supported API so the body can be capped. See the docstring below.
 """
-    _http_stream_request(stream, max_body_bytes) -> Nullable{HTTP.Request}
+    _http_stream_request(stream, max_body_bytes) -> Union{HTTP.Request, _BodyRejected}
 
 Buffer the request body into an `HTTP.Request`, refusing to exceed `max_body_bytes` (`0` means
-unlimited). Returns `nothing` when the ceiling was passed, which `stream_handler` turns into a 413.
+unlimited). Returns a `_BodyRejected` when the ceiling was passed, which `stream_handler` turns
+into a 413.
 
 This replaces the `HTTP._buffered_stream_request` call Nitro made until #17. That function is
 `startread` + `read(stream)`, and `read` on a server stream is an unbounded `append!` loop. The
@@ -84,49 +91,88 @@ function _http_stream_request(stream::HTTP.Stream, max_body_bytes::Int64)::Union
         # (`content_length == -1`; `ChunkedBody` bounds only the chunk-size line, never the total).
         # So the ceiling is enforced a second time while reading. The pre-check above is an
         # optimization — THIS loop is the guarantee.
-        chunk = declared > 0 ? min(declared, Int64(_STREAM_CHUNK_BYTES)) : Int64(_STREAM_CHUNK_BYTES)
-        scratch = Vector{UInt8}(undef, chunk)
-        # CLAMPED, and the clamp is the whole point. `declared` is an unverified client claim, so
-        # hinting it directly would let one header line commit the heap: `Content-Length:` at the
-        # ceiling reserves the ceiling before a single body byte arrives, and with
-        # `max_body_bytes = nothing` the claim is unbounded, so `Content-Length: 1099511627776`
-        # buys a 1 TiB reservation for a few hundred bytes on the wire. That is a cheaper version
-        # of the exact attack this function exists to stop. Hinting one chunk keeps the win where
-        # it mattered — small and medium bodies, where `append!` doubling is a real fraction of
-        # request cost — while peak memory stays tied to bytes RECEIVED rather than bytes claimed.
-        declared > 0 && sizehint!(body_bytes, min(declared, chunk))
+        #
+        # Each read lands straight in `body_bytes`, through a view of the bytes past the ones
+        # already received (#535). HTTP's `_server_readbytes!` allocates `nb` bytes of its own on
+        # EVERY call and copies them into `dest`, and no public read avoids that, so `nb` is the
+        # one lever there is: a fixed-length read asks for exactly what the body has left, and a
+        # chunked one starts at `_CHUNKED_FIRST_READ` and doubles only while reads come back full.
+        # A chunked read returns at most the rest of the current chunk, so asking for a full
+        # `_STREAM_CHUNK_BYTES` from the start cost a 64 KiB allocation per chunk, plus one for the
+        # terminal read that returns 0 — three 64 KiB buffers with the `scratch`, ~193 KiB in all,
+        # for a 200-byte body. The growth is CLAMPED, and the clamp is the whole point: `declared`
+        # is an unverified client claim, so sizing the buffer from it would let one header line
+        # commit the heap — `Content-Length:` at the ceiling reserves the ceiling before a single
+        # body byte arrives, and with `max_body_bytes = nothing` the claim is unbounded, so
+        # `Content-Length: 1099511627776` would buy a 1 TiB reservation for a few hundred bytes on
+        # the wire. That is a cheaper version of the exact attack this function exists to stop.
+        # test/max_body_bytes_tests.jl pins it with a 256 MiB claim and 300 bytes sent.
+        # `body_bytes` is never longer than about twice (the bytes RECEIVED plus one read), nor than
+        # the declared length or one byte past the ceiling (the `remaining + 1` read below).
+        want = declared > 0 ? min(declared, Int64(_STREAM_CHUNK_BYTES)) : Int64(_CHUNKED_FIRST_READ)
         received = Int64(0)
+        short = false
         while true
-            # `_server_readbytes!` allocates `want` bytes internally, so capping `want` keeps a
-            # small fixed-length POST to one allocation of its own size rather than a full chunk,
-            # and holds peak buffering at `max_body_bytes + 1` rather than a chunk beyond it.
             # `remaining + 1` -- one past the ceiling, so the loop can SEE an over-limit body
-            # rather than stopping exactly at the limit and mistaking a truncation for a fit. It is
-            # spelled this way rather than as `min(chunk, remaining + 1)` because `remaining + 1`
+            # rather than stopping exactly at the limit and mistaking a truncation for a fit, and
+            # peak buffering stays at `max_body_bytes + 1` rather than a read beyond it. It is
+            # spelled this way rather than as `min(want, remaining + 1)` because `remaining + 1`
             # overflows to `typemin` when the limit is `typemax(Int64)`, which `min` would then
             # happily pick -- handing `readbytes!` a negative `nb` and 500-ing every request with a
-            # body. Adding only on the branch where `remaining < chunk <= 65536` makes that
+            # body. Adding only on the branch where `remaining < want <= 65536` makes that
             # unrepresentable.
             remaining = max_body_bytes - received
-            want = (max_body_bytes > 0 && remaining < chunk) ? remaining + one(Int64) : chunk
-            n = readbytes!(stream, scratch, want)
-            n == 0 && break
+            nb = (max_body_bytes > 0 && remaining < want) ? remaining + one(Int64) : want
+            # A short read means the chunk ran out, so the next one may bring nothing but the
+            # terminal 0. It reads into the room the last one left rather than growing the body
+            # for it — for a one-chunk body, that is the difference between one buffer and two.
+            room = length(body_bytes) - received
+            short && room > 0 && (nb = min(nb, room))
+            if room < nb
+                # The LENGTH doubles, and the bytes past `received` are the room later reads fill:
+                # a large body is copied about once in all, rather than about twice under
+                # `resize!`'s own growth. Capped at the declared length and the ceiling, so the
+                # doubling never reserves what the client has only claimed.
+                grown = 2 * length(body_bytes)
+                declared > 0 && (grown = min(grown, declared))
+                max_body_bytes > 0 && (grown = min(grown, max_body_bytes))
+                resize!(body_bytes, max(received + nb, grown))
+            end
+            n = readbytes!(stream, @view(body_bytes[received+1:received+nb]), nb)
             received += n
+            n == 0 && break
             max_body_bytes > 0 && received > max_body_bytes && return _BodyRejected(true)
-            append!(body_bytes, @view(scratch[1:n]))
             # A fixed-length body is complete here, so break rather than spend a second
             # `readbytes!` purely to observe the terminal 0. `FixedLengthBody.remaining` has
             # already reached 0, so `read_closed` is set and keep-alive survives.
             declared >= 0 && received >= declared && break
+            if declared > 0
+                want = min(declared - received, Int64(_STREAM_CHUNK_BYTES))
+            elseif n == want
+                # Full at the size asked for, not merely at the room a short read left.
+                want = min(2 * want, Int64(_STREAM_CHUNK_BYTES))
+            end
+            short = n < nb
         end
+        resize!(body_bytes, received)
     end
 
     body = isempty(body_bytes) ? HTTP.EmptyBody() : HTTP.BytesBody(body_bytes)
+    # The headers are COPIED and must stay so: `head` is what HTTP.jl itself checks after the
+    # pipeline has run, and the WebSocket handshake's Origin check reads it. With the vector
+    # shared, a middleware that rewrote `req`'s `Origin` in place would rewrite the head too and
+    # widen what the handshake admits — the property test/websocket_tests.jl's `/ws/rewritten`
+    # route pins (#374). The trailers are ADOPTED (#533): nothing in HTTP's server reads the
+    # head's, and on this path they are always empty (HTTP keeps a chunked request's trailers on
+    # its `ChunkedBody`, not on the head), so the default copy bought two allocations per request
+    # and no isolation. `copyheaders = false` applies to both, which is why the
+    # headers are copied by hand.
     return HTTP.Request(
         head.method,
         head.target;
-        headers        = head.headers,
+        headers        = copy(head.headers),
         trailers       = head.trailers,
+        copyheaders    = false,
         body           = body,
         host           = head.host,
         content_length = length(body_bytes),
