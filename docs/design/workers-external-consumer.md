@@ -703,6 +703,33 @@ two-process test, which adds SQLite.jl as a test dependency. Where it departs fr
   than the lease still risks is **another** process's adjudicator, which can find that lease
   already expired when it is written: the case the rule "the lease must exceed the worst pause"
   covers, and a reason a lease far above the heartbeat's period is the default.
+- **A claim in flight bounds that clock too** ([#666](https://github.com/PingoLee/Nitro.jl/issues/666)).
+  "A run claimed since cannot be expired yet" held only for a claim that returned at once:
+  - `claim_next!` stamps the lease from the time it was called, and its row is `RUNNING` under that
+    lease before the claim returns. The first claim of a fresh process compiles its whole path;
+  - until the run is in `held`, no heartbeat snapshot has it, so a tick that read its clock past
+    that lease took the run back from the very process still claiming it. On a `:fail` queue that
+    failed a healthy run. Its two-process signature: the first claim (s1) gone before any tick
+    renewed it, `held` one short from the first tick on, no log of either;
+  - so the claim loop publishes a clock (`claim_clock`) before it calls the store, then reads the
+    clock it stamps the lease from and hands that to the store, so the published one is never
+    later. `_start_run!` clears it under the lock it registers the run with; a run given back keeps
+    it until the hand-back is done. The tick reads, in order, its own clock, `claim_clock` and its
+    snapshot. A run missing from the snapshot was then either in flight at the second read, or its
+    claim was published after it, which stamps a lease that cannot be expired at the tick's clock.
+    A claim in flight bounds the adjudication to `claim_clock + lease` (less a millisecond), so it
+    defers other processes' expired leases only while a claim has outlasted its own lease.
+
+  The issue first suspected #653's heartbeat pin. An in-process store whose claim returns 1.6 s
+  after stamping a 1 s lease reproduced the take-back, with no pin and no load, so the
+  pinned-against-unpinned latency measurement was not run. The new claim record then caught it
+  on the real driver, in an unloaded local run of the two-process test (1.13.2, SQLite): s1's
+  first claim took 2.74 s against its 2 s lease, and returned 0.74 s after the lease it had written
+  ran out. What a claim slower than the lease still risks is, again, another process's
+  adjudicator. Since #666 the child logs, at `@debug`, each claim with its `claim_s` and stamped
+  expiry, each renewal that comes after the lease it extends (`late_s`), each held run found no
+  longer the consumer's own, with its reason, and each run's end. The e2e test prints every record
+  naming a failing scenario's runs from the start of the log, and their marker files.
 - **One attempt loop.** `_run_attempts!` (`src/Workers/queue.jl`) is now the loop of the queued
   executor, the async one and the consumer, which differ only in `on_complete` / `on_cancel`. The
   two executors used to carry identical copies. A third copy for the consumer is what this avoided.

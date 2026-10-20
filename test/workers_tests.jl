@@ -6401,9 +6401,8 @@ end
 waitfor(f; timeout = 10) = timedwait(f, timeout; pollint = 0.02) === :ok
 
 # A web App that submits, and a consumer App over the same store, with a short lease so the
-# heartbeat ticks every ~0.33 s. Not shorter: a run claimed just after a tick's snapshot is not
-# renewed by that tick, so a stall longer than the lease before the tick's own adjudication would
-# take it back, and on a slow CI host that would be a flake.
+# heartbeat ticks every ~0.33 s. Not shorter: a renewal stalled for longer than the lease, by a
+# slow CI host, lets the run's lease lapse, and a test then reads a take-back nobody asked for.
 function pair(; store = SharedStore(), heavy = External(on_lease_expiry = :requeue), k = 1,
               queues = ["heavy" => k], kw...)
     web = setup!(App(); heavy)
@@ -6701,6 +6700,38 @@ end
         @test get_task_info(store, id).attempt == 1
     finally
         store.renew_hook[] = nothing
+        store.requeue_hook[] = nothing
+        stop!(web, c)
+    end
+end
+
+# #666: a claim stamps its lease from the clock it read when it began, and a first claim can take
+# longer than the lease to return (PormG commits and compiles its way out). Until it returns the
+# run is in no heartbeat snapshot, so a tick's own adjudication found an expired RUNNING row and
+# took it back from the consumer still claiming it. On a `:fail` queue that fails a healthy run.
+@testset "a claim slower than the lease is not taken back by its own consumer's heartbeat" begin
+    store = SharedStore()
+    slowed = Threads.Atomic{Bool}(false)
+    returned = Threads.Atomic{Bool}(false)
+    adjudicated_after = Threads.Atomic{Int}(0)
+    store.claimed_hook[] = _ -> if !Threads.atomic_xchg!(slowed, true)
+        sleep(1.6)                                                  # the lease is 1 s
+        returned[] = true
+    end
+    store.requeue_hook[] = () -> returned[] && Threads.atomic_add!(adjudicated_after, 1)
+    web, c, _ = pair(; store, queues = ["other" => 1])
+    try
+        id = submit(web, "slow-claim", "block"; queue = "other")
+        # Every tick of the slow claim's 1.6 s adjudicated, and two more after it returned.
+        @test waitfor(() -> adjudicated_after[] >= 2; timeout = 10)
+        @test status(store, id) == RUNNING
+        @test get_task_info(store, id).claimed_by == c.consumer_id
+        @test seen("slow-claim") === :started
+        notify(gate("slow-claim"))
+        @test waitfor(() -> status(store, id) == COMPLETED)
+        @test get_task_info(store, id).attempt == 1
+    finally
+        store.claimed_hook[] = nothing
         store.requeue_hook[] = nothing
         stop!(web, c)
     end

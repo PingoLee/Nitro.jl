@@ -484,9 +484,13 @@ struct SharedStore <: AbstractWorkerStore
     # before it is written, as PormG's renewal does: a test sleeps in it to make a renewal return
     # after the lease it wrote has run out (#623).
     renew_hook::Base.RefValue{Any}
+    # Run after every `claim_next!` that claimed a run, with the run: the row is written, its
+    # lease stamped from the clock read when the call began, and the call has not returned, as a
+    # first PormG claim still committing and compiling its way out (#666). A test sleeps in it.
+    claimed_hook::Base.RefValue{Any}
 end
 SharedStore() = SharedStore(InMemoryWorkerStore(), Ref{Any}(nothing), Ref{Any}(nothing), Ref{Any}(nothing),
-                            Ref{Any}(nothing))
+                            Ref{Any}(nothing), Ref{Any}(nothing))
 
 # Each forward with the contract's own arity: a varargs forward can be ambiguous with the
 # generated fixed-arity fallbacks on `AbstractWorkerStore`.
@@ -520,7 +524,10 @@ end
 function _W.claim_next!(s::SharedStore, queue::String, consumer::String; kw...)
     hook = s.claim_hook[]
     hook === nothing || hook(queue)
-    return _W.claim_next!(s.inner, queue, consumer; kw...)
+    run = _W.claim_next!(s.inner, queue, consumer; kw...)
+    claimed = s.claimed_hook[]
+    run === nothing || claimed === nothing || Base.invokelatest(claimed, run)
+    return run
 end
 
 end # module SharedClaimStore
