@@ -1,7 +1,7 @@
 ﻿@testitem "Protobuf extension" tags=[:extension] setup=[NitroCommon] begin
 using HTTP
 using ProtoBuf
-using Nitro: protobuf
+using Nitro: Nitro, protobuf
 
 include(".messages/people_pb.jl");
 using .people_pb: People, Person
@@ -184,7 +184,9 @@ using .bounds2_pb: Point, Line, Drawing, Tag, Labeled, Row, Table, Bag, Box
     @testset "proto2 required sub-messages are not mistaken for merges" begin
         # Current codegen holds a `required` message field in a plain `Ref{T}()`, which for a
         # `T` laid out inline with no pointer reads as assigned before the field is seen. Counted
-        # as a merge, 9 two-point lines -- 18 first occurrences, no repeats -- were refused.
+        # as a merge, 9 two-point lines -- 18 first occurrences, no repeats -- were refused. Whether
+        # this round-trip holds depends on that unwritten memory, so it is not the test that the
+        # buffer is never read: the `#685` testset below is.
         drawing = Drawing([Line(Point(i, i), Point(-i, 2i)) for i in 1:40])
         back = protobuf(protobuf(drawing, "/data"), Drawing)
         @test length(back.lines) == 40
@@ -195,6 +197,57 @@ using .bounds2_pb: Point, Line, Drawing, Tag, Labeled, Row, Table, Bag, Box
         back = protobuf(protobuf(table, "/data"), Table)
         @test [r.item.k for r in back.rows] == 1:40
         @test back.rows[40].item.tag == Tag(40) && back.rows[39].item.tag === nothing
+    end
+
+    @testset "a proto2 required inline sub-message's first occurrence never reads its buffer (#685)" begin
+        # The `Ref{T}()` codegen allocates for such a field is never written before its first
+        # occurrence, and what it holds depends on the optimization level: the test above passed
+        # at `-O2` and failed at `-O0`. Filling the buffer first makes the read visible at every
+        # level: a set `tag` merged with the `nothing` below has no upstream method. The unset one
+        # is a control -- upstream merges a real `nothing` with `nothing` fine, so it passes either
+        # way -- and stays to show the result never depends on what the buffer held.
+        ext = Base.get_extension(Nitro, :ProtoBufExt)
+        body = protobuf(Labeled(nothing, 2)).body
+        for garbage in (Labeled(nothing, 1), Labeled(Tag(7), 1))
+            r = Ref{Labeled}(garbage)
+            ProtoBuf.Codecs.decode!(ext._BoundedDecoder(IOBuffer(vcat(varint(length(body)), body))), r)
+            @test r[] == Labeled(nothing, 2)
+            r = Ref{Labeled}(garbage)
+            ProtoBuf.Codecs.decode!(ext._BoundedDecoder(IOBuffer(vcat(body, 0x04))), r, Val{:group})
+            @test r[] == Labeled(nothing, 2)
+        end
+    end
+
+    @testset "repeats of a proto2 required inline sub-message are merged and counted (#685)" begin
+        # Each repeat is `item { tag { id: i }, k: i }`. A set `tag` each time, because upstream's
+        # merge has no method for a set optional sub-message followed by an unset one.
+        item(i) = (b = protobuf(Labeled(Tag(i), i)).body; vcat(0x0a, varint(length(b)), b))
+        repeats(n) = reduce(vcat, item(i) for i in 1:n)
+        MERGES = "protobuf body merges repeated singular sub-message fields more than 16 times"
+        @test decoded(repeats(17), Row).item == Labeled(Tag(17), 17)
+        @test refused(repeats(18), Row) == MERGES
+        # The same through the group form, which no generated fixture reaches: 17 occurrences on
+        # one buffer are 16 merges, and the 18th is refused.
+        ext = Base.get_extension(Nitro, :ProtoBufExt)
+        group(i) = vcat(protobuf(Labeled(Tag(i), i)).body, 0x04)
+        d = ext._BoundedDecoder(IOBuffer(reduce(vcat, group(i) for i in 1:18)))
+        r = Ref{Labeled}()
+        for _ in 1:17
+            ProtoBuf.Codecs.decode!(d, r, Val{:group})
+        end
+        @test r[] == Labeled(Tag(17), 17)
+        @test_throws ArgumentError(MERGES) ProtoBuf.Codecs.decode!(d, r, Val{:group})
+    end
+
+    @testset "first occurrences are recorded per message, not per body (#685)" begin
+        # One live record per row would hold every row's buffer until the body ends; leaving each
+        # row's message drops what it recorded.
+        ext = Base.get_extension(Nitro, :ProtoBufExt)
+        table = Table([Row(Labeled(nothing, i)) for i in 1:1_000])
+        d = ext._BoundedDecoder(IOBuffer(protobuf(table).body))
+        back = ProtoBuf.Codecs.decode(d, Table)
+        @test [r.item.k for r in back.rows] == 1:1_000
+        @test isempty(d.filled) && d.level[] == 0 && d.depth[] == 0
     end
 
     @testset "a proto2 required sub-message that can hold a vector is still capped" begin
