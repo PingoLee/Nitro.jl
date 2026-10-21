@@ -25,7 +25,8 @@ import Sockets
 #       parameter order matching its positional constructor `Router(_404, _405, middleware)`.
 #   • src/routerhof.jl — `_gethandler` resolves an exact route without upstream's `split` and
 #       `Params()` (#445): `Node.exact`, `Node.segment`, `Params`, and `match` on an exhausted
-#       segment list.
+#       segment list; it binary-searches `Node.exact`, so it relies on `insert!` keeping that
+#       vector sorted by segment (#559).
 #   • src/core/transport.jl — `_upgrade_websocket!` (#374) runs the private
 #       `WebSockets._origin_allowed_default` with a proxy-reported scheme, mirrors `upgrade`'s
 #       `stream.tracked.conn isa TLS.Conn`, and classifies a refused handshake by
@@ -178,6 +179,16 @@ end
     @test H.match(b, "POST", none, 1) === missing            # a method mismatch, not a miss
     @test H.match(a, "GET", none, 1) === nothing             # no leaf at all
     @test H.match(child(r.routes, "c"), "PATCH", none, 1) isa H.Leaf   # a "*" leaf takes any method
+
+    # `_exact_child` binary-searches `Node.exact` (#559), which upstream `insert!` keeps sorted by
+    # segment, byte by byte. Losing the order costs only speed (a miss falls back to upstream),
+    # which no other test would notice, so this is where it shows.
+    w = HTTP.Router()
+    for s in ("r10", "b", "r9", "é", "a", "r1", "ab", "Z", "r100")
+        HTTP.register!(w, "GET", "/$s", h)
+    end
+    @test issorted(w.routes.exact; by = n -> codeunits(n.segment::String))
+    @test length(w.routes.exact) == 9
 end
 
 @testset "router hands over STILL-ENCODED path segments" begin

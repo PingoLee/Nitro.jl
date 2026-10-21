@@ -37,7 +37,8 @@ end
 
 Nitro.Core.Routing.urlpatterns(BENCH_CTX, "", Nitro.RouteDefinition[
     Nitro.path("/bench/ping", (req) -> "pong", method="GET"),
-    Nitro.path("/bench/items/<int:id>", (req, id::Int) -> Res.json(Dict("id" => id)), method="GET"),
+    Nitro.path("/bench/items/<int:id>", (req, id::Int) -> Res.json(Dict("id" => id)), method="GET",
+               name="bench-item"),
     Nitro.path("/bench/q", function (req)
         q1 = getquery(req)   # first touch
         q2 = getquery(req)   # second touch — measures repeated queryvars cost

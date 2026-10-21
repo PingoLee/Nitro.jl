@@ -117,6 +117,15 @@ end
 const PLAINTEXT = "Hello, World!"
 json_body() = JSON.json(Dict("message" => "Hello, World!"))
 
+# `/links` and `/links_prebuilt`: 20 links, one per line, each from `link(i)`.
+function links_body(link::F) where {F}
+    io = IOBuffer()
+    for i in 1:20
+        println(io, link(i))
+    end
+    return String(take!(io))
+end
+
 # `/query?id=7&name=bench`, Nitro modes only: a `Query{T}` bind of a `@kwdef` struct, so typed
 # binding (`struct_builder`, #537) is on the measured path next to `/plaintext` and `/json`.
 Base.@kwdef struct QueryArgs
@@ -384,6 +393,11 @@ function start_nitro()
         path("/gc",        req -> Res.send(gc_body(); content_type = "application/json"); method = "GET"),
         path("/probe",     req -> Res.send(probe_body(); content_type = "text/tab-separated-values"); method = "GET"),
         path("/query",     (req, q::Query{QueryArgs}) -> Res.send(q.payload.name); method = "GET"),
+        # `/links` reverses 20 links with `url`, as a page template would; `/links_prebuilt`
+        # prints the same body by hand, so the gap is `url` alone (#557).
+        path("/items/<int:id>", (req, id::Int) -> Res.send("item"); method = "GET", name = "item"),
+        path("/links",     req -> Res.send(links_body(i -> url(app, "item"; id = i))); method = "GET"),
+        path("/links_prebuilt", req -> Res.send(links_body(i -> string("/items/", i))); method = "GET"),
     )
     if HOLDS
         hold_json, hold_json_typed, hold_multipart, hold_file, hold_file_stream = hold_routes()

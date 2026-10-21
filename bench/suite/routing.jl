@@ -5,6 +5,10 @@ SUITE["routing"] = BenchmarkGroup()
 SUITE["routing"]["full_pipeline_ping"] = @benchmarkable run_bench_request(req) setup=(
     req = bench_request("GET", "/bench/ping")) evals=1
 
+# Reversing a named route with one `<int:id>`. It ran a regex `replace` over the pattern and built
+# a `Dict` and a `Set` per call: 1.03 µs and 32 allocations before #557.
+SUITE["routing"]["url_named"] = @benchmarkable Nitro.url(BENCH_CTX, "bench-item"; id = 42)
+
 # The chain-cache lookup a warm served request makes, in isolation: build the key and look it up
 # (#250). It replaced a `genkey` benchmark that had stopped measuring the request path at all —
 # the hit path built a different string by then, and since #250 it builds none: the key is a

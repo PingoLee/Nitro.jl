@@ -1532,10 +1532,17 @@ end
 
 What `url` needs to reverse a named route: the full registered `path` (`{param}` placeholders)
 and the converter `type_hints` a value must satisfy to fill each one (#328). Internal.
+
+`literals` and `params` are `path` split once, at registration (#557): `literals[i]` is the text
+in front of placeholder `params[i]`, and `literals[end]` the text after the last one, so `url`
+joins pieces instead of running a regex `replace` over the pattern per call. Both are derived
+from `path`, so equality and hashing leave them out.
 """
 struct NamedRoute
     path::String
     type_hints::Dict{Symbol, Type}
+    literals::Vector{String}
+    params::Vector{Symbol}
 end
 
 Base.:(==)(a::NamedRoute, b::NamedRoute) = a.path == b.path && a.type_hints == b.type_hints
