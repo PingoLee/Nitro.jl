@@ -28,7 +28,8 @@
 #             queued  spawned - started: spawned and not yet begun (no stack yet)
 #             live    started - finished: begun and not ended, each holding a stack
 #             heaps   the tasks in the `:default` multiqueue heaps, which also counts parents woken
-#                     from their `fetch` and waiting to resume
+#                     from their `fetch` and waiting to resume (on a build whose scheduler is the
+#                     work-stealing backend: its rings, LIFO slots and injection queue instead)
 #           The reads race with other threads' writes, so each is a sample, not an exact count.
 #           After each run spawned == started == finished is asserted: every spawned task completed.
 #           Its wall time is reported only to show what the counting costs.
@@ -86,16 +87,7 @@ const SPAWNED, STARTED, FINISHED, PEAK_QUEUED, PEAK_LIVE, PEAK_HEAPS = 1, 2, 3, 
 end
 @inline _peak!(tid::Int, k::Int, x::Int) = x > _get(tid, k) && _set!(tid, k, x)
 
-const HEAP_LISTS = MULTIQ_HEAP_LISTS
-
-function _in_heaps()
-    tp = ccall(:jl_threadpoolid, Int8, (Int16,), Threads.threadid() - 1) + 1
-    n = 0
-    for h in HEAP_LISTS[tp]
-        n += @atomic :monotonic h.ntasks
-    end
-    return n
-end
+_in_heaps() = multiq_queued(Int(ccall(:jl_threadpoolid, Int8, (Int16,), Threads.threadid() - 1)) + 1)
 
 @noinline function _sample!()
     s = st = f = 0
@@ -334,7 +326,7 @@ function measure()
     min_runs = min(runs, parse(Int, get(ENV, "MIN_RUNS", "3")))
     budget = parse(Float64, get(ENV, "BUDGET_S", "30"))
     counted = parse(Int, get(ENV, "INSTR_RUNS", VALIDATE ? "1" : "3"))
-    labels = (string(VERSION), Base.GIT_VERSION_INFO.commit_short,
+    labels = (string(VERSION), MULTIQ_BUILD,
               string(Threads.nthreads(:default), ",", Threads.nthreads(:interactive)),
               GUARD_TIMER === nothing ? "0" : "1", MULTIQ_VARIANT, get(ENV, "ROUND", "1"))
     println(stderr, "nested: julia ", VERSION, " (", labels[2], "), threads ", labels[3],

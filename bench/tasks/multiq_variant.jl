@@ -51,6 +51,14 @@
 # drift from it. C and E are hand copies, so they refuse to load on a build whose `partr.jl` they
 # were not copied from (`PARTR_CRC`).
 #
+# Builds with a selectable scheduler (JuliaLang/julia#62285 moves `Base.Partr` to
+# `Base.Scheduler.Partr` beside a work-stealing backend, chosen at build time by `JULIA_SCHEDULER` and
+# read back as `Base.JULIA_SCHEDULER`): every reference to the partr module goes through `PARTR`, so
+# A loads on either backend and `MULTIQ_BACKEND` names the one the build runs; the variants that
+# patch partr refuse a build whose backend is not partr, since there they would patch dead code. The
+# TSV label of such a build is `<commit>/<backend>`, and `multiq_backend_check` confirms the backend
+# from what the warm-up burst touched (rings grown, or partr heaps grown), not from the build flag.
+#
 # World age: the C runtime calls `trypoptask` and `checktaskempty` in the world of the task that
 # is waiting. An idle thread waits in a task made before the redefinition, so in the old world: its
 # startup root task on 1.12, its long-lived scheduler task (`Base.get_sched_task`) from 1.13. Left
@@ -87,10 +95,22 @@ const MULTIQ_VALIDATE = get(ENV, "VALIDATE", "0") == "1"
 
 # `Base._crc32c` of the `base/partr.jl` C was copied from.
 const PARTR_CRC = Dict(v"1.12.7" => 0xe7c9e7fd, v"1.13.2" => 0xa74d567b, v"1.14.0-DEV.3725" => 0xae19d8ec)
-const PARTR_FILE = joinpath(Sys.BINDIR, Base.DATAROOTDIR, "julia", "base", "partr.jl")
+const PARTR_FILE = let base = joinpath(Sys.BINDIR, Base.DATAROOTDIR, "julia", "base")
+    isfile(joinpath(base, "partr.jl")) ? joinpath(base, "partr.jl") : joinpath(base, "scheduler", "partr.jl")
+end
+
+# The build's partr module, the scheduler backend it runs and the label its TSV rows carry.
+const PARTR = isdefined(Base, :Partr) ? Base.Partr : Base.Scheduler.Partr
+const MULTIQ_BACKEND = !isdefined(Base, :Scheduler) ? :partr :
+    Base.Scheduler.ChosenScheduler === PARTR ? :partr :
+    Symbol(lowercase(String(nameof(Base.Scheduler.ChosenScheduler))))
+const MULTIQ_BUILD = Base.GIT_VERSION_INFO.commit_short *
+    (isdefined(Base, :Scheduler) ? "/" * String(MULTIQ_BACKEND) : "")
+MULTIQ_VARIANT == "A" || MULTIQ_BACKEND === :partr ||
+    error("VARIANT=$(MULTIQ_VARIANT) patches partr, and this build's scheduler is $(MULTIQ_BACKEND)")
 
 # One counter per thread, 64 Ints apart. Validation only.
-@eval Base.Partr const variant_calls = zeros(Int, 64 * Threads.maxthreadid())
+@eval PARTR const variant_calls = zeros(Int, 64 * Threads.maxthreadid())
 const _COUNT = MULTIQ_VALIDATE ? :(variant_calls[64 * (Threads.threadid() - 1) + 1] += 1) : nothing
 
 # The build's own definition of `name`, parsed from its `partr.jl`.
@@ -135,7 +155,8 @@ end
 # sticky task's owner to `multiq_deletemin`; the nightly also restructured the retry loop and
 # renamed `_unsetindex!`. Shared by C (and D over it) and E.
 const _NT_GUARD = VERSION >= v"1.13-" ? :(if nt == 0; nt = UInt32(1); end) : nothing
-const _UNSET = VERSION >= v"1.14-" ? :(Base.unsetindex!) : :(Base._unsetindex!)
+# `_unsetindex!` became `unsetindex!` during 1.14-DEV, so this goes by the name, not the version.
+const _UNSET = isdefined(Base, :unsetindex!) ? :(Base.unsetindex!) : :(Base._unsetindex!)
 const _WAKE_OWNER = quote
     # This task is sticky to a different thread, so we can't run it.
     # Wake that thread so it can come pick up its own work, then keep
@@ -151,12 +172,12 @@ _check_partr_crc() = get(PARTR_CRC, VERSION, nothing) == Base._crc32c(read(PARTR
           "this build's ($VERSION) differs")
 
 if MULTIQ_VARIANT == "A0"
-    Core.eval(Base.Partr, _count_calls!(_partr_function(:multiq_sift_down)))
+    Core.eval(PARTR, _count_calls!(_partr_function(:multiq_sift_down)))
 elseif MULTIQ_VARIANT == "B"
     let f = _partr_function(:multiq_sift_down)
         n = _lt_to_le!(f)
         n == 1 || error("expected one `<` in multiq_sift_down, found $n")
-        Core.eval(Base.Partr, _count_calls!(f))
+        Core.eval(PARTR, _count_calls!(f))
     end
 elseif MULTIQ_SEQ_HEAPS
     _check_partr_crc()
@@ -169,7 +190,7 @@ elseif MULTIQ_SEQ_HEAPS
             seq_less(heap, Int(k), 1) && error("C popped seq $(heap.seqs[1]) before slot $k's seq $(heap.seqs[k])")
         end
     end : nothing
-    @eval Base.Partr begin
+    @eval PARTR begin
         mutable struct seqheap
             const lock::SpinLock
             const tasks::Vector{Task}
@@ -364,7 +385,7 @@ elseif MULTIQ_SEQ_HEAPS
         @assert @isdefined(rn1) "Assertion to tell the compiler about the definedness of this variable"
     end
     if VERSION >= v"1.14-"
-        @eval Base.Partr function $_C_DELETEMIN()
+        @eval PARTR function $_C_DELETEMIN()
             local rn1::UInt32
             local heap, task
 
@@ -390,7 +411,7 @@ elseif MULTIQ_SEQ_HEAPS
             $_POP
         end
     else
-        @eval Base.Partr function $_C_DELETEMIN()
+        @eval PARTR function $_C_DELETEMIN()
             local rn1::UInt32
 
             tid = Threads.threadid()
@@ -421,7 +442,7 @@ if SLOT_BUDGET !== nothing
         :(ccall(:jl_wakeup_threadpool, Cvoid, (Int8,), slot_tpid)) :
         :(ccall(:jl_wakeup_thread, Cvoid, (Int16,), Int16(-1)))
     _vcount(field) = MULTIQ_VALIDATE ? :(s.$field += 1) : nothing
-    @eval Base.Partr begin
+    @eval PARTR begin
         # One per thread, 128 bytes: the slot, then fields only its own thread writes.
         mutable struct taskslot
             @atomic task::Union{Nothing,Task}
@@ -533,7 +554,7 @@ if PERIODIC_K !== nothing
     const _E_EMPTY = _E_NEGATIVE == "lengths" ? :(length(hs[i].buckets[1].tasks) == 0) :
                      _E_NEGATIVE == "firstbucket" ? :(hs[i].buckets[1].n == 0) :
                      :((@atomic :monotonic hs[i].ntasks) == 0)
-    @eval Base.Partr begin
+    @eval PARTR begin
         # E: one ring deque per priority. `head` is the ring index of the oldest entry; the ring's
         # capacity is a power of two, so the k-th oldest is at `e_idx(b, k)`. `shadow` is the same
         # entries in insertion order, VALIDATE only (empty otherwise).
@@ -850,7 +871,7 @@ if PERIODIC_K !== nothing
         return task
     end
     if VERSION >= v"1.14-"
-        @eval Base.Partr function multiq_deletemin()
+        @eval PARTR function multiq_deletemin()
             local rn1::UInt32
             local heap, task, b, front::Bool, ok::Bool   # assigned in the loop, used after it
 
@@ -876,7 +897,7 @@ if PERIODIC_K !== nothing
             $_E_POP
         end
     else
-        @eval Base.Partr function multiq_deletemin()
+        @eval PARTR function multiq_deletemin()
             local rn1::UInt32
 
             tid = Threads.threadid()
@@ -906,8 +927,33 @@ if PERIODIC_K !== nothing
 end
 
 # The heap list the variant runs on: what nested.jl counts as "in heaps".
-const MULTIQ_HEAP_LISTS = PERIODIC_K !== nothing ? Base.Partr.e_heaps :
-                          MULTIQ_SEQ_HEAPS ? Base.Partr.seq_heaps : Base.Partr.heaps
+const MULTIQ_HEAP_LISTS = PERIODIC_K !== nothing ? PARTR.e_heaps :
+                          MULTIQ_SEQ_HEAPS ? PARTR.seq_heaps : PARTR.heaps
+
+# What nested.jl counts as "in heaps": the tasks queued in the live scheduler's structures of pool
+# `tp` (1 `:interactive`, 2 `:default`), read racily. Under partr and every variant, the heaps'
+# `ntasks`; under the work-stealing backend the live span of every ring (`tail - real`), the LIFO
+# slots and the injection stripes, which is where a queued task sits there.
+function multiq_queued(tp::Int)
+    n = 0
+    if MULTIQ_BACKEND === :partr
+        for h in MULTIQ_HEAP_LISTS[tp]
+            n += @atomic :monotonic h.ntasks
+        end
+    else
+        WS = Base.Scheduler.ChosenScheduler
+        for r in WS.Rings[tp]
+            n += Int((@atomic :monotonic r.tail) - WS.real_of(@atomic :monotonic r.head))
+            (@atomic :monotonic r.lifo) === nothing || (n += 1)
+        end
+        for s in WS.Injects[tp].stripes
+            n += @atomic :monotonic s.n
+        end
+    end
+    return n
+end
+MULTIQ_BACKEND in (:partr, :workstealing) ||
+    error("multiq_queued knows partr and workstealing, not $(MULTIQ_BACKEND)")
 
 # Runs pinned to one thread, in the current world. From 1.13 a thread idles in a long-lived
 # scheduler task of its own (`Base.get_sched_task`, a `OncePerThread` running `wait_forever`), which
@@ -955,6 +1001,30 @@ _burst() = foreach(wait, [Threads.@spawn sum(1:100) for _ in 1:200])
 foreach(wait, [Threads.@spawn :interactive _burst() for _ in 1:8])
 foreach(wait, [Threads.@spawn :default _burst() for _ in 1:8])
 
+# On a build with a selectable backend, confirm `MULTIQ_BACKEND` from what the burst touched: the
+# work-stealing rings grow to one per thread of each pool on first use and partr's heaps grow on
+# the first insert, so exactly one of the two structures is populated after it.
+function multiq_backend_check()
+    isdefined(Base, :Scheduler) || return nothing
+    Base.JULIA_SCHEDULER === MULTIQ_BACKEND ||
+        error("Base.JULIA_SCHEDULER is :$(Base.JULIA_SCHEDULER), but ChosenScheduler is $(MULTIQ_BACKEND)")
+    rings = isdefined(Base.Scheduler, :Workstealing) ?
+        (length(Base.Scheduler.Workstealing.Rings[1]), length(Base.Scheduler.Workstealing.Rings[2])) : (0, 0)
+    heaps = (length(PARTR.heaps[1]), length(PARTR.heaps[2]))
+    if MULTIQ_BACKEND === :workstealing
+        rings == (Threads.nthreads(:interactive), Threads.nthreads(:default)) ||
+            error("workstealing build, but the rings per pool are $rings")
+        heaps == (0, 0) || error("workstealing build, but partr grew heaps $heaps")
+    else
+        rings == (0, 0) || error("partr build, but work-stealing rings grew: $rings")
+        heaps[2] > 0 || error("partr build, but no heap in the :default pool after the warm-up")
+    end
+    println(stderr, "multiq_variant: backend ", MULTIQ_BACKEND, " confirmed: Base.JULIA_SCHEDULER = :",
+            Base.JULIA_SCHEDULER, ", rings per pool ", rings, ", partr heaps per pool ", heaps)
+    return nothing
+end
+multiq_backend_check()
+
 println(stderr, "multiq_variant: VARIANT=", MULTIQ_VARIANT, MULTIQ_VALIDATE ? " (VALIDATE)" : "",
         MULTIQ_SEQ_HEAPS || PERIODIC_K !== nothing ? ", partr.jl crc matches $(VERSION)" : "",
         SLOT_BUDGET === nothing ? "" : ", slot budget $(SLOT_BUDGET == typemax(Int) ? "none" : SLOT_BUDGET)",
@@ -962,24 +1032,24 @@ println(stderr, "multiq_variant: VARIANT=", MULTIQ_VARIANT, MULTIQ_VALIDATE ? " 
         PERIODIC_K !== nothing && !isempty(_E_NEGATIVE) ? ", NEGATIVE CONTROL $(_E_NEGATIVE)" : "")
 
 # Calls into the new code, per thread (validation only).
-multiq_variant_calls() = [Base.Partr.variant_calls[64 * (tid - 1) + 1] for tid in 1:Threads.maxthreadid()]
+multiq_variant_calls() = [PARTR.variant_calls[64 * (tid - 1) + 1] for tid in 1:Threads.maxthreadid()]
 
 # End of a process: under C and E, nothing ever went into the build's own heaps, and the
 # variant's are empty (under E: every live count 0 and every bucket's ring and shadow empty).
 function multiq_variant_check()
     MULTIQ_SEQ_HEAPS || PERIODIC_K !== nothing || return nothing
     for tp in 1:2
-        n_old = sum((h.ntasks for h in Base.Partr.heaps[tp]); init = 0)
+        n_old = sum((h.ntasks for h in PARTR.heaps[tp]); init = 0)
         n_new = sum((h.ntasks for h in MULTIQ_HEAP_LISTS[tp]); init = 0)
         n_old == 0 || error("$MULTIQ_VARIANT: $n_old tasks in the build's own heaps of pool $tp")
         n_new == 0 || error("$MULTIQ_VARIANT: $n_new tasks left in the variant's heaps of pool $tp")
     end
     if SLOT_BUDGET !== nothing
-        full = [tid for tid in 1:Threads.maxthreadid() if (@atomic Base.Partr.slots[tid].task) !== nothing]
+        full = [tid for tid in 1:Threads.maxthreadid() if (@atomic PARTR.slots[tid].task) !== nothing]
         isempty(full) || error("D: tasks left in the slots of tids $full")
     end
     if PERIODIC_K !== nothing
-        for tp in 1:2, h in Base.Partr.e_heaps[tp], b in h.buckets
+        for tp in 1:2, h in PARTR.e_heaps[tp], b in h.buckets
             b.n == 0 || error("E: bucket $(b.priority) of a pool-$tp heap holds $(b.n) entries at exit")
             isempty(b.shadow) || error("E: bucket $(b.priority) of a pool-$tp heap has $(length(b.shadow)) shadow entries at exit")
             h.priority == typemax(UInt16) || error("E: a pool-$tp heap publishes priority $(h.priority) while empty")
@@ -995,8 +1065,8 @@ multiq_watchdog(secs::Integer) = MULTIQ_VALIDATE ? Int(ccall(:alarm, Cuint, (Cui
 # D, VALIDATE only: per `:default` tid, the counts kept in its slot.
 function multiq_slot_counts()
     SLOT_BUDGET === nothing && return nothing
-    ss = Base.Partr.slots
-    tids = Base.Partr.slot_tids
+    ss = PARTR.slots
+    tids = PARTR.slot_tids
     return (tids = tids, pops = [ss[t].pops for t in tids], steals = [ss[t].steals for t in tids],
             flushes = [ss[t].flushes for t in tids], displaced = [ss[t].displaced for t in tids],
             bounced = [ss[t].bounced for t in tids])
@@ -1036,10 +1106,10 @@ function _slot_probe(reps::Int = 20, hold_ms::Float64 = 200.0)
             while time_ns() - t0 < 5_000_000
                 GC.safepoint()
             end
-            s = Base.Partr.slots[Threads.threadid()]
+            s = PARTR.slots[Threads.threadid()]
             dummy = Task(() -> nothing)
             prev = @atomicswap s.task = dummy
-            e = Base.Partr.multiq_check_empty()
+            e = PARTR.multiq_check_empty()
             back = @atomicswap s.task = prev
             (e, back === dummy)
         end)
@@ -1078,7 +1148,7 @@ end
 # E, VALIDATE only: per tid, the counts kept in its pop state.
 function multiq_budget_counts()
     PERIODIC_K === nothing && return nothing
-    es = Base.Partr.e_states
+    es = PARTR.e_states
     tids = 1:Threads.maxthreadid()
     return (tids = tids, pops = [es[t].pops for t in tids], periodic = [es[t].periodic for t in tids],
             older = [es[t].older for t in tids], fallbacks = [es[t].fallbacks for t in tids])
@@ -1124,7 +1194,7 @@ end
 #    must say non-empty (`E_NEGATIVE=firstbucket` fails the second: a lost wake-up). The dummy is
 #    taken back out through the same bucket, under the heap's lock.
 function _e_probe(reps::Int = 20)
-    P = Base.Partr
+    P = PARTR
     seen_empty = false
     for _ in 1:reps
         sleep(0.05)
@@ -1173,21 +1243,21 @@ end
 # One heap, driven by the variant's own sift functions and the per-heap steps of the variant's
 # `multiq_insert` / `multiq_deletemin`, with dummy tasks that never run.
 
-_newheap() = MULTIQ_SEQ_HEAPS ? Base.Partr.seqheap() : Base.Partr.taskheap()
+_newheap() = MULTIQ_SEQ_HEAPS ? PARTR.seqheap() : PARTR.taskheap()
 
 function _push!(h, t::Task)
     if h.ntasks >= length(h.tasks)
         resize!(h.tasks, 2 * length(h.tasks))
-        h isa Base.Partr.taskheap || resize!(h.seqs, 2 * length(h.seqs))
+        h isa PARTR.taskheap || resize!(h.seqs, 2 * length(h.seqs))
     end
     n = h.ntasks + Int32(1)
     @atomic h.ntasks = n
     h.tasks[n] = t
-    if !(h isa Base.Partr.taskheap)
+    if !(h isa PARTR.taskheap)
         h.seqs[n] = h.next
         h.next += UInt64(1)
     end
-    Base.Partr.multiq_sift_up(h, n)
+    PARTR.multiq_sift_up(h, n)
 end
 
 function _pop!(h)
@@ -1195,9 +1265,9 @@ function _pop!(h)
     n = h.ntasks
     @atomic h.ntasks = n - Int32(1)
     h.tasks[1] = h.tasks[n]
-    h isa Base.Partr.taskheap || (h.seqs[1] = h.seqs[n])
-    VERSION >= v"1.14-" ? Base.unsetindex!(h.tasks, Int(n)) : Base._unsetindex!(h.tasks, Int(n))
-    n > 1 && Base.Partr.multiq_sift_down(h, Int32(1))
+    h isa PARTR.taskheap || (h.seqs[1] = h.seqs[n])
+    isdefined(Base, :unsetindex!) ? Base.unsetindex!(h.tasks, Int(n)) : Base._unsetindex!(h.tasks, Int(n))
+    n > 1 && PARTR.multiq_sift_down(h, Int32(1))
     return t
 end
 
@@ -1260,21 +1330,21 @@ end
 
 # ── E's single-heap asserts: one `eheap` driven by E's own bucket operations ─────────────────
 
-_e_newheap() = Base.Partr.eheap()
+_e_newheap() = PARTR.eheap()
 
 function _e_push!(h, t::Task, prio::UInt16 = 0x0000)
     t.priority = prio
-    b = Base.Partr.e_bucket!(h, prio)
-    Base.Partr.e_push_back!(b, t, Base.Partr.e_stamp())
-    Base.Partr.e_publish!(h, h.ntasks + Int32(1))
+    b = PARTR.e_bucket!(h, prio)
+    PARTR.e_push_back!(b, t, PARTR.e_stamp())
+    PARTR.e_publish!(h, h.ntasks + Int32(1))
 end
 
 # A normal pop (the newest of the lowest live priority) or a periodic one (the oldest of it).
 function _e_pop!(h, periodic::Bool)
-    b = h.buckets[Base.Partr.e_min_index(h)]
-    t = periodic ? Base.Partr.e_front(b) : Base.Partr.e_back(b)
-    periodic ? Base.Partr.e_remove_front!(b) : Base.Partr.e_remove_back!(b)
-    Base.Partr.e_publish!(h, h.ntasks - Int32(1))
+    b = h.buckets[PARTR.e_min_index(h)]
+    t = periodic ? PARTR.e_front(b) : PARTR.e_back(b)
+    periodic ? PARTR.e_remove_front!(b) : PARTR.e_remove_back!(b)
+    PARTR.e_publish!(h, h.ntasks - Int32(1))
     return t
 end
 
@@ -1387,6 +1457,10 @@ end
 
 function multiq_unit_asserts()
     PERIODIC_K === nothing || return _e_unit_asserts()
+    if MULTIQ_BACKEND !== :partr
+        println(stderr, "multiq_variant: single-heap asserts skipped: the build's scheduler is ", MULTIQ_BACKEND)
+        return nothing
+    end
     n, m = 30, 3000
     fd, (worst, waiting), il = _fill_drain(20), _steady(n, m), _interleaved(2000)
     if MULTIQ_VARIANT in ("A", "A0")

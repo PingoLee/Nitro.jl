@@ -9,11 +9,15 @@
 #   VALIDATE=1 bench/tasks/nested.sh 0 validate.tsv
 #   julia bench/tasks/nested.jl --report out.tsv
 #
+#   CHANNELS     juliaup channels, or the path of a julia binary (anything with a `/`) for a build
+#                outside juliaup; two builds of one commit are told apart by the TSV's commit label,
+#                `<commit>/<scheduler backend>` on a build with a selectable one
 #   WORKLOADS    nested.jl workloads, "fib_fine fib_coarse msort reduce fanout" by default
 #   SKIP         "<variant>:<workload>" pairs not run, for a variant known to be pathological on a
 #                workload: B on fine-grain fib (default "B:fib_fine"; one run did not end in minutes)
 #   TIMEOUT_S    each process is killed after this many seconds (default 600). A kill appends a row
-#                whose digest is `timeout`; --report lists it instead of numbers
+#                whose digest is `timeout`; --report lists it instead of numbers, and the script
+#                exits 2 at the end (1 is a failure that stopped it)
 #
 # Every other nested.jl variable (RUNS, BUDGET_S, FIB_FINE, VALIDATE, ...) passes through. The real
 # julia binary is run, not the juliaup launcher, so that the timeout's SIGKILL reaches it.
@@ -32,8 +36,12 @@ mkdir -p "$(dirname "$TSV")"
 status=0
 
 for ch in $CHANNELS; do
-  jl="$(julia +"$ch" -e 'print(joinpath(Sys.BINDIR, "julia"))')" || { echo "nested.sh: no julia +$ch" >&2; exit 1; }
-  ver="$("$jl" -e 'print(VERSION, "\t", Base.GIT_VERSION_INFO.commit_short)')"
+  case "$ch" in
+    */*) jl="$ch" ;;   # a julia binary outside juliaup, e.g. a source build
+    *)   jl="$(julia +"$ch" -e 'print(joinpath(Sys.BINDIR, "julia"))')" || { echo "nested.sh: no julia +$ch" >&2; exit 1; } ;;
+  esac
+  ver="$("$jl" -e 'print(VERSION, "\t", Base.GIT_VERSION_INFO.commit_short,
+                       isdefined(Base, :Scheduler) ? "/" * String(Base.JULIA_SCHEDULER) : "")')"
   for layout in $LAYOUTS; do
     for w in $WORKLOADS; do
       for variant in $VARIANTS; do
@@ -48,7 +56,7 @@ for ch in $CHANNELS; do
           # julia, commit, threads, guard, variant, round, bench, then 18 empty numbers and the digest
           printf '%s\t%s\t%s\t%s\t%s%s\ttimeout\n' "$ver" "$layout" "${GUARD:-1}" "$variant" "$ROUND" \
             "$(printf '\t%s' "$w" NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN)" >>"$TSV"
-          status=1
+          status=2
         elif [ "$rc" != 0 ]; then
           echo "nested.sh: julia +$ch --threads=$layout VARIANT=$variant $w failed ($rc)" >&2
           exit 1

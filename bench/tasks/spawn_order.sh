@@ -12,6 +12,9 @@
 # Appends one line per cell to <tsv>, writing the header only when the file is new. spawn_order.jl
 # reads D, CS, HS, CELLS, MODES, CLIENTS, GUARD and VARIANT from the environment.
 #
+#   CHANNELS     juliaup channels, or the path of a julia binary (anything with a `/`) for a build
+#                outside juliaup; two builds of one commit are told apart by the TSV's commit label,
+#                `<commit>/<scheduler backend>` on a build with a selectable one
 #   VARIANTS     multiq_variant.jl variants to run, "A" (stock) by default
 #   A0_CELLS     CELLS for variant A0 only (it is a cost control; default: CELLS)
 #   CELLS=none   skip spawn_order.jl (run only the tasks.jl rows below)
@@ -20,7 +23,11 @@
 #   MICRO_WHAT   what tasks.jl runs, "micro" by default (e.g. "micro queued")
 #   MICRO_PROJECT  the environment for tasks.jl (it needs BenchmarkTools), default bench/; "{mm}"
 #                is replaced with the channel's major.minor, for one environment per version
-#   TIMEOUT_S    each process is killed after this many seconds (default 900); a hang is a failure
+#   TIMEOUT_S    each spawn_order.jl process is killed after this many seconds (default 900); a hang
+#                is a failure
+#   MICRO_TIMEOUT_S  each tasks.jl process is killed after this many seconds (default TIMEOUT_S); a kill
+#                appends a `killed` row (`<round> <julia> <layout> <variant> killed julia <what>
+#                timeout=<s>`) to MICRO_OUT and the script goes on, exiting 2 at the end
 #
 # The real julia binary is run, not the juliaup launcher, so that the timeout's SIGKILL reaches it.
 set -uo pipefail
@@ -32,13 +39,18 @@ LAYOUTS="${LAYOUTS:-8,1 8,0}"
 VARIANTS="${VARIANTS:-A}"
 CPUS="${CPUS:-0,1,2,3,6,7,8,9}"
 TIMEOUT_S="${TIMEOUT_S:-900}"
+MICRO_TIMEOUT_S="${MICRO_TIMEOUT_S:-$TIMEOUT_S}"
 MICRO_OUT="${MICRO_OUT:-}"
 MICRO_PROJECT="${MICRO_PROJECT:-$HERE/..}"
 MICRO_WHAT="${MICRO_WHAT:-micro}"
 mkdir -p "$(dirname "$TSV")"
+status=0
 
 for ch in $CHANNELS; do
-  jl="$(julia +"$ch" -e 'print(joinpath(Sys.BINDIR, "julia"))')" || { echo "spawn_order.sh: no julia +$ch" >&2; exit 1; }
+  case "$ch" in
+    */*) jl="$ch" ;;   # a julia binary outside juliaup, e.g. a source build
+    *)   jl="$(julia +"$ch" -e 'print(joinpath(Sys.BINDIR, "julia"))')" || { echo "spawn_order.sh: no julia +$ch" >&2; exit 1; } ;;
+  esac
   mm="$("$jl" -e 'print(VERSION.major, ".", VERSION.minor)')"
   ver="$("$jl" -e 'print(VERSION)')"
   for layout in $LAYOUTS; do
@@ -53,12 +65,19 @@ for ch in $CHANNELS; do
           { echo "spawn_order.sh: julia +$ch --threads=$layout VARIANT=$variant failed or timed out" >&2; exit 1; }
       fi
       if [ -n "$MICRO_OUT" ]; then
-        VARIANT="$variant" timeout -s KILL "$TIMEOUT_S" taskset -c "$CPUS" "$jl" \
+        VARIANT="$variant" timeout -s KILL "$MICRO_TIMEOUT_S" taskset -c "$CPUS" "$jl" \
           --project="${MICRO_PROJECT//\{mm\}/$mm}" --threads="$layout" "$HERE/tasks.jl" $MICRO_WHAT |
           sed "s/^/$ROUND\t$ver\t$layout\t$variant\t/" >>"$MICRO_OUT"
-        [ "${PIPESTATUS[0]}" = 0 ] ||
-          { echo "spawn_order.sh: tasks.jl $MICRO_WHAT +$ch --threads=$layout VARIANT=$variant failed or timed out" >&2; exit 1; }
+        rc="${PIPESTATUS[0]}"
+        if [ "$rc" = 137 ]; then
+          echo "spawn_order.sh: tasks.jl $MICRO_WHAT $ch --threads=$layout VARIANT=$variant killed after ${MICRO_TIMEOUT_S}s" >&2
+          printf '%s\t%s\t%s\t%s\tkilled\tjulia\t%s\ttimeout=%s\n' "$ROUND" "$ver" "$layout" "$variant" "$MICRO_WHAT" "$MICRO_TIMEOUT_S" >>"$MICRO_OUT"
+          status=2
+        elif [ "$rc" != 0 ]; then
+          echo "spawn_order.sh: tasks.jl $MICRO_WHAT $ch --threads=$layout VARIANT=$variant failed ($rc)" >&2; exit 1
+        fi
       fi
     done
   done
 done
+exit "$status"
