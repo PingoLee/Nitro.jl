@@ -36,6 +36,13 @@ Both key on a *prefix* of the client address — `/32` for IPv4 and `/64` for IP
 so an IPv6 client cannot buy quota by rotating source addresses inside its own allocation
 (#22). See the two strategy docstrings for the full keyword list.
 
+# Response headers
+
+An admitted response and a `429` carry `X-RateLimit-Limit`, `X-RateLimit-Remaining` and
+`X-RateLimit-Reset` (seconds until a slot frees). If an inner layer already set one of them, the
+inner value is kept. Only a refusal carries `Retry-After`: the `429`, and the full-store `503`
+below. An admitted response has nothing to wait for, so it carries none (#560).
+
 # Capacity
 
 Both hold about `max_clients` client buckets (default 10 000; split across lock stripes, see
@@ -467,6 +474,8 @@ function _respond(handle::Function, req::HTTP.Request, outcome::Int, remaining::
     if outcome == _LIMIT
         resp = HTTP.Response(429, limit_body)
         set_rate_headers!(resp, rate_limit, 0, reset_time)
+        # Only a refusal says when to retry; an admitted response has nothing to wait for (#560).
+        push!(resp.headers, "Retry-After" => string(reset_time))
         return resp
     end
     # Own the handler's (possibly shared/`const`) response before adding headers.
@@ -946,55 +955,40 @@ end
 """
     set_rate_headers!(resp::HTTP.Response, rate_limit::Int, remaining_requests::Int, reset_time::Int)
 
-Conditionally sets standard rate limiting headers on an HTTP response if they are not already present.
-This function implements a "header preservation" pattern, ensuring that headers set by inner middleware
-(e.g., route-level rate limits) are not overwritten by outer middleware (e.g., router-level limits),
-allowing the most restrictive or specific limits to take precedence in nested middleware chains.
+Adds the three `X-RateLimit-*` headers to `resp`, each one only if it is not already present.
+That keeps a header an inner layer wrote, such as a route-level limiter inside a router-level one,
+so the most specific limit is the one the client sees.
+
+It does not write `Retry-After`. That header means "wait this long before retrying", which only a
+refusal answers (RFC 9110 §10.2.3, RFC 6585 §4), so the limiter adds it to its own `429` and `503`
+and never to an admitted response (#560).
 
 # Arguments
-- `resp::HTTP.Response`: The HTTP response object to modify. Headers are added in-place.
-- `rate_limit::Int`: The maximum number of requests allowed in the current window. Used for the `X-RateLimit-Limit` header.
-- `remaining_requests::Int`: The number of requests remaining in the current window. Used for the `X-RateLimit-Remaining` header (clamped to 0 if negative).
-- `reset_time::Int`: The number of seconds until the rate limit window resets. Used for the `X-RateLimit-Reset` header.
+- `resp::HTTP.Response`: the response to modify, in place. A caller that did not build it owns its
+  headers first (`own_response_headers`).
+- `rate_limit::Int`: the requests allowed per window, for `X-RateLimit-Limit`.
+- `remaining_requests::Int`: the requests left in the window, for `X-RateLimit-Remaining`. A
+  negative value is written as 0.
+- `reset_time::Int`: the seconds until a slot frees, for `X-RateLimit-Reset`.
 """
 function set_rate_headers!(resp::HTTP.Response, rate_limit::Int, remaining_requests::Int, reset_time::Int)
-    
-    # Header flags which are set to true when they're found
-    has_limit = false
-    has_remaining = false
-    has_reset = false
-    has_retry = false
-    
-    # Loop over the headers once and try to find each header
+    has_limit = has_remaining = has_reset = false
     for (k, _) in resp.headers
-        # End if all headers are found
-        if has_retry && has_limit && has_remaining && has_reset
-            break
-        elseif !has_retry && header_name_isequal(k, "Retry-After")
-            has_retry = true
-        elseif !has_limit && header_name_isequal(k, "X-RateLimit-Limit")
+        if !has_limit && header_name_isequal(k, "X-RateLimit-Limit")
             has_limit = true
-        elseif !has_remaining && header_name_isequal(k, "X-RateLimit-Remaining" )
+        elseif !has_remaining && header_name_isequal(k, "X-RateLimit-Remaining")
             has_remaining = true
         elseif !has_reset && header_name_isequal(k, "X-RateLimit-Reset")
             has_reset = true
         end
+        has_limit && has_remaining && has_reset && return resp
     end
-
-    # Conditionally set the headers if they don't exist
-    if !has_retry
-        HTTP.setheader(resp, "Retry-After" => string(reset_time))
-    end
-    if !has_limit
-        HTTP.setheader(resp, "X-RateLimit-Limit" => string(rate_limit))
-    end
-    if !has_remaining
-        HTTP.setheader(resp, "X-RateLimit-Remaining" => string(max(0, remaining_requests)))
-    end
-    if !has_reset
-        HTTP.setheader(resp, "X-RateLimit-Reset" => string(reset_time))
-    end  
-
+    # The scan proved each absent header absent, so append it. `HTTP.setheader` would scan and
+    # compact the whole vector again for each one.
+    has_limit     || push!(resp.headers, "X-RateLimit-Limit" => string(rate_limit))
+    has_remaining || push!(resp.headers, "X-RateLimit-Remaining" => string(max(0, remaining_requests)))
+    has_reset     || push!(resp.headers, "X-RateLimit-Reset" => string(reset_time))
+    return resp
 end
 
 end

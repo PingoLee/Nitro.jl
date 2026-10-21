@@ -1012,6 +1012,63 @@ end
     end
 end
 
+# ── #560: Retry-After only on a refusal, and the admitted path appends ────────
+# `set_rate_headers!` wrote `Retry-After` on every admitted 200, where it means nothing
+# (RFC 9110 §10.2.3), and set each header with `HTTP.setheader`, a compaction pass per call.
+const H560 = ["Content-Type" => "text/plain", "Content-Length" => "2", "Date" => "x",
+              "Server" => "y", "Vary" => "Origin"]
+f560_names(r) = [lowercase(h.first) for h in r.headers]
+
+@testset "Rate limiter: an admitted response carries no Retry-After (#560)" begin
+    for strategy in (:fixed_window, :sliding_window)
+        w = RateLimiter(; strategy, auto_extract_ip=false, rate_limit=2, window=Minute(1)).middleware(
+            _ -> HTTP.Response(200, H560, "ok"))
+        ok = w(f421_req())
+        @test (strategy, ok.status, HTTP.hasheader(ok, "Retry-After")) == (strategy, 200, false)
+        @test HTTP.header(ok, "X-RateLimit-Limit") == "2"
+        @test HTTP.header(ok, "X-RateLimit-Remaining") == "1"
+        @test 0 <= parse(Int, HTTP.header(ok, "X-RateLimit-Reset")) <= 60
+        # Each header once, after the handler's own.
+        @test f560_names(ok) == ["content-type", "content-length", "date", "server", "vary",
+                                 "x-ratelimit-limit", "x-ratelimit-remaining", "x-ratelimit-reset"]
+        w(f421_req())
+        refused = w(f421_req())
+        @test (strategy, refused.status) == (strategy, 429)
+        @test 1 <= parse(Int, HTTP.header(refused, "Retry-After")) <= 60
+        @test HTTP.header(refused, "Retry-After") == HTTP.header(refused, "X-RateLimit-Reset")
+        @test HTTP.header(refused, "X-RateLimit-Remaining") == "0"
+        @test count(==("retry-after"), f560_names(refused)) == 1
+    end
+end
+
+@testset "Rate limiter: an inner layer's rate headers are kept, not duplicated (#560)" begin
+    inner = HTTP.Response(503, ["x-ratelimit-limit" => "7", "Retry-After" => "9"], "busy")
+    w = RateLimiter(; auto_extract_ip=false, rate_limit=100).middleware(_ -> inner)
+    r = w(f421_req())
+    @test HTTP.header(r, "X-RateLimit-Limit") == "7"
+    @test HTTP.header(r, "Retry-After") == "9"
+    @test count(==("x-ratelimit-limit"), f560_names(r)) == 1
+    @test count(==("retry-after"), f560_names(r)) == 1
+    @test HTTP.header(r, "X-RateLimit-Remaining") == "99"
+    # The shared response the handler returned is untouched.
+    @test f560_names(inner) == ["x-ratelimit-limit", "retry-after"]
+end
+
+@testset "set_rate_headers! costs its three values, not a String per header (#542, #560)" begin
+    srh! = Nitro.Core.RateLimiterMiddleware.set_rate_headers!
+    # Three `string(Int)` values and the vector's growth are the floor: 7 at -O2. It was ~290 on
+    # this 5-header response while each name compare went through `lowercase` (#542). The
+    # positive control is that fold, once per header, for a single name.
+    fresh = [HTTP.Response(200, copy(H560), "ok") for _ in 1:22]
+    i = Ref(0)
+    @testset let r = HTTP.Response(200, copy(H560), "ok"),
+                 added = allocs(() -> srh!(fresh[i[] += 1], 100, 99, 60)),
+                 lowercasing = allocs(() -> count(h -> lowercase(h.first) == "retry-after", r.headers))
+        @test added.count <= 12
+        @test lowercasing.count > 12
+    end
+end
+
 end # @testitem "Rate limiter construction and keying"
 
 
