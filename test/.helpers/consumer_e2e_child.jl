@@ -31,9 +31,9 @@ mode == "interrupt" && Base.exit_on_sigint(false)
 e2e_is_postgres(dbspec) && @eval using LibPQ
 store = e2e_store(dbspec)
 app = e2e_setup!(App())
-write(joinpath(outdir, "$consumer_id.ready"), string(getpid()))
+e2e_write(joinpath(outdir, "$consumer_id.ready"), getpid())
 reason = consume!(app; store, queues = ["requeue" => 2, "fail" => 1], lease, poll_interval = 0.1,
                   drain_timeout = 10, consumer_id,
                   max_runs = mode == "oneshot" ? 1 : nothing, exit_when_idle = mode == "oneshot")
 # Reached only when the wait returns normally; a SIGTERM exits through the `atexit` drain instead.
-write(joinpath(outdir, "$consumer_id.returned"), string(reason))
+e2e_write(joinpath(outdir, "$consumer_id.returned"), reason)
