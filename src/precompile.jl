@@ -23,6 +23,12 @@ struct PrecompilePlain
     score::Float64
 end
 
+# A multipart upload shape for `MultipartForm{T}` (#551): one text field and one file.
+Base.@kwdef struct PrecompileUpload
+    category::String = ""
+    file::FormFile
+end
+
 @compile_workload begin
     ctx = App()
 
@@ -215,6 +221,57 @@ end
         Core.internalrequest(ctx, claims_req; catch_errors=false)
     end
 
+    # ── Second pass: the shapes still compiled on a fresh server's first request (#551) ─────────
+    #
+    # Measured over a socket, one shape per FRESH process (Julia 1.13.2, `-t 8`), as the excess
+    # over a first-request floor of ~1.44 s that is HTTP.jl's own connection loop (see the
+    # transport block). Before -> after this block: `Cookie{T}` 345 -> 50 ms, `payload(req)`
+    # 495 -> 55, `Files{FormFile}` 270 -> 40, `MultipartForm{T}` 400 -> 180, `url()` 175 -> 15.
+    #
+    # Measured and left out, because a workload cannot hold them: `Header{T}` and a `Query{T}`
+    # request that omits a defaulted field (~250 ms each) cost the same with a workload route over
+    # `PrecompileRecord`, so that time is the app's own `T`; likewise a `Json{T}` whose `T` nests
+    # another `@kwdef` struct, and the `MultipartForm{T}` remainder above.
+    #
+    # POST bodies are `Vector{UInt8}`, which is what a request read off a socket carries; see the
+    # typed-JSON block below.
+    Core.Routing.urlpatterns(ctx, "", RouteDefinition[
+        path("/precompile/extract/cookie", (req::Request, sid::Cookie{String}) -> Res.send(sid.value)),
+        path("/precompile/extract/files", (req::Request, file::Files{FormFile}) ->
+             Res.send(file.payload.filename), method="POST"),
+        path("/precompile/extract/upload", (req::Request, up::MultipartForm{PrecompileUpload}) ->
+             Res.send(up.payload.category), method="POST"),
+        path("/precompile/payload", (req::Request) -> Res.send(string(length(payload(req)))),
+             method="POST"),
+        path("/precompile/reverse", (req::Request) ->
+             Res.send(Core.Routing.url(ctx, "precompile_item"; id = 7))),
+        path("/precompile/named/<int:id>", (req::Request, id::Int) -> Res.status(204);
+             name = "precompile_item"),
+    ])
+    Core.internalrequest(ctx, Request("GET", "/precompile/extract/cookie", ["Cookie" => "sid=p"]);
+                         catch_errors=false)
+    Core.internalrequest(ctx, Request("POST", "/precompile/payload",
+                                      ["Content-Type" => "application/x-www-form-urlencoded"],
+                                      Vector{UInt8}("a=1")); catch_errors=false)
+    Core.internalrequest(ctx, Request("GET", "/precompile/reverse"); catch_errors=false)
+    let boundary = "precompileboundary"
+        file_part = string("--", boundary, "\r\n",
+                           "Content-Disposition: form-data; name=\"file\"; filename=\"p.txt\"\r\n",
+                           "Content-Type: text/plain\r\n\r\ncontents\r\n")
+        upload = string("--", boundary, "\r\n",
+                        "Content-Disposition: form-data; name=\"category\"\r\n\r\np\r\n",
+                        file_part, "--", boundary, "--\r\n")
+        for (target, body) in (("/precompile/extract/files", string(file_part, "--", boundary, "--\r\n")),
+                               ("/precompile/extract/upload", upload))
+            Core.internalrequest(
+                ctx,
+                Request("POST", target, ["Content-Type" => "multipart/form-data; boundary=$boundary"],
+                        Vector{UInt8}(body));
+                catch_errors=false,
+            )
+        end
+    end
+
     # ── Typed JSON under Nitro's read style (#306) ──────────────────────────────────────
     #
     # Every typed parse of client JSON passes `NITRO_READ_STYLE` (it never interns a client
@@ -295,12 +352,19 @@ end
         path("/precompile/parse/multipart", (req::Request) ->
              Res.json(Dict{String,Any}("n" => length(multipart(req)))), method="POST"),
     ])
-    Core.internalrequest(
-        ctx,
-        Request("POST", "/precompile/parse/form",
-                ["Content-Type" => "application/x-www-form-urlencoded"], "a=1&b=2");
-        catch_errors=false,
-    )
+    # Both body types (#551). A `String` body is a `Request{BytesBody{CodeUnits{…}}}`, which is
+    # what an `internalrequest` caller usually builds; a socket delivers a
+    # `Request{BytesBody{Vector{UInt8}}}`, and with only the first warmed, the first upload to a
+    # fresh server compiled `multipartbody` again (~175 ms). The #551 block above sends multipart
+    # as bytes; this one keeps the `String` form warm.
+    for body in ("a=1&b=2", Vector{UInt8}("a=1&b=2"))
+        Core.internalrequest(
+            ctx,
+            Request("POST", "/precompile/parse/form",
+                    ["Content-Type" => "application/x-www-form-urlencoded"], body);
+            catch_errors=false,
+        )
+    end
     let boundary = "precompileboundary"
         body = string(
             "--", boundary, "\r\n",
@@ -345,6 +409,22 @@ end
         precompile(Core._handle_reporting, (typeof(request_handler), stream))
         precompile(Core._write_response_body!, (stream, String))
         precompile(Core._write_response_body!, (stream, Vector{UInt8}))
+        # The two streaming bodies (#551), ~120 ms each on a first request: a streamed file
+        # (`Res.file(req, path; stream = true)`, and a mount's files over its threshold), whose
+        # body type is whatever `servecontent` builds over an `IO`, so it is read off a real
+        # call rather than named; and `Res.sse`'s `SSEStream`, with the builder itself.
+        mktempdir() do dir
+            file = joinpath(dir, "streamed.bin")
+            write(file, "precompile")
+            open(file) do io
+                body = Core.HTTP.servecontent(Request("GET", "/"), io).body
+                precompile(Core._write_response_body!, (stream, typeof(body)))
+            end
+        end
+        let events = Res.sse()
+            precompile(Core._write_response_body!, (stream, typeof(events.body)))
+            close(events.body)
+        end
     end
 
     # NOTE: a live-server round-trip (serve! + loopback HTTP.get) is still intentionally NOT

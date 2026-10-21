@@ -107,6 +107,26 @@ using Test
 # falls back to `stdout` when it is missing. If an upgrade renames it, the lines go quiet
 # on a pass again, and the test itself still asserts.
 #
+# ── The #551 shapes, which need limits of their own ───────────────────────────────────────
+#
+# #551's second workload pass covered four more shapes. Their cold cost is a smaller multiple of
+# the baseline than #242's, so 8x would pass them cold. Measured on Julia 1.13.2 / Linux, same
+# protocol (best of two, baseline best of three, ~0.068 s):
+#
+#               warm (this workload)   cold (workload before #551)
+#   cookie_ext         0.85x                    5.6x
+#   files_ext          0.72x                    5.35x
+#   payload            0.74x                    7.7x
+#   url                1.0x                     2.7x
+#
+# 2.5x for the first three leaves ~2.9x of margin on the flake side and ~2.1x on the false-pass
+# side; `url` gets 1.8x, ~1.8x and ~1.5x. CI runs the suite at `-O0` with `--check-bounds=yes`,
+# and the probes inherit both through `Base.julia_cmd()`. Under those flags (baseline ~0.04 s) the
+# warm ratios fall to 0.44–0.72x and `url` to 0.50x, while cold reads 5.8–7.8x and 2.4x, so at CI's
+# own flags `url` has ~3.6x on the flake side and ~1.33x on the false-pass side. These are one
+# OS's numbers, so the `warmth:` lines below are what should move them, not a red on a loaded
+# developer box.
+#
 # This is a `:slow` item — it spawns one Julia process per measurement. `--skip-tags slow`
 # drops it.
 
@@ -122,7 +142,9 @@ const MAX_RATIO = 8.0
 # sanity check on the measurement, not a tight bound, and the ratio is the real protection.
 const MAX_BASELINE_SECONDS = 1.0
 
-const SHAPES = ["dict_any", "query_ext", "json_ext", "formdata", "multipart"]
+const SHAPES = ["dict_any" => MAX_RATIO, "query_ext" => MAX_RATIO, "json_ext" => MAX_RATIO,
+                "formdata" => MAX_RATIO, "multipart" => MAX_RATIO,
+                "cookie_ext" => 2.5, "files_ext" => 2.5, "payload" => 2.5, "url" => 1.8]
 
 probe = joinpath(@__DIR__, ".helpers", "precompile_warmth_probe.jl")
 @test isfile(probe)
@@ -159,12 +181,12 @@ try
 
     # Two samples per numerator, not one: ReTestItems runs with `retries=0` here, so a single
     # sample makes one GC pause or one moment of CPU steal on a shared runner a hard red.
-    @testset "$shape stays warm" for shape in SHAPES
+    @testset "$shape stays warm" for (shape, limit) in SHAPES
         shape_s = best_of(shape, 2)
         ratio = shape_s / baseline
         warmth("ratio shape=$shape ratio=$(round(ratio; digits = 2)) shape_s=$(fmt(shape_s)) " *
-               "baseline_s=$(fmt(baseline)) limit=$MAX_RATIO")
-        @test ratio < MAX_RATIO
+               "baseline_s=$(fmt(baseline)) limit=$limit")
+        @test ratio < limit
     end
 finally
     warmth("end $(memory())")
