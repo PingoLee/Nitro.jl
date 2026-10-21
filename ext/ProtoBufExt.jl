@@ -64,22 +64,25 @@ const MAX_PROTOBUF_MERGES = 16
 
 # `io` is the field name `PBC.get_stream` reads. `endpos`/`group` are only used by code from an
 # older ProtoBuf.jl, which asks the decoder itself where a sub-message ends (`message_done(d)`);
-# current code passes both as arguments instead. The two counters are SHARED by every nested
-# decoder, so one count covers current code (same decoder all the way down), older code (a fresh
-# one per level), and group skips alike. They are never unwound on a throw, and need not be: the
-# decoder is private to one `_decode_bounded` call, and nothing in ProtoBuf.jl catches an error
-# partway through a decode, so a throw ends the only use of the counters.
+# current code passes both as arguments instead. The two counters, `filled` and `level` are
+# SHARED by every nested decoder, so one count covers current code (same decoder all the way
+# down), older code (a fresh one per level), and group skips alike. They are never unwound on a
+# throw, and need not be: the decoder is private to one `_decode_bounded` call, and nothing in
+# ProtoBuf.jl catches an error partway through a decode, so a throw ends the only use of them.
+# `filled` and `level` are explained at `_repeat`.
 struct _BoundedDecoder{I<:IO} <: PBC.AbstractProtoDecoder
     io::I
     endpos::Int
     group::Bool
     depth::Base.RefValue{Int}
     merges::Base.RefValue{Int}
+    filled::Vector{Base.RefValue}
+    level::Base.RefValue{Int}
 end
 
-_BoundedDecoder(io::IO) = _BoundedDecoder(io, 0, false, Ref(0), Ref(0))
+_BoundedDecoder(io::IO) = _BoundedDecoder(io, 0, false, Ref(0), Ref(0), Base.RefValue[], Ref(0))
 _nested(d::_BoundedDecoder, endpos::Int, group::Bool) =
-    _BoundedDecoder(d.io, endpos, group, d.depth, d.merges)
+    _BoundedDecoder(d.io, endpos, group, d.depth, d.merges, d.filled, d.level)
 
 # Fixed messages that never quote the body, so `safe_extract`'s 400 carries nothing the sender
 # wrote -- the convention `MAX_JSON_DEPTH` set for JSON (#314).
@@ -92,12 +95,21 @@ function _read_prefix(io::IO)::Int
     return Int(len)
 end
 
-function _enter!(d::_BoundedDecoder)
+# Entering a level also opens its slice of `filled`; leaving drops it (see `_repeat`). `_enter!`
+# returns the enclosing level's start, for `_leave!` to restore.
+function _enter!(d::_BoundedDecoder)::Int
     (d.depth[] += 1) <= MAX_PROTOBUF_DEPTH ||
         _throw_protobuf("protobuf message nests deeper than $MAX_PROTOBUF_DEPTH levels")
+    outer = d.level[]
+    d.level[] = length(d.filled)
+    return outer
+end
+function _leave!(d::_BoundedDecoder, outer::Int)
+    resize!(d.filled, d.level[])
+    d.level[] = outer
+    d.depth[] -= 1
     return nothing
 end
-_leave!(d::_BoundedDecoder) = (d.depth[] -= 1; nothing)
 
 function _merged!(d::_BoundedDecoder)
     (d.merges[] += 1) <= MAX_PROTOBUF_MERGES ||
@@ -159,19 +171,19 @@ _current_codegen(::Type{T}) where {T} =
 function PBC.decode(d::_BoundedDecoder, ::Type{Ref{T}}) where {T}
     io = d.io
     endpos = _read_prefix(io) + position(io)
-    _enter!(d)
+    outer = _enter!(d)
     out = _current_codegen(T) ? PBC.decode(d, T, endpos, false) :
                                 PBC.decode(_nested(d, endpos, false), T)
-    _leave!(d)
+    _leave!(d, outer)
     position(io) == endpos ||
         _throw_protobuf("protobuf sub-message does not end where its length prefix says")
     return out
 end
 
 function PBC.decode(d::_BoundedDecoder, ::Type{Ref{T}}, ::Type{Val{:group}}) where {T}
-    _enter!(d)
+    outer = _enter!(d)
     out = _current_codegen(T) ? PBC.decode(d, T, 0, true) : PBC.decode(_nested(d, 0, true), T)
-    _leave!(d)
+    _leave!(d, outer)
     return out
 end
 
@@ -196,9 +208,9 @@ function Base.skip(d::_BoundedDecoder, wire_type::PBC.WireType)
     if wire_type == PBC.LENGTH_DELIMITED
         skip(d.io, _read_prefix(d.io))
     elseif wire_type == PBC.START_GROUP
-        _enter!(d)
+        outer = _enter!(d)
         invoke(Base.skip, Tuple{PBC.AbstractProtoDecoder, PBC.WireType}, d, wire_type)
-        _leave!(d)
+        _leave!(d, outer)
     else
         invoke(Base.skip, Tuple{PBC.AbstractProtoDecoder, PBC.WireType}, d, wire_type)
     end
@@ -207,29 +219,59 @@ end
 
 # -- Merges of a repeated singular sub-message field -------------------------------------------
 
-# Counted here, then handed to upstream, which does the merge itself. All four signatures are
-# needed: the `S>:Nothing` pair is what current generated code uses for an optional field
-# (`Ref{Union{Nothing,T}}`), and defining only the plain pair would leave those calls ambiguous
-# against upstream's.
+# A repeat is counted here, then handed to upstream, which does the merge itself. All four
+# signatures are needed: the `S>:Nothing` pair is what current generated code uses for an
+# optional field (`Ref{Union{Nothing,T}}`), and defining only the plain pair would leave those
+# calls ambiguous against upstream's.
 #
-# The plain pair holds proto2 `required` fields, in a `Ref{T}()`. When `T` is stored inline and
-# its layout holds no pointer, that ref reads as ASSIGNED before the field is ever seen, so
-# `isassigned` cannot tell a first occurrence from a repeat -- counting it refused ordinary
-# messages. That is not only isbits types: a message whose `optional` sub-message field is
-# `Union{Nothing, <isbits>}` is laid out inline too. Such a `T` need not be counted anyway: with
-# no pointer it holds no vector, so merging one is O(1), and the quadratic cost this cap exists
-# for cannot arise. Any `T` that CAN hold a vector has a pointer, and there `isassigned` is
-# reliable. (`allocatedinline` alone is not the test: a struct holding a `Vector` is inline too.)
-_counts_merge(buffer::Base.RefValue{T}) where {T} =
-    !(Base.allocatedinline(T) && Base.datatype_pointerfree(T)) && isassigned(buffer)
+# The plain pair holds proto2 `required` fields, in a `Ref{T}()`, and upstream tells a repeat from
+# a first occurrence with `isassigned`. When `T` is stored inline and its layout holds no pointer,
+# that ref reads as ASSIGNED before the field is ever seen -- not only for isbits types: a message
+# whose `optional` sub-message field is `Union{Nothing, <isbits>}` is laid out inline too. So
+# upstream merges even the FIRST occurrence into memory nothing wrote, and the result depends on
+# what that memory held: an out-of-range `Union` selector byte gave a `MethodError` (printed as
+# `_merge_structs(::Nothing, ::Nothing)`) at `-O0` and not at `-O2` (#685). For such a `T` the
+# decoder records each ref it fills in `filled` instead, and the first occurrence is decoded here
+# without reading `buffer[]`. Any other `T` has a pointer, its ref reads unassigned until
+# written, and `isassigned` stays the test, so `filled` never holds those refs. (`allocatedinline`
+# alone is not the test: a struct holding a `Vector` is inline too.) A repeat of either kind is
+# counted, then merged upstream into a value that is now defined.
+#
+# Generated code allocates its refs per message, so only the message being decoded can repeat
+# one of them. `filled` is therefore a stack: entries from `level + 1` on belong to the current
+# message, and `_leave!` drops them with it. Kept for the whole body instead, a body of many small
+# messages -- a repeated field of 4-byte rows -- would hold one live ref per row until the end,
+# and the per-body memory bound #325 aims for would be a few times the body again. Bounded this
+# way, `filled` never holds more than the required inline fields of the messages currently open,
+# so the linear scan stays short. An entry is a live ref, so `===` cannot meet a reused address.
+_untracked(::Type{T}) where {T} = !(Base.allocatedinline(T) && Base.datatype_pointerfree(T))
+
+function _repeat(d::_BoundedDecoder, buffer::Base.RefValue{T}) where {T}
+    _untracked(T) && return isassigned(buffer)
+    filled = d.filled
+    for i in (d.level[] + 1):length(filled)
+        @inbounds filled[i] === buffer && return true
+    end
+    return false
+end
+
+function _filled!(d::_BoundedDecoder, buffer::Base.RefValue{T}) where {T}
+    _untracked(T) || push!(d.filled, buffer)
+    return nothing
+end
 
 function PBC.decode!(d::_BoundedDecoder, buffer::Base.RefValue{S}) where {S>:Nothing}
     isnothing(buffer[]) || _merged!(d)
     return invoke(PBC.decode!, Tuple{PBC.AbstractProtoDecoder, Base.RefValue{S}}, d, buffer)
 end
 function PBC.decode!(d::_BoundedDecoder, buffer::Base.RefValue{T}) where {T}
-    _counts_merge(buffer) && _merged!(d)
-    return invoke(PBC.decode!, Tuple{PBC.AbstractProtoDecoder, Base.RefValue{T}}, d, buffer)
+    if _repeat(d, buffer)
+        _merged!(d)
+        return invoke(PBC.decode!, Tuple{PBC.AbstractProtoDecoder, Base.RefValue{T}}, d, buffer)
+    end
+    buffer[] = PBC.decode(d, Ref{T})
+    _filled!(d, buffer)
+    return nothing
 end
 function PBC.decode!(d::_BoundedDecoder, buffer::Base.RefValue{S},
                      ::Type{Val{:group}}) where {S>:Nothing}
@@ -238,9 +280,14 @@ function PBC.decode!(d::_BoundedDecoder, buffer::Base.RefValue{S},
                   d, buffer, Val{:group})
 end
 function PBC.decode!(d::_BoundedDecoder, buffer::Base.RefValue{T}, ::Type{Val{:group}}) where {T}
-    _counts_merge(buffer) && _merged!(d)
-    return invoke(PBC.decode!, Tuple{PBC.AbstractProtoDecoder, Base.RefValue{T}, Type{Val{:group}}},
-                  d, buffer, Val{:group})
+    if _repeat(d, buffer)
+        _merged!(d)
+        return invoke(PBC.decode!, Tuple{PBC.AbstractProtoDecoder, Base.RefValue{T}, Type{Val{:group}}},
+                      d, buffer, Val{:group})
+    end
+    buffer[] = PBC.decode(d, Ref{T}, Val{:group})
+    _filled!(d, buffer)
+    return nothing
 end
 
 """
