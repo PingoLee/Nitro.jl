@@ -72,6 +72,17 @@ function _builder_headers(default::Pair{String,String}, headers)
     return apply_headers!(h, headers)
 end
 
+# The caller's headers as one collection this response owns, read the way HTTP's constructors read
+# them (`mkheaders`: pairs, 2-tuples or a Dict; adjacent duplicates joined, every `Set-Cookie`
+# kept). For a builder that used to hand `headers` to `HTTP.Response(status, headers, body)`, which
+# runs `copy(mkheaders(...))` on it and on an empty trailer set (#541). `mkheaders` returns an
+# `HTTP.Headers` as is, so that one is copied: the caller's value is never the response's.
+_owned_headers(headers) = headers isa HTTP.Headers ? copy(headers) : HTTP.mkheaders(headers)
+
+# The `headers` default of every builder. A literal `[]` there is a fresh `Vector{Any}` per call
+# (#541). Builders only iterate their `headers`; nothing may push to this one.
+const NO_HEADERS = Pair{String,String}[]
+
 """
     content_disposition(filename, disposition) -> String
 
@@ -213,7 +224,7 @@ end
 
 Return an HTTP.Response with the provided data serialized to JSON and the Content-Type header set to application/json.
 """
-function json(data; status::Int=200, headers::Vector=[])
+function json(data; status::Int=200, headers::Vector=NO_HEADERS)
     return _new_response(status, _builder_headers("Content-Type" => "application/json; charset=utf-8", headers),
                          JSON.json(data))
 end
@@ -224,7 +235,7 @@ end
 Return an HTTP.Response for a body that is *already* serialized JSON. The bytes are sent
 verbatim — passing them through `JSON.json` would re-encode them as an array of integers.
 """
-function json(data::Vector{UInt8}; status::Int=200, headers::Vector=[])
+function json(data::Vector{UInt8}; status::Int=200, headers::Vector=NO_HEADERS)
     return _new_response(status, _builder_headers("Content-Type" => "application/json; charset=utf-8", headers),
                          data)
 end
@@ -238,7 +249,7 @@ Security: this is the framework's markup sink. Everything else defaults to a non
 content type, and a raw `String` returned from a handler is served as text/plain without
 content-sniffing. Escape user-influenced data before it reaches here, always.
 """
-function html(content::String; status::Int=200, headers::Vector=[])
+function html(content::String; status::Int=200, headers::Vector=NO_HEADERS)
     return _new_response(status, _builder_headers("Content-Type" => "text/html; charset=utf-8", headers),
                          content)
 end
@@ -248,7 +259,7 @@ end
 
 Return an empty HTTP.Response with the specified status code.
 """
-function status(code::Int; headers::Vector=[])
+function status(code::Int; headers::Vector=NO_HEADERS)
     return _new_response(code, apply_headers!(HTTP.Headers(length(headers)), headers), "")
 end
 
@@ -261,7 +272,7 @@ Return an HTTP.Response with the provided string body. Defaults to text/plain; p
 Security: `content_type` makes this an opt-in markup sink — `send(x; content_type="text/html")`
 is exactly as dangerous as `html(x)`. Escape user-influenced data first.
 """
-function send(body::String; status::Int=200, headers::Vector=[], content_type::String="text/plain; charset=utf-8")
+function send(body::String; status::Int=200, headers::Vector=NO_HEADERS, content_type::String="text/plain; charset=utf-8")
     return _new_response(status, _builder_headers("Content-Type" => content_type, headers), body)
 end
 
@@ -270,7 +281,7 @@ end
 
 Return an HTTP.Response for a raw byte body. Defaults to application/octet-stream.
 """
-function send(body::Vector{UInt8}; status::Int=200, headers::Vector=[], content_type::String="application/octet-stream")
+function send(body::Vector{UInt8}; status::Int=200, headers::Vector=NO_HEADERS, content_type::String="application/octet-stream")
     return _new_response(status, _builder_headers("Content-Type" => content_type, headers), body)
 end
 
@@ -291,26 +302,31 @@ sent as an ASCII `filename=` fallback plus an RFC 5987 `filename*=UTF-8''…` wi
 
 Custom headers are applied last and may override defaults.
 """
-function file(path::String; status::Int=200, headers::Vector=[], filename=nothing,
+function file(path::String; status::Int=200, headers::Vector=NO_HEADERS, filename=nothing,
               disposition::Union{Nothing,String}=nothing, loadfile=nothing)
     body = isnothing(loadfile) ? read(path) : loadfile(path)
-    response = HTTP.Response(status, body=body)
     content_type = mime_from_path(path, MIME"application/octet-stream"()) |> contenttype_from_mime
 
-    HTTP.setheader(response, "Content-Type" => content_type)
+    h = HTTP.Headers(3 + length(headers))
+    push!(h, "Content-Type" => content_type)
     # `sizeof`, not `length`: a `loadfile` returning a String makes `length` a *character* count.
-    HTTP.setheader(response, "Content-Length" => string(sizeof(body)))
+    push!(h, "Content-Length" => string(sizeof(body)))
     # An empty `disposition` means the same as `nothing`; emitting it would produce a
     # malformed `Content-Disposition: ; filename="..."`.
     wanted = isnothing(disposition) || isempty(disposition) ? nothing : disposition
     if !isnothing(wanted) || !isnothing(filename)
         resolved_filename = isnothing(filename) ? basename(path) : filename
-        HTTP.setheader(response, "Content-Disposition" =>
+        push!(h, "Content-Disposition" =>
             content_disposition(resolved_filename, something(wanted, "attachment")))
     end
-    apply_headers!(response, headers)
-    return response
+    apply_headers!(h, headers)
+    return _file_response(status, h, body)
 end
+
+# `read` gives bytes and a `loadfile` usually gives bytes or a String: those take the field
+# constructor (#541). Any other body keeps HTTP's keyword form, which knows how to wrap it.
+_file_response(status, h::HTTP.Headers, body::Union{String,Vector{UInt8}}) = _new_response(status, h, body)
+_file_response(status, h::HTTP.Headers, body) = HTTP.Response(status; body = body, headers = h)
 
 """
     file(req, path; headers=[], filename=nothing, disposition=nothing, loadfile=nothing,
@@ -353,7 +369,7 @@ path("/reports/<int:id>.csv", function (req::HTTP.Request, id::Int)
 end)
 ```
 """
-function file(req::HTTP.Request, path::String; headers::Vector=[], filename=nothing,
+function file(req::HTTP.Request, path::String; headers::Vector=NO_HEADERS, filename=nothing,
               disposition::Union{Nothing,String}=nothing, loadfile=nothing,
               etag = :weak_stat, cache_control::Union{Nothing,AbstractString}=nothing,
               allow_ranges::Bool=true, stream::Bool=false)
@@ -364,7 +380,10 @@ function file(req::HTTP.Request, path::String; headers::Vector=[], filename=noth
         throw(ArgumentError("Res.file: `stream=true` and `etag=:strong` are mutually exclusive — a strong tag hashes the whole body, which is what streaming avoids. Use `:weak_stat`, or pass a tag you computed yourself"))
     end
 
-    extra = Vector{Pair{String,String}}()
+    # An `HTTP.Headers`, which `servecontent`'s `mkheaders` takes as is: a `Vector` of pairs would
+    # be converted into one first (#549). Built per call, never shared — `servecontent` copies it
+    # today, but that is its business, not a contract to lean on.
+    extra = HTTP.Headers(2)
     if !isnothing(cache_control)
         push!(extra, "Cache-Control" => String(cache_control))
     end
@@ -377,11 +396,13 @@ function file(req::HTTP.Request, path::String; headers::Vector=[], filename=noth
             content_disposition(resolved_filename, something(wanted, "attachment")))
     end
 
+    # No `name =` below: `servecontent` reads it only when `content_type` is missing, and
+    # `file_content_type` always returns one (#549).
     if stream
         io = open(path, "r")
         try
             tag, modtime = file_validators(path; etag = etag)
-            resp = HTTP.servecontent(req, io; name = basename(path), modtime = modtime,
+            resp = HTTP.servecontent(req, io; modtime = modtime,
                                      content_type = file_content_type(path), etag = tag,
                                      headers = extra, allow_ranges = allow_ranges)
             adopt_stream_io!(resp, io)
@@ -397,7 +418,7 @@ function file(req::HTTP.Request, path::String; headers::Vector=[], filename=noth
     # When `loadfile` decided the body, the file's own size is not the body's size, so the
     # validators must describe what is being sent (#92's rule, one layer up).
     tag, modtime = file_validators(path; etag = etag, bytes = source)
-    resp = HTTP.servecontent(req, source; name = basename(path), modtime = modtime,
+    resp = HTTP.servecontent(req, source; modtime = modtime,
                              content_type = file_content_type(path), etag = tag,
                              headers = extra, allow_ranges = allow_ranges)
     return apply_headers!(resp, headers)
@@ -409,7 +430,7 @@ end
 Return an HTTP redirect response with the Location header set. Pass `status=307` to
 preserve the request method and body.
 """
-function redirect(url::String; status::Int=302, headers::Vector=[])
+function redirect(url::String; status::Int=302, headers::Vector=NO_HEADERS)
     return _new_response(status, _builder_headers("Location" => url, headers), "")
 end
 
@@ -560,7 +581,7 @@ it a shutdown signal of its own from a `LifecycleMiddleware`'s `on_shutdown`. Se
 Caller-supplied `headers` are applied last, so they override the defaults above — a
 `Cache-Control` you pass wins.
 """
-function sse(; status::Int=200, headers::Vector=[], max_len::Integer=SSE_MAX_EVENT_BYTES)
+function sse(; status::Int=200, headers::Vector=NO_HEADERS, max_len::Integer=SSE_MAX_EVENT_BYTES)
     response = HTTP.sse_stream(status; max_len = max_len)
     # Nitro's one addition to HTTP's SSE header set. nginx buffers a proxied response by default,
     # and an event stream that arrives in one lump at the end is indistinguishable from a hung
@@ -570,7 +591,7 @@ function sse(; status::Int=200, headers::Vector=[], max_len::Integer=SSE_MAX_EVE
     return response
 end
 
-function sse(producer::Function; status::Int=200, headers::Vector=[],
+function sse(producer::Function; status::Int=200, headers::Vector=NO_HEADERS,
              max_len::Integer=SSE_MAX_EVENT_BYTES)
     # Built through the method above, NOT through `HTTP.sse_stream(response, f)`. That overload
     # re-runs HTTP's `_configure_sse_response!`, which would `setheader` `Content-Type` and

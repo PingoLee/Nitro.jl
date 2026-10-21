@@ -1,7 +1,7 @@
 ﻿module ProtoBufExt
 
 import HTTP
-import Nitro: ProtoBuffer, protobuf
+import Nitro: ProtoBuffer, protobuf, Res
 import Nitro.Types: Param, LazyRequest
 import Nitro.Extractors: Extractor, extract, try_validate, safe_extract
 import ProtoBuf
@@ -423,15 +423,17 @@ Encode a protobuf message into the body of an HTTP.Response
 # Returns
 - An HTTP response object with the encoded protobuf message in its body.
 """
-function protobuf(content::T; status = 200, headers = []) :: HTTP.Response where {T}
+function protobuf(content::T; status = 200, headers = Res.NO_HEADERS) :: HTTP.Response where {T}
     io = IOBuffer()
     encode(ProtoEncoder(io), content)
     body = take!(io)
-    # Format the response
-    response = HTTP.Response(status, headers, body = body)
-    HTTP.setheader(response, "Content-Type" => "application/octet-stream")
-    HTTP.setheader(response, "Content-Length" => string(sizeof(body)))
-    return response
+    # Format the response through the field constructor, not `HTTP.Response(status, headers;
+    # body)` (#541). The caller's headers are read as that constructor read them, and the two
+    # below still replace a caller's `Content-Type`/`Content-Length`.
+    h = Res._owned_headers(headers)
+    HTTP.setheader(h, "Content-Type" => "application/octet-stream")
+    HTTP.setheader(h, "Content-Length" => string(sizeof(body)))
+    return Res._new_response(status, h, body)
 end
 
 """

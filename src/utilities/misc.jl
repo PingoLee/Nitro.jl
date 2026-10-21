@@ -742,17 +742,19 @@ The `Content-Type` is the first of these that applies, and there is only ever on
 caller's header, so a template served as `text/plain` precisely so that unescaped output was safe
 went out as `text/html` whenever the rendered value looked like markup.
 """
-function response(content::String, status=200, headers=[]; content_type=nothing, detect=true) :: HTTP.Response
-    response = HTTP.Response(status, headers, content)
-    if !HTTP.hasheader(response, "Content-Type")
+function response(content::String, status=200, headers=Res.NO_HEADERS; content_type=nothing, detect=true) :: HTTP.Response
+    # Through `Res._new_response`, not `HTTP.Response(status, headers, content)` (#541); the
+    # caller's headers are read exactly as that constructor read them.
+    h = Res._owned_headers(headers)
+    if !HTTP.hasheader(h, "Content-Type")
         if !isnothing(content_type)
-            HTTP.setheader(response, "Content-Type" => content_type)
+            HTTP.setheader(h, "Content-Type" => content_type)
         elseif detect
-            HTTP.setheader(response, "Content-Type" => HTTP.sniff(content))
+            HTTP.setheader(h, "Content-Type" => HTTP.sniff(content))
         end
     end
-    HTTP.setheader(response, "Content-Length" => string(sizeof(content)))
-    return response
+    HTTP.setheader(h, "Content-Length" => string(sizeof(content)))
+    return Res._new_response(status, h, content)
 end
 
 

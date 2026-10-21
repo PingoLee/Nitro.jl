@@ -63,6 +63,27 @@ elseif SHAPE == "multipart"
                   "--", bnd, "--\r\n")
     (() -> hit("POST", "/x", ["Content-Type" => "multipart/form-data; boundary=$bnd"],
                body; catch_errors = false)), "\"n\":1"
+# The #551 shapes. POST bodies are `Vector{UInt8}`, as a socket delivers them.
+elseif SHAPE == "cookie_ext"
+    reg("/x", (r::HTTP.Request, sid::Nitro.Cookie{String}) -> Res.send(sid.value))
+    (() -> hit("GET", "/x", ["Cookie" => "sid=abc"]; catch_errors = false)), "abc"
+elseif SHAPE == "files_ext"
+    reg("/x", (r::HTTP.Request, doc::Nitro.Files{Nitro.FormFile}) -> Res.send(doc.payload.filename),
+        method = "POST")
+    bnd = "probeboundary"
+    body = string("--", bnd, "\r\n",
+                  "Content-Disposition: form-data; name=\"doc\"; filename=\"r.txt\"\r\n",
+                  "Content-Type: text/plain\r\n\r\nv\r\n", "--", bnd, "--\r\n")
+    (() -> hit("POST", "/x", ["Content-Type" => "multipart/form-data; boundary=$bnd"],
+               Vector{UInt8}(body); catch_errors = false)), "r.txt"
+elseif SHAPE == "payload"
+    reg("/x", (r::HTTP.Request) -> Res.send(string(length(Nitro.payload(r)))), method = "POST")
+    (() -> hit("POST", "/x", ["Content-Type" => "application/x-www-form-urlencoded"],
+               Vector{UInt8}("a=1&b=2"); catch_errors = false)), "2"
+elseif SHAPE == "url"
+    reg("/item/<int:id>", (r::HTTP.Request, id::Int) -> Res.status(204); name = "item")
+    reg("/x", (r::HTTP.Request) -> Res.send(Nitro.url(app, "item"; id = 3)))
+    (() -> hit("GET", "/x"; catch_errors = false)), "/item/3"
 else
     error("unknown shape: $SHAPE")
 end

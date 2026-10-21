@@ -137,6 +137,64 @@ end
     @test Res.send("x").content_length == keyword_builder("x").content_length == 1
 end
 
+# What `Res.file(path)` and `Util.response` did before #541, kept as the reference each is measured
+# against: HTTP's constructors, then `setheader` per header.
+function keyword_file(path)
+    body = read(path)
+    response = HTTP.Response(200, body = body)
+    content_type = Nitro.Res.mime_from_path(path, MIME"application/octet-stream"()) |> Nitro.Res.contenttype_from_mime
+    HTTP.setheader(response, "Content-Type" => content_type)
+    HTTP.setheader(response, "Content-Length" => string(sizeof(body)))
+    return response
+end
+function positional_response(content, headers)
+    response = HTTP.Response(200, headers, content)
+    HTTP.setheader(response, "Content-Type" => "text/html")
+    HTTP.setheader(response, "Content-Length" => string(sizeof(content)))
+    return response
+end
+
+@testset "Res.file and Util.response skip HTTP's header-copying constructors (#541)" begin
+    path = joinpath(@__DIR__, "content", "test.txt")
+    noheaders = Pair{String,String}[]
+    @testset let file = allocs(() -> Res.file(path); calls = 1000),
+                 keyword = allocs(() -> keyword_file(path); calls = 1000)
+        @test file.count + 3 <= keyword.count
+    end
+    out = "<p>rendered</p>"
+    @testset let ours = allocs(() -> Nitro.Util.response(out, 200, noheaders; content_type = "text/html"); calls = 1000),
+                 positional = allocs(() -> positional_response(out, noheaders); calls = 1000)
+        @test ours.count + 3 <= positional.count
+    end
+    # The `headers` default is shared, not a fresh `Vector{Any}` per call. Positive control: a
+    # literal `[]` from the caller still costs its allocation.
+    s = "x"
+    @testset let default = allocs(() -> Res.send(s); calls = 1000),
+                 literal = allocs(() -> Res.send(s; headers = []); calls = 1000)
+        @test default.count + 1 <= literal.count
+    end
+    @test isempty(Res.NO_HEADERS)
+
+    # Same response, cheaper. `Util.response` reads caller headers the way HTTP's constructor did:
+    # adjacent duplicates joined, every `Set-Cookie` kept, a Dict or 2-tuples accepted.
+    for headers in (noheaders, ["X-A" => "1"], ["Set-Cookie" => "a=1", "Set-Cookie" => "b=2"],
+                    ["Vary" => "A", "Vary" => "B"], Dict("X-D" => "1"), [("X-T", "1")])
+        ours = Nitro.Util.response(out, 200, headers; content_type = "text/html")
+        @test ours.headers.entries == positional_response(out, headers).headers.entries
+        @test ours.content_length == sizeof(out)
+    end
+    # A caller's `HTTP.Headers` is copied, never adopted: the response is not an alias of it.
+    caller = HTTP.Headers(["X-H" => "1"])
+    resp = Nitro.Util.response(out, 200, caller)
+    @test resp.headers !== caller
+    @test caller.entries == ["X-H" => "1"]
+
+    # A `loadfile` body that is neither bytes nor a String still builds, through HTTP's own form.
+    sub = Res.file(path; loadfile = p -> SubString(read(p, String), 1))
+    @test text(sub) == read(path, String)
+    @test Dict(sub.headers)["Content-Length"] == string(filesize(path))
+end
+
 @testset "Res.file — Content-Disposition is opt-in" begin
     # A plain `Res.file(path)` serves INLINE. Static mounts (`staticfiles`, `spafiles`,
     # `dynamicfiles`) all route through here, so an `attachment` default would turn an SPA's

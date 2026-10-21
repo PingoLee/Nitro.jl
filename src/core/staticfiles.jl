@@ -292,10 +292,17 @@ end
 # decides that, and it is HTTP.jl public API precisely so callers do not re-derive the precondition
 # table — weak-versus-strong tag comparison and the order the four preconditions are evaluated in
 # are both easy to get plausibly wrong.
+#
+# Two things this deliberately does NOT pass `servecontent` (#549). No `name`: `servecontent` reads it
+# only to infer a `Content-Type` when none is given, and `mf.content_type` always is, so the
+# `basename` it used to take cost 13 allocations per hit for nothing. And `extra` is an
+# `HTTP.Headers`, which `servecontent`'s `mkheaders` takes as is rather than converting a `Vector`.
+# It is built per request, never shared across them: that `servecontent` copies it before writing
+# is HTTP.jl's implementation, not a contract.
 function _serve_mounted(req::HTTP.Request, mf::MountedFile, policy::MountPolicy, cache,
                         headers::Vector, loadfile, cache_control)
-    extra = isnothing(cache_control) ? Pair{String,String}[] :
-            Pair{String,String}["Cache-Control" => String(cache_control)]
+    extra = HTTP.Headers(1)
+    isnothing(cache_control) || push!(extra, "Cache-Control" => String(cache_control))
 
     if mf.stream
         # Peak memory is one chunk buffer, not the file. The body is a cursor over an open handle
@@ -308,7 +315,7 @@ function _serve_mounted(req::HTTP.Request, mf::MountedFile, policy::MountPolicy,
         io = open(mf.path, "r")
         try
             tag, modtime = Res.file_validators(mf.path; etag = _effective_etag(policy, true))
-            resp = HTTP.servecontent(req, io; name = basename(mf.path), modtime = modtime,
+            resp = HTTP.servecontent(req, io; modtime = modtime,
                                      content_type = mf.content_type, etag = tag,
                                      headers = extra)
             Res.adopt_stream_io!(resp, io)
@@ -337,7 +344,7 @@ function _serve_mounted(req::HTTP.Request, mf::MountedFile, policy::MountPolicy,
         fresh = _read_with_validators(mf.path, policy, loadfile)
         (fresh.bytes, fresh.etag, fresh.modtime)
     end
-    resp = HTTP.servecontent(req, source; name = basename(mf.path), modtime = modtime,
+    resp = HTTP.servecontent(req, source; modtime = modtime,
                              content_type = mf.content_type, etag = tag, headers = extra)
     return Res.apply_headers!(resp, headers)
 end

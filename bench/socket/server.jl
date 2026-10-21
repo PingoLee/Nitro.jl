@@ -65,6 +65,9 @@
 #                       `ok <parts>`; `GET /hold/file` is `Res.file(req, HOLD_FILE)`, the whole-file
 #                       read (`file_100mib`), and `GET /hold/file_stream` the same with
 #                       `stream = true`, the negative control (`file_100mib_stream_read`).
+#   STATIC=0|1          Nitro only: also mount a temp folder holding one 2 KiB `a.txt` with
+#                       `staticfiles(app, dir, "static")` (the default `:eager` cache), so
+#                       `GET /static/a.txt` is a warm static hit to compare with `/plaintext` (#549).
 #   HOLD_FILE=<path>    The file the two `/hold/file*` routes serve. Default
 #                       `bench/results/hold-100mib.bin`, written (100 MiB of random bytes) when
 #                       missing and read once at startup, so it is in page cache.
@@ -107,6 +110,7 @@ const WORKERS    = get(ENV, "WORKERS", "0") == "1"
 const LAG        = get(ENV, "LAG", "0") == "1"
 const LOGIN      = get(ENV, "LOGIN", "0") == "1"
 const HOLDS      = get(ENV, "HOLDS", "0") == "1"
+const STATIC     = get(ENV, "STATIC", "0") == "1"
 const AGG_ROWS   = parse(Int, get(ENV, "AGG_ROWS", "0"))
 const BURST_K    = parse(Int, get(ENV, "BURST_K", string(max(Threads.nthreads(:default) - 2, 1))))
 
@@ -408,6 +412,11 @@ function start_nitro()
             path("/hold/file",        hold_file; method = "GET"),
             path("/hold/file_stream", hold_file_stream; method = "GET"),
         )
+    end
+    if STATIC
+        static_dir = mktempdir()
+        write(joinpath(static_dir, "a.txt"), repeat("a", 2048))
+        staticfiles(app, static_dir, "static")
     end
     if LOGIN
         login, login_bcrypt = login_routes()
