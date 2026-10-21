@@ -1,6 +1,9 @@
 @testitem "AccessLog middleware" tags=[:middleware] setup=[NitroCommon] begin
 using Nitro.Core
 using Nitro
+using Dates
+using Random
+using Sockets
 
 # Collect sink deliveries under a lock — the sink runs on the writer task/thread.
 function collecting_sink()
@@ -353,6 +356,36 @@ end
     @test all(r -> !r.matched, records)
 end
 
+# #561: `ts` is UTC. `Dates.now()` is glibc's `localtime_r`, which takes a process-wide lock per
+# call, so every request thread queued on it. On a UTC-zoned host (CI runners) local time IS UTC
+# and this cannot tell the two apart; the child-process item below sets a zone so it can.
+@testset "ts is UTC, and the ip is the address as text (#561)" begin
+    records, sink = collecting_sink()
+    lf = AccessLog(sink; batch = 10)
+    handler = lf.middleware(req -> Response(200, "ok"))
+    startup(lf)
+    before = now(UTC)
+    for ip in (ip"203.0.113.9", ip"0.0.0.0", ip"255.255.255.255", ip"10.0.1.100", ip"2001:db8::1")
+        req = Request("GET", "/ip"); Nitro.Core.setip!(req, ip)
+        handler(req)
+    end
+    handler(Request("GET", "/no-ip"))
+    after = now(UTC)
+    shutdown(lf)
+    @test all(r -> before <= r.ts <= after, records)
+    @test [r.ip for r in records] ==
+          ["203.0.113.9", "0.0.0.0", "255.255.255.255", "10.0.1.100", "2001:db8::1", nothing]
+end
+
+@testset "the IPv4 formatter writes what string(ip) writes" begin
+    ipstr = Nitro.Core.Middleware.StructuredAccessLogMiddleware._ip_string
+    rng = Random.RandomDevice()       # a testset reseeds the global RNG
+    sample = [IPv4(rand(rng, UInt32)) for _ in 1:10_000]
+    @test filter(ip -> ipstr(ip) != string(ip), sample) == IPv4[]
+    @test ipstr("set by an app") == "set by an app"          # `setip!` is untyped
+    @test ipstr(ip"::ffff:192.0.2.1") == string(ip"::ffff:192.0.2.1")
+end
+
 end # @testitem
 
 # #401, end to end: `matched` is the ROUTER's verdict (`route_missed`), so it has to survive the
@@ -542,19 +575,20 @@ function wait_for(cond; timeout = 10.0)
     return true
 end
 
-@testset "prune runs every interval with cutoff = now() - retention" begin
+@testset "prune runs every interval with cutoff = now(UTC) - retention (#561)" begin
     cutoffs, prune, count, tasks_since = recording_prune()
     lf = AccessLog(recs -> nothing; prune, retention = Day(90),
                    prune_interval = Millisecond(20))
     startup(lf)
-    before = now()
+    before = now(UTC)
     @test wait_for(() -> count() >= 3)                # it keeps firing, not just once
-    after = now()
+    after = now(UTC)
     shutdown(lf)
 
-    # Each cutoff is 90 days behind the clock that stamps `AccessRecord.ts` (`now()`). Only the
-    # first three are bounded by `after`: on >1 thread a later tick can land between `after` and
-    # `shutdown` -- pushes are in order, so these three were computed before `wait_for` returned.
+    # Each cutoff is 90 days behind the clock that stamps `AccessRecord.ts` (`now(UTC)`, #561).
+    # Only the first three are bounded by `after`: on >1 thread a later tick can land between
+    # `after` and `shutdown` -- pushes are in order, so these three were computed before
+    # `wait_for` returned.
     @test all(c -> before - Day(90) - Second(5) <= c <= after - Day(90), cutoffs()[1:3])
 end
 
@@ -563,9 +597,9 @@ end
     lf = AccessLog(recs -> nothing; prune, retention = Month(3),
                    prune_interval = Millisecond(20))
     startup(lf)
-    before = now()
+    before = now(UTC)
     @test wait_for(() -> count() >= 1)
-    after = now()
+    after = now(UTC)
     shutdown(lf)
     @test before - Month(3) - Second(5) <= cutoffs()[1] <= after - Month(3)   # first only, as above
 end
@@ -769,4 +803,43 @@ end
     @test !any(m -> occursin("sink failed", m), ms)
     @test [r.path for r in records] == ["/second"]
 end
+end
+
+# #561, where a zone can be set. A test process has long since read its zone, and CI runners are
+# UTC, where local time and UTC agree, so the in-process check above passes either way there.
+# This child runs at UTC+14 (POSIX `UTC-14`): a `Dates.now()` stamp is then 14 hours off.
+@testitem "AccessLog ts is UTC whatever the local zone (#561)" tags=[:middleware, :slow] setup=[NitroCommon] begin
+    using Test
+    using Nitro
+
+    code = """
+    using Nitro, HTTP, Dates
+    recs = AccessRecord[]
+    lf = AccessLog(r -> append!(recs, r); batch = 1)
+    h = lf.middleware(req -> HTTP.Response(200, "ok"))
+    Nitro.Core.startup(lf)
+    h(HTTP.Request("GET", "/"))
+    Nitro.Core.shutdown(lf)
+    print(Dates.value(recs[1].ts - now(UTC)), " ", Dates.value(now() - now(UTC)))
+    """
+    # `--code-coverage=none` and captured streams: the child-process pattern of
+    # test/bodyparser_tests.jl `run_child`, for the reasons written there (#84, #244, #273).
+    cmd = addenv(`$(Base.julia_cmd()) --code-coverage=none --startup-file=no
+                  --project=$(Base.active_project()) -e $code`, "TZ" => "UTC-14")
+    out, err = IOBuffer(), IOBuffer()
+    p = run(pipeline(ignorestatus(cmd); stdout = out, stderr = err))
+    stdout_text, stderr_text = String(take!(out)), String(take!(err))
+    failure = (p.exitcode, p.termsignal) == (0, 0) ? nothing :
+        "child exit $(p.exitcode), signal $(p.termsignal); stderr: $(stderr_text)"
+    @test failure === nothing
+
+    vals = tryparse.(Int, split(strip(stdout_text)))
+    @test length(vals) == 2 && all(v -> v isa Int, vals)
+    if length(vals) == 2 && all(v -> v isa Int, vals)
+        ts_minus_utc, local_offset = vals
+        @test abs(ts_minus_utc) < 60_000                     # ms: the record is UTC
+        # Proof the zone took, so the line above could have failed. Windows' CRT reads `TZ` in
+        # its own grammar, so only a POSIX libc is held to it.
+        Sys.iswindows() || @test local_offset > 13 * 3_600_000
+    end
 end

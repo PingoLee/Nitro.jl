@@ -26,6 +26,7 @@ module StructuredAccessLogMiddleware
 
 using HTTP
 using Dates
+using Sockets: IPv4
 using ...Core: getip, route_missed, LifecycleMiddleware
 using ...Util: _log_target_path, _check_access_log_skip
 using ...Errors: loggable, is_unrecoverable
@@ -42,7 +43,8 @@ One captured HTTP request. Framework-level fields plus `context`, an app-supplie
 `Dict{Symbol,Any}` (from the `annotate` hook) carrying identity/tenant/session/etc.
 The sink maps these onto whatever storage it uses.
 
-- `ts`          — capture time (`Dates.now()`)
+- `ts`          — capture time, in **UTC** (`now(UTC)`). It was local time (`Dates.now()`)
+                  before #561; `Dates.now()` takes a process-wide libc lock on every call
 - `method`      — HTTP verb
 - `path`        — request path, reduced exactly as the console access log reduces it: query
                   and fragment stripped, and an absolute-form target (`http://user:pw@h/x`)
@@ -219,6 +221,24 @@ function _raw_query(target::AbstractString)::Union{Nothing, String}
     return start > stop ? nothing : String(SubString(target, start, stop))
 end
 
+# The record's `ip`. `string(::IPv4)` goes through `sprint` and an `IOBuffer`: 13 allocations and
+# ~250 ns per request. Dotted-quad written into one buffer is 3 and ~65 ns (#561). IPv6 keeps
+# `string`, whose `::` compression is not worth repeating here, and so does anything else an app
+# stored with `setip!`, which is untyped.
+function _ip_string(ip::IPv4)::String
+    buf = Base.StringVector(15)
+    n = 0
+    for shift in (24, 16, 8, 0)
+        b = (ip.host >> shift) % UInt8
+        b >= 100 && (buf[n += 1] = UInt8('0') + b ÷ 100)
+        b >= 10 && (buf[n += 1] = UInt8('0') + (b ÷ 10) % 10)
+        buf[n += 1] = UInt8('0') + b % 10
+        shift == 0 || (buf[n += 1] = UInt8('.'))
+    end
+    return String(resize!(buf, n))
+end
+_ip_string(ip)::String = string(ip)
+
 # Redaction is decided HERE, at capture, not left to the sink (#320). The record used to carry
 # the raw query and a prefix-sliced path, so an app persisting it wrote password-reset tokens,
 # OAuth codes and absolute-form credentials (`http://user:pw@h/x`) into its access-log store --
@@ -234,11 +254,13 @@ function _capture!(r::_Run, req::HTTP.Request, resp, t0::UInt64, annotate, log_q
         query = log_query ? _truncate_field(_raw_query(target), max_field_bytes) : nothing
         status = resp isa HTTP.Response ? Int(resp.status) : (resp === nothing ? 500 : 200)
         ipaddr = getip(req)
-        ip = ipaddr === nothing ? nothing : string(ipaddr)
+        ip = ipaddr === nothing ? nothing : _ip_string(ipaddr)
         ua = HTTP.header(req, "User-Agent", "")
         user_agent = isempty(ua) ? nothing : _truncate_field(ua, max_field_bytes)
         method = _truncate_field(req.method, max_field_bytes)
-        rec = AccessRecord(now(), method, path, query, status, _matched(req), duration_ms,
+        # UTC, not `now()`: local time is glibc's `localtime_r`, which takes a process-wide
+        # lock per call, so every request thread queued on it (#561).
+        rec = AccessRecord(now(UTC), method, path, query, status, _matched(req), duration_ms,
                            ip, user_agent, _annotate(annotate, req))
         _enqueue!(r, rec)
     catch err
@@ -413,7 +435,7 @@ serve(app; middleware = [
                      `cutoff`. Runs on a background task, never on a request, so it may block on
                      a database.
 - `retention`      — how long a record is kept: any positive `Period`, `Month(3)` included.
-                     The cutoff is `Dates.now() - retention`, the same clock that stamps
+                     The cutoff is `now(UTC) - retention`, the same clock that stamps
                      `AccessRecord.ts`, so the comparison is like for like.
 - `prune_interval` — how often `prune` runs; a positive fixed-length `Period` (`Hour(1)` when
                      omitted). `Month`/`Quarter`/`Year` are rejected, since they cannot be
@@ -476,9 +498,9 @@ function AccessLog(sink::Function; capacity::Integer=10_000,
     retention === nothing || Dates.value(retention) > 0 || throw(ArgumentError(
         "AccessLog: `retention` must be positive, got $retention."))
     pruner = prune === nothing ? nothing :
-        # `now()`, not `now(UTC)`: the cutoff must come from the clock that stamps
-        # `AccessRecord.ts` (`_capture!`), or every record is misjudged by the UTC offset.
-        _janitor(() -> prune(now() - retention), something(prune_interval, Hour(1)),
+        # `now(UTC)`: the cutoff must come from the clock that stamps `AccessRecord.ts`
+        # (`_capture!`), or every record is misjudged by the UTC offset.
+        _janitor(() -> prune(now(UTC) - retention), something(prune_interval, Hour(1)),
                  "AccessLog", "retention prune", "prune_interval")
 
     w = _Writer(sink, Int(batch), Threads.Atomic{Bool}(false),
