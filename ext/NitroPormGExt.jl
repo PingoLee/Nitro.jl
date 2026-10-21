@@ -18,7 +18,8 @@ import Nitro.Core.Errors: is_unrecoverable, ClaimPoisonedError, loggable
 
 import Nitro.Workers: AbstractWorkerStore, TaskInfo, TaskStatus, TaskOptions,
     PENDING, RUNNING, COMPLETED, FAILED, CANCELLED,
-    TaskAuthority, Owner, System, UNSUPPLIED, owner_of, _is_authorized, TASK_KEY_DELIMITER,
+    TaskAuthority, Owner, System, UNSUPPLIED, owner_of, _is_authorized, _owns, _may_read_durable,
+    TASK_KEY_DELIMITER,
     _check_page,
     get_task_info, set_task!, replace_task!, add_watcher!, try_transition!,
     delete_task!, try_delete_task!, cleanup_tasks!, get_all_tasks,
@@ -967,6 +968,26 @@ function get_task_info(store::PormGWorkerStore, task_id::String)
         @warn "PormGWorkerStore: failed to read task" task_id exception_type=typeof(e)
         rethrow()
     end
+end
+
+# The authorization read `_visible_record` makes before the full one (#565): the `watchers` column
+# alone, so a caller who may not see the task never fetches or decodes its `result`. The owner
+# needs no read at all, since the id names them. `System` is authorized by definition. Logs and
+# rethrows like `get_task_info`, for the same reason: a failed read is not "not yours".
+_may_read_durable(::PormGWorkerStore, ::System, ::String) = true
+function _may_read_durable(store::PormGWorkerStore, authority::Owner, task_id::String)
+    _owns(authority, task_id) && return true
+    row = try
+        _task_objects(store).filter("id" => task_id).values("watchers").first()
+    catch e
+        @warn "PormGWorkerStore: failed to read task" task_id exception_type=typeof(e)
+        rethrow()
+    end
+    row === nothing && return false
+    watchers_str = string(_row_or(row, :watchers, "watchers", ""))
+    isempty(watchers_str) && return false
+    watchers = _parse_stored_json(v -> convert(Vector{String}, v), watchers_str, "watchers", task_id)
+    return authority.user_id in watchers
 end
 
 # A fresh row has no watchers to preserve, so a create always writes them, whichever entry point

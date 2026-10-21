@@ -343,9 +343,15 @@ LeasePolicy(on_expiry::Symbol; max_attempts::Int = 3) = LeasePolicy(on_expiry, m
 _is_authorized(::System, ::TaskInfo) = true
 
 function _is_authorized(authority::Owner, task_info::TaskInfo)
-    owner = owner_of(task_info.id)
-    owner !== nothing && owner == authority.user_id && return true
+    _owns(authority, task_info.id) && return true
     return authority.user_id in task_info.watchers
+end
+
+# The half of `_is_authorized` the id alone decides: a `:user`-scoped id names its owner. Split out
+# so a store can authorize before it reads the record (`_may_read_durable`, #565).
+function _owns(authority::Owner, task_id::String)
+    owner = owner_of(task_id)
+    return owner !== nothing && owner == authority.user_id
 end
 
 # There is deliberately no raising `_authorize_task!` any more (#323). The read and cancel paths

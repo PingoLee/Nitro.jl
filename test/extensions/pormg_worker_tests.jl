@@ -1903,6 +1903,62 @@ else
             return String(take!(io)), value
         end
 
+        @testset "a caller who may not see a task is refused before its record decodes (#565)" begin
+            m = MockTaskModel()
+            store_v = RealPormGWorkerStore(model=m)
+            rt_v = WorkerRuntime(store_v)
+            t = TaskInfo("alice::report")
+            t.status = COMPLETED
+            t.result = Dict("n" => 1)
+            push!(t.watchers, "alice", "bob")
+            replace_task!(store_v, t.id, t)
+            # A `result` no full read can decode: whoever reaches `_from_db_record` throws on it,
+            # and a caller refused from the watcher projection never does.
+            m._table["alice::report"]["result"] = "{\"token\": sk_SECRET_565}"
+
+            _, (stranger, missing_id, cancel) = _rendered_logs() do
+                (get_task_status("alice::report", Owner("mallory"); runtime=rt_v),
+                 get_task_status("alice::absent", Owner("mallory"); runtime=rt_v),
+                 cancel_task("alice::report", Owner("mallory"); runtime=rt_v))
+            end
+            # A foreign id now answers exactly as a missing one, as #323 requires; it used to throw.
+            @test is_not_found(stranger)
+            @test is_not_found(missing_id)
+            @test is_not_found(cancel)
+            @test m._table["alice::report"]["status"] == "COMPLETED"
+
+            # The owner and the grantee still read the whole record, so for them it still throws.
+            for who in ("alice", "bob")
+                thrown = nothing
+                _rendered_logs() do
+                    try
+                        get_task_status("alice::report", Owner(who); runtime=rt_v)
+                    catch e
+                        thrown = e
+                    end
+                end
+                @test thrown isa ErrorException && occursin("does not decode", thrown.msg)
+            end
+
+            # Decodable again: the grantee is served after the projection, and so is `System()`.
+            m._table["alice::report"]["result"] = "{\"n\":2}"
+            @test get_task_status("alice::report", Owner("bob"); runtime=rt_v)[:result]["n"] == 2
+            @test get_task_status("alice::report", System(); runtime=rt_v)[:result]["n"] == 2
+
+            # The projection decides on the watcher column alone, and a bad one still throws:
+            # authorizing a caller from a list that cannot be read is not an option.
+            m._table["alice::report"]["watchers"] = "not json"
+            thrown = nothing
+            _rendered_logs() do
+                try
+                    get_task_status("alice::report", Owner("mallory"); runtime=rt_v)
+                catch e
+                    thrown = e
+                end
+            end
+            @test thrown isa ErrorException && occursin("`watchers`", thrown.msg)
+        end
+
         @testset "one undecodable row is skipped, not the whole listing (#267)" begin
             m = MockTaskModel()
             store_d = RealPormGWorkerStore(model=m)

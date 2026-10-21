@@ -720,17 +720,23 @@ _not_found() = Dict{Symbol, Any}(:error => "Task not found", :status => "NOT_FOU
 # the runs differ, the durable record is what gets served; the live object is served only when it
 # is the same run, which keeps a cross-process grantee's progress bar live, as #96 requires.
 #
-# **One durable read on every refusal path.** A missing id and a foreign id both reach the durable
-# read exactly once and stop there, so they do not differ in ROUND-TRIPS -- a second read only on
-# the "exists but not yours" path would have put the oracle back as a gross timing difference.
-# They are not byte-for-byte equal in cost, though: a hit decodes the row (`result` included) and a
-# miss does not, so a large result is measurable over many probes, and a foreign row whose stored
-# JSON no longer decodes throws where a missing id answers NOT_FOUND. Closing that needs an
-# authorization read from a projection (`id`, `run_id`, `watchers`) before the full record.
+# **One durable read on every refusal path.** A missing id and a foreign id both reach the store
+# exactly once and stop there, so they do not differ in ROUND-TRIPS -- a second read only on the
+# "exists but not yours" path would have put the oracle back as a gross timing difference.
+#
+# **Authorized before it is decoded** (#565). A full read decodes the row, `result` included, so a
+# foreign id with a large result used to cost a decode a missing id does not: measurable over many
+# probes, and a foreign row whose stored `result` no longer decodes threw where a missing id
+# answers NOT_FOUND. `_may_read_durable` refuses first where the store can tell cheaply -- the
+# PormG store reads the watcher column alone -- so a refusal reads that projection and stops, for a
+# foreign id and a missing one alike. A caller the id does not name pays the projection and then
+# the full read: a grantee, and every reader of a `:global` task, whose id names no owner. The
+# owner, whom the id alone authorizes, pays only the full read.
 function _visible_record(runtime::WorkerRuntime, authority::TaskAuthority, task_id::String)
     live = get_active_task_info(runtime, task_id)
     live !== nothing && _is_authorized(authority, live) && return live
 
+    _may_read_durable(runtime.store, authority, task_id) || return nothing
     # `get_task_info(store, ·)` is the DURABLE read -- no store caches live objects (#167).
     durable = get_task_info(runtime.store, task_id)
     (durable === nothing || !_is_authorized(authority, durable)) && return nothing
