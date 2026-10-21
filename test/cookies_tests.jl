@@ -2011,3 +2011,130 @@ end
     end
 end
 end
+
+# #545: every encrypted cookie re-derived its AES key with HKDF on SHA.jl -- 59 allocations and
+# two thirds of the decrypt -- although the key is a pure function of the secret. HKDF now runs
+# on libcrypto, and the places that seal a secret once (`CookieConfig`, `CookieAuthMiddleware`)
+# derive the key there as a `CookieKey`.
+@testitem "Cookie keys are derived once, on libcrypto (#545)" tags=[:core, :security] setup=[NitroCommon] begin
+using Nitro
+using Nitro.Types: CookieConfig
+using HTTP
+using Test
+using Dates
+using SHA
+using JSON
+using Random
+const Cookies = Nitro.Cookies
+const Crypto = Nitro.Crypto
+const CookieKey = Crypto.CookieKey
+using Nitro.Errors: CookieError
+
+secret = SecretString("nitro-test-cookie-secret-0123456789abcdef")
+other = SecretString("another-cookie-secret-0123456789abcdef!!")
+# Minted by the SHA.jl HKDF this replaced (main at 23a86dce), so the format is pinned against
+# the old code and not against itself.
+old_key = "a86cd5c50d2ede3338b2d07c0e0f969483fe0e021d182c2d8a7f809d0cea9e6b"
+old_token = "AcLABK0IRLsAaUhWn8gSsZA8oqRUQYMglNVYgoTukUs7ai_YZAYnZaFpwXql-hdrl0yW2g"
+opened_at = DateTime(2026, 10, 22)
+
+@testset "HKDF on libcrypto matches an SHA.jl HKDF byte for byte" begin
+    function reference(ikm, salt, info, len)
+        prk = SHA.hmac_sha256(isempty(salt) ? zeros(UInt8, 32) : Vector{UInt8}(salt), Vector{UInt8}(ikm))
+        okm, block, i = UInt8[], UInt8[], 0x01
+        while length(okm) < len
+            block = SHA.hmac_sha256(prk, vcat(block, Vector{UInt8}(info), i))
+            append!(okm, block)
+            i += 0x01
+        end
+        return okm[1:len]
+    end
+    rng = Random.RandomDevice()
+    mismatches = Any[]
+    for ikm_len in (0, 1, 32, 64, 65, 200), salt_len in (0, 13, 64, 65), info_len in (0, 10, 27, 80),
+        len in (1, 31, 32, 33, 64, 100)
+        ikm, salt, info = rand(rng, UInt8, ikm_len), rand(rng, UInt8, salt_len), rand(rng, UInt8, info_len)
+        Crypto._hkdf_sha256(ikm, salt, info, len) == reference(ikm, salt, info, len) ||
+            push!(mismatches, (ikm_len, salt_len, info_len, len))
+    end
+    @test mismatches == Any[]
+    # The longest output, and inputs that are not dense vectors.
+    ikm = rand(rng, UInt8, 40)
+    @test Crypto._hkdf_sha256(ikm, UInt8[], UInt8[1, 2], 255 * 32) == reference(ikm, UInt8[], UInt8[1, 2], 255 * 32)
+    @test Crypto._hkdf_sha256(view(ikm, 1:2:40), view(ikm, 2:2:20), view(ikm, 3:9), 42) ==
+          reference(ikm[1:2:40], ikm[2:2:20], ikm[3:9], 42)
+    @test Crypto._hkdf_sha256(codeunits("key"), UInt8[], UInt8[], 32) == reference(codeunits("key"), UInt8[], UInt8[], 32)
+end
+
+@testset "a key and a token from the old derivation still open" begin
+    @test bytes2hex(Crypto._cookie_key(secret)) == old_key
+    @test bytes2hex(collect(CookieKey(secret).bytes)) == old_key
+    for key in (secret, Crypto.reveal(secret), CookieKey(secret))
+        @test Crypto.decrypt_payload(key, old_token; purpose = "auth_token", now = opened_at) == "user-42"
+    end
+    req = HTTP.Request("GET", "/", ["Cookie" => "auth_token=$old_token"])
+    @test Cookies.get_cookie(req, "auth_token"; encrypted = true, config = CookieConfig(secret_key = secret)) == "user-42"
+    @test_throws CookieError Crypto.decrypt_payload(CookieKey(other), old_token; purpose = "auth_token", now = opened_at)
+end
+
+@testset "a CookieKey and its secret seal and open each other's tokens" begin
+    by_key = Crypto.encrypt_payload(CookieKey(secret), "v"; purpose = "p")
+    by_secret = Crypto.encrypt_payload(secret, "v"; purpose = "p")
+    @test Crypto.decrypt_payload(secret, by_key; purpose = "p") == "v"
+    @test Crypto.decrypt_payload(CookieKey(secret), by_secret; purpose = "p") == "v"
+    @test_throws CookieError Crypto.decrypt_payload(CookieKey(secret), by_key; purpose = "q")
+end
+
+@testset "CookieConfig derives it at construction, and stays a value" begin
+    cfg = CookieConfig(secret_key = secret)
+    @test cfg.cookie_key isa CookieKey
+    @test cfg.cookie_key.bytes == CookieKey(secret).bytes
+    @test CookieConfig().cookie_key === nothing
+    # An NTuple, not a Vector: two configs built from one secret are still equal.
+    @test CookieConfig(secret_key = secret) == CookieConfig(secret_key = Crypto.reveal(secret))
+    @test CookieConfig(secret_key = secret) != CookieConfig(secret_key = other)
+    # The positional form keeps its nine arguments; the key is never passed in.
+    @test CookieConfig(secret, true, true, "Lax", "/", nothing, nothing, nothing, nothing) == cfg
+    @test_throws MethodError CookieConfig(cookie_key = CookieKey(secret))
+end
+
+@testset "a per-call secret_key still wins over the config's key" begin
+    token = Crypto.encrypt_payload(other, "mine"; purpose = "c")
+    req = HTTP.Request("GET", "/", ["Cookie" => "c=$token"])
+    cfg = CookieConfig(secret_key = secret)
+    @test Cookies.get_cookie(req, "c"; encrypted = true, config = cfg) === nothing
+    @test Cookies.get_cookie(req, "c"; encrypted = true, config = cfg, secret_key = other) == "mine"
+    res = Cookies.set_cookie!(HTTP.Response(200), "c", "mine"; config = cfg, secret_key = other)
+    sealed = split(split(HTTP.header(res, "Set-Cookie"), ';')[1], '='; limit = 2)[2]
+    @test Crypto.decrypt_payload(other, sealed; purpose = "c") == "mine"
+end
+
+@testset "nothing that holds a derived key prints it" begin
+    key = CookieKey(secret)
+    leaked(s) = occursin(old_key, s) || occursin(repr(key.bytes), s) || occursin(Crypto.reveal(secret), s)
+    @test repr(key) == "CookieKey(****)"
+    @test sprint(show, MIME"text/plain"(), key) == "CookieKey(****)"
+    @test JSON.json(key) == "\"****\""
+    cfg = CookieConfig(secret_key = secret)
+    @test !leaked(repr(cfg))
+    @test !leaked(sprint(show, MIME"text/plain"(), cfg))
+    @test !leaked(repr(CookieAuthMiddleware(token -> token; secret_key = secret)))
+end
+
+@testset "an encrypted read derives no key per call" begin
+    # The keyed bounds sit below the 59 allocations the SHA.jl derivation alone cost; the
+    # positive control is the per-call path, which still derives and must cost more.
+    @testset let k = CookieKey(secret), s = secret, t = old_token, at = opened_at,
+                 cfg = CookieConfig(secret_key = secret),
+                 req = HTTP.Request("GET", "/", ["Cookie" => "auth_token=$old_token"]),
+                 derive = allocs(() -> Crypto._cookie_key(s)),
+                 keyed = allocs(() -> Crypto.decrypt_payload(k, t; purpose = "auth_token", now = at)),
+                 per_call = allocs(() -> Crypto.decrypt_payload(s, t; purpose = "auth_token", now = at)),
+                 read = allocs(() -> Cookies.get_cookie(req, "auth_token"; encrypted = true, config = cfg))
+        @test derive.count <= 12
+        @test keyed.count <= 32
+        @test read.count <= 35
+        @test per_call.count >= keyed.count + 5
+    end
+end
+end

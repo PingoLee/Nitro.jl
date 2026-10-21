@@ -5,7 +5,7 @@ using ...Types
 using ...Types: _is_identity
 using ...Cookies: get_cookie
 using ...Errors: CookieError, is_unrecoverable
-using ...Crypto: SecretString, _cookie_secret
+using ...Crypto: SecretString, CookieKey, _cookie_secret
 using ...Util: _auth_credential, _check_denial_factory, _deny, _takes_request
 
 export BearerAuth, CookieAuthMiddleware
@@ -129,9 +129,11 @@ describe the same principal, so a second auth layer cannot authorize against the
 function CookieAuthMiddleware(validate_token::Function; cookie_name::String = "auth_token", secret_key::Union{AbstractString, SecretString, Nothing} = nothing,
                               unauthorized = _cookie_unauthorized)
     _check_denial_factory(unauthorized, :unauthorized)
-    # Normalized once, here, so the closures capture a `SecretString` and not the raw key --
-    # `repr` of a closure prints its captures (#307).
-    sealed = _cookie_secret(secret_key)
+    # Normalized once, here, so the closures capture a masked `CookieKey` and not the raw key --
+    # `repr` of a closure prints its captures (#307). The AES key is derived here too, not per
+    # request (#545).
+    secret = _cookie_secret(secret_key)
+    sealed = secret === nothing ? nothing : CookieKey(secret)
     return function (handle::Function)
         return function(req::HTTP.Request)
             # Try to extract the authentication cookie. A `CookieError` (one that does not

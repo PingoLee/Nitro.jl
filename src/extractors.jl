@@ -17,7 +17,7 @@ using ..Errors: ValidationError, UnsupportedMediaTypeError, AuthDenial, Validato
 using ...Core: getjson, getform, getprincipal
 using ..Types
 using ..Cookies
-using ..Crypto: SecretString
+using ..Crypto: SecretString, CookieKey
 # HTTP.jl v2 newly exports `Cookie` at the top level, which collides with Nitro's
 # `Cookie` extractor (defined in `Types`). Import it explicitly so the unqualified
 # `Cookie` references below resolve unambiguously to ours, not `HTTP.Cookie`.
@@ -898,7 +898,7 @@ claims_field_bind(::Type{FT}, value) where {FT} =
 Extracts a cookie from a request and converts it into a custom type.
 This is a helper used by the cookie strategy in Core.
 """
-function extract(param::Param{Cookie{T}}, request::LazyRequest, secret_key::Union{AbstractString, SecretString, Nothing}) :: Cookie{T} where {T}
+function extract(param::Param{Cookie{T}}, request::LazyRequest, secret_key::Union{AbstractString, SecretString, CookieKey, Nothing}) :: Cookie{T} where {T}
     # The cookie name is either explicitly set in the Cookie struct or defaults to the parameter name
     cookie_name = if param.hasdefault && !isnothing(param.default.name) && !isempty(param.default.name)
         param.default.name
@@ -934,7 +934,7 @@ end
 """
 Extracts a session from a request using the application context as a store.
 """
-function extract(param::Param{Session{T}}, request::LazyRequest, secret_key::Union{AbstractString, SecretString, Nothing}, app_context::Any) :: Session{T} where {T}
+function extract(param::Param{Session{T}}, request::LazyRequest, secret_key::Union{AbstractString, SecretString, CookieKey, Nothing}, app_context::Any) :: Session{T} where {T}
     # 1. Get the session cookie name
     session_cookie_name = if param.hasdefault && !isnothing(param.default.name) && !isempty(param.default.name)
         param.default.name

@@ -8,7 +8,7 @@ using ..Types: _normalize_domain, _store_call, _store_bool
 using ..Errors
 using ..Util: _is_tchar, _ascii_casefold_eq
 
-using ..Crypto: encrypt_payload, decrypt_payload, secure_uuid4, SecretString, _cookie_secret
+using ..Crypto: encrypt_payload, decrypt_payload, secure_uuid4, SecretString, CookieKey, _cookie_secret
 
 export parse_cookies, format_cookie, get_cookie, set_cookie!, load_cookie_settings!,
     storesession!, prunesessions!, regenerate_session!
@@ -473,7 +473,7 @@ function get_cookie(
     default::Any = nothing; 
     encrypted::Bool = false,
     config::CookieConfig = CookieConfig(),
-    secret_key::Union{AbstractString, SecretString, Nothing} = nothing,
+    secret_key::Union{AbstractString, SecretString, CookieKey, Nothing} = nothing,
     max_cookie_size::Union{Int, Nothing} = nothing,
     kwargs...
 )
@@ -486,7 +486,7 @@ function get_cookie(
 
     # Validated BEFORE the lookup: a bad per-call key is configuration, and must fail on every
     # call rather than only on the ones that happen to carry the cookie.
-    final_secret = isnothing(secret_key) ? config.secret_key : _cookie_secret(secret_key)
+    final_secret = isnothing(secret_key) ? config.cookie_key : _cookie_secret(secret_key)
 
     target_name = string(name)
     headers = if source isa HTTP.Request || source isa HTTP.Response
@@ -580,7 +580,7 @@ function set_cookie!(
     secure::Nullable{Bool} = nothing, 
     samesite::Nullable{String} = nothing,
     encrypted::Nullable{Bool} = nothing,
-    secret_key::Union{AbstractString, SecretString, Nothing} = nothing
+    secret_key::Union{AbstractString, SecretString, CookieKey, Nothing} = nothing
 )
     # `string(value)` below would write a masked secret's DISPLAY form -- `SecretString("****")`
     # -- as the cookie value, the same failure #307 fixed for the key. Refuse rather than guess:
@@ -654,7 +654,7 @@ function set_cookie!(
     end
     
     # 3. Handle Encryption
-    final_secret = isnothing(secret_key) ? config.secret_key : _cookie_secret(secret_key)
+    final_secret = isnothing(secret_key) ? config.cookie_key : _cookie_secret(secret_key)
     is_encrypted = isnothing(encrypted) ? !isnothing(final_secret) : encrypted
     str_value = string(value)
 

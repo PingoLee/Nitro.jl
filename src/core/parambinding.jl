@@ -35,14 +35,14 @@ struct CookieStrategy{T}
     ctx::App
 end
 (s::CookieStrategy)(lr::LazyRequest) =
-    extract(s.param, lr, s.ctx.service.cookies[].secret_key)
+    extract(s.param, lr, s.ctx.service.cookies[].cookie_key)
 
 struct SessionStrategy{T}
     param::Param{T}
     ctx::App
 end
 (s::SessionStrategy)(lr::LazyRequest) =
-    extract(s.param, lr, s.ctx.service.cookies[].secret_key, request_app_context(lr.request))
+    extract(s.param, lr, s.ctx.service.cookies[].cookie_key, request_app_context(lr.request))
 
 struct PathParamStrategy{T}
     param::Param{T}

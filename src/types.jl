@@ -13,7 +13,7 @@ using LRUCache: LRU
 using ..Util
 using ..Errors: ValidationError, StoreInterfaceError, ValidatorFault, SessionStoreFault,
     implements_contract_method, store_contract_error, is_unrecoverable, loggable
-using ..Crypto: SecretString, _cookie_secret
+using ..Crypto: SecretString, CookieKey, _cookie_secret
 
 export Server, Nullable, Context,
     LifecycleMiddleware, startup, shutdown, require_fixed_period,
@@ -518,27 +518,39 @@ captures one (a middleware closure, a `LifecycleMiddleware`) prints the key.
 
 `domain` is validated and normalized (trimmed, lowercased, `[A-Za-z0-9.-]` only) when the config
 is built, so an invalid one fails at startup rather than on the first response.
-"""
-@kwdef struct CookieConfig
-    secret_key::Nullable{SecretString} = nothing
-    httponly::Bool = true
-    secure::Bool = true
-    samesite::String = "Lax"
-    path::String = "/"
-    domain::Nullable{String} = nothing
-    maxage::Nullable{Int} = nothing
-    expires::Nullable{DateTime} = nothing
-    max_cookie_size::Nullable{Int} = nothing
 
-    # Every construction path -- the keyword form above, `configcookies`, `serve(secret_key = …)`
+A config with a `secret_key` also holds the AES key derived from it, in an internal `cookie_key`
+field (#545). It is derived once here rather than on every encrypted cookie, and is masked in
+`show` like the secret.
+"""
+struct CookieConfig
+    secret_key::Nullable{SecretString}
+    httponly::Bool
+    secure::Bool
+    samesite::String
+    path::String
+    domain::Nullable{String}
+    maxage::Nullable{Int}
+    expires::Nullable{DateTime}
+    max_cookie_size::Nullable{Int}
+    # Derived from `secret_key`, never passed in -- which is why this struct writes its keyword
+    # constructor by hand instead of `@kwdef`, which would make it one more keyword.
+    cookie_key::Nullable{CookieKey}
+
+    # Every construction path -- the keyword form below, `configcookies`, `serve(secret_key = …)`
     # -- lands here, so this is where a key becomes a `SecretString`. See `_cookie_secret`.
     function CookieConfig(secret_key, httponly, secure, samesite, path, domain, maxage, expires,
                           max_cookie_size)
-        return new(_cookie_secret(secret_key), httponly, secure, samesite, path,
+        sealed = _cookie_secret(secret_key)
+        return new(sealed, httponly, secure, samesite, path,
                    domain === nothing ? nothing : _normalize_domain(domain), maxage,
-                   expires, max_cookie_size)
+                   expires, max_cookie_size, sealed === nothing ? nothing : CookieKey(sealed))
     end
 end
+
+CookieConfig(; secret_key = nothing, httponly = true, secure = true, samesite = "Lax", path = "/",
+             domain = nothing, maxage = nothing, expires = nothing, max_cookie_size = nothing) =
+    CookieConfig(secret_key, httponly, secure, samesite, path, domain, maxage, expires, max_cookie_size)
 
 """
     Cookie{T}
