@@ -288,7 +288,7 @@ julia --project=docs -e 'using Pkg; Pkg.develop(PackageSpec(path=pwd())); Pkg.in
 julia --project=docs docs/make.jl
 ```
 
-- **CI runs the suite on Julia 1.13 across Linux/macOS/Windows at `JULIA_NUM_THREADS` 1 **and** 2.** (1.12 left the matrix by decision on #526, ahead of the floor moving to `^1.13`.)
+- **CI runs the suite on Julia 1.13 on Linux and Windows at `JULIA_NUM_THREADS` 1 **and** 2.** (1.12 left the matrix by decision on #526, ahead of the floor moving to `^1.13`. The macOS legs are parked for the pre-release phase: over 40 runs they never failed alone and were the only legs cancelled for runner capacity. The matrix comment in `ci.yml` says what they stop covering and when to restore them.)
   It runs them at **`-O0`** (#667), so reproduce a CI red with `julia -O0`: an allocation probe can
   read differently at the default `-O2`.
   A change that only passes single-threaded is not green.

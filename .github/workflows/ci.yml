@@ -64,14 +64,30 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Julia 1.13 only, on the full OS x thread-count grid: the maintainer's decision on
+        # Julia 1.13 only, on the OS x thread-count grid: the maintainer's decision on
         # #526. It is the version every application on Nitro runs, and the floor `[compat]`
         # will declare once the floor PR lands (`julia = "^1.13"`). Until it does, the declared
         # floor `^1.12` is deliberately NOT tested: a leg for a version nothing ships would be
         # the configuration-nobody-runs CI the PormG pin rules warn about. 1.12 used to hold
         # this grid while 1.13 ran on one ubuntu leg, on the reasoning that version-specific
-        # breakage is not OS-specific; #301's Windows-only crash and the macOS-only e2e reds
-        # (#623) say it can be, so the one version in use gets every leg.
+        # breakage is not OS-specific; #301's Windows-only crash says it can be, so the one
+        # version in use gets every leg that earns its place.
+        #
+        # macOS is PARKED (commented out in `os` below), like `nightly`, for the pre-release
+        # phase. Over the 40 CI runs before it was parked, the two macOS legs failed only when
+        # ubuntu and Windows failed on the same commit -- not one macOS-only red -- and were the
+        # only legs GitHub cancelled before their first step (runner capacity: 6 of those 40
+        # runs), each one a re-run by hand. They are not the wall-clock long pole either; the
+        # Windows legs are. Parking them removes the cancellations and nothing else.
+        #
+        # What parking loses: the one area where macOS differs from Linux in a way the suite
+        # exercises is signal handling and task parking -- the SIGTERM `atexit` path in
+        # `src/core/lifecycle.jl` (#677/#688) and the consumer e2e's SIGINFO stack dump
+        # (#682). A green grid says nothing about macOS there until the legs come back.
+        # RESTORE the `macos-latest` entry when the pre-release phase ends, or before merging a
+        # change to `src/core/transport.jl`, `src/core/lifecycle.jl` or the Workers signal
+        # handling, whichever comes first. (The parked `nightly` entry below is version
+        # churn, a different reason; it comes back with the `~1.14.0-0` bump.)
         #
         # `~1.13.0-0` rather than `'1.13'` because plain semver ranges exclude
         # pre-releases; the `-0` lower bound opts them in. It resolves to >=1.13.0-0 and
@@ -85,7 +101,7 @@ jobs:
           - '~1.13.0-0'
         os:
           - ubuntu-latest
-          - macos-latest
+          # - macos-latest   # PARKED -- see the comment above
           - windows-latest
         threads: [1, 2]
         # No `include:` for now: the 1.13 entry that used to sit here as one ubuntu leg moved
