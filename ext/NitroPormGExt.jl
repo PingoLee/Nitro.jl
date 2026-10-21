@@ -33,7 +33,7 @@ import Nitro.Workers: AbstractWorkerStore, TaskInfo, TaskStatus, TaskOptions,
     get_queue_authorizer, set_queue_authorizer!,
     get_error_redactor, set_error_redactor!,
     get_watch_authorizer, set_watch_authorizer!,
-    lock_tasks
+    TaskLocks, task_locks
 import Nitro: pormg_nitro_worker
 
 export PormGWorkerStore, pormg_nitro_worker
@@ -731,7 +731,9 @@ query — bind it to `db_key` first.
 struct PormGWorkerStore <: AbstractWorkerStore
     model::Any
     db_key::String
-    task_lock::ReentrantLock
+    # Process-local, per task id (#711): no data method here takes them. One store-wide lock held
+    # across every statement capped a process at one round trip at a time.
+    locks::TaskLocks
     queue_authorizer::Ref{Any}
     watch_authorizer::Ref{Any}
     error_redactor::Ref{Any}
@@ -746,7 +748,7 @@ function PormGWorkerStore(; model=nothing, db_key::String="db")
     return PormGWorkerStore(
         m,
         db_key,
-        ReentrantLock(),
+        TaskLocks(),
         Ref{Any}(nothing),
         Ref{Any}(nothing),
         Ref{Any}(nothing),
@@ -1770,11 +1772,7 @@ function set_watch_authorizer!(store::PormGWorkerStore, authorizer)
     return authorizer
 end
 
-function lock_tasks(callback::Function, store::PormGWorkerStore)
-    return lock(store.task_lock) do
-        callback()
-    end
-end
+task_locks(store::PormGWorkerStore) = store.locks
 
 # ============================================================================
 # SECTION 8: Table Bootstrap & Convenience Constructor

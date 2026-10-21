@@ -591,7 +591,9 @@ store-counted admission, the start-time refusals, `requeue_expired!` on the rete
   process's runs, which keeps its path free of store reads. The checks run inside
   `_register_or_watch!`, where a run is about to be minted, so joining a live key is never refused
   by them. The count is a plain read, so it is the one claim-capability method called under
-  `lock_tasks`.
+  `lock_tasks`. Since [#711](https://github.com/PingoLee/Nitro.jl/issues/711) that lock is the
+  key's stripe, so the count and the write it admits also hold the store's admission lock, which
+  keeps the bounds exact against this process's own concurrent submits.
 - **`release_claim!(…; policy)` enforces the attempt bound in the store**, as proposed on #514
   (2026-10-15): at the bound under `:requeue` the run is `FAILED`, under `:fail` a hand-back is
   never failed, because nothing expired. Its error has its own wording ("Handed back … not

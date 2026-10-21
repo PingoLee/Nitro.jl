@@ -62,7 +62,7 @@ export TaskStatus, PENDING, RUNNING, COMPLETED, FAILED, CANCELLED,
 #
 # * The store's data-access contract -- `get_task_info`, `set_task!`, `replace_task!`,
 #   `add_watcher!`, `try_transition!`, `delete_task!`, `try_delete_task!`, `cleanup_tasks!`,
-#   `clear_records!`, `list_running_task_refs`, `RunningTaskRef`, `lock_tasks`, and the optional
+#   `clear_records!`, `list_running_task_refs`, `RunningTaskRef`, `task_locks`, `TaskLocks`, and the optional
 #   claim capability `claim_next!`, `renew_leases!`, `release_claim!`, `requeue_expired!`,
 #   `count_external_runs`, `LeaseRenewal`, `LeasePolicy` (#514) -- and the live-run
 #   internals `get_active_task`, `get_active_task_info`, `register_run!`. A backend implements them

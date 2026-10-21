@@ -82,7 +82,7 @@ function _finish_task!(runtime::WorkerRuntime, task_info::TaskInfo, to::TaskStat
                        result=UNSUPPLIED,
                        progress::Union{Nothing, Real}=nothing)
     finished_at = current_time_utc()
-    return lock_tasks(runtime) do
+    return lock_tasks(runtime, task_info.id) do
         # `run_id` is what makes this write ADDRESSED rather than merely atomic: #88 made
         # terminal transitions compare-and-set, but they still named only a task id, and a task
         # id outlives the run writing under it (#108).
@@ -112,7 +112,8 @@ function _finish_task!(runtime::WorkerRuntime, task_info::TaskInfo, to::TaskStat
 end
 
 # Claim the start of a run: read the record durably, verify it still belongs to the run the caller
-# carries, and publish the run's handles -- as ONE critical section under the store lock. Returns
+# carries, and publish the run's handles -- as ONE critical section under the key's stripe of the
+# store's `TaskLocks`. Returns
 # the run's `TaskInfo` when the handles were published and `nothing` when this run must not start.
 # The contract callers rely on: `try`/`finally _deregister_run!` is entered if and only if
 # `register_run!` succeeded.
@@ -142,23 +143,24 @@ end
 # a successor exists whose own submit will run it -- or, if its `put!` lost a teardown race, will
 # record it terminal instead, or failing both is logged as an orphan (#182 territory).
 #
-# **Everything under `lock_tasks`** (#198). The check and the publish used to be two steps with
-# no lock between them, and a supersede landing in that gap -- `cancel_task` plus a re-submit,
-# which need only `lock_tasks`, free by then -- let a run that had just verified its ownership
+# **Everything under the key's `lock_tasks` stripe** (#198). The check and the publish used to be
+# two steps with no lock between them, and a supersede landing in that gap -- `cancel_task` plus a
+# re-submit, which need only that stripe, free by then -- let a run that had just verified its ownership
 # publish over the LIVE SUCCESSOR's entries. Its `finally` then deleted them on a fence that now
 # matched, leaving a genuinely-running job with no handle: `recover_zombie_tasks!` reads exactly
 # that as death and writes FAILED over it, and `cancel_task` can no longer reach its live object.
 # The window was nanoseconds and the safety argument was an ordering coincidence.
 #
-# Every supersede holds `lock_tasks` (`_register_or_watch!`), and the eviction that makes the
+# Every supersede holds the key's stripe (`_register_or_watch!`), and the eviction that makes the
 # successor own the slot -- `replace_task!(runtime, ·)` -- happens under it. So a run that reads
-# and verifies its ownership under the same lock finds the slot empty or its own BY CONSTRUCTION;
-# no supersede can interleave. This is the process-local half of what workers §6 says about that
+# and verifies its ownership under the same stripe finds the slot empty or its own BY
+# CONSTRUCTION; no supersede can interleave. The slot, the record and the supersede are all about
+# ONE key, which is why a per-key stripe is enough (#711). This is the process-local half of what workers §6 says about that
 # lock: it cannot make a read-then-durable-write atomic across processes, which is why the run's
 # durable write (`try_transition!`, below in each caller) stays a `run_id`-fenced CAS outside
 # this section. What it CAN do is serialise this process's run-handle caches against this
-# process's supersede path -- and those caches have no other writer. The lock order it adds,
-# `lock_tasks` -> `active_lock`, is the one `_finish_task!` -> `_deregister_run!` already uses.
+# process's supersede path -- and those caches have no other writer for the key. The lock order it
+# adds, stripe -> `active_lock`, is the one `_finish_task!` -> `_deregister_run!` already uses.
 #
 # `register_run!` being a compare-and-set as well is the guard on that argument: under this lock a
 # refusal is unreachable in production, so a hit means out-of-band state (the test-only
@@ -176,7 +178,7 @@ end
 # this run's name is the same "a value escapes under the wrong run's identity" error #191 fixed.
 # No caller reads the return except to test it against `nothing`.
 function _claim_run!(runtime::WorkerRuntime, task_key::String, run_id::UUID)
-    return lock_tasks(runtime) do
+    return lock_tasks(runtime, task_key) do
         task_info = get_task_info(runtime.store, task_key)
         task_info === nothing && return nothing
 
@@ -257,7 +259,7 @@ end
 
 function _execute_queued_task(runtime::WorkerRuntime, item::QueueItem)
     # The durable read, the #191 identity check against the ITEM's carried `run_id`, and the
-    # handle publish, as one critical section under the store lock -- see `_claim_run!` for why
+    # handle publish, as one critical section under the key's stripe -- see `_claim_run!` for why
     # each of those is the way it is. `nothing` means this run must not start: the record is
     # gone, it belongs to a successor, or it was cancelled before it was dequeued.
     #

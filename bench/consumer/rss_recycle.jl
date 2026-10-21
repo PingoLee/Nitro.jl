@@ -36,7 +36,7 @@ for (f, n) in ((:get_task_info, 1), (:set_task!, 2), (:replace_task!, 2), (:add_
     args = [Symbol("a", i) for i in 1:n]
     @eval W.$f(s::BenchStore, $(args...); kw...) = W.$f(s.inner, $(args...); kw...)
 end
-W.lock_tasks(cb::Function, s::BenchStore) = W.lock_tasks(cb, s.inner)
+W.task_locks(s::BenchStore) = W.task_locks(s.inner)
 W._visible_across_processes(::BenchStore) = true
 
 Base.@kwdef struct Heavy

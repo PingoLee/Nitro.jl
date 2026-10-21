@@ -336,8 +336,8 @@ function _warn_undeclared_queue(runtime::WorkerRuntime, name::String)
 end
 
 # A slot in `queue`'s buffer, as a compare-and-set loop on its counter -- no lock, because the
-# caller holds `lock_tasks`, and `queue_lock` may not be taken inside that (`get_queue_status`
-# holds `queue_lock` while it lists under the store's lock).
+# caller holds a `lock_tasks` stripe, and `queue_lock` is never taken inside one (`TaskLocks`;
+# `get_queue_status` holds `queue_lock` across a store listing).
 function _reserve_queue_slot!(queue::WorkerQueue)
     while true
         n = @atomic queue.reserved
@@ -476,9 +476,10 @@ get_worker_queues(runtime::WorkerRuntime) = runtime.worker_queues
 get_queue_lock(runtime::WorkerRuntime) = runtime.queue_lock
 get_cleanup_scheduler(runtime::WorkerRuntime) = runtime.cleanup_scheduler
 
-# The task lock is the STORE's — it serializes store operations, and two runtimes over one store
-# must contend on the same one or `_register_or_watch!` stops being mutually exclusive.
-lock_tasks(callback::Function, runtime::WorkerRuntime) = lock_tasks(callback, runtime.store)
+# The task locks are the STORE's, so two runtimes over one store contend on the same stripe and
+# `_register_or_watch!` stays mutually exclusive per key (#711).
+lock_tasks(callback::Function, runtime::WorkerRuntime, task_id::String) =
+    lock_tasks(callback, runtime.store, task_id)
 
 # ============================================================================
 # Process-local run handles
@@ -521,8 +522,8 @@ So this refuses to publish over a foreign `run_id`. Re-publishing one's **own** 
 idempotent; an empty slot accepts anything. The return is `Bool` since #198 — it used to hand back
 `task_info`, which no caller read. The refusal is a *guard*, not the fix: the fix is `_claim_run!`
 (`src/Workers/queue.jl`), which performs the durable read, the identity check and this publish
-under `lock_tasks` — the lock every supersede holds and evicts under — so a production run always
-finds the slot empty or its own. What the CAS adds is that the fence stays honest even for a publish
+under the key's `lock_tasks` stripe — the one every supersede of that key holds and evicts under —
+so a production run always finds the slot empty or its own. What the CAS adds is that the fence stays honest even for a publish
 that did not come through the claim: the test-only registrars, or a refactor that moves the read
 back outside the lock. Either way the slot never names a run the record does not.
 """
@@ -1054,27 +1055,23 @@ function shutdown!(runtime::WorkerRuntime; drain_timeout::Real = WORKER_DRAIN_TI
     end
 
     # OUTSIDE `queue_lock`, deliberately. These are store writes, and the queue processor takes
-    # the store lock (`_finish_task!`) and then `queue_lock` (its own `finally`); holding
-    # `queue_lock` across a store write here is that pair in the opposite order. One `lock_tasks`
-    # for the whole batch rather than one per item, which is the shape `recover_zombie_tasks!`
-    # already uses for a sweep.
+    # a key's stripe (`_finish_task!`) and then `queue_lock` (its own `finally`); holding
+    # `queue_lock` across a store write here is that pair in the opposite order. Each item under
+    # its own key's stripe, the shape `recover_zombie_tasks!` uses for a sweep: the abandon is a
+    # fact about one key, and a batch-wide lock is what #711 removed.
     #
     # Unconditional -- this runs at `drain_timeout = 0` too. That keyword means "do not WAIT", and
     # abandoning the backlog costs no wait; letting a teardown silently execute a queue's backlog
     # is not something anyone opted into by declining to wait for in-flight runs.
-    if !isempty(abandoned_items)
-        lock_tasks(runtime) do
-            for item in abandoned_items
-                try
-                    _abandon_queued_item!(runtime, item)
-                catch error
-                    @error "Worker queued task abandoned but not recorded during teardown" exception=(loggable(error), catch_backtrace()) task_key=item.task_key
-                end
-                # After the `catch`, so a store failure above cannot skip it: the run will never
-                # start, so its owner's reservation (#324) ends here either way.
-                _release_run!(runtime, item.run_id)
-            end
+    for item in abandoned_items
+        try
+            lock_tasks(() -> _abandon_queued_item!(runtime, item), runtime, item.task_key)
+        catch error
+            @error "Worker queued task abandoned but not recorded during teardown" exception=(loggable(error), catch_backtrace()) task_key=item.task_key
         end
+        # After the `catch`, so a store failure above cannot skip it: the run will never
+        # start, so its owner's reservation (#324) ends here either way.
+        _release_run!(runtime, item.run_id)
     end
 
     if iszero(drain_timeout)

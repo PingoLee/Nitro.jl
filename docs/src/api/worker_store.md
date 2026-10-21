@@ -15,6 +15,8 @@ grants read and cancel — so an application reaches tasks through the authority
 Nitro.Workers.AbstractWorkerStore
 Nitro.Workers.InMemoryWorkerStore
 Nitro.Workers.missing_store_methods
+Nitro.Workers.TaskLocks
+Nitro.Workers.task_locks
 Nitro.Workers.get_task_info
 Nitro.Workers.set_task!
 Nitro.Workers.replace_task!

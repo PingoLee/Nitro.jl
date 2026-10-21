@@ -11,7 +11,7 @@ using Nitro.Workers
 # exercises them directly, so it names them.
 using Nitro.Workers: get_task_info, set_task!, replace_task!, add_watcher!, try_transition!,
     delete_task!, try_delete_task!, cleanup_tasks!, list_running_task_refs, RunningTaskRef,
-    lock_tasks, get_active_task, get_active_task_info, register_run!, get_worker_queues,
+    lock_tasks, task_locks, get_active_task, get_active_task_info, register_run!, get_worker_queues,
     claim_next!, renew_leases!, release_claim!, requeue_expired!, count_external_runs,
     LeaseRenewal, LeasePolicy
 using Nitro.Errors: AuthorizationError, ClaimPoisonedError
@@ -117,7 +117,7 @@ end
 #
 # It is a LEAF lock: nothing is acquired while holding it and no callback runs under it. That,
 # and only that, is what makes an order inversion unrepresentable -- NOT any claim about
-# `store.task_lock` being held on the way in. It frequently is not: `get_task_status` and
+# a key's `lock_tasks` stripe being held on the way in. It frequently is not: `get_task_status` and
 # `get_all_tasks` reach the store through no `lock_tasks` at all, and #226 was precisely a
 # lock-free polling read interleaving with a worker task that did hold it. Anyone who reads a
 # "production always locks first" guarantee into this will conclude the lock below is redundant.
@@ -2944,16 +2944,15 @@ else
             end
         end
 
-        @testset "lock_tasks provides mutual exclusion for PormGWorkerStore" begin
+        @testset "lock_tasks provides mutual exclusion per task id for PormGWorkerStore" begin
             # Regression: lock_tasks was a no-op for PormGWorkerStore, leaving
             # _register_or_watch! and cancel_task unprotected against concurrent writers.
             store5 = RealPormGWorkerStore(model=MockTaskModel())
-            rt_store5 = WorkerRuntime(store5)
 
             counter = Ref(0)
             n = 20
             tasks = map(1:n) do _
-                Threads.@spawn lock_tasks(store5) do
+                Threads.@spawn lock_tasks(store5, "user::same") do
                     v = counter[]
                     sleep(0.001)
                     counter[] = v + 1
@@ -2962,6 +2961,37 @@ else
             foreach(wait, tasks)
 
             @test counter[] == n
+        end
+
+        @testset "a section on one task id does not wait for another id's (#711)" begin
+            # The ceiling #548 measured: one store-wide lock held across every round trip. The
+            # locks are per id now, so a held section blocks its own id and nothing else.
+            store6 = RealPormGWorkerStore(model=MockTaskModel())
+            locks = task_locks(store6)
+            @test task_locks(store6) === locks
+            a = "user::a"
+            b = first(k for k in ("user::b$i" for i in 1:1000)
+                      if Nitro.Workers._stripe_index(locks, k) != Nitro.Workers._stripe_index(locks, a))
+
+            held, release = Base.Event(), Base.Event()
+            holder = Threads.@spawn lock_tasks(store6, a) do
+                notify(held)
+                wait(release)
+            end
+            try
+                wait(held)
+                other = Threads.@spawn lock_tasks(() -> :ran, store6, b)
+                @test timedwait(() -> istaskdone(other), 10.0) === :ok
+                @test fetch(other) === :ran
+                same = Threads.@spawn lock_tasks(() -> :ran, store6, a)
+                sleep(0.2)
+                @test !istaskdone(same)
+                notify(release)
+                @test fetch(same) === :ran
+            finally
+                notify(release)
+                wait(holder)
+            end
         end
 
         @testset "the mock database is serialized, so concurrent queries cannot lose a write (#226)" begin

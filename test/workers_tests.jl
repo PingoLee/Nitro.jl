@@ -102,7 +102,7 @@ using Nitro.Workers
 # exercises them directly, so it names them.
 using Nitro.Workers: get_task_info, set_task!, replace_task!, add_watcher!, try_transition!,
     delete_task!, try_delete_task!, cleanup_tasks!, clear_records!, list_running_task_refs,
-    RunningTaskRef, lock_tasks, get_active_task, get_active_task_info, register_run!,
+    RunningTaskRef, lock_tasks, task_locks, TaskLocks, get_active_task, get_active_task_info, register_run!,
     WorkerQueue, QueueItem, get_worker_queues, get_queue_lock
 using Nitro.Errors: AuthorizationError, StoreInterfaceError, WorkerUnavailableError, WorkerCapacityError
 using Base.ScopedValues: ScopedValue, with
@@ -149,9 +149,17 @@ struct NothingWorkerStore <: AbstractWorkerStore end
 struct WideStore <: AbstractWorkerStore end
 Nitro.Workers.get_task_info(::WideStore, ::AbstractString) = "wide"
 
-# Implements only the one contract method whose store argument is not first.
-struct OnlyLockStore <: AbstractWorkerStore end
-Nitro.Workers.lock_tasks(callback::Function, ::OnlyLockStore) = callback()
+# Implements only the locking row: it holds its `TaskLocks`, it does not lock anything itself (#711).
+struct OnlyLocksStore <: AbstractWorkerStore
+    locks::TaskLocks
+end
+OnlyLocksStore() = OnlyLocksStore(TaskLocks())
+Nitro.Workers.task_locks(s::OnlyLocksStore) = s.locks
+
+# A third-party store written before #711, when a backend implemented `lock_tasks` itself. Its
+# method is dead code now, and the conformance check has to say what replaced it.
+struct PreTaskLocksStore <: AbstractWorkerStore end
+Nitro.Workers.lock_tasks(callback::Function, ::PreTaskLocksStore) = callback()
 
 # Two shapes of third-party store written before `try_transition!` gained its `run_id` fence.
 struct StaleKwStore <: AbstractWorkerStore end
@@ -172,15 +180,16 @@ Nitro.Workers.try_transition!(::StaleNoKwStore, ::String, from, ::TaskStatus) = 
 struct DataOnlyStore <: AbstractWorkerStore
     rows::Dict{String, TaskInfo}
     lk::ReentrantLock
+    locks::TaskLocks
     qa::Base.RefValue{Any}
     wa::Base.RefValue{Any}
     er::Base.RefValue{Any}
 
-    DataOnlyStore() = new(Dict{String, TaskInfo}(), ReentrantLock(),
+    DataOnlyStore() = new(Dict{String, TaskInfo}(), ReentrantLock(), TaskLocks(),
                           Ref{Any}(nothing), Ref{Any}(nothing), Ref{Any}(nothing))
 end
 
-Nitro.Workers.lock_tasks(callback::Function, s::DataOnlyStore) = lock(callback, s.lk)
+Nitro.Workers.task_locks(s::DataOnlyStore) = s.locks
 Nitro.Workers.get_task_info(s::DataOnlyStore, id::String) = lock(() -> get(s.rows, id, nothing), s.lk)
 Nitro.Workers.set_task!(s::DataOnlyStore, id::String, t::TaskInfo) = lock(() -> (s.rows[id] = t), s.lk)
 Nitro.Workers.replace_task!(s::DataOnlyStore, id::String, t::TaskInfo) = lock(() -> (s.rows[id] = t), s.lk)
@@ -256,7 +265,7 @@ Nitro.Workers.set_error_redactor!(s::DataOnlyStore, f) = (s.er[] = f)
     missing_names = missing_store_methods(NothingWorkerStore)
     @test length(missing_names) == length(Nitro.Workers.WORKER_STORE_INTERFACE)
     @test :get_task_info in missing_names
-    @test :lock_tasks in missing_names          # the callback-first row
+    @test :task_locks in missing_names          # the locking row (#711)
     @test :try_transition! in missing_names
 
     # The lifecycle rows LEFT the contract in #167, so a store owes none of them.
@@ -348,20 +357,166 @@ end
     @test get_task_info(WideStore(), "id") == "wide"
     @test !(:get_task_info in missing_store_methods(WideStore))
 
-    # The callback-first row is the one whose store is not the first argument, so a detector that
-    # assumed position 1 would mis-handle exactly this method and nothing else.
-    @test !(:lock_tasks in missing_store_methods(OnlyLockStore))
-    @test length(missing_store_methods(OnlyLockStore)) ==
+    # A store that implements the locking row and nothing else owes exactly the rest.
+    @test !(:task_locks in missing_store_methods(OnlyLocksStore))
+    @test length(missing_store_methods(OnlyLocksStore)) ==
           length(Nitro.Workers.WORKER_STORE_INTERFACE) - 1
+end
+
+@testset "a store that still implements lock_tasks itself is told what replaced it (#711)" begin
+    # Before #711 a backend implemented `lock_tasks(callback, store)`. That method is never called
+    # now -- Nitro implements `lock_tasks(callback, store, task_id)` once, on `task_locks` -- so
+    # the conformance check names the row it still owes instead of passing it quietly.
+    @test :task_locks in missing_store_methods(PreTaskLocksStore)
+    err = try
+        Nitro.Workers.lock_tasks(() -> nothing, PreTaskLocksStore(), "k")
+        nothing
+    catch e
+        e
+    end
+    @test err isa StoreInterfaceError
+    @test err.f === task_locks
+end
+
+# A key of `owner` whose stripe differs from `key`'s, so a test about two ids is about two locks.
+function other_stripe_key(locks::TaskLocks, key::String, owner::String)
+    i = Nitro.Workers._stripe_index(locks, key)
+    return first(k for k in ("$owner::k$j" for j in 1:1000) if Nitro.Workers._stripe_index(locks, k) != i)
+end
+
+@testset "lock_tasks orders one task id, not the whole store (#711)" begin
+    store = InMemoryWorkerStore()
+    locks = task_locks(store)
+    @test locks isa TaskLocks && task_locks(store) === locks
+    @test isempty(missing_store_methods(InMemoryWorkerStore))
+
+    a = "user::a"
+    b = other_stripe_key(locks, a, "user")
+    held, release = Base.Event(), Base.Event()
+    holder = Threads.@spawn lock_tasks(store, a) do
+        notify(held)
+        wait(release)
+    end
+    try
+        wait(held)
+        # Another id's section runs while `a`'s is held...
+        other = Threads.@spawn lock_tasks(() -> :ran, store, b)
+        @test wait_for(() -> istaskdone(other); timeout = 10.0) === :ok
+        @test fetch(other) === :ran
+        # ...and so do the store's own data methods, which take only its registry lock.
+        @test get_task_info(store, a) === nothing
+        # The same id waits for it.
+        same = Threads.@spawn lock_tasks(() -> :ran, store, a)
+        sleep(0.2)
+        @test !istaskdone(same)
+        notify(release)
+        @test fetch(same) === :ran
+    finally
+        notify(release)
+        wait(holder)
+    end
+end
+
+# Forwards to an `InMemoryWorkerStore` and parks the zombie sweep's FAILED write on `gate_id`
+# until `release` fires, so a test can look at what is locked while a verdict is in flight.
+struct ParkedSweepStore <: AbstractWorkerStore
+    inner::InMemoryWorkerStore
+    gate_id::String
+    parked::Base.Event
+    release::Base.Event
+end
+for (f, n) in ((:get_task_info, 1), (:set_task!, 2), (:replace_task!, 2), (:add_watcher!, 2),
+               (:delete_task!, 1), (:try_delete_task!, 2), (:cleanup_tasks!, 1),
+               (:get_all_tasks, 1), (:get_queue_authorizer, 0), (:set_queue_authorizer!, 1),
+               (:get_watch_authorizer, 0), (:set_watch_authorizer!, 1), (:get_error_redactor, 0),
+               (:set_error_redactor!, 1), (:list_running_task_refs, 0))
+    args = [Symbol("a", i) for i in 1:n]
+    @eval Nitro.Workers.$f(s::ParkedSweepStore, $(args...); kw...) = Nitro.Workers.$f(s.inner, $(args...); kw...)
+end
+Nitro.Workers.task_locks(s::ParkedSweepStore) = task_locks(s.inner)
+function Nitro.Workers.try_transition!(s::ParkedSweepStore, id::String, from, to::TaskStatus; kw...)
+    if id == s.gate_id && to == FAILED
+        notify(s.parked)
+        wait(s.release)
+    end
+    return try_transition!(s.inner, id, from, to; kw...)
+end
+
+@testset "the zombie sweep locks one task's verdict, not the sweep (#711)" begin
+    inner = InMemoryWorkerStore()
+    zombie = "ghost::z"
+    lock(inner.registry_lock) do
+        t = TaskInfo(zombie)
+        t.status = RUNNING
+        inner.task_registry[zombie] = t
+    end
+    store = ParkedSweepStore(inner, zombie, Base.Event(), Base.Event())
+    rt = WorkerRuntime(store)
+    try
+        sweep = Threads.@spawn recover_zombie_tasks!(; runtime = rt)
+        wait(store.parked)
+        # The verdict holds its own key's stripe: another section on that key waits for it...
+        same = Threads.@spawn lock_tasks(() -> :ran, rt, zombie)
+        sleep(0.2)
+        @test !istaskdone(same)
+        # ...while a submit on a key in another stripe runs to completion meanwhile.
+        free = other_stripe_key(task_locks(store), zombie, "user")
+        submit = Threads.@spawn begin
+            id = submit_task(last(split(free, "::")), () -> "done", Owner("user"); runtime = rt)
+            wait_for(() -> get_task_status(id, Owner("user"); runtime = rt)[:status] == "COMPLETED";
+                     timeout = 10.0)
+        end
+        @test wait_for(() -> istaskdone(submit); timeout = 10.0) === :ok
+        @test fetch(submit) === :ok
+        notify(store.release)
+        @test fetch(sweep) == 1
+        @test fetch(same) === :ran
+        @test get_task_info(inner, zombie).status == FAILED
+    finally
+        notify(store.release)
+        reset_runtime!(rt)
+    end
+end
+
+@testset "a submit is not held up by another task's section (#711)" begin
+    # The #548 ceiling, as a behavior: before #711 every submit, run start and finish in the
+    # process waited for whichever section was open, whatever task it was about.
+    store = InMemoryWorkerStore()
+    rt = WorkerRuntime(store)
+    try
+        blocked = other_stripe_key(task_locks(store), "user::free", "user")
+        held, release = Base.Event(), Base.Event()
+        holder = Threads.@spawn lock_tasks(rt, blocked) do
+            notify(held)
+            wait(release)
+        end
+        try
+            wait(held)
+            # Spawned, so a regression to one store-wide lock fails this assertion rather than
+            # hanging the item until its timeout.
+            submit = Threads.@spawn begin
+                id = submit_task("free", () -> "done", Owner("user"); runtime = rt)
+                wait_for(() -> get_task_status(id, Owner("user"); runtime = rt)[:status] == "COMPLETED";
+                         timeout = 10.0)
+            end
+            @test wait_for(() -> istaskdone(submit); timeout = 10.0) === :ok
+            @test fetch(submit) === :ok
+        finally
+            notify(release)
+            wait(holder)
+        end
+    finally
+        reset_runtime!(rt)
+    end
 end
 
 # -- The claim capability (#514) ----------------------------------------------------------------
 
 # A store that forwards to an `InMemoryWorkerStore` and runs `hook(inner)` just before each
 # `try_transition!`: another process's claim landing in the window between `cancel_task`'s read
-# and its fenced write. `lock_tasks` is the inner store's lock, and the hook runs under it, which
-# is fine for the inner store's own (reentrant) lock and is exactly the interleaving a second
-# process produces, since that process does not take this one's lock at all.
+# and its fenced write. The hook runs under the key's `lock_tasks` stripe, which the inner store's
+# data methods never take (they take its `registry_lock`), and is exactly the interleaving a
+# second process produces, since that process does not take this one's locks at all.
 struct ClaimRaceStore <: AbstractWorkerStore
     inner::InMemoryWorkerStore
     hook::Base.RefValue{Any}
@@ -386,7 +541,7 @@ _W.get_watch_authorizer(s::ClaimRaceStore) = _W.get_watch_authorizer(s.inner)
 _W.set_watch_authorizer!(s::ClaimRaceStore, f) = _W.set_watch_authorizer!(s.inner, f)
 _W.get_error_redactor(s::ClaimRaceStore) = _W.get_error_redactor(s.inner)
 _W.set_error_redactor!(s::ClaimRaceStore, f) = _W.set_error_redactor!(s.inner, f)
-_W.lock_tasks(cb::Function, s::ClaimRaceStore) = _W.lock_tasks(cb, s.inner)
+_W.task_locks(s::ClaimRaceStore) = _W.task_locks(s.inner)
 function _W.try_transition!(s::ClaimRaceStore, id::String, from, to::TaskStatus; kw...)
     h = s.hook[]
     s.persistent || (s.hook[] = nothing)
@@ -2130,7 +2285,7 @@ end
         @test cancel_result[:status] == "Task cancelled"
         @test wait_for(() -> get_task_status(cancel_id, Owner("user"); runtime=rt_store)[:status] == "CANCELLED") == :ok
 
-        lock(store.task_lock) do
+        lock(store.registry_lock) do
             expired = TaskInfo("expired-task")
             expired.status = COMPLETED
             expired.completed_at = Dates.now(Dates.UTC) - Dates.Day(10)
@@ -2157,7 +2312,7 @@ end
         @test worker_store(ctx_one) === store
         @test worker_store(ctx_two) === other_runtime.store
 
-        lock(store.task_lock) do
+        lock(store.registry_lock) do
             expired = TaskInfo("scheduled-expired")
             expired.status = COMPLETED
             expired.completed_at = Dates.now(Dates.UTC) - Dates.Day(10)
@@ -2190,7 +2345,7 @@ end
     # to the `InMemoryWorkerStore` it wraps. Mirrors `FlakyStore` (test/session_tests.jl) and
     # `FlakyBucketStore` (test/middleware/lifecycle_middleware_tests.jl), which guard the same
     # property for the middleware janitors. The scheduler calls `cleanup_tasks!` and nothing
-    # else; `lock_tasks` and `get_task_info` are forwarded defensively, so the wrapper stays a
+    # else; `task_locks` and `get_task_info` are forwarded defensively, so the wrapper stays a
     # valid store if the `finally` teardown below ever reaches one of them.
     mutable struct FlakyCleanupStore <: AbstractWorkerStore
         inner         :: InMemoryWorkerStore
@@ -2205,11 +2360,11 @@ end
         end
         return Nitro.Workers.cleanup_tasks!(s.inner, retain_days)
     end
-    Nitro.Workers.lock_tasks(f::Function, s::FlakyCleanupStore) = Nitro.Workers.lock_tasks(f, s.inner)
+    Nitro.Workers.task_locks(s::FlakyCleanupStore) = Nitro.Workers.task_locks(s.inner)
     Nitro.Workers.get_task_info(s::FlakyCleanupStore, id::String) = Nitro.Workers.get_task_info(s.inner, id)
 
     inner = InMemoryWorkerStore()
-    lock(inner.task_lock) do
+    lock(inner.registry_lock) do
         expired = TaskInfo("flaky-expired")
         expired.status = COMPLETED
         expired.completed_at = Dates.now(Dates.UTC) - Dates.Day(10)
@@ -2367,7 +2522,7 @@ end
         s.sweeps += 1
         throw(InterruptException())
     end
-    Nitro.Workers.lock_tasks(f::Function, s::InterruptingCleanupStore) = Nitro.Workers.lock_tasks(f, s.inner)
+    Nitro.Workers.task_locks(s::InterruptingCleanupStore) = Nitro.Workers.task_locks(s.inner)
     Nitro.Workers.get_task_info(s::InterruptingCleanupStore, id::String) = Nitro.Workers.get_task_info(s.inner, id)
 
     store = InterruptingCleanupStore(InMemoryWorkerStore(), 0)
@@ -2426,7 +2581,7 @@ end
     @test get_queue_status(ctx, "reports", System())[:running] == true
     @test get_cleanup_scheduler(worker_runtime(ctx))[] isa CleanupScheduler
 
-    lock(store.task_lock) do
+    lock(store.registry_lock) do
         expired = TaskInfo("lifecycle-expired")
         expired.status = COMPLETED
         expired.completed_at = Dates.now(Dates.UTC) - Dates.Day(10)
@@ -3076,8 +3231,8 @@ end
     #
     # Two halves close it. `register_run!` is a compare-and-set on the live `run_id`, so a
     # foreign publish is REFUSED rather than applied; and `_claim_run!` performs the durable
-    # read, the identity check and the publish under `lock_tasks` -- the lock every supersede
-    # holds -- so a run that verifies ownership finds the slot empty or its own by construction.
+    # read, the identity check and the publish under the key's `lock_tasks` stripe -- the one every
+    # supersede of that key holds -- so a run that verifies ownership finds the slot empty or its own by construction.
     # The first half is what these tests can hold in place; the second is a lock discipline,
     # reviewed by reading `_claim_run!`, for the same reason the #167 two-write window was.
     @testset "register_run! is a compare-and-set on the live run" begin
@@ -3177,7 +3332,7 @@ end
     end
 
     @testset "a run whose slot is held by a foreign run declines at claim time" begin
-        # The out-of-band state the CAS guards. Under `lock_tasks` nothing in production can put
+        # The out-of-band state the CAS guards. Under the key's stripe nothing in production can put
         # a foreign run in the slot between the identity check and the publish -- every mint
         # goes through `replace_task!(runtime, ·)`, which evicts under that same lock -- so a
         # refusal here means either test-only state, as below, or a refactor that moved the read
@@ -3925,7 +4080,7 @@ end
 
     try
         # Setup a running task that has NO live execution handle
-        lock(store.task_lock) do
+        lock(store.registry_lock) do
             t1 = TaskInfo("zombie-running")
             t1.status = RUNNING
             t1.created_at = Dates.now(Dates.UTC)
@@ -3977,7 +4132,7 @@ end
     # The in-memory backend implements it, and reports only RUNNING records, with the run id
     # the fenced transition is addressed to and the start time.
     mem = InMemoryWorkerStore()
-    running = lock(() -> seed_rows!(mem.task_registry), mem.task_lock)
+    running = lock(() -> seed_rows!(mem.task_registry), mem.registry_lock)
     @test Nitro.Core.Errors.implements_contract_method(list_running_task_refs, InMemoryWorkerStore, AbstractWorkerStore, 1)
     @test list_running_task_refs(mem) == [RunningTaskRef((running.id, running.run_id, started, nothing))]
 
@@ -3999,7 +4154,7 @@ end
     rt = WorkerRuntime(store)
     owner = Owner("alice")
     try
-        lock(store.task_lock) do
+        lock(store.registry_lock) do
             # Inserted out of order, so a page that came back in Dict order would show it.
             for (id, watchers, status) in (("alice::3", ["alice"], RUNNING), ("a-global", ["alice"], PENDING),
                                            ("bob::1", ["bob"], RUNNING), ("alice::1", String[], RUNNING),
@@ -4097,7 +4252,7 @@ end
     rt = WorkerRuntime(store)
     live = @async sleep(0.05)
     try
-        lock(store.task_lock) do
+        lock(store.registry_lock) do
             for (id, started) in (("log::zombie", nothing), ("log::zombie2", nothing),
                                   ("log::live", nothing), ("log::young", Dates.now(Dates.UTC)))
                 t = TaskInfo(id)
@@ -4130,7 +4285,7 @@ end
 
 @testset "a retention tick that retired rows says so (#238)" begin
     store = InMemoryWorkerStore()
-    lock(store.task_lock) do
+    lock(store.registry_lock) do
         expired = TaskInfo("retire-me")
         expired.status = COMPLETED
         expired.completed_at = Dates.now(Dates.UTC) - Dates.Day(10)
@@ -4162,14 +4317,14 @@ end
     struct ThrowingTransitionStore <: AbstractWorkerStore
         inner::InMemoryWorkerStore
     end
-    Nitro.Workers.lock_tasks(f::Function, s::ThrowingTransitionStore) = Nitro.Workers.lock_tasks(f, s.inner)
+    Nitro.Workers.task_locks(s::ThrowingTransitionStore) = Nitro.Workers.task_locks(s.inner)
     Nitro.Workers.list_running_task_refs(s::ThrowingTransitionStore; kw...) =
         Nitro.Workers.list_running_task_refs(s.inner; kw...)
     Nitro.Workers.try_transition!(::ThrowingTransitionStore, ::String, from, ::TaskStatus; run_id, kw...) =
         error("simulated connection drop on the transition")
 
     inner = InMemoryWorkerStore()
-    lock(inner.task_lock) do
+    lock(inner.registry_lock) do
         t = TaskInfo("throws::1"); t.status = RUNNING
         inner.task_registry[t.id] = t
     end
@@ -4202,7 +4357,7 @@ const _ZOMBIE_ERROR = "Worker process terminated unexpectedly mid-execution."
 
 function _seed!(store::InMemoryWorkerStore, id::String, status::TaskStatus;
                 started_at=nothing, completed_at=nothing, result=nothing)
-    lock(store.task_lock) do
+    lock(store.registry_lock) do
         t = TaskInfo(id)
         t.status = status
         t.started_at = started_at
@@ -6297,6 +6452,56 @@ end
         @test err isa WorkerCapacityError && err.kind === :owner
     finally
         notify(gate)
+        uninstall!(app; drain_timeout = 0)
+    end
+end
+
+@testset "a bound stays exact against this process's own concurrent submits (#711)" begin
+    # Two submits on different keys take different `lock_tasks` stripes, so only the admission
+    # lock keeps one's count from reading before the other's write. The hook holds every count
+    # open long enough that, without it, both read 0 pending and both are admitted.
+    store = SharedStore()
+    app, runtime = external_app(; store, queues = ["heavy" => heavy(max_pending = 1)])
+    try
+        job = Job("crunch", HeavyArgs(n = 1))
+        # Different stripes, or the stripe alone would serialize them and this would prove nothing.
+        stripe(id) = _W._stripe_index(_W.task_locks(store), id)
+        @test stripe("u_p::p") != stripe("u_q::q")
+        store.count_hook[] = () -> sleep(0.3)
+        outcomes = map(("p", "q")) do key
+            Threads.@spawn try
+                submit_queued_task(app, "heavy", key, job, Owner("u_$key"))
+                :admitted
+            catch e
+                e isa WorkerCapacityError && e.kind === :queue ? :refused : rethrow()
+            end
+        end
+        @test sort([fetch(t) for t in outcomes]) == [:admitted, :refused]
+        @test count_external_runs(runtime.store, [_W.PENDING]; queue_name = "heavy") == 1
+    finally
+        store.count_hook[] = nothing
+        uninstall!(app; drain_timeout = 0)
+    end
+
+    # The owner quota is counted the same way, under the same lock: two external submits of one
+    # owner on different keys admit one.
+    store = SharedStore()
+    app, runtime = external_app(; store, runtime_kw = (; max_runs_per_owner = 1))
+    try
+        job = Job("crunch", HeavyArgs(n = 1))
+        @test _W._stripe_index(_W.task_locks(store), "u1::x") != _W._stripe_index(_W.task_locks(store), "u1::y")
+        store.count_hook[] = () -> sleep(0.3)
+        outcomes = map(("x", "y")) do key
+            Threads.@spawn try
+                submit_queued_task(app, "heavy", key, job, Owner("u1"))
+                :admitted
+            catch e
+                e isa WorkerCapacityError && e.kind === :owner ? :refused : rethrow()
+            end
+        end
+        @test sort([fetch(t) for t in outcomes]) == [:admitted, :refused]
+    finally
+        store.count_hook[] = nothing
         uninstall!(app; drain_timeout = 0)
     end
 end
