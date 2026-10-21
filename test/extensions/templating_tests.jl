@@ -391,6 +391,40 @@ Well, 6000.0 dollars, after taxes.
         end
     end
 
+    @testset "mustache parses its template once, when the handler is built (#550)" begin
+        body(resp) = String(resp.body)
+        # A string or IO template renders from tokens, not by re-tokenizing per call. Positive
+        # control: `Mustache.render` on the string, which is what each request used to run.
+        from_tokens = mustache(mustache_template)
+        for (label, handler) in ("string" => mustache(mustache_template_str),
+                                 "io"     => mustache(IOBuffer(mustache_template_str)))
+            @testset "$label" begin
+                @test body(handler(data)) == body(from_tokens(data))
+                @testset let ours = allocs(() -> handler(data); calls = 100),
+                             tokens = allocs(() -> from_tokens(data); calls = 100),
+                             reparse = allocs(() -> Mustache.render(mustache_template_str, data); calls = 100)
+                    @test ours.count <= tokens.count + 2
+                    @test reparse.count > tokens.count + 20
+                end
+            end
+        end
+
+        # So a malformed template fails here, as `otera` does, not as a 500 on every request.
+        @test_throws ArgumentError mustache("<p>{{#open}}closed under another name{{/other}}</p>")
+        @test_throws ArgumentError mustache(IOBuffer("<p>{{name</p>"))
+        mktempdir() do dir
+            bad = joinpath(dir, "bad.html")
+            write(bad, "<p>{{/closed}}never opened</p>")
+            @test_throws ArgumentError mustache(bad; from_file = true)
+        end
+
+        # `tags` is spent on the parse; every other keyword still reaches each render.
+        @test body(mustache("<p><<name>></p>"; tags = ("<<", ">>"))(Dict("name" => "x"))) == "<p>x</p>"
+        @test body(mustache(IOBuffer("[[name]]"); tags = ("[[", "]]"))(Dict("name" => "y"))) == "y"
+        @test body(mustache("{{tags}}"; tags = ("{{", "}}"))(Dict())) == ""
+        @test body(mustache("{{a}}-{{b}}"; b = 2)(Dict("a" => 1))) == "1-2"
+    end
+
 end
 
 end
