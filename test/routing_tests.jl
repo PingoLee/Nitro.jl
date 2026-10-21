@@ -370,6 +370,59 @@ end
 
 end
 
+@testitem "url() reverses from the pattern split at registration (#557)" tags=[:core] setup=[NitroCommon] begin
+using Test
+using HTTP
+using Nitro
+using Nitro.Core: App
+using Nitro.Core.Routing: urlpatterns
+
+app = App()
+urlpatterns(app, "/api", Nitro.RouteDefinition[
+    Nitro.path("/about", req -> "ok"; name = "about"),
+    Nitro.path("/items/<int:id>", (req, id::Int) -> "ok"; name = "item"),
+    Nitro.path("/org/{org}/repo/{repo}/issues/<int:n>", (req, org, repo, n::Int) -> "ok";
+               name = "issue"),
+    Nitro.path("/{lead}/tail", (req, lead) -> "ok"; name = "lead"),
+    Nitro.path("/café/{v}", (req, v) -> "ok"; name = "unicode"),
+])
+refusal(f) = try f(); "no error" catch e; e isa ArgumentError ? e.msg : rethrow() end
+
+# The literal text around each placeholder comes through unchanged, including a placeholder
+# first or last in the pattern and a literal the route was registered with percent-encoded.
+@test url(app, "about") == "/api/about"
+@test url(app, "item"; id = 7) == "/api/items/7"
+@test url(app, "issue"; repo = "web", n = 3, org = "acme") == "/api/org/acme/repo/web/issues/3"
+@test url(app, "lead"; lead = "x y") == "/api/x%20y/tail"
+@test url(app, "unicode"; v = "ü") == "/api/caf%C3%A9/%C3%BC"
+# A string that is not a `String` (`string` hands it back as is) is still taken, as when every
+# value went through a `Dict{String,String}`.
+@test url(app, "item"; id = Test.GenericString("7")) == "/api/items/7"
+@test url(app, "lead"; lead = lazy"a b") == "/api/a%20b/tail"
+
+# Every refusal keeps its message, and the order they are checked in: placeholders left to
+# right first, unknown keywords only once every placeholder is filled.
+@test refusal(() -> url(app, "nope")) == "Unknown route name: 'nope'"
+@test refusal(() -> url(app, "issue"; org = "acme", n = 3)) ==
+      "Missing route parameter 'repo' for route '/api/org/{org}/repo/{repo}/issues/{n}'"
+@test refusal(() -> url(app, "issue"; n = 3, zz = 1)) ==
+      "Missing route parameter 'org' for route '/api/org/{org}/repo/{repo}/issues/{n}'"
+@test refusal(() -> url(app, "item"; id = 1, zeta = 2, alpha = 3)) ==
+      "Unknown route parameters for route '/api/items/{id}': alpha, zeta"
+@test refusal(() -> url(app, "about"; id = 1)) ==
+      "Unknown route parameters for route '/api/about': id"
+@test refusal(() -> url(app, "item"; id = "x", extra = 1)) ==
+      "Route parameter 'id' for route '/api/items/{id}' does not match its Int64 converter"
+@test refusal(() -> url(app, "issue"; org = "..", repo = "web", n = 3)) ==
+      "Route parameter 'org' for route '/api/org/{org}/repo/{repo}/issues/{n}' cannot be empty, '.' or '..'"
+
+# The pattern is split once, when the name registers: reversing it no longer runs a regex
+# `replace`, builds a `Dict` of the keywords or a `Set` of the ones used (32 allocations for
+# one `Int` before #557). What is left is the value's `string`, its escape and the output.
+@test allocs(() -> url(app, "about")).count <= 6
+@test allocs(() -> url(app, "item"; id = 7)).count <= 10
+end
+
 @testitem "Scalar path & query params reject bad input with 400" tags=[:core] setup=[NitroCommon] begin
 
 using Test

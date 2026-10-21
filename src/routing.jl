@@ -186,7 +186,7 @@ end
 
 function register_named_route!(ctx::App, name::String, full_path::String,
                                type_hints::Dict{Symbol, Type} = Dict{Symbol, Type}())
-    route = NamedRoute(full_path, copy(type_hints))
+    route = NamedRoute(full_path, copy(type_hints), split_route_pattern(full_path)...)
     return Base.lock(ctx.service.named_routes_lock) do
         existing = get(ctx.service.named_routes, name, nothing)
         if isnothing(existing)
@@ -226,7 +226,8 @@ applies: a value the route itself would not accept.
 
 The value is left out of the message, as `parseparam`'s own errors leave it out.
 """
-function check_route_value(pattern::String, param_name::AbstractString, raw::String, type_hints::Dict{Symbol, Type})
+function check_route_value(pattern::String, param_name::Union{Symbol, AbstractString}, raw::String,
+                           type_hints::Dict{Symbol, Type})
     if raw in ("", ".", "..")
         throw(ArgumentError(
             "Route parameter '$param_name' for route '$pattern' cannot be empty, '.' or '..'"
@@ -246,31 +247,52 @@ function check_route_value(pattern::String, param_name::AbstractString, raw::Str
     return nothing
 end
 
-function build_named_route(pattern::String, type_hints::Dict{Symbol, Type}, kwargs)
-    provided = Dict{String, String}(string(key) => string(value) for (key, value) in kwargs)
-    consumed = Set{String}()
+# `pattern` split around its `{param}` placeholders, once, when the name registers (#557):
+# `literals[i]` precedes `params[i]` and `literals[end]` follows the last one. It matches with
+# `ROUTE_PARAM_REGEX`, so it finds exactly the placeholders the old per-call `replace` did.
+function split_route_pattern(pattern::String)
+    literals = String[]
+    params = Symbol[]
+    from = 1
+    for m in eachmatch(ROUTE_PARAM_REGEX, pattern)
+        push!(literals, pattern[from:prevind(pattern, m.offset)])
+        push!(params, Symbol(m.captures[1]::SubString{String}))
+        from = m.offset + ncodeunits(m.match)
+    end
+    push!(literals, pattern[from:end])
+    return literals, params
+end
 
-    route = replace(pattern, ROUTE_PARAM_REGEX => function(match)
-        captures = Base.match(ROUTE_PARAM_REGEX, match).captures
-        param_name = captures[1]
-        if !haskey(provided, param_name)
+function build_named_route(route::NamedRoute, kwargs)
+    pattern = route.path
+    io = IOBuffer(; sizehint = ncodeunits(pattern) + 16)
+    for (i, param_name) in pairs(route.params)
+        write(io, route.literals[i])
+        if !haskey(kwargs, param_name)
             throw(ArgumentError("Missing route parameter '$param_name' for route '$pattern'"))
         end
 
-        raw = provided[param_name]
-        check_route_value(pattern, param_name, raw, type_hints)
-        push!(consumed, param_name)
-        return HTTP.escapeuri(raw)
-    end)
+        # `string` hands any AbstractString back as is (an InlineString, a LazyString), and the
+        # check takes a `String`, as the old `Dict{String,String}` of the keywords made it.
+        raw = convert(String, string(kwargs[param_name]))::String
+        check_route_value(pattern, param_name, raw, route.type_hints)
+        write(io, HTTP.escapeuri(raw))
+    end
+    write(io, route.literals[end])
 
-    extra_params = sort!(collect(setdiff(Set(keys(provided)), consumed)))
-    if !isempty(extra_params)
-        throw(ArgumentError(
-            "Unknown route parameters for route '$pattern': $(join(extra_params, ", "))"
-        ))
+    # Checked once every placeholder is filled, as before: a missing value outranks an extra one.
+    for key in keys(kwargs)
+        key in route.params || throw_unknown_route_params(pattern, route.params, kwargs)
     end
 
-    return route
+    return String(take!(io))
+end
+
+@noinline function throw_unknown_route_params(pattern::String, params::Vector{Symbol}, kwargs)
+    extra_params = sort!([string(key) for key in keys(kwargs) if !(key in params)])
+    throw(ArgumentError(
+        "Unknown route parameters for route '$pattern': $(join(extra_params, ", "))"
+    ))
 end
 
 """
@@ -288,7 +310,7 @@ function url(ctx::App, name::String; kwargs...)
         throw(ArgumentError("Unknown route name: '$name'"))
     end
 
-    return build_named_route(route.path, route.type_hints, kwargs)
+    return build_named_route(route, kwargs)
 end
 
 
