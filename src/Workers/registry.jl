@@ -815,6 +815,15 @@ supports_claims(store::AbstractWorkerStore) = supports_claims(typeof(store))
 # opts out below.
 _visible_across_processes(::AbstractWorkerStore) = true
 
+# Whether `authority` may be served `task_id`'s durable record, asked BEFORE that record is read
+# (#565). `false` means the full read would be refused or would find nothing; `true` means "read it
+# and decide on the record". A pre-filter, never the gate: `_visible_record` re-checks the record it
+# reads, because the run can change between the two reads and a re-run resets the watcher list.
+# `true` unless a backend can do better. One whose full read decodes the stored `result` answers it
+# from a projection of the watcher list instead, so a caller who may not see the task never pays
+# for that decode, and a foreign id costs what a missing one does.
+_may_read_durable(::AbstractWorkerStore, ::TaskAuthority, ::String) = true
+
 function _missing_methods(S::Type{<:AbstractWorkerStore}, interface)
     names = Symbol[]
     for (f, argtypes) in interface
@@ -880,9 +889,9 @@ function set_task!(store::InMemoryWorkerStore, task_id::String, task_info::TaskI
         end
 
         # A different object: copy the volatile state across and keep the *stored*
-        # record's watchers, run_id, cancel_reason AND the claim fields (`external`,
-        # `claimed_by`, `lease_expires_at`, `attempt`, #514) and the named-job identity
-        # (`job_name`, `job_args`, #514) — precisely what the serializing
+        # record's watchers, run_id, cancel_reason (and its `cancel_waker`, #568) AND the claim
+        # fields (`external`, `claimed_by`, `lease_expires_at`, `attempt`, #514) and the named-job
+        # identity (`job_name`, `job_args`, #514) — precisely what the serializing
         # store achieves by omitting those columns. The list below is otherwise "copy every
         # field", so those absences ARE the rule.
         #

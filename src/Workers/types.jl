@@ -257,6 +257,13 @@ mutable struct TaskInfo
     # caller object carrying `:none` would ERASE a cancel that had already been requested,
     # which is the #88 clobber with the sign flipped.
     @atomic cancel_reason::Symbol
+    # What a run parked on its own token waits on, or `nothing` (#568): the retry backoff
+    # (`_backoff_wait`) publishes one for as long as it sleeps, and `_request_cancel!` notifies it
+    # once it has set the token. Process-local like the token, never persisted, and not copied by
+    # `set_task!`. Both are `@atomic`, which is sequentially consistent: the waiter publishes, then
+    # re-reads the token; the canceller sets the token, then reads the waker. At least one of them
+    # sees the other, so a cancel cannot fall between the two and leave the backoff asleep.
+    @atomic cancel_waker::Union{Nothing, Base.Event}
 
     function TaskInfo(id::String; queue_name::Union{Nothing, String}=nothing, external::Bool=false,
                       job_name::Union{Nothing, String}=nothing, job_args::Union{Nothing, String}=nothing)
@@ -280,6 +287,7 @@ mutable struct TaskInfo
             job_name,
             job_args,
             :none,
+            nothing,
         )
     end
 end
@@ -343,9 +351,15 @@ LeasePolicy(on_expiry::Symbol; max_attempts::Int = 3) = LeasePolicy(on_expiry, m
 _is_authorized(::System, ::TaskInfo) = true
 
 function _is_authorized(authority::Owner, task_info::TaskInfo)
-    owner = owner_of(task_info.id)
-    owner !== nothing && owner == authority.user_id && return true
+    _owns(authority, task_info.id) && return true
     return authority.user_id in task_info.watchers
+end
+
+# The half of `_is_authorized` the id alone decides: a `:user`-scoped id names its owner. Split out
+# so a store can authorize before it reads the record (`_may_read_durable`, #565).
+function _owns(authority::Owner, task_id::String)
+    owner = owner_of(task_id)
+    return owner !== nothing && owner == authority.user_id
 end
 
 # There is deliberately no raising `_authorize_task!` any more (#323). The read and cancel paths
@@ -403,6 +417,10 @@ const CANCEL_REASONS = (:user, :timeout, :superseded, :shutdown, :lease_lost)
 function _request_cancel!(task_info::TaskInfo, reason::Symbol)
     @assert reason in CANCEL_REASONS "unknown cancellation reason :$reason"
     _, won = @atomicreplace task_info.cancel_reason :none => reason
+    if won
+        waker = @atomic task_info.cancel_waker
+        waker === nothing || notify(waker)
+    end
     return won
 end
 

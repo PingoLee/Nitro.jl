@@ -3475,6 +3475,53 @@ end
         end
     end
 
+    @testset "#568: the retry backoff parks on the token, and a cancel wakes it" begin
+        # The token half: a waker published on the run is notified by the cancel that wins the
+        # token, and only by that one.
+        ti = TaskInfo("u::waker")
+        woken = Base.Event()
+        @atomic ti.cancel_waker = woken
+        waiter = Threads.@spawn wait(woken)
+        @test Nitro.Workers._request_cancel!(ti, :user)
+        @test timedwait(() -> istaskdone(waiter), 5.0) == :ok
+        @test !Nitro.Workers._request_cancel!(ti, :timeout)      # lost: the reason stays :user
+        @test cancel_reason(ti) === :user
+
+        # `_backoff_wait` returns at once on a token already set, and otherwise at the first of
+        # its deadline and a cancel. A 60 s deadline means only the cancel can end this one.
+        @test (@elapsed Nitro.Workers._backoff_wait(ti, 60.0)) < 1.0
+        ti2 = TaskInfo("u::backoff")
+        parked = Threads.@spawn Nitro.Workers._backoff_wait(ti2, 60.0)
+        @test timedwait(() -> (@atomic ti2.cancel_waker) !== nothing, 5.0) == :ok
+        @test Nitro.Workers._request_cancel!(ti2, :user)
+        @test timedwait(() -> istaskdone(parked), 5.0) == :ok
+        @test (@atomic ti2.cancel_waker) === nothing          # unpublished on the way out
+        @test (@elapsed Nitro.Workers._backoff_wait(TaskInfo("u::deadline"), 0.2)) < 5.0
+
+        # Through the runtime: a run in its 2 s backoff is parked with its waker published, and
+        # `cancel_task` ends the backoff rather than the deadline doing it.
+        store = InMemoryWorkerStore()
+        rt_store = WorkerRuntime(store)
+        failed_once = Base.Event()
+        try
+            id = submit_task("parks", () -> (notify(failed_once); error("always")), Owner("u");
+                options=TaskOptions(retry_on_failure=true, max_retries=3), runtime=rt_store)
+            wait(failed_once)
+            live = get_active_task_info(rt_store, id)
+            @test live !== nothing
+            @test timedwait(() -> (@atomic live.cancel_waker) !== nothing, 5.0) == :ok
+            # Still parked when the cancel lands, so its deadline has not ended the backoff.
+            @test (@atomic live.cancel_waker) !== nothing
+            @test cancel_task(id, Owner("u"); runtime=rt_store)[:status] == "Task cancelled"
+            @test get_task_status(id, Owner("u"); runtime=rt_store)[:status] == "CANCELLED"
+            # `cancel_task` wrote CANCELLED itself; what shows the backoff woke on the cancel is
+            # that it unpublished its waker at once, well inside the 2 s deadline it was parked for.
+            @test wait_for(() -> (@atomic live.cancel_waker) === nothing; timeout=1.0) == :ok
+        finally
+            reset_runtime!(rt_store)
+        end
+    end
+
     @testset "nothing in Workers injects an exception into a task" begin
         # A source assertion, because the property is "no site in this module does this"
         # rather than "this function behaves thus" -- and reintroducing the injection is
@@ -5072,9 +5119,14 @@ end
         held = submit_queued_task("q", "held", () -> "never", Owner("u"); runtime = rt)
         # Taken out of the buffer and parked, so the channel no longer has it.
         @test wait_for(() -> !isempty(get_worker_queues(rt)["q"].held)) == :ok
+        processors = copy(get_worker_queues(rt)["q"].processors)
         shutdown!(rt; drain_timeout = 0)
         # Terminal when `shutdown!` returns, not whenever the processor wakes up.
         @test get_task_status(held, System(); runtime = rt)[:status] == "CANCELLED"
+        # And the processor does wake: it parks on `abandoned_released` now rather than polling
+        # `draining` (#568), so a teardown that set the flag without notifying would leave it
+        # asleep until the abandoned callback returned -- here, never, since the gate is shut.
+        @test wait_for(() -> all(istaskdone, processors); timeout = 5.0) == :ok
     finally
         foreach(_ -> isready(gate) || put!(gate, nothing), 1:2)
         @test wait_for(() -> capacity_idle(rt)) == :ok

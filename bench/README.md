@@ -31,6 +31,7 @@ bench/
 │                       #   fairness/, the per-connection client fairness.sh drives
 ├── tasks/              # Julia tasks vs goroutines, no HTTP: tasks.jl, go/, run.sh
 ├── scope/              # collide.jl: what one @with costs when its ScopedValue key shares a HAMT slot (#633)
+├── workers/            # store_throughput.jl: one process's submit/finish rate through a worker store's task lock (#548)
 ├── results/            # JSON run outputs — gitignored (machine-specific)
 └── .gitignore          # ignores results/, Manifest.toml and per-version Manifest-v*.toml
 ```

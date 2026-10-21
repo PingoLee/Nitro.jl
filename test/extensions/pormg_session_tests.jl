@@ -250,6 +250,27 @@ function Base.getproperty(qs::MockQuerySet, name::Symbol)
                 _as_db_row(row)
             end
         end
+    elseif name === :update_or_create
+        # PormG's `update_or_create(lookup...; defaults)`: ONE statement that inserts the lookup
+        # plus the defaults, or sets the defaults on the row the lookup matches, and reports which
+        # (`(row, created)`). One lock hold, because on a real database it is one `INSERT … ON
+        # CONFLICT DO UPDATE` (or one `BEGIN IMMEDIATE` transaction on SQLite). No `:after_first`
+        # hook: it reads nothing a concurrent statement could land between (#567).
+        upsert_fn = function(lookup::Pair{String,<:Any}...; defaults)
+            isempty(defaults) && error("MockSessionQuerySet: update_or_create() needs defaults, as PormG does.")
+            return lock(_mock_lock(qs)) do
+                table = _selected_table(qs)
+                key = Dict{Symbol,Any}(Symbol(k) => v for (k, v) in lookup)[:session_key]
+                created = !haskey(table, key)
+                row = created ? Dict{Symbol,Any}(Symbol(k) => v for (k, v) in lookup) : table[key]
+                for (k, v) in defaults
+                    row[Symbol(k)] = v
+                end
+                table[key] = row
+                (_as_db_row(row), created)
+            end
+        end
+        return upsert_fn
     elseif name === :update
         return function(pairs::Pair{String,<:Any}...)
             # PormG refuses an unfiltered update outright (`UnsafeMutationError`), and returns
@@ -483,6 +504,25 @@ end
         set_session!(store, "sess-1", Dict{String,Any}("user_id" => 99); ttl=3600)
         @test length(store.model._table) == 1          # updated in place, not duplicated
         @test get_session(store, "sess-1") == Dict{String,Any}("user_id" => 99)
+    end
+
+    @testset "a write is one upsert, never a probe read first (#567)" begin
+        # The id is almost always fresh, so a SELECT before the write found nothing nearly every
+        # time and cost a round trip per new session. Counted through the `.first()` hook, which
+        # every read of a row passes.
+        m = MockModel()
+        s = RealPormGSessionStore(model=m)
+        reads = Ref(0)
+        getfield(m, :mdb).hooks[:after_first] = () -> (reads[] += 1)
+        try
+            set_session!(s, "fresh", Dict{String,Any}("v" => 1); ttl=60)
+            set_session!(s, "fresh", Dict{String,Any}("v" => 2); ttl=60)   # and an overwrite
+        finally
+            delete!(getfield(m, :mdb).hooks, :after_first)
+        end
+        @test reads[] == 0
+        @test length(m._table) == 1
+        @test get_session(s, "fresh") == Dict{String,Any}("v" => 2)
     end
 
     @testset "delete" begin
@@ -1377,6 +1417,54 @@ end
     @test hook("   ") == "   "
     @test hook(nothing) === nothing
     @test hook(42) == 42
+end
+
+end
+
+# The store's write through a REAL PormG connection (#567). Every other session test runs on a
+# mock, and the mock carries its own copy of `update_or_create`: its conflict target, its keyword
+# shape and its `created` flag are exactly what only a real database can confirm. SQLite is a test
+# dependency; PostgreSQL is checked by hand (CI has none).
+@testitem "PormG session store on a real SQLite file (#567)" tags=[:extension, :pormg] setup=[NitroCommon] begin
+
+using Test
+using Dates
+using Nitro
+using PormG
+using SQLite
+using Nitro.Types: get_session, set_session!, session_store_full
+
+key = "nitro_session_real_567"
+PormG.register_connection(key, joinpath(mktempdir(), "sessions.sqlite"); adapter = "SQLite")
+try
+    PormG.config[key].change_data = true
+    PormG.config[key].change_db = true
+    ext = Base.get_extension(Nitro, :NitroPormGExt)
+    store = Nitro.pormg_nitro_session(db_key = key, max_sessions = 3)
+    rows() = ext._session_objects(store).count()
+    row(id) = ext._session_objects(store).filter("session_key" => id).first()
+
+    @test store.count[] == 0
+    set_session!(store, "real-1", Dict{String,Any}("v" => 1); ttl = 60)
+    @test rows() == 1
+    @test store.count[] == 1                       # created: counted once
+    born = row("real-1")[:created_at]
+
+    sleep(1.1)                                     # `created_at` reads in whole seconds
+    set_session!(store, "real-1", Dict{String,Any}("v" => 2); ttl = 60)
+    @test rows() == 1                              # an overwrite adds no row...
+    @test store.count[] == 1                       # ...and no count
+    @test get_session(store, "real-1") == Dict{String,Any}("v" => 2)
+    # A fresh store resets `created_at` on the overwrite too (#362).
+    @test ext._parse_db_datetime(row("real-1")[:created_at]) > ext._parse_db_datetime(born)
+
+    set_session!(store, "real-2", Dict{String,Any}(); ttl = 60)
+    set_session!(store, "real-3", Dict{String,Any}(); ttl = 60)
+    @test session_store_full(store)
+finally
+    # PormG falls back to the sole loaded connection for an unbound model, so a leaked entry could
+    # be picked up by a later test item -- the reason every other item here removes its key.
+    delete!(PormG.config, key)
 end
 
 end
