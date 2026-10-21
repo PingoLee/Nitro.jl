@@ -93,6 +93,10 @@ chose `/products`, and neither had to know the other's decision. Registration ha
     it. Nitro's test suite instantiates and tests both, so the example stays in step with the
     framework.
 
+    The same shape carries further packages beside it:
+    [`examples/auth_package`](https://github.com/PingoLee/Nitro.jl/tree/main/examples/auth_package)
+    ships login, logout and the token middleware a host guards its own routes with.
+
 ### Composing several packages
 
 `include_routes` returns a `Vector{RouteDefinition}`, so combine groups with `vcat` — nesting them

@@ -1,34 +1,7 @@
-@testitem "examples/reusable_package -- both projects resolve, pass their tests and serve (#6)" tags=[:core, :slow, :network] setup=[NitroCommon] begin
+@testitem "examples/reusable_package -- both projects resolve, pass their tests and serve (#6)" tags=[:core, :slow, :network] setup=[NitroCommon, ExampleHarness] begin
 using Test
-using Nitro
-using Pkg: TOML
 
-# The rot guard for the example tree: an example only stays right if something runs it. It runs
-# in a copy of the example, so instantiating writes no Manifest.toml into the checkout. The
-# copy's `[sources]` point Nitro at this checkout by an absolute path; `HostApp`'s relative path
-# to `CatalogApp` holds inside the copy.
-#
-# One child, in HostApp's environment, which resolves CatalogApp and Nitro through those
-# sources: one resolve and one precompile, and both projects' tests `include`d rather than run
-# through `Pkg.test`, whose sandboxes would each resolve and precompile again and could outrun
-# the suite's per-item ceiling. The trade: CatalogApp's own `[targets]` are not resolved
-# standalone, as the README's per-project `Pkg.test()` does. The child's `JULIA_LOAD_PATH` is
-# pinned so this test environment cannot leak into what it resolves; `@stdlib` is what supplies
-# `Test`.
-checkout = pkgdir(Nitro)
-example = joinpath(mktempdir(), "reusable_package")
-cp(joinpath(checkout, "examples", "reusable_package"), example)
-for project in ("CatalogApp", "HostApp")
-    dir = joinpath(example, project)
-    rm(joinpath(dir, "Manifest.toml"); force = true)   # one left by a local run of the example
-    file = joinpath(dir, "Project.toml")
-    p = TOML.parsefile(file)
-    @test p["sources"]["Nitro"] == Dict("path" => "../../..")   # the example tracks its checkout
-    p["sources"]["Nitro"] = Dict("path" => checkout)
-    open(io -> TOML.print(io, p), file, "w")
-end
-root = joinpath(example, "HostApp")
-logfile = joinpath(mktempdir(), "child.log")
+example = copy_example("reusable_package", ("CatalogApp", "HostApp"))
 
 script = """
     using Pkg
@@ -62,19 +35,51 @@ script = """
     end
     """
 
-# Below the suite's 600 s per-item ceiling, so a hung child is killed and its log printed here
-# rather than the whole item being cut off with nothing to read.
-cmd = addenv(Cmd(`$(Base.julia_cmd()) --project=$root -e $script`; dir = root),
-             "JULIA_LOAD_PATH" => join(["@", "@stdlib"], Sys.iswindows() ? ';' : ':'),
-             "JULIA_PROJECT" => nothing)
-proc = open(logfile, "w") do log
-    run(pipeline(cmd; stdout = log, stderr = log); wait = false)
+@test run_child(joinpath(example, "HostApp"), script)
 end
-if timedwait(() -> process_exited(proc), 540) === :timed_out
-    kill(proc)
-    wait(proc)
-end
-ok = success(proc)
-ok || println(read(logfile, String))
-@test ok
+
+@testitem "examples/auth_package -- both projects resolve, pass their tests and serve (#674)" tags=[:core, :slow, :network] setup=[NitroCommon, ExampleHarness] begin
+using Test
+
+example = copy_example("auth_package", ("AuthKit", "AuthHost"))
+
+script = """
+    using Pkg
+    Pkg.instantiate()
+
+    using AuthKit, AuthHost, HTTP, Nitro, Sockets, Test
+    include(joinpath(pkgdir(AuthKit), "test", "runtests.jl"))
+    include(joinpath(pkgdir(AuthHost), "test", "runtests.jl"))
+
+    # And `main()` boots on a real port: sign in, then call the admin-only route with the token.
+    server = Sockets.listen(Sockets.localhost, 0)
+    port = Int(Sockets.getsockname(server)[2])
+    close(server)
+    ENV["PORT"] = string(port)
+    ENV["AUTH_JWT_SECRET"] = "s"^32
+    ENV["ADMIN_PASSWORD"] = "wonderland"
+    ENV["MEMBER_PASSWORD"] = "builder"
+    AuthHost.main(; host = "127.0.0.1", async = true, show_banner = false, access_log = nothing)
+    try
+        base = "http://127.0.0.1:\$port"
+        r = HTTP.get("\$base/admin/report"; retry = false, status_exception = false)
+        r.status == 401 || error("the report without a token answered \$(r.status)")
+        r = HTTP.post("\$base/auth/login", ["Content-Type" => "application/json"],
+                      "{\\"username\\": \\"alice\\", \\"password\\": \\"wonderland\\"}";
+                      retry = false, status_exception = false)
+        r.status == 200 || error("login answered \$(r.status)")
+        auth = ["Authorization" => "Bearer " * Nitro.json(r)["token"]]
+        r = HTTP.get("\$base/admin/report", auth; retry = false, status_exception = false)
+        r.status == 200 || error("the report with alice's token answered \$(r.status)")
+        Nitro.json(r)["requested_by"] == "alice" || error("unexpected body: \$(String(r.body))")
+        r = HTTP.post("\$base/auth/logout", auth; retry = false, status_exception = false)
+        r.status == 204 || error("logout answered \$(r.status)")
+        r = HTTP.get("\$base/admin/report", auth; retry = false, status_exception = false)
+        r.status == 401 || error("the report after logout answered \$(r.status)")
+    finally
+        terminate(AuthHost.app)
+    end
+    """
+
+@test run_child(joinpath(example, "AuthHost"), script)
 end
