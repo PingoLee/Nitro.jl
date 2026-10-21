@@ -361,13 +361,37 @@ end
 @inline _is_expired(b::Tuple{Int, DateTime}, window::Period, t::DateTime) = t - b[2] > window
 @inline _expires_at(b::Tuple{Int, DateTime}, window::Period) = b[2] + window + Millisecond(1)
 
-# Sliding window: expired once its newest timestamp is at or before the `filter!` cutoff, i.e.
-# the request path would prune every timestamp. `maximum`, not `last`: a clock step backwards
-# can push out of order, and reaping a bucket that still holds a live timestamp is an eviction.
+# Sliding window: expired once its newest timestamp is at or before the prune cutoff, i.e. the
+# request path would prune every timestamp. A bucket is sorted -- `_record!` inserts a
+# stepped-back reading in place -- so the newest is `last`. It used to be `maximum`, a pass over
+# the bucket per bucket the reaper visited (#564).
 @inline _is_expired(b::Vector{DateTime}, window::Period, t::DateTime) =
-    isempty(b) || maximum(b) <= t - window
+    isempty(b) || last(b) <= t - window
 @inline _expires_at(b::Vector{DateTime}, window::Period) =
-    isempty(b) ? typemin(DateTime) : maximum(b) + window
+    isempty(b) ? typemin(DateTime) : last(b) + window
+
+# Drops the timestamps at or before `cutoff` from a sorted bucket: a prefix. `deleteat!` on a
+# leading range moves the array's start rather than its elements, so the cost is the prefix
+# found, not the bucket's length. The caller holds the stripe's lock.
+function _drop_expired_prefix!(timestamps::Vector{DateTime}, cutoff::DateTime)
+    n = 0
+    @inbounds while n < length(timestamps) && timestamps[n + 1] <= cutoff
+        n += 1
+    end
+    n > 0 && deleteat!(timestamps, 1:n)
+    return timestamps
+end
+
+# Records a request at `t`, keeping the bucket sorted for the prune, `first` and `last`. The clock
+# only moves forward, so this is a `push!`. When the wall clock has stepped back, `t` goes in at
+# its sorted place instead: an O(n) shift, paid only on the rare step. The bucket then holds
+# exactly the timestamps an unsorted one would, so every count and expiry is unchanged. Clamping
+# `t` up to `last` instead would hold a client to one quota per `window` plus the step's size.
+# The caller holds the stripe's lock.
+function _record!(timestamps::Vector{DateTime}, t::DateTime)
+    (isempty(timestamps) || t >= last(timestamps)) && return push!(timestamps, t)
+    return insert!(timestamps, searchsortedlast(timestamps, t) + 1, t)
+end
 
 # Deletes every expired bucket and returns the earliest instant a survivor can expire (`typemax`
 # when none survive). The caller holds the stripe's lock.
@@ -810,8 +834,8 @@ function SlidingRateLimiter(;
         if isempty(timestamps)
             return window_seconds
         else
-            oldest_timestamp = minimum(timestamps)
-            return calculate_reset_time(current_time, oldest_timestamp, window)
+            # Sorted, so the oldest is the first (#564).
+            return calculate_reset_time(current_time, first(timestamps), window)
         end
     end
 
@@ -866,17 +890,17 @@ function SlidingRateLimiter(;
                 end
                 timestamps = DateTime[]
                 rate_limit_store[key] = timestamps
-                # A new bucket is never throttled (`rate_limit > 0`), so the `push!`
+                # A new bucket is never throttled (`rate_limit > 0`), so the `_record!`
                 # below always records `current_time`; note that expiry now.
                 _note_expiry!(stripe, current_time + window)
             else
                 timestamps = existing
             end
 
-            # Prune expired timestamps (sliding window cleanup)
-            # Keep only timestamps within the current window
-            cutoff_time = current_time - window
-            filter!(timestamp -> timestamp > cutoff_time, timestamps)
+            # Prune the timestamps that left the window. They are sorted (see `_record!`
+            # below), so they are a prefix: dropping it costs what it removes, not a pass over
+            # every live timestamp under this lock (#564).
+            _drop_expired_prefix!(timestamps, current_time - window)
 
             # Check if adding this request would exceed the limit
             if length(timestamps) >= rate_limit
@@ -888,7 +912,7 @@ function SlidingRateLimiter(;
             # the old code produced — it computed them after `handle(req)`, but
             # the vector could not change meanwhile because the lock was
             # (wrongly) held across the handler.
-            push!(timestamps, current_time)
+            _record!(timestamps, current_time)
             # Remaining quota, and time until the oldest request expires (when
             # 1 slot becomes available).
             return (_ADMIT, rate_limit - length(timestamps),
