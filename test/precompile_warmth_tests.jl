@@ -119,13 +119,19 @@ using Test
 #   payload            0.74x                    7.7x
 #   url                1.0x                     2.7x
 #
-# 2.5x for the first three leaves ~2.9x of margin on the flake side and ~2.1x on the false-pass
-# side; `url` gets 1.8x, ~1.8x and ~1.5x. CI runs the suite at `-O0` with `--check-bounds=yes`,
-# and the probes inherit both through `Base.julia_cmd()`. Under those flags (baseline ~0.04 s) the
-# warm ratios fall to 0.44–0.72x and `url` to 0.50x, while cold reads 5.8–7.8x and 2.4x, so at CI's
-# own flags `url` has ~3.6x on the flake side and ~1.33x on the false-pass side. These are one
-# OS's numbers, so the `warmth:` lines below are what should move them, not a red on a loaded
-# developer box.
+# CI runs the suite at `-O0` with `--check-bounds=yes`, and the probes inherit both through
+# `Base.julia_cmd()`. Under those flags (baseline ~0.04 s) cold reads 5.8–7.8x and `url` 2.4x.
+#
+# The first CI run (PR #708, all four Linux/Windows legs) read the warm side at 0.44–0.77x, `url`
+# at 0.53–0.59x, with one exception: `cookie_ext` read 2.1x on Linux at 1 thread. Its baseline
+# was unusually fast (0.030 s) and its own time unusually slow (0.063 s, against ~0.035 s on the
+# other legs). The first three were set at 2.5x from one developer box, and that run left 1.19x.
+# They are 3.5x now: 1.67x above the worst warm reading seen, and 1.53x below the lowest cold one
+# (`files_ext`, 5.35x). Those are the same margins the 8x above was chosen for. `url` stays at
+# 1.8x: ~3x above its warm readings and ~1.33x below cold. Its whole effect is ~175 ms, so there is
+# no room for more on either side.
+#
+# Move these with the `warmth:` lines from CI, not with a red on a loaded developer box.
 #
 # This is a `:slow` item — it spawns one Julia process per measurement. `--skip-tags slow`
 # drops it.
@@ -144,7 +150,7 @@ const MAX_BASELINE_SECONDS = 1.0
 
 const SHAPES = ["dict_any" => MAX_RATIO, "query_ext" => MAX_RATIO, "json_ext" => MAX_RATIO,
                 "formdata" => MAX_RATIO, "multipart" => MAX_RATIO,
-                "cookie_ext" => 2.5, "files_ext" => 2.5, "payload" => 2.5, "url" => 1.8]
+                "cookie_ext" => 3.5, "files_ext" => 3.5, "payload" => 3.5, "url" => 1.8]
 
 probe = joinpath(@__DIR__, ".helpers", "precompile_warmth_probe.jl")
 @test isfile(probe)
