@@ -8,7 +8,7 @@ using ...Core: getip, setip!, getpeerip, header_name_isequal
 using ...Types: Nullable, REQUEST_FORWARDED_PROTO_KEY
 using ...Errors: is_unrecoverable
 # Byte-safe header-value helpers: malformed UTF-8 must not turn into a 500 (see their comment).
-using ...Util: _ows_strip, _ascii_lower_eq, _is_tchar
+using ...Util: _ows_strip, _ascii_casefold_eq, _is_tchar
 
 export ExtractIP, extract_ip
 
@@ -348,10 +348,8 @@ end
 function _scheme_token(value::Nullable{AbstractString})::Nullable{String}
     value === nothing && return nothing
     token = _ows_strip(value)
-    all(isascii, token) || return nothing
-    token = lowercase(token)
-    (token == "https" || token == "wss") && return "https"
-    (token == "http"  || token == "ws")  && return "http"
+    (_ascii_casefold_eq(token, "https") || _ascii_casefold_eq(token, "wss")) && return "https"
+    (_ascii_casefold_eq(token, "http")  || _ascii_casefold_eq(token, "ws"))  && return "http"
     return nothing
 end
 
@@ -405,7 +403,7 @@ end
 function _forwarded_node(value::Nullable{AbstractString})::Nullable{IPAddr}
     value === nothing && return nothing
     v = _ows_strip(value)
-    (isempty(v) || startswith(v, '_') || _ascii_lower_eq(v, "unknown")) && return nothing
+    (isempty(v) || startswith(v, '_') || _ascii_casefold_eq(v, "unknown")) && return nothing
     return _try_parse_ip(_normalize_entry(v))
 end
 
@@ -477,11 +475,10 @@ function _forwarded_pair(s::String, a::Int, b::Int, for_::Nullable{SubString{Str
     value = _forwarded_value(_ows_strip(SubString(pair, nextind(pair, eq), lastindex(pair))))
     (isempty(name) || !all(_is_tchar, name) || value === nothing) &&
         return (false, for_, proto, nonblank)
-    key = lowercase(name)                           # ASCII: every char is a tchar
-    if key == "for"
+    if _ascii_casefold_eq(name, "for")              # ASCII: every char is a tchar
         for_ === nothing || return (false, for_, proto, nonblank)
         for_ = value
-    elseif key == "proto"
+    elseif _ascii_casefold_eq(name, "proto")
         proto === nothing || return (false, for_, proto, nonblank)
         proto = value
     end                                             # `by`, `host`, extensions: not read

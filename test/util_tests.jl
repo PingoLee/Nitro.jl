@@ -744,3 +744,69 @@ end
         @test UInt64(512) * 2^20 < hinted <= UInt64(2)^30
     end
 end
+
+@testitem "Header-name scans fold ASCII and allocate nothing per header (#542)" tags=[:core, :middleware] setup=[NitroCommon] begin
+using Nitro
+using HTTP
+using Test
+const U = Nitro.Core.Util
+const MW = Nitro.Core.Middleware
+const COP = MW.CrossOriginProtectionMiddleware
+const CSRF = MW.CSRFMiddleware_
+const XIP = MW.ExtractIPMiddleware
+
+# 15 headers, the looked-up ones late: every scan walks past most of the names first.
+hdrs = ["Host" => "a.example", "User-Agent" => "probe/1.0", "Accept" => "*/*",
+        "Accept-Language" => "en", "Accept-Encoding" => "gzip", "Connection" => "keep-alive",
+        "Cache-Control" => "no-cache", "Pragma" => "no-cache", "Referer" => "https://a.example/",
+        "Sec-Fetch-Dest" => "empty", "Sec-Fetch-Mode" => "cors", "DNT" => "1",
+        "sec-fetch-site" => "same-origin", "AUTHORIZATION" => "Bearer abc.def",
+        "x-forwarded-for" => "203.0.113.7"]
+req = HTTP.Request("POST", "/", hdrs, "")
+
+@testset "names match ASCII case-insensitively, and nothing looser" begin
+    @test U.header_name_isequal("Sec-Fetch-Site", "sec-fetch-site")
+    @test U.header_name_isequal("X-RATELIMIT-LIMIT", "X-RateLimit-Limit")
+    @test !U.header_name_isequal("Cookie", "Cookies")
+    # KELVIN SIGN lowercases to 'k', so `lowercase(a) == lowercase(b)` used to accept it.
+    @test !U.header_name_isequal("Key", "Key")
+    @test COP._single_header(req, "Sec-Fetch-Site") == "same-origin"
+    @test COP._single_header(req, "Origin") === nothing
+    @test CSRF._bearer_only(req)
+    @test XIP._header_value(req, "X-Forwarded-For", true) == "203.0.113.7"
+    res = HTTP.Response(200, ["SET-COOKIE" => "csrftoken=v; Path=/"])
+    @test CSRF._response_sets_cookie(res, "csrftoken")
+    @test !CSRF._response_sets_cookie(res, "csrf")             # a prefix of the name, not the name
+    @test !CSRF._response_sets_cookie(HTTP.Response(200, ["Set-Cookie" => "csrftoken"]), "csrftoken")
+    @test !CSRF._response_sets_cookie(HTTP.Response(200, ["X-Set-Cookie" => "csrftoken=v"]), "csrftoken")
+end
+
+@testset "ExtractIP's Forwarded tokens fold without lowercase" begin
+    @test XIP._scheme_token("HTTPS") == "https"
+    @test XIP._scheme_token(" WsS ") == "https"
+    @test XIP._scheme_token("Http") == "http"
+    @test XIP._scheme_token("ftp") === nothing
+    @test XIP._scheme_token("httpé") === nothing
+    @test XIP._forwarded_node("UNKNOWN") === nothing
+    ok, for_, proto, _ = XIP._forwarded_pair("FOR=192.0.2.1", 1, 13, nothing, nothing, false)
+    @test ok && for_ == "192.0.2.1" && proto === nothing
+    ok, for_, proto, _ = XIP._forwarded_pair("Proto=https", 1, 11, nothing, nothing, false)
+    @test ok && for_ === nothing && proto == "https"
+end
+
+@testset "a scan costs what its result costs, not a String per header" begin
+    # `lowercase` was 7 allocations per call, so each of these walks cost ~100-200 allocations on
+    # this request. The positive control does exactly that walk and must break the bound.
+    # `r`, a local: a closure over the untyped testitem global would allocate on its own.
+    @testset let r = req,
+                 single = allocs(() -> COP._single_header(r, "Origin")),
+                 bearer = allocs(() -> CSRF._bearer_only(r)),
+                 forwarded = allocs(() -> XIP._header_value(r, "X-Forwarded-Proto", false)),
+                 lowercasing = allocs(() -> count(h -> lowercase(h.first) == "origin", r.headers))
+        @test single.count <= 2
+        @test bearer.count <= 2
+        @test forwarded.count <= 2
+        @test lowercasing.count > 2
+    end
+end
+end

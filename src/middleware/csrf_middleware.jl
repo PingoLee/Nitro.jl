@@ -483,9 +483,12 @@ that shadows it — `set_cookie!` appends, and the browser takes the last one, s
 end up holding a token that does not match what the handler told it to send.
 """
 function _response_sets_cookie(res::HTTP.Response, cookie_name::String)
-    prefix = cookie_name * "="
-    for header in res.headers
-        lowercase(header.first) == "set-cookie" && startswith(header.second, prefix) && return true
+    n = ncodeunits(cookie_name)
+    for (name, value) in res.headers
+        header_name_isequal(name, "Set-Cookie") || continue
+        # `startswith(value, cookie_name * "=")`, without building the prefix per call (#542)
+        startswith(value, cookie_name) && ncodeunits(value) > n && codeunit(value, n + 1) == UInt8('=') &&
+            return true
     end
     return false
 end
