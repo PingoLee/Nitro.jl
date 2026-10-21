@@ -1366,6 +1366,72 @@ end
 end
 end
 
+@testitem "A wide table of sibling routes is binary-searched, same answers as upstream (#559)" tags=[:core] setup=[NitroCommon] begin
+using Test
+using HTTP
+using Random
+using Nitro.Core.RouterHOF: _gethandler, _exact_child, EXACT_SCAN_MAX
+
+# Siblings that sort close together byte by byte: shared prefixes, a prefix of another sibling,
+# lengths 1 to 4, non-ASCII, and bytes >= 0x80 that are not valid UTF-8 on their own.
+const SIBLINGS = unique(vcat(
+    ["r$(lpad(i, 3, '0'))" for i in 1:300],
+    ["r", "r0", "r00", "r1", "a", "ab", "abc", "b", "z", "Z", "é", "éa", "e", "f", "~", "-x",
+     "\xff", "\xffa", "\xc3"],
+))
+const PROBES = vcat(SIBLINGS, ["r301", "r0000", "", "rr", "é\xff", "aa", "ac", "A", "zz"])
+
+function wide_router(order)
+    r = HTTP.Router()
+    for s in order
+        HTTP.register!(r, "GET", "/api/$s", req -> s)
+        HTTP.register!(r, "GET", "/api/$s/{id}", req -> "$s/{id}")
+    end
+    return r
+end
+
+@testset "every sibling and every near miss resolves as upstream resolves it" begin
+    # Registration order must not matter: upstream re-sorts on insert.
+    for order in (SIBLINGS, reverse(SIBLINGS), shuffle(Random.Xoshiro(559), SIBLINGS))
+        r = wide_router(order)
+        for s in PROBES, tail in ("", "/42"), m in ("GET", "POST")
+            req = HTTP.Request(m, "/api/$s$tail")
+            want = HTTP.Handlers.gethandler(r, req)
+            got = _gethandler(r, req)
+            @test (s, tail, m, got[1] === want[1], got[2], got[3]) == (s, tail, m, true, want[2], want[3])
+        end
+    end
+end
+
+@testset "the search finds every sibling itself, not by falling back" begin
+    # Every width either side of the scan/search switch, and the wide table.
+    for n in vcat(0:(EXACT_SCAN_MAX + 3), length(SIBLINGS))
+        held = SIBLINGS[1:n]
+        api = n == 0 ? HTTP.Handlers.Node[] : only(wide_router(held).routes.exact).exact
+        for s in PROBES
+            child = _exact_child(api, SubString(s))
+            @test (n, s, child === nothing ? nothing : child.segment) ==
+                  (n, s, s in held ? s : nothing)
+        end
+    end
+end
+
+# The order is upstream's, not Nitro's. If a release stopped keeping it, the search may miss a
+# sibling it holds, and a miss is a request upstream resolves: slower, never a wrong route.
+@testset "with the order broken, every answer is still upstream's" begin
+    r = wide_router(SIBLINGS)
+    api = only(r.routes.exact)
+    shuffle!(Random.Xoshiro(1), api.exact)
+    @test !issorted(api.exact; by = n -> codeunits(n.segment))
+    for s in PROBES, tail in ("", "/42")
+        req = HTTP.Request("GET", "/api/$s$tail")
+        want = HTTP.Handlers.gethandler(r, req)
+        got = _gethandler(r, req)
+        @test (s, tail, got[1] === want[1], got[2], got[3]) == (s, tail, true, want[2], want[3])
+    end
+end
+end
+
 @testitem "Path params with nothing to decode reuse the router's map (#558)" tags=[:core] setup=[NitroCommon] begin
 using Test
 using HTTP

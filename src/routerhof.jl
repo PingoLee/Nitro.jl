@@ -38,6 +38,9 @@ const EMPTY_PARAMS = HTTP.Handlers.Params()
 # "which leaf of THIS node serves `m`", which is upstream's terminal step verbatim.
 const NO_SEGMENTS = SubString{String}[]
 
+# Up to this many exact children, `_exact_child` scans; past it, it binary-searches (#559).
+const EXACT_SCAN_MAX = 8
+
 """
     _gethandler(r::HTTP.Router, req) -> (handler, route, params)
 
@@ -64,8 +67,8 @@ it had before.
 router will match, which is why the fast path sees nearly every request. It does not depend on
 that for correctness: a target it declines is one upstream resolves instead.
 
-Reads the `Node.exact`/`Node.segment` fields and `match`, all canaried in
-test/http_internals_contract_tests.jl.
+Reads the `Node.exact`/`Node.segment` fields and `match`, and binary-searches `Node.exact` on the
+order upstream keeps it in (#559), all canaried in test/http_internals_contract_tests.jl.
 """
 function _gethandler(r::HTTP.Router, req::HTTP.Request)
     leaf = _exact_leaf(r.routes, req.method, req.target)
@@ -83,21 +86,47 @@ function _exact_leaf(root::HTTP.Handlers.Node, method::String, target::String)
     while i <= last
         stop = something(findnext(==('/'), target, i), last + 1)
         if stop > i
-            segment = SubString(target, i, prevind(target, stop))
-            child = nothing
-            for c in node.exact
-                if c.segment == segment
-                    child = c
-                    break
-                end
-            end
+            child = _exact_child(node.exact, SubString(target, i, prevind(target, stop)))
             child === nothing && return nothing
-            node = child::HTTP.Handlers.Node
+            node = child
         end
         i = stop + 1
     end
     leaf = HTTP.Handlers.match(node, method, NO_SEGMENTS, 1)
     return leaf isa HTTP.Handlers.Leaf ? leaf : nothing
+end
+
+# The exact child whose segment is `segment`, or `nothing`. Upstream `insert!` re-sorts
+# `node.exact` by segment after every insert, but its own `find` still scans it, so the last of
+# 500 sibling routes cost 2 µs against 61 ns for the first (#559); a binary search makes the
+# width logarithmic. The comparison is bytewise, the order `isless(::String, ::String)` sorts by.
+# Should that order ever break, the search can only miss, never pick a wrong node, and a miss is
+# a request upstream resolves: slower, never wrong. A node with a few children, the common
+# shape, keeps the plain scan, which is cheaper there than the search's `memcmp`s.
+function _exact_child(exact::Vector{HTTP.Handlers.Node}, segment::SubString{String})
+    if length(exact) <= EXACT_SCAN_MAX
+        for child in exact
+            child.segment == segment && return child
+        end
+        return nothing
+    end
+    lo, hi = 1, length(exact)
+    while lo <= hi
+        mid = (lo + hi) >>> 1
+        child = exact[mid]
+        order = _bytecmp(child.segment::String, segment)
+        order == 0 && return child
+        order < 0 ? (lo = mid + 1) : (hi = mid - 1)
+    end
+    return nothing
+end
+
+# `cmp` by bytes, then by length: what `cmp(::String, ::String)` computes.
+function _bytecmp(a::String, b::SubString{String})
+    na, nb = ncodeunits(a), ncodeunits(b)
+    c = GC.@preserve a b ccall(:memcmp, Cint, (Ptr{UInt8}, Ptr{UInt8}, Csize_t),
+                               pointer(a), pointer(b), min(na, nb))
+    return c == 0 ? cmp(na, nb) : Int(sign(c))
 end
 
 # "This slot carries at least one middleware." Both registrars gate on this rather than on
