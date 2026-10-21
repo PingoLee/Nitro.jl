@@ -83,3 +83,49 @@ script = """
 
 @test run_child(joinpath(example, "AuthHost"), script)
 end
+
+@testitem "examples/worker_package -- both projects resolve, pass their tests and serve (#675)" tags=[:core, :slow, :network, :workers] setup=[NitroCommon, ExampleHarness] begin
+using Test
+
+example = copy_example("worker_package", ("ReportKit", "ReportHost"))
+
+script = """
+    using Pkg
+    Pkg.instantiate()
+
+    using ReportKit, ReportHost, HTTP, Nitro, Sockets, Test
+    include(joinpath(pkgdir(ReportKit), "test", "runtests.jl"))
+    include(joinpath(pkgdir(ReportHost), "test", "runtests.jl"))
+
+    # And `main()` boots on a real port: its worker runtime runs a report submitted over HTTP.
+    server = Sockets.listen(Sockets.localhost, 0)
+    port = Int(Sockets.getsockname(server)[2])
+    close(server)
+    ENV["PORT"] = string(port)
+    ENV["ALICE_TOKEN"] = "alice-token"
+    ENV["BOB_TOKEN"] = "bob-token"
+    ReportHost.main(; host = "127.0.0.1", async = true, show_banner = false, access_log = nothing)
+    try
+        base = "http://127.0.0.1:\$port"
+        alice = ["Authorization" => "Bearer alice-token"]
+        r = HTTP.post("\$base/api/reports", ["Content-Type" => "application/json", alice...],
+                      "{\\"title\\": \\"totals\\", \\"rows\\": 100}"; retry = false, status_exception = false)
+        r.status == 202 || error("the submit answered \$(r.status)")
+        status_url = base * Nitro.json(r)["status_url"]
+        deadline = time() + 60
+        report = Nitro.json(HTTP.get(status_url, alice; retry = false, status_exception = false))
+        while report["status"] in ("PENDING", "RUNNING") && time() < deadline
+            sleep(0.05)
+            report = Nitro.json(HTTP.get(status_url, alice; retry = false, status_exception = false))
+        end
+        report["status"] == "COMPLETED" || error("the report ended \$(report["status"])")
+        report["result"]["total"] == 5050 || error("unexpected result: \$(report["result"])")
+        r = HTTP.get(status_url, ["Authorization" => "Bearer bob-token"]; retry = false, status_exception = false)
+        r.status == 404 || error("bob reading alice's report answered \$(r.status)")
+    finally
+        terminate(ReportHost.app)
+    end
+    """
+
+@test run_child(joinpath(example, "ReportHost"), script)
+end

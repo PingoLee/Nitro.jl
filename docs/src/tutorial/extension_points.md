@@ -95,7 +95,10 @@ chose `/products`, and neither had to know the other's decision. Registration ha
 
     The same shape carries further packages beside it:
     [`examples/auth_package`](https://github.com/PingoLee/Nitro.jl/tree/main/examples/auth_package)
-    ships login, logout and the token middleware a host guards its own routes with.
+    ships login, logout and the token middleware a host guards its own routes with, and
+    [`examples/worker_package`](https://github.com/PingoLee/Nitro.jl/tree/main/examples/worker_package)
+    ships a background job and the routes that queue and poll it, on a worker runtime the host
+    starts.
 
 ### Composing several packages
 
