@@ -419,12 +419,9 @@ function _run_attempts!(runtime::WorkerRuntime, task_info::TaskInfo, callback::F
             # Cancellation-aware backoff. The catch above checks CANCELLED before sleeping and
             # never after, and the interrupt that used to abort this sleep is gone (#127) -- so a
             # cancel landing inside a 2/4/8s window re-invoked the user callback on a task that was
-            # already cancelled. Polling the token instead of sleeping blind also cuts cancellation
-            # latency during a backoff from seconds to milliseconds.
-            deadline = time() + 2.0 ^ (retry_count + 1)
-            while time() < deadline && !cancel_requested(task_info)
-                sleep(0.05)
-            end
+            # already cancelled. The wait ends at the deadline or when the token is set, whichever
+            # comes first. It parks rather than polls (#568).
+            _backoff_wait(task_info, 2.0 ^ (retry_count + 1))
 
             # The token is process-local, so a cancel issued on another node sets nothing here. One
             # durable read per ATTEMPT (not per poll) covers that without a round-trip every 50ms.
@@ -439,6 +436,25 @@ function _run_attempts!(runtime::WorkerRuntime, task_info::TaskInfo, callback::F
     end
 
     return task_info
+end
+
+# Park for `seconds`, or until `task_info`'s cancellation token is set (#568). This used to poll the
+# token every 50 ms, twenty wake-ups a second per run backing off, for up to 14 s per run at the
+# default retries. Now it parks once on an `Event` woken by a `Timer` at the deadline and by
+# `_request_cancel!` through `cancel_waker` (see that field for why a cancel cannot slip between
+# the publish and the wait).
+function _backoff_wait(task_info::TaskInfo, seconds::Float64)
+    cancel_requested(task_info) && return nothing
+    woken = Base.Event()
+    @atomic task_info.cancel_waker = woken
+    timer = Timer(_ -> notify(woken), seconds)
+    try
+        cancel_requested(task_info) || wait(woken)
+    finally
+        close(timer)
+        @atomic task_info.cancel_waker = nothing
+    end
+    return nothing
 end
 
 # Top `queue_name`'s processors back up to its concurrency, and return the queue.
@@ -501,9 +517,7 @@ function _spawn_queue_processor(runtime::WorkerRuntime, queue::WorkerQueue, queu
                 # other.
                 if _abandoned_saturated(runtime)
                     lock(() -> push!(queue.held, item), qlock)
-                    while _abandoned_saturated(runtime) && !(@atomic queue.draining)
-                        sleep(0.05)
-                    end
+                    _await_unsaturated(runtime, queue)
                     lock(qlock) do
                         i = findfirst(x -> x === item, queue.held)
                         i === nothing || deleteat!(queue.held, i)

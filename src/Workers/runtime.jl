@@ -81,6 +81,7 @@ data and the tenant, so two runtimes over one store correctly share one security
 | `max_concurrent_runs` / `max_runs_per_owner` / `allow_undeclared_queues` | The limits above, fixed at construction |
 | `declared_queues` / `initial_queues` / `warned_queues` | The queue names a submit may use and each one's concurrency (under `queue_lock`), the constructor's declarations, which `reset_runtime!` restores, and the undeclared names already logged (bounded) |
 | `reservations` / `owner_runs` / `async_runs` / `abandoned_runs` / `reservation_lock` | One entry per live run, keyed by `run_id` and tagged `:async`, `:queued` or `:abandoned`, and the counts the limits read. `reservation_lock` is a leaf: nothing else is locked, and no store or app code runs, while it is held |
+| `abandoned_released` | A `Threads.Condition` on `reservation_lock` that a queue processor holding an item parks on while abandoned callbacks fill the cap, notified by whatever can end that hold (#568) |
 
 `active_task_infos` is the live-`TaskInfo` cache, and it lives here for **both** backends. It was
 previously a `PormGWorkerStore` field with no in-memory counterpart — the in-memory store answered
@@ -121,6 +122,7 @@ struct WorkerRuntime{S <: AbstractWorkerStore}
     async_runs::Base.RefValue{Int}       # :async + :abandoned -- what `max_concurrent_runs` admits against
     abandoned_runs::Base.RefValue{Int}   # :abandoned alone -- what holds the queues
     reservation_lock::ReentrantLock
+    abandoned_released::Threads.Condition   # on `reservation_lock`; see `_await_unsaturated`
 
     function WorkerRuntime(store::S;
                            max_concurrent_runs::Union{Nothing, Integer} = 64,
@@ -132,6 +134,7 @@ struct WorkerRuntime{S <: AbstractWorkerStore}
                 throw(ArgumentError("`$name` must be at least 1 or `nothing`, got $value"))
         end
         initial = _queue_specs(queues)
+        reservation_lock = ReentrantLock()
         return new{S}(
             store,
             Dict{String, WorkerQueue}(),
@@ -151,7 +154,8 @@ struct WorkerRuntime{S <: AbstractWorkerStore}
             Dict{String, Int}(),
             Ref(0),
             Ref(0),
-            ReentrantLock(),
+            reservation_lock,
+            Threads.Condition(reservation_lock),
         )
     end
 end
@@ -384,7 +388,10 @@ function _release_run!(runtime::WorkerRuntime, run_id::UUID)
         left = runtime.owner_runs[owner] - 1
         left <= 0 ? delete!(runtime.owner_runs, owner) : (runtime.owner_runs[owner] = left)
         kind === :queued || (runtime.async_runs[] -= 1)
-        kind === :abandoned && (runtime.abandoned_runs[] -= 1)
+        if kind === :abandoned
+            runtime.abandoned_runs[] -= 1
+            notify(runtime.abandoned_released)
+        end
         return true
     end
 end
@@ -432,6 +439,24 @@ function _abandoned_saturated(runtime::WorkerRuntime)
     cap = runtime.max_concurrent_runs
     cap === nothing && return false
     return lock(() -> runtime.abandoned_runs[] >= cap, runtime.reservation_lock)
+end
+
+# Park a queue processor until `_abandoned_saturated` clears or `queue` starts draining (#568). It
+# used to poll both every 50 ms, which is twenty wake-ups a second for as long as an abandoned
+# callback keeps its thread. Every write that can end the wait notifies `abandoned_released` under
+# `reservation_lock`: an abandoned run's release (`_release_run!`), a reset, and a teardown, which
+# sets `draining` first. `draining` is atomic and not under the lock, so it is re-read under the
+# lock on every wake; a teardown that set it after that read notifies only once it can take the
+# lock, which is after this task is already parked.
+function _await_unsaturated(runtime::WorkerRuntime, queue::WorkerQueue)
+    cap = runtime.max_concurrent_runs
+    cap === nothing && return nothing
+    lock(runtime.reservation_lock) do
+        while runtime.abandoned_runs[] >= cap && !(@atomic queue.draining)
+            wait(runtime.abandoned_released)
+        end
+    end
+    return nothing
 end
 
 function _release_capacity!(runtime::WorkerRuntime, queue::Union{Nothing, WorkerQueue}, run_id::UUID)
@@ -929,9 +954,10 @@ failure mode — so the outcome is whatever the run reaches on its own:
 | running its callback, which throws | `FAILED` with that message (or a retry, if one is left) |
 | **between retries**, parked in the cancellation-aware backoff | **`CANCELLED`**, error `"Cancelled by worker shutdown"` |
 
-That third row surprises people, so it is stated rather than implied: the retry backoff polls this
-very token, so a drain landing inside one ends the run as cancelled. Reaching a terminal state
-there is the useful behaviour — the alternative is a job that restarts during teardown.
+That third row surprises people, so it is stated rather than implied: setting this very token
+wakes a run parked in the retry backoff, so a drain landing inside one ends the run as cancelled.
+Reaching a terminal state there is the useful behaviour — the alternative is a job that restarts
+during teardown.
 
 **The message names the shutdown, and that is new in #183.** The drain sets the token with
 reason `:shutdown` ([`CANCEL_REASONS`](@ref)) and `_cancel_task!` renders the stored text from it,
@@ -980,6 +1006,10 @@ function shutdown!(runtime::WorkerRuntime; drain_timeout::Real = WORKER_DRAIN_TI
         pending = Vector{QueueItem}()
         for queue in values(runtime.worker_queues)
             @atomic queue.draining = true
+            # A processor parked in `_await_unsaturated` re-reads `draining` only when woken
+            # (#568). Here, beside the write, so nothing later in this block can skip it.
+            # `reservation_lock` is a leaf, so taking it under `queue_lock` is allowed.
+            lock(() -> notify(runtime.abandoned_released), runtime.reservation_lock)
             if isopen(queue.channel)
                 close(queue.channel)
             end
@@ -1166,6 +1196,7 @@ function reset_runtime!(runtime::WorkerRuntime=default_runtime(); drain_timeout:
         empty!(runtime.owner_runs)
         runtime.async_runs[] = 0
         runtime.abandoned_runs[] = 0
+        notify(runtime.abandoned_released)
     end
     lock(runtime.queue_lock) do
         empty!(runtime.declared_queues)

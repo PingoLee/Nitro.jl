@@ -889,9 +889,9 @@ function set_task!(store::InMemoryWorkerStore, task_id::String, task_info::TaskI
         end
 
         # A different object: copy the volatile state across and keep the *stored*
-        # record's watchers, run_id, cancel_reason AND the claim fields (`external`,
-        # `claimed_by`, `lease_expires_at`, `attempt`, #514) and the named-job identity
-        # (`job_name`, `job_args`, #514) — precisely what the serializing
+        # record's watchers, run_id, cancel_reason (and its `cancel_waker`, #568) AND the claim
+        # fields (`external`, `claimed_by`, `lease_expires_at`, `attempt`, #514) and the named-job
+        # identity (`job_name`, `job_args`, #514) — precisely what the serializing
         # store achieves by omitting those columns. The list below is otherwise "copy every
         # field", so those absences ARE the rule.
         #

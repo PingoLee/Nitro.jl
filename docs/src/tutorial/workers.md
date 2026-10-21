@@ -626,9 +626,9 @@ so a drained run records whatever it reaches on its own:
 | running its callback, which throws | `FAILED` with that message (or a retry, if one is left) |
 | parked **between retries**, in the cancellation-aware backoff | `CANCELLED`, error `"Cancelled by worker shutdown"` |
 
-The third row is easy to miss: the retry backoff polls this same token, so a shutdown landing
-inside one ends the run as cancelled. Reaching a terminal state there is the useful outcome —
-better than a job restarting during teardown.
+The third row is easy to miss: setting this same token wakes a run parked in the retry
+backoff, so a shutdown landing inside one ends the run as cancelled. Reaching a terminal state
+there is the useful outcome — better than a job restarting during teardown.
 
 The error text names the shutdown, so alerting that treats `CANCELLED` as "a person did this" can
 filter on it. That is the same string on both submit paths, and `"Cancelled by user"` now means a

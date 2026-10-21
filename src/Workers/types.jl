@@ -257,6 +257,13 @@ mutable struct TaskInfo
     # caller object carrying `:none` would ERASE a cancel that had already been requested,
     # which is the #88 clobber with the sign flipped.
     @atomic cancel_reason::Symbol
+    # What a run parked on its own token waits on, or `nothing` (#568): the retry backoff
+    # (`_backoff_wait`) publishes one for as long as it sleeps, and `_request_cancel!` notifies it
+    # once it has set the token. Process-local like the token, never persisted, and not copied by
+    # `set_task!`. Both are `@atomic`, which is sequentially consistent: the waiter publishes, then
+    # re-reads the token; the canceller sets the token, then reads the waker. At least one of them
+    # sees the other, so a cancel cannot fall between the two and leave the backoff asleep.
+    @atomic cancel_waker::Union{Nothing, Base.Event}
 
     function TaskInfo(id::String; queue_name::Union{Nothing, String}=nothing, external::Bool=false,
                       job_name::Union{Nothing, String}=nothing, job_args::Union{Nothing, String}=nothing)
@@ -280,6 +287,7 @@ mutable struct TaskInfo
             job_name,
             job_args,
             :none,
+            nothing,
         )
     end
 end
@@ -409,6 +417,10 @@ const CANCEL_REASONS = (:user, :timeout, :superseded, :shutdown, :lease_lost)
 function _request_cancel!(task_info::TaskInfo, reason::Symbol)
     @assert reason in CANCEL_REASONS "unknown cancellation reason :$reason"
     _, won = @atomicreplace task_info.cancel_reason :none => reason
+    if won
+        waker = @atomic task_info.cancel_waker
+        waker === nothing || notify(waker)
+    end
     return won
 end
 
