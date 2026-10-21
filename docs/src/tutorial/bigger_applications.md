@@ -314,7 +314,7 @@ rewritten request still gets its new route's guards. See
 ### Global middleware
 
 ```julia
-serve(middleware=[SessionMiddleware(store=MemoryStore()), RateLimiter()])
+serve(app; middleware=[SessionMiddleware(store=MemoryStore()), RateLimiter()])
 ```
 
 ### Route-level middleware
@@ -357,7 +357,7 @@ api = include_routes("/api", [
     path("/products", ProductHandlers.create_product, method="POST"),
 ]; middleware=[BearerAuth(validator)])
 
-urlpatterns("", vcat(browser, api))
+urlpatterns(app, "", vcat(browser, api))
 ```
 
 A `POST /login` meets `SessionMiddleware`, then `CSRFMiddleware`, then its handler. `GET /account`
@@ -410,10 +410,13 @@ handler — for example, to reuse validation logic or chain computations:
 
 ```julia
 using HTTP
+import ..app   # the handle src/MyApp.jl defines before it includes the handlers
 
 function process_and_fetch(req::HTTP.Request, id::Int)
-    # call another endpoint inside the same server
-    inner = internalrequest(HTTP.Request("GET", "/api/products/$id"))
+    # call another endpoint inside the same server. `/api/products` sits behind the `api`
+    # group's BearerAuth above, which still runs, so pass the caller's credentials along.
+    inner = internalrequest(app, HTTP.Request("GET", "/api/products/$id",
+                                              ["Authorization" => HTTP.header(req, "Authorization", "")]))
     data  = JSON3.read(inner.body)
     # ... further processing
     return Res.json(data)
@@ -422,8 +425,8 @@ end
 
 !!! warning "An internal request skips your global middleware"
     `internalrequest` runs only the middleware you pass to that call, not the global list given
-    to `serve(middleware = …)`. Authentication, sessions, CSRF and rate limiting installed
-    globally do not apply to it. Route and router middleware still run. Unless the request
+    to `serve(app; middleware = …)`. Authentication, sessions, CSRF and rate limiting installed
+    globally do not apply to it. Group and route middleware still run. Unless the request
     already carries a client IP, it is `127.0.0.1`.
 
     Build the target yourself, as above, from values you have already validated (`id` is an

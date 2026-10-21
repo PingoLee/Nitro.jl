@@ -1,0 +1,22 @@
+name = "AuthHost"
+uuid = "1af7aa85-9033-48d4-bd8e-0424a10acc04"
+authors = ["Nitro.jl Contributors"]
+version = "0.1.0"
+
+[deps]
+AuthKit = "3c620143-20b7-48d2-abd3-01c9ffabe142"
+HTTP = "cd3eb016-35fb-5094-929b-558a96fad6f3"
+Nitro = "e5efdb2c-68ee-4494-894d-55bb80f0a340"
+
+[sources]
+AuthKit = {path = "../AuthKit"}
+Nitro = {path = "../../.."}
+
+[compat]
+julia = "1.12"
+
+[extras]
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+[targets]
+test = ["Test"]

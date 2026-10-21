@@ -531,3 +531,71 @@ function _W.claim_next!(s::SharedStore, queue::String, consumer::String; kw...)
 end
 
 end # module SharedClaimStore
+
+# ── The example tree's rot guard (test/examples_tests.jl) ──
+#
+# An example only stays right if something runs it. Each item in test/examples_tests.jl runs one
+# example in a copy of it, so instantiating writes no Manifest.toml into the checkout. The copy's
+# `[sources]` point Nitro at this checkout by an absolute path; the relative paths between an
+# example's own projects hold inside the copy.
+#
+# One child per example, in its host project's environment, which resolves the example's other
+# projects and Nitro through those sources: one resolve and one precompile, and every project's
+# tests `include`d rather than run through `Pkg.test`, whose sandboxes would each resolve and
+# precompile again and could outrun the suite's per-item ceiling. The trade: a package project's
+# own `[targets]` are not resolved standalone, as the README's per-project `Pkg.test()` does.
+# The child's `JULIA_LOAD_PATH` is pinned so this test environment cannot leak into what it
+# resolves; `@stdlib` is what supplies `Test`.
+@testsetup module ExampleHarness
+using Test
+using Nitro
+using Pkg: TOML
+
+export copy_example, run_child
+
+"""
+    copy_example(name, projects) -> String
+
+Copy `examples/<name>` to a temporary directory, drop any Manifest.toml a local run left, and
+point each project's Nitro source at this checkout. Returns the copy's path.
+"""
+function copy_example(name::String, projects)
+    checkout = pkgdir(Nitro)
+    example = joinpath(mktempdir(), name)
+    cp(joinpath(checkout, "examples", name), example)
+    for project in projects
+        dir = joinpath(example, project)
+        rm(joinpath(dir, "Manifest.toml"); force = true)
+        file = joinpath(dir, "Project.toml")
+        p = TOML.parsefile(file)
+        @test p["sources"]["Nitro"] == Dict("path" => "../../..")   # the example tracks its checkout
+        p["sources"]["Nitro"] = Dict("path" => checkout)
+        open(io -> TOML.print(io, p), file, "w")
+    end
+    return example
+end
+
+"""
+    run_child(root, script; timeout = 540) -> Bool
+
+Run `script` in a fresh Julia whose project is `root`, and print its log when it fails. The
+default timeout sits below the suite's 600 s per-item ceiling, so a hung child is killed and its
+log printed here rather than the whole item being cut off with nothing to read.
+"""
+function run_child(root::String, script::String; timeout::Real = 540)
+    logfile = joinpath(mktempdir(), "child.log")
+    cmd = addenv(Cmd(`$(Base.julia_cmd()) --project=$root -e $script`; dir = root),
+                 "JULIA_LOAD_PATH" => join(["@", "@stdlib"], Sys.iswindows() ? ';' : ':'),
+                 "JULIA_PROJECT" => nothing)
+    proc = open(logfile, "w") do log
+        run(pipeline(cmd; stdout = log, stderr = log); wait = false)
+    end
+    if timedwait(() -> process_exited(proc), timeout) === :timed_out
+        kill(proc)
+        wait(proc)
+    end
+    ok = success(proc)
+    ok || println(read(logfile, String))
+    return ok
+end
+end # module ExampleHarness

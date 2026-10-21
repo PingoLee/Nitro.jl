@@ -1,0 +1,22 @@
+name = "ReportHost"
+uuid = "1b95b9bd-cf7a-4df5-acba-7aaaaf9ea7dd"
+authors = ["Nitro.jl Contributors"]
+version = "0.1.0"
+
+[deps]
+HTTP = "cd3eb016-35fb-5094-929b-558a96fad6f3"
+Nitro = "e5efdb2c-68ee-4494-894d-55bb80f0a340"
+ReportKit = "7510d9b3-7050-4fef-b0bd-ac7dba2e74f8"
+
+[sources]
+Nitro = {path = "../../.."}
+ReportKit = {path = "../ReportKit"}
+
+[compat]
+julia = "1.12"
+
+[extras]
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+[targets]
+test = ["Test"]
