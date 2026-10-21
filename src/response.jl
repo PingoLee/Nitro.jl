@@ -380,7 +380,10 @@ function file(req::HTTP.Request, path::String; headers::Vector=NO_HEADERS, filen
         throw(ArgumentError("Res.file: `stream=true` and `etag=:strong` are mutually exclusive — a strong tag hashes the whole body, which is what streaming avoids. Use `:weak_stat`, or pass a tag you computed yourself"))
     end
 
-    extra = Vector{Pair{String,String}}()
+    # An `HTTP.Headers`, which `servecontent`'s `mkheaders` takes as is: a `Vector` of pairs would
+    # be converted into one first (#549). Built per call, never shared — `servecontent` copies it
+    # today, but that is its business, not a contract to lean on.
+    extra = HTTP.Headers(2)
     if !isnothing(cache_control)
         push!(extra, "Cache-Control" => String(cache_control))
     end
@@ -393,11 +396,13 @@ function file(req::HTTP.Request, path::String; headers::Vector=NO_HEADERS, filen
             content_disposition(resolved_filename, something(wanted, "attachment")))
     end
 
+    # No `name =` below: `servecontent` reads it only when `content_type` is missing, and
+    # `file_content_type` always returns one (#549).
     if stream
         io = open(path, "r")
         try
             tag, modtime = file_validators(path; etag = etag)
-            resp = HTTP.servecontent(req, io; name = basename(path), modtime = modtime,
+            resp = HTTP.servecontent(req, io; modtime = modtime,
                                      content_type = file_content_type(path), etag = tag,
                                      headers = extra, allow_ranges = allow_ranges)
             adopt_stream_io!(resp, io)
@@ -413,7 +418,7 @@ function file(req::HTTP.Request, path::String; headers::Vector=NO_HEADERS, filen
     # When `loadfile` decided the body, the file's own size is not the body's size, so the
     # validators must describe what is being sent (#92's rule, one layer up).
     tag, modtime = file_validators(path; etag = etag, bytes = source)
-    resp = HTTP.servecontent(req, source; name = basename(path), modtime = modtime,
+    resp = HTTP.servecontent(req, source; modtime = modtime,
                              content_type = file_content_type(path), etag = tag,
                              headers = extra, allow_ranges = allow_ranges)
     return apply_headers!(resp, headers)

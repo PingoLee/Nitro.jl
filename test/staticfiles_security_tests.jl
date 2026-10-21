@@ -991,6 +991,41 @@ end
     end
 end
 
+@testset "a warm :eager hit adds nothing of its own to servecontent (#549)" begin
+    C = Nitro.Core
+    mktempdir() do dir
+        p = joinpath(dir, "a.weird")          # an extension no MIME table knows
+        write(p, repeat("a", 2048))
+        policy = C.MountPolicy(:eager, C.MOUNT_STREAM_THRESHOLD, C.MOUNT_CACHE_MAX_BYTES, :weak_stat)
+        mf = C.MountedFile(p, policy; loadfile = nothing)
+        req = HTTP.Request("GET", "/static/a.weird")
+        none = Any[]
+        for cc in (nothing, "public, max-age=60")
+            # What every hit did before #549: a `basename` for `servecontent`'s `name`, which it
+            # reads only when no `content_type` is given, and a `Vector` it converts to `Headers`.
+            before() = HTTP.servecontent(req, mf.bytes; name = basename(mf.path), modtime = mf.modtime,
+                                         content_type = mf.content_type, etag = mf.etag,
+                                         headers = cc === nothing ? Pair{String,String}[] :
+                                                   Pair{String,String}["Cache-Control" => cc])
+            ours() = C._serve_mounted(req, mf, policy, nothing, none, nothing, cc)
+            # Same response: the type still comes from the mount, not from the name.
+            @test ours().headers.entries == before().headers.entries
+            @test HTTP.header(ours(), "Content-Type") == "application/octet-stream"
+            @testset let ours = allocs(ours; calls = 1000), before = allocs(before; calls = 1000)
+                @test ours.count + 8 <= before.count
+            end
+        end
+
+        # `Res.file(req, path)` dropped the same `name`; its type is still the path's.
+        resp = Res.file(req, p)
+        @test HTTP.header(resp, "Content-Type") == "application/octet-stream"
+        # Both default to `:weak_stat`, so the mount's frozen validators are this call's too.
+        @test resp.headers.entries ==
+              HTTP.servecontent(req, read(p); name = basename(p), modtime = mf.modtime,
+                                content_type = "application/octet-stream", etag = mf.etag).headers.entries
+    end
+end
+
 @testset "the SPA fallback carries validators, like the file it serves" begin
     # The history fallback is an SPA server's hottest path. It used to re-`read` index.html per
     # request and emit no validators at all, so every deep link cost a full body (#40).
