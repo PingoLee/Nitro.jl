@@ -137,7 +137,7 @@ end
 Pass it wherever middleware is accepted:
 
 ```julia
-serve(middleware = [TraceRequests])
+serve(app; middleware = [TraceRequests])
 ```
 
 ### Configurable middleware
@@ -155,7 +155,7 @@ list accepts either form. Only code that composes a middleware **by hand** has t
 request function is then the `.middleware` field, not the value itself.
 
 ```julia
-serve(middleware = [SessionMiddleware(store = store)])          # either form works here
+serve(app; middleware = [SessionMiddleware(store = store)])     # either form works here
 wrapped = SessionMiddleware(store = store).middleware(handler)  # composing by hand
 ```
 
@@ -191,11 +191,11 @@ pass it `unauthorized = (req, reason) -> …` instead; see
 ### Execution order
 
 Every middleware list runs **top-down**: the first entry is outermost, sees the request first, and
-therefore sees the response last. That holds for the global list, a `router(...; middleware)`
-list and a `path(...; middleware)` list alike.
+therefore sees the response last. That holds for the global list, an
+`include_routes(...; middleware)` group list and a `path(...; middleware)` list alike.
 
 ```julia
-serve(middleware = [A, B])
+serve(app; middleware = [A, B])
 # A before  →  B before  →  handler  →  B after  →  A after
 
 path("/admin", handler; middleware = [BearerAuth(validator), GuardMiddleware(login_required())])
@@ -205,14 +205,14 @@ path("/admin", handler; middleware = [BearerAuth(validator), GuardMiddleware(log
 The full nesting, outermost to innermost, is:
 
 ```
-global middleware  →  router middleware  →  route middleware  →  handler
+global middleware  →  group middleware (outer group first)  →  route middleware  →  handler
 ```
 
-So a guard placed on a *router* runs before an auth layer placed on one of its *routes*.
+So a guard placed on a *group* runs before an auth layer placed on one of its *routes*.
 Authenticate at the same level as the guard, or at an outer one.
 
-!!! note "Route and router lists ran bottom-up before #312"
-    Before that fix, only the global list ran top-down. A route or router list ran in reverse,
+!!! note "Route lists ran bottom-up before #312"
+    Before that fix, only the global list ran top-down. A per-route list ran in reverse,
     so `[BearerAuth(v), GuardMiddleware(...)]` checked its guards before authenticating. If you
     reversed a list to work around that, put it back in the order you mean.
 
@@ -237,14 +237,14 @@ the client sent it.
 
 That makes `startswith(req.target, "/files/private/")` hold for a directory inside a mount, not
 only for the literal segments of a route. Write the prefix you test in canonical form too:
-`"/caf%C3%A9/"`, not `"/caf%c3%a9/"` or `"/café/"`. Guards on the route or router are still the
+`"/caf%C3%A9/"`, not `"/caf%c3%a9/"` or `"/café/"`. Guards on the route or its group are still the
 better place to authorize: they run on the route that was actually matched, not on a URL pattern
 that has to be kept in step with `urlpatterns`.
 
 ### Rewriting the method or the target
 
-The route, and with it the router and route middleware, is chosen **after** global middleware
-runs and **before** router middleware runs. A layer that rewrites `req.method` or `req.target`
+The route, and with it the group and route middleware, is chosen **after** global middleware
+runs and **before** group middleware runs. A layer that rewrites `req.method` or `req.target`
 therefore belongs in the global list. An `X-HTTP-Method-Override` layer, a legacy path alias
 and a locale prefix are the usual cases. From there the rewritten request gets the new route's
 own middleware and guards:
@@ -270,11 +270,11 @@ Order inside the global list still matters. A global layer listed *before* the r
 decision on the original request: `CSRFMiddleware` skips its check for `GET`, so a `GET`
 rewritten into a `DELETE` after it has already passed.
 
-A router- or route-level layer runs after the route was chosen, and after every global layer. If
+A group- or route-level layer runs after the route was chosen, and after every global layer. If
 it rewrites the request onto a route with **different** middleware, Nitro refuses the request
 with a `500` and logs an error naming both routes, because serving it would skip the new route's
 guards. A rewrite that stays on the same route is served, and so is one onto a route that has no
-router or route middleware. Stripping a trailing slash and mapping `HEAD` onto its `GET` are both
+group or route middleware. Stripping a trailing slash and mapping `HEAD` onto its `GET` are both
 fine. The global layers still ran on the original request, which is one more reason to put the
 rewrite in the global list.
 
