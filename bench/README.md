@@ -139,6 +139,8 @@ julia bench/socket/probe_report.jl bench/results/fairness-<stamp>-raw  # the PRO
   The Nitro modes also serve `/query?id=7&name=bench`, which binds a `Query{T}` of a `@kwdef`
   struct and answers `name`, so typed binding is measurable beside `/plaintext` (#537):
   `ROUTES="/plaintext /json /query?id=7&name=bench" bench/socket/run.sh`.
+  `/links` answers 20 links reversed with `url(app, "item"; id = i)`, and `/links_prebuilt` the
+  same body printed by hand, so the gap between them is `url` alone (#557).
   `WORKERS=1` adds `/burst?n=K` to the Nitro modes, which submits K Workers jobs that each burn
   `JOB_MS` (default 500), and `/cpu_job`, which submits one `/cpu` of work to a queue of
   concurrency `BURST_K` and answers `202` (a full queue answers `503`); `/jobs` counts the
