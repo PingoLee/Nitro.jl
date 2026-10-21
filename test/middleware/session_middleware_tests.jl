@@ -142,6 +142,13 @@ using Nitro.Core.Cookies: storesession!, prunesessions!
         res = writing(two_lines)(HTTP.Request("GET", "/"))
         @test headers_of(res, "Cache-Control") == ["private, max-age=60, immutable"]
 
+        # A `private` inside a quoted argument is not the directive, and a qualified `private="…"`
+        # still lets a shared cache store the cookie (#697).
+        res = writing(["Cache-Control" => "public, no-cache=\"a, private, b\""])(HTTP.Request("GET", "/"))
+        @test headers_of(res, "Cache-Control") == ["private, no-cache=\"a, private, b\""]
+        res = writing(["Cache-Control" => "public, private=\"X-Debug\", max-age=60"])(HTTP.Request("GET", "/"))
+        @test headers_of(res, "Cache-Control") == ["private, max-age=60"]
+
         # The rotation path too: a handler-driven `regenerate_session!` on an existing session.
         sid0 = String(match(r"cache_session=([^;]+)",
                             HTTP.header(writing(Pair{String,String}[])(HTTP.Request("GET", "/")), "Set-Cookie")).captures[1])
@@ -1943,7 +1950,9 @@ marked(headers...) = [string(k, ": ", v) for (k, v) in _mark_private!(HTTP.Respo
     @test marked("Cache-Control" => " , ,") == ["Cache-Control: private", "Vary: Cookie"]
     @test marked("Cache-Control" => "no-cache=\"a, b\", public") == ["Cache-Control: private, no-cache=\"a, b\"", "Vary: Cookie"]
     @test marked("Cache-Control" => "Public=1") == ["Cache-Control: private", "Vary: Cookie"]
-    @test marked("Cache-Control" => "private=\"x\"") == ["Cache-Control: private=\"x\"", "Vary: Cookie"]
+    # Not what main wrote: a qualified `private="x"` withholds only the named field from a shared
+    # cache (RFC 9111 §5.2.2.7), so it is no longer read as private already (#697).
+    @test marked("Cache-Control" => "private=\"x\"") == ["Cache-Control: private", "Vary: Cookie"]
     # Several Cache-Control lines collapse into one `private` line in order (`setheader`).
     response = HTTP.Response(200, ["Cache-Control" => "max-age=0"])
     push!(response.headers, "X-Other" => "1", "cache-control" => "Public , s-maxage=5")
@@ -1975,6 +1984,69 @@ end
                                               ["Content-Type" => "text/plain", "Content-Length" => "5", "Date" => "x", "X-Request-Id" => "y"]))
         @test mark.count - fresh.count <= 4
         @test control.count > 4 + 1
+    end
+end
+end
+
+# #697: `_mark_private!` split each `Cache-Control` line on every `,`, quotes or not, so a quoted
+# field-name list holding `private` (`no-cache="a, private, b"`) read as the `private` directive:
+# the response kept `public` and a shared cache could store one visitor's `Set-Cookie`.
+@testitem "_mark_private! reads quoted Cache-Control arguments (#697)" tags=[:middleware] setup=[NitroCommon] begin
+using Nitro
+using HTTP
+using Test
+using Nitro.Util: _mark_private!
+
+cache_control(value) = HTTP.header(_mark_private!(HTTP.Response(200, ["Cache-Control" => value])), "Cache-Control")
+
+@testset "a comma inside a quoted argument does not end the directive" begin
+    # The issue's case: `public` goes, `private` comes first, and the argument is kept intact.
+    @test cache_control("public, no-cache=\"a, private, b\"") == "private, no-cache=\"a, private, b\""
+    # A quoted `public` is a field name, not the directive, so the argument is kept as it came.
+    # The split on every `,` dropped it from the middle of the list: `no-cache="a, b"`.
+    @test cache_control("no-cache=\"a, public, b\", max-age=5") == "private, no-cache=\"a, public, b\", max-age=5"
+    # An escaped quote does not close the string, so `private` is still inside it. A reader that
+    # ignored the backslash would close the string there and find a bare `private` after it.
+    @test cache_control("public, no-cache=\"a\\\", private, b\"") == "private, no-cache=\"a\\\", private, b\""
+end
+
+@testset "only a bare private or no-store is private already" begin
+    # A qualified `private` lets a shared cache store everything it does not name (RFC 9111
+    # §5.2.2.7), `Set-Cookie` included unless listed; the bare `private` replaces it.
+    @test cache_control("private=\"x, y\"") == "private"
+    @test cache_control("public, private=\"Set-Cookie\", max-age=60") == "private, max-age=60"
+    for value in ("private", "PRIVATE", "no-store", "private, max-age=60", "max-age=0, No-Store")
+        @test cache_control(value) == value
+    end
+end
+
+@testset "a malformed directive is dropped, so it cannot carry a public through" begin
+    # Unterminated: everything after the open quote is one element, and it is not written back.
+    @test cache_control("max-age=5, foo=\"x, public") == "private, max-age=5"
+    @test cache_control("no-cache=\"x\\") == "private"
+    # A quote anywhere but right after `=`, or text after the closing quote.
+    @test cache_control("x\"y, public, \"z, max-age=5") == "private, max-age=5"
+    @test cache_control("no-cache=\"x\"y, public") == "private"
+    # Invalid UTF-8 inside the quotes is content: nothing throws, and the `private` stays quoted.
+    @test cache_control("public, no-cache=\"\xff, private, b\"") == "private, no-cache=\"\xff, private, b\""
+end
+
+@testset "a bare private beside a malformed directive does not count" begin
+    # A cache that opens a quote at any `"` reads these `private`s as quoted content.
+    @test cache_control("public, x\"y, private, \"z") == "private"
+    @test cache_control("public, a = \"x, private, y\"") == "private"
+    # Two lines: a cache that joins them (RFC 9110 §5.3) lets the first one's open quote swallow
+    # the second. The `X-Other` keeps HTTP.jl from folding the adjacent lines into one.
+    response = HTTP.Response(200, ["Cache-Control" => "public, no-cache=\"x", "X-Other" => "1", "Cache-Control" => "private"])
+    _mark_private!(response)
+    @test [h.second for h in response.headers if lowercase(h.first) == "cache-control"] == ["private"]
+end
+
+@testset "reading a Cache-Control that is already private allocates nothing" begin
+    headers() = ["Vary" => "Cookie", "Cache-Control" => "private, no-cache=\"a, b\", max-age=60"]
+    @testset let fresh = allocs(() -> HTTP.Response(200, headers())),
+                 mark = allocs(() -> _mark_private!(HTTP.Response(200, headers())))
+        @test mark.count == fresh.count
     end
 end
 end

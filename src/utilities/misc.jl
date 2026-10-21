@@ -613,6 +613,7 @@ function _mark_private!(response::HTTP.Response)
     vary_cookie = false
     cache_control = false
     already_private = false
+    malformed = false
     for (name, value) in response.headers
         if _ascii_casefold_eq(name, "vary")
             for element in eachsplit(value, ',')
@@ -621,8 +622,17 @@ function _mark_private!(response::HTTP.Response)
             end
         elseif _ascii_casefold_eq(name, "cache-control")
             cache_control = true
-            for element in eachsplit(value, ',')
-                directive = _directive_name(element)
+            # Only a BARE `private` or `no-store` keeps a shared cache from storing the response.
+            # A qualified `private="Set-Cookie"` withholds just the named fields and lets a shared
+            # cache store the rest (RFC 9111 §5.2.2.7), so it is not private enough (#697).
+            # A malformed element anywhere voids the answer: in `x"y, private, "z` a cache that
+            # opens a quote at any `"` reads no `private` at all, and a cache that joins the
+            # lines (RFC 9110 §5.3) lets one line's unterminated quote swallow the next line's.
+            i = 1
+            while i <= ncodeunits(value)
+                element, i, ok = _next_list_element(value, i)
+                ok || (malformed = true)
+                directive = _ows_strip(element)
                 (_ascii_casefold_eq(directive, "private") || _ascii_casefold_eq(directive, "no-store")) &&
                     (already_private = true)
             end
@@ -635,28 +645,31 @@ function _mark_private!(response::HTTP.Response)
 
     # `private` wins over `public`; every other directive (`max-age`, `immutable`, …) is kept, so
     # the visitor's own browser still caches exactly as the handler asked. A response already
-    # `private` or `no-store` is left alone.
-    already_private && return response
+    # `private` or `no-store`, and well-formed, is left alone.
+    already_private && !malformed && return response
     # `setheader` replaces EVERY existing `Cache-Control` line with this one.
     HTTP.setheader(response, "Cache-Control" => cache_control ? _privatized_cache_control(response) : "private")
     return response
 end
 
 # The `Cache-Control` value `_mark_private!` writes over a response that has one: `private`, then
-# every non-empty directive of every line in order, trimmed, except `public`. A quoted element
-# holding a comma (`no-cache="a, b"`) splits in two, but the pieces are re-joined in order with
-# ", ", so it is written back as it came. The split does not know about quotes, though: a
-# handler's `no-cache="a, private, b"` yields a bare `private` element, and `_mark_private!`
-# then reads the response as private already and leaves it alone.
+# every non-empty, well-formed directive of every line in order, trimmed, with its quoted argument
+# intact (`no-cache="a, b"` is written back as it came). Dropped: `public`, a qualified
+# `private="…"` (the bare `private` written first subsumes it), and a malformed directive -- one
+# a cache could read differently than this does, so it may not carry a `public` past us.
 function _privatized_cache_control(response::HTTP.Response)
     io = IOBuffer()
     print(io, "private")
     for (name, value) in response.headers
         _ascii_casefold_eq(name, "cache-control") || continue
-        for element in eachsplit(value, ',')
+        i = 1
+        while i <= ncodeunits(value)
+            element, i, ok = _next_list_element(value, i)
             directive = _ows_strip(element)
-            isempty(directive) && continue
-            _ascii_casefold_eq(_directive_name(directive), "public") && continue
+            (ok && !isempty(directive)) || continue
+            directive_name = _directive_name(directive)
+            (_ascii_casefold_eq(directive_name, "public") || _ascii_casefold_eq(directive_name, "private")) &&
+                continue
             print(io, ", ", directive)
         end
     end
@@ -665,6 +678,48 @@ end
 
 # A list element's directive name: the part before any `=`, trimmed.
 _directive_name(element::AbstractString) = _ows_strip(first(eachsplit(element, '='; limit = 2)))
+
+# The element of the comma-separated list `s` (RFC 9110 §5.6.1) that starts at byte `i`, the byte
+# where the next one starts, and whether the element is well-formed. A `Cache-Control` directive
+# is `token [ "=" ( token / quoted-string ) ]` (RFC 9111 §5.2), and a comma inside the
+# quoted-string is content: `no-cache="a, private, b"` is ONE element, which a plain split on `,`
+# read as three, one of them a bare `private` (#697). Inside the quotes a backslash escapes the
+# next byte (§5.6.4). Not well-formed: a `"` anywhere but right after the `=`, anything but
+# SP/HTAB after the closing quote, or a quote still open at the end of `s` -- which then runs to
+# the end, so nothing after an unterminated quote is read as a directive.
+#
+# Delimiters are ASCII, so scanning code units is safe for any UTF-8 -- or any invalid UTF-8 -- in
+# a value, and the element is a view of `s`: nothing allocates.
+function _next_list_element(s::AbstractString, i::Int)
+    n = ncodeunits(s)
+    j = i
+    ok = true
+    quoted = false                      # inside a quoted-string
+    closed = false                      # past its closing quote
+    while j <= n
+        c = codeunit(s, j)
+        if quoted
+            if c == UInt8('\\')
+                j += 1                  # a quoted-pair: the next byte is content
+            elseif c == UInt8('"')
+                quoted, closed = false, true
+            end
+        elseif c == UInt8(',')
+            break
+        elseif c == UInt8('"')
+            if !closed && j > i && codeunit(s, j - 1) == UInt8('=')
+                quoted = true
+            else
+                ok = false
+            end
+        elseif closed && c != UInt8(' ') && c != UInt8('\t')
+            ok = false
+        end
+        j += 1
+    end
+    stop = min(j, n + 1)                # a trailing `\` inside the quotes stepped past the end
+    return (SubString(s, i, thisind(s, stop - 1)), stop + 1, ok && !quoted)
+end
 
 
 """

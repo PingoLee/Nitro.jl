@@ -207,8 +207,8 @@ is saved with the full lifetime at once.
   request, and a cookieless visitor cannot sign in through such a form until the store has room.
 
 A response that sets the session cookie also gets `Vary: Cookie`, and `Cache-Control: private` in
-place of any `public` (other directives are kept). A shared cache therefore never serves one
-visitor's session to another.
+place of any `public` or qualified `private="…"` (other well-formed directives are kept, and a
+malformed one is dropped). A shared cache therefore never serves one visitor's session to another.
 
 # Session lifetime (`max_age`, `absolute_max_age`)
 
