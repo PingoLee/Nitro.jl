@@ -606,40 +606,65 @@ _rebuild_with_headers(resp::HTTP.Response{B}, headers::HTTP.Headers) where {B} =
 # included before `session_middleware.jl`. Only ever call it on headers the caller already owns
 # (`own_response_headers`).
 function _mark_private!(response::HTTP.Response)
-    vary = String[]
-    cache_control = String[]
+    # One pass over the headers, reading each list element in place (#563). This used to build a
+    # `lowercase` String per header and `String[]` lists of every element: ~40 allocations per
+    # cookie write, for what is usually "append two fixed lines". Names and directives fold
+    # ASCII only and trim only SP/HTAB, so a malformed-UTF-8 value cannot throw here either.
+    vary_cookie = false
+    cache_control = false
+    already_private = false
     for (name, value) in response.headers
-        field = lowercase(name)
-        if field == "vary"
-            append!(vary, _header_list(value))
-        elseif field == "cache-control"
-            append!(cache_control, _header_list(value))
+        if _ascii_casefold_eq(name, "vary")
+            for element in eachsplit(value, ',')
+                token = _ows_strip(element)
+                (token == "*" || _ascii_casefold_eq(token, "cookie")) && (vary_cookie = true)
+            end
+        elseif _ascii_casefold_eq(name, "cache-control")
+            cache_control = true
+            for element in eachsplit(value, ',')
+                directive = _directive_name(element)
+                (_ascii_casefold_eq(directive, "private") || _ascii_casefold_eq(directive, "no-store")) &&
+                    (already_private = true)
+            end
         end
     end
 
     # `Vary` may already span several field lines -- `Cors` pushes its own `Vary: Origin` -- and
     # another line is additive by definition, so nothing already there is rewritten.
-    if !any(t -> t == "*" || lowercase(t) == "cookie", vary)
-        push!(response.headers, "Vary" => "Cookie")
-    end
+    vary_cookie || push!(response.headers, "Vary" => "Cookie")
 
     # `private` wins over `public`; every other directive (`max-age`, `immutable`, …) is kept, so
     # the visitor's own browser still caches exactly as the handler asked. A response already
     # `private` or `no-store` is left alone.
-    names = String[lowercase(strip(first(split(d, '='; limit = 2)))) for d in cache_control]
-    if !("private" in names || "no-store" in names)
-        kept = String[d for (d, n) in zip(cache_control, names) if n != "public"]
-        # `setheader` replaces EVERY existing `Cache-Control` line with this one.
-        HTTP.setheader(response, "Cache-Control" => join(pushfirst!(kept, "private"), ", "))
-    end
+    already_private && return response
+    # `setheader` replaces EVERY existing `Cache-Control` line with this one.
+    HTTP.setheader(response, "Cache-Control" => cache_control ? _privatized_cache_control(response) : "private")
     return response
 end
 
-# The comma-separated elements of a list-valued header, trimmed. A quoted element holding a comma
-# (`no-cache="a, b"`) splits in two, but the pieces are re-joined in order with ", ", so it is
-# written back as it came -- and no directive name this function tests can be inside quotes.
-_header_list(value::AbstractString) =
-    String[strip(element) for element in split(value, ',') if !isempty(strip(element))]
+# The `Cache-Control` value `_mark_private!` writes over a response that has one: `private`, then
+# every non-empty directive of every line in order, trimmed, except `public`. A quoted element
+# holding a comma (`no-cache="a, b"`) splits in two, but the pieces are re-joined in order with
+# ", ", so it is written back as it came. The split does not know about quotes, though: a
+# handler's `no-cache="a, private, b"` yields a bare `private` element, and `_mark_private!`
+# then reads the response as private already and leaves it alone.
+function _privatized_cache_control(response::HTTP.Response)
+    io = IOBuffer()
+    print(io, "private")
+    for (name, value) in response.headers
+        _ascii_casefold_eq(name, "cache-control") || continue
+        for element in eachsplit(value, ',')
+            directive = _ows_strip(element)
+            isempty(directive) && continue
+            _ascii_casefold_eq(_directive_name(directive), "public") && continue
+            print(io, ", ", directive)
+        end
+    end
+    return String(take!(io))
+end
+
+# A list element's directive name: the part before any `=`, trimmed.
+_directive_name(element::AbstractString) = _ows_strip(first(eachsplit(element, '='; limit = 2)))
 
 
 """

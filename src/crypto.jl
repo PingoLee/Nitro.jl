@@ -1,7 +1,6 @@
 module Crypto
 
 using OpenSSL
-using SHA
 using UUIDs
 using Dates
 using Dates: DateTime
@@ -211,12 +210,23 @@ end
 # SHA.jl does; refusing empty keys is the callers' policy (`_empty_hmac_key`), not this
 # function's.
 function _hmac_sha256(key::Union{String, SubString{String}}, message::Union{String, SubString{String}})
-    ncodeunits(key) <= typemax(Cint) || throw(ArgumentError("HMAC key too long"))
     out = Vector{UInt8}(undef, 32)
+    GC.@preserve key message _hmac_sha256!(out, pointer(key), ncodeunits(key), pointer(message), ncodeunits(message))
+    return out
+end
+
+# Any other string type is MACed over its UTF-8 bytes.
+_hmac_sha256(key::AbstractString, message::AbstractString) = _hmac_sha256(String(key), String(message))
+
+# The libcrypto call both string methods above and `_hkdf_sha256` share: MAC `msglen` bytes at
+# `message` under `keylen` bytes at `key`, into the first 32 bytes of `out`. The caller keeps all
+# three buffers rooted.
+function _hmac_sha256!(out::Vector{UInt8}, key::Ptr{UInt8}, keylen::Integer, message::Ptr{UInt8}, msglen::Integer)
+    keylen <= typemax(Cint) || throw(ArgumentError("HMAC key too long"))
+    length(out) >= 32 || throw(ArgumentError("HMAC-SHA256 output buffer must hold 32 bytes"))
     md = @ccall OpenSSL.libcrypto.EVP_sha256()::Ptr{Cvoid}
-    ret = GC.@preserve key message out @ccall OpenSSL.libcrypto.HMAC(
-        md::Ptr{Cvoid}, pointer(key)::Ptr{UInt8}, ncodeunits(key)::Cint,
-        pointer(message)::Ptr{UInt8}, ncodeunits(message)::Csize_t,
+    ret = GC.@preserve out @ccall OpenSSL.libcrypto.HMAC(
+        md::Ptr{Cvoid}, key::Ptr{UInt8}, keylen::Cint, message::Ptr{UInt8}, msglen::Csize_t,
         out::Ptr{UInt8}, C_NULL::Ptr{Cuint})::Ptr{UInt8}
     if ret == C_NULL
         # The error queue is per OS thread; leave nothing behind for an unrelated TLS call.
@@ -225,9 +235,6 @@ function _hmac_sha256(key::Union{String, SubString{String}}, message::Union{Stri
     end
     return out
 end
-
-# Any other string type is MACed over its UTF-8 bytes.
-_hmac_sha256(key::AbstractString, message::AbstractString) = _hmac_sha256(String(key), String(message))
 
 # PBKDF2-HMAC-SHA256 (RFC 8018) through libcrypto's `PKCS5_PBKDF2_HMAC`, for the password
 # hashers in `Auth` (#311). It replaced a pure-Julia loop that called `SHA.hmac_sha256` per
@@ -412,26 +419,85 @@ const MIN_TOKEN_BYTES = 1 + 12 + 16 + 16
 HKDF (RFC 5869) with HMAC-SHA256: extract a pseudorandom key from `ikm` under `salt`, then
 expand it to `len` bytes bound to `info`. An empty `salt` is the RFC's all-zero salt (HMAC pads
 the key to its block size either way).
+
+Both HMACs go through libcrypto (`_hmac_sha256!`), reading `ikm` and `salt` in place, so the
+32-byte cookie key costs 9 small allocations (#545). It used to run on `SHA.hmac_sha256`, which
+copies its arguments and allocates its padded keys and contexts: 59 allocations and ~3.6 µs, two
+thirds of every encrypted cookie read.
 """
 function _hkdf_sha256(ikm::AbstractVector{UInt8}, salt::AbstractVector{UInt8},
                       info::AbstractVector{UInt8}, len::Integer)
     0 < len <= 255 * 32 || throw(ArgumentError("HKDF-SHA256 output length must be 1:$(255 * 32), got $len"))
-    prk = SHA.hmac_sha256(Vector{UInt8}(salt), Vector{UInt8}(ikm))
-    okm = UInt8[]
-    block = UInt8[]
+    ikm_bytes = ikm isa _HKDFBytes ? ikm : Vector{UInt8}(ikm)
+    salt_bytes = isempty(salt) ? HKDF_ZERO_SALT : salt isa _HKDFBytes ? salt : Vector{UInt8}(salt)
+    prk = Vector{UInt8}(undef, 32)
+    GC.@preserve ikm_bytes salt_bytes _hmac_sha256!(prk, pointer(salt_bytes), length(salt_bytes),
+                                                    pointer(ikm_bytes), length(ikm_bytes))
+    # T(i) = HMAC(prk, T(i-1) ‖ info ‖ i), with T(0) empty. `message` holds T(i-1) ‖ info ‖ i,
+    # so the first round MACs only its tail, from byte 33.
+    ninfo = length(info)
+    message = Vector{UInt8}(undef, 32 + ninfo + 1)
+    copyto!(message, 33, info, firstindex(info), ninfo)
+    block = Vector{UInt8}(undef, 32)
+    okm = Vector{UInt8}(undef, len)
+    filled = 0
     counter = 0x01
-    while length(okm) < len
-        block = SHA.hmac_sha256(prk, vcat(block, info, counter))
-        append!(okm, block)
+    while filled < len
+        message[end] = counter
+        from = counter == 0x01 ? 33 : 1
+        GC.@preserve prk message _hmac_sha256!(block, pointer(prk), 32, pointer(message, from),
+                                               length(message) - from + 1)
+        n = min(32, len - filled)
+        copyto!(okm, filled + 1, block, 1, n)
+        copyto!(message, 1, block, 1, 32)
+        filled += n
         counter += 0x01
     end
-    return okm[1:len]
+    return okm
 end
+
+# RFC 5869: a salt that is not provided is HashLen zero bytes.
+const HKDF_ZERO_SALT = zeros(UInt8, 32)
+
+# The inputs `_hkdf_sha256` reads in place: each has a `pointer` to its contiguous bytes. Any other
+# vector -- a strided view, or `codeunits` of a custom string type -- is copied first.
+const _HKDFBytes = Union{Vector{UInt8}, Base.CodeUnits{UInt8, String}}
 
 _cookie_key(secret::SecretString) =
     _hkdf_sha256(codeunits(reveal(secret)), UInt8[], COOKIE_KEY_INFO, 32)
 
-_token_aad(purpose::AbstractString) = vcat(TOKEN_VERSION, Vector{UInt8}(codeunits(purpose)))
+"""
+    CookieKey(secret::SecretString)
+
+The AES key `_cookie_key` derives from `secret`, derived once (#545). It is internal and not
+exported. HKDF is a pure function of the secret, and even on libcrypto it costs two HMAC
+one-shots, ~2 µs and 60 % of an encrypted cookie read. So the places that seal a secret once
+derive the key there too: `CookieConfig`'s constructor (its `cookie_key` field) and
+`CookieAuthMiddleware`. `encrypt_payload`/`decrypt_payload`, and the `secret_key` of
+`get_cookie`/`set_cookie!`, take one wherever they take a secret.
+
+The bytes are an `NTuple`, so two `CookieConfig`s built from one secret stay `==`. A `Vector`
+would compare by identity. `show` and `JSON.lower` mask them, the same as `SecretString`'s.
+"""
+struct CookieKey
+    bytes::NTuple{32, UInt8}
+    CookieKey(secret::SecretString) = new(NTuple{32, UInt8}(_cookie_key(secret)))
+end
+
+Base.show(io::IO, ::CookieKey) = print(io, "CookieKey(****)")
+Base.show(io::IO, ::MIME"text/plain", k::CookieKey) = show(io, k)
+JSON.lower(::CookieKey) = "****"
+
+_cookie_secret(key::CookieKey) = key
+_cookie_key(key::CookieKey) = collect(key.bytes)
+
+function _token_aad(purpose::AbstractString)
+    bytes = codeunits(String(purpose))
+    aad = Vector{UInt8}(undef, 1 + length(bytes))
+    aad[1] = TOKEN_VERSION
+    copyto!(aad, 2, bytes, 1, length(bytes))
+    return aad
+end
 
 _unix_seconds(t::DateTime) = floor(Int64, Dates.datetime2unix(t))
 
@@ -464,8 +530,9 @@ function _gcm_aad!(ctx::OpenSSL.EvpCipherContext, aad::Vector{UInt8})
     return nothing
 end
 
-_gcm_cipher() = OpenSSL.EvpCipher(ccall((:EVP_get_cipherbyname, OpenSSL.libcrypto), Ptr{Cvoid},
-                                        (Cstring,), "AES-256-GCM"))
+# `EVP_aes_256_gcm()` returns libcrypto's static table directly; `EVP_get_cipherbyname` looked the
+# same table up by name, through a read-locked name map, on every token (#545).
+_gcm_cipher() = OpenSSL.EvpCipher(@ccall OpenSSL.libcrypto.EVP_aes_256_gcm()::Ptr{Cvoid})
 
 """
     encrypt_payload(secret, payload; purpose, expires = nothing, now = Dates.now(UTC)) -> String

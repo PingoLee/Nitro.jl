@@ -1012,7 +1012,7 @@ another key or for another cookie name — reads as `default`. Keyword arguments
 [`Nitro.Cookies.get_cookie`](@ref).
 """
 function get_cookie(app::App, req::Nitro.Request, name::String, default::Any=nothing; kwargs...)
-    secret_key = app.service.cookies[].secret_key
+    secret_key = app.service.cookies[].cookie_key
     # `encrypted` defaults to whatever the app's config implies.
     encrypted = Base.get(kwargs, :encrypted, !isnothing(secret_key))
     return Nitro.Core.get_cookie(req, name, default; secret_key=secret_key, encrypted=encrypted, kwargs...)

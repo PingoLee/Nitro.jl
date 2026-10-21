@@ -8,7 +8,7 @@ using ..Types: _normalize_domain, _store_call, _store_bool
 using ..Errors
 using ..Util: _is_tchar, _ascii_casefold_eq
 
-using ..Crypto: encrypt_payload, decrypt_payload, secure_uuid4, SecretString, _cookie_secret
+using ..Crypto: encrypt_payload, decrypt_payload, secure_uuid4, SecretString, CookieKey, _cookie_secret
 
 export parse_cookies, format_cookie, get_cookie, set_cookie!, load_cookie_settings!,
     storesession!, prunesessions!, regenerate_session!
@@ -44,10 +44,17 @@ end
 Helper to convert SameSite string to standard string
 """
 function _samesite_to_mode(val::String) :: Union{String, Nothing}
-    val_lower = lowercase(strip(val))
-    val_lower == "lax" && return "Lax"
-    val_lower == "strict" && return "Strict"
-    val_lower == "none" && return "None"
+    # An ASCII fold, not `lowercase`, which cost 7 allocations on every cookie write (#563).
+    # `lowercase` also maps 'İ' to 'i', so a non-ASCII value keeps the old comparison and still
+    # reads "strİct" as Strict.
+    mode = strip(val)
+    return isascii(mode) ? _samesite_mode(mode) : _samesite_mode(lowercase(mode))
+end
+
+function _samesite_mode(mode::AbstractString) :: Union{String, Nothing}
+    _ascii_casefold_eq(mode, "lax") && return "Lax"
+    _ascii_casefold_eq(mode, "strict") && return "Strict"
+    _ascii_casefold_eq(mode, "none") && return "None"
     nothing
 end
 
@@ -310,51 +317,62 @@ function format_cookie(
 )
     _validate_cookie_name(name)
     _validate_cookie_value(value)
-    path = _normalize_path(path)
-
-    parts = ["$name=$value", "Path=$path"]
-    
-    if !isnothing(domain)
-        # The strict validator every other path uses (#329). This one used to reject only a
-        # space and `:`, so `domain = "evil.com; Secure"` injected attributes into the header.
-        push!(parts, "Domain=$(_normalize_domain(domain))")
-    end
-    
-    # Handle Max-Age=0 and convert to past Expires for better reliability
-    if !isnothing(maxage)
-        push!(parts, "Max-Age=$maxage")
-        if maxage == 0
-            # Set expires to epoch
-            push!(parts, "Expires=Thu, 01 Jan 1970 00:00:00 GMT")
-        end
-    end
-
-    if isnothing(maxage) && !isnothing(expires)
-        push!(parts, "Expires=$(Dates.format(expires, Dates.RFC1123Format)) GMT")
-    end
-    
-    if httponly
-        push!(parts, "HttpOnly")
-    end
-    
-    # SameSite validation
+    # The strict domain validator every other path uses (#329). This one used to reject only a
+    # space and `:`, so `domain = "evil.com; Secure"` injected attributes into the header.
+    # Titlecased, not `_samesite_to_mode`: `uppercasefirst` maps 'ſ' to 'S', and this spelling of
+    # the check has always read "ſtrict" as Strict. `set_cookie!` does not come through here.
     ss = uppercasefirst(lowercase(strip(samesite)))
-    if ss == "None" 
+    return _write_cookie(name, value, _normalize_path(path),
+                         isnothing(domain) ? nothing : _normalize_domain(domain), expires, maxage,
+                         httponly, secure, ss in ("Lax", "Strict", "None") ? ss : nothing)
+end
+
+# The `Set-Cookie` line itself, from attributes that are already normalized: `path` strict,
+# `domain` through `_normalize_domain`, `samesite` one of "Lax"/"Strict"/"None" or `nothing` for
+# none. `format_cookie` and `set_cookie!` both end here, so the two cannot drift; `set_cookie!`
+# skips `format_cookie` because it has normalized everything already (#563).
+function _write_cookie(name::String, value::String, path::String, domain::Nullable{String},
+                       expires::Nullable{Dates.DateTime}, maxage::Nullable{Int}, httponly::Bool,
+                       secure::Bool, samesite::Nullable{String})
+    if samesite == "None" && !secure
         # SameSite=None cookies must be Secure
-        if !secure
-            @warn "SameSite=None cookies must also be Secure. Setting Secure=true."
-            secure = true
-        end
-        push!(parts, "SameSite=None")
-    elseif ss in ("Lax", "Strict")
-        push!(parts, "SameSite=$ss")
+        @warn "SameSite=None cookies must also be Secure. Setting Secure=true."
+        secure = true
     end
 
-    if secure
-        push!(parts, "Secure")
+    # One `write` per piece: a multi-argument `print` allocates for its argument tuple.
+    io = IOBuffer(; sizehint = ncodeunits(name) + ncodeunits(value) + ncodeunits(path) + 96)
+    write(io, name); write(io, '='); write(io, value)
+    write(io, "; Path="); write(io, path)
+    if !isnothing(domain)
+        write(io, "; Domain="); write(io, domain)
     end
-    
-    return join(parts, "; ")
+    if !isnothing(maxage)
+        write(io, "; Max-Age="); _write_decimal(io, maxage)
+        # Max-Age=0 also carries a past Expires, for clients that ignore Max-Age.
+        maxage == 0 && write(io, "; Expires=Thu, 01 Jan 1970 00:00:00 GMT")
+    elseif !isnothing(expires)
+        write(io, "; Expires="); write(io, Dates.format(expires, Dates.RFC1123Format)); write(io, " GMT")
+    end
+    httponly && write(io, "; HttpOnly")
+    if !isnothing(samesite)
+        write(io, "; SameSite="); write(io, samesite)
+    end
+    secure && write(io, "; Secure")
+    return String(take!(io))
+end
+
+# `print(io, n)` for an `Int`, without the intermediate String `print` builds for it.
+function _write_decimal(io::IO, n::Int)
+    if n < 0
+        write(io, '-')
+        # `typemin(Int)` has no positive counterpart, so its last digit is peeled off first.
+        n == typemin(Int) && return (_write_decimal(io, -(n ÷ 10)); write(io, UInt8('8')); nothing)
+        n = -n
+    end
+    n >= 10 && _write_decimal(io, n ÷ 10)
+    write(io, UInt8('0') + UInt8(n % 10))
+    return nothing
 end
 
 const HOST_COOKIE_PREFIX = "__Host-"
@@ -473,7 +491,7 @@ function get_cookie(
     default::Any = nothing; 
     encrypted::Bool = false,
     config::CookieConfig = CookieConfig(),
-    secret_key::Union{AbstractString, SecretString, Nothing} = nothing,
+    secret_key::Union{AbstractString, SecretString, CookieKey, Nothing} = nothing,
     max_cookie_size::Union{Int, Nothing} = nothing,
     kwargs...
 )
@@ -486,7 +504,7 @@ function get_cookie(
 
     # Validated BEFORE the lookup: a bad per-call key is configuration, and must fail on every
     # call rather than only on the ones that happen to carry the cookie.
-    final_secret = isnothing(secret_key) ? config.secret_key : _cookie_secret(secret_key)
+    final_secret = isnothing(secret_key) ? config.cookie_key : _cookie_secret(secret_key)
 
     target_name = string(name)
     headers = if source isa HTTP.Request || source isa HTTP.Response
@@ -580,7 +598,7 @@ function set_cookie!(
     secure::Nullable{Bool} = nothing, 
     samesite::Nullable{String} = nothing,
     encrypted::Nullable{Bool} = nothing,
-    secret_key::Union{AbstractString, SecretString, Nothing} = nothing
+    secret_key::Union{AbstractString, SecretString, CookieKey, Nothing} = nothing
 )
     # `string(value)` below would write a masked secret's DISPLAY form -- `SecretString("****")`
     # -- as the cookie value, the same failure #307 fixed for the key. Refuse rather than guess:
@@ -590,45 +608,54 @@ function set_cookie!(
         "would be written as its masked display form. Pass `reveal(value)` if the secret " *
         "really belongs in a cookie."))
 
-    # 1. Resolve values (Explicit param > Dict > Config Default)
-    merged_attrs = Dict{Symbol, Any}()
-    
-    # helper to set if not nothing
-    function set_if_not_nothing(key::Symbol, val)
-        if !isnothing(val)
-            merged_attrs[key] = val
-        end
+    # 1. Resolve values (Explicit param > Dict > Config Default). An `attrs` entry wins over the
+    # config even when it is `nothing`: that drops a configured Max-Age or Expires for one cookie.
+    # The Dict is only built when `attrs` has entries; every framework write passes none, and
+    # used to pay a `Dict{Symbol,Any}` and a closure for it on every cookie (#563).
+    # Path before domain, in both branches: when both are invalid, the path's error is the one
+    # reported, as it always was.
+    if isempty(attrs)
+        return _set_cookie!(res, name, value, config,
+                            _normalize_runtime_path(isnothing(path) ? config.path : path),
+                            isnothing(domain) ? config.domain : _normalize_domain(domain),
+                            isnothing(expires) ? config.expires : expires,
+                            isnothing(maxage) ? config.maxage : maxage,
+                            isnothing(httponly) ? config.httponly : httponly,
+                            isnothing(secure) ? config.secure : secure,
+                            isnothing(samesite) ? config.samesite : samesite, encrypted, secret_key)
     end
-
-    # First load from attrs dict
+    given = Dict{Symbol, Any}()
     for (k, v) in attrs
-        merged_attrs[_normalize_attribute_name(k)] = v
+        given[_normalize_attribute_name(k)] = v
     end
-
-    # Explicit params override dict
-    set_if_not_nothing(:path, path)
-    set_if_not_nothing(:domain, domain)
-    set_if_not_nothing(:expires, expires)
-    set_if_not_nothing(:maxage, maxage)
-    set_if_not_nothing(:httponly, httponly)
-    set_if_not_nothing(:secure, secure)
-    set_if_not_nothing(:samesite, samesite)
-
-    # 2. Normalize and apply defaults from config
-    final_path = _normalize_runtime_path(Base.get(merged_attrs, :path, isnothing(config.path) ? "/" : config.path))
-
-    final_domain = nothing
-    if haskey(merged_attrs, :domain)
-        final_domain = _normalize_domain(merged_attrs[:domain])
-    elseif !isnothing(config.domain)
-        final_domain = config.domain
+    pick(kw, key, default) = !isnothing(kw) ? kw : haskey(given, key) ? given[key] : default
+    final_path = _normalize_runtime_path(pick(path, :path, config.path))
+    final_domain = if !isnothing(domain)
+        _normalize_domain(domain)
+    elseif haskey(given, :domain)
+        _normalize_domain(given[:domain])
+    else
+        config.domain
     end
+    return _set_cookie!(res, name, value, config, final_path, final_domain,
+                        pick(expires, :expires, config.expires), pick(maxage, :maxage, config.maxage),
+                        pick(httponly, :httponly, config.httponly), pick(secure, :secure, config.secure),
+                        pick(samesite, :samesite, config.samesite), encrypted, secret_key)
+end
 
+# `set_cookie!` past the resolution: every attribute is already the one to use (`path` and
+# `domain` normalized), and `nothing` means "none", not "the config's". Untyped, so it
+# specializes on the keywords' own types when `attrs` was empty and takes the Dict's `Any` values
+# when it was not.
+function _set_cookie!(res::HTTP.Response, name, value, config::CookieConfig, final_path,
+                      final_domain, expires, maxage, httponly, secure, samesite, encrypted,
+                      secret_key)
+    # 2. Normalize the rest
     final_maxage = nothing
     final_expires = nothing
-    
+
     # Handle Max-Age and Expires
-    ma_input = Base.get(merged_attrs, :maxage, config.maxage)
+    ma_input = maxage
     if !isnothing(ma_input)
         mv, is_logout, logout_expires = _normalize_maxage(ma_input)
         if is_logout
@@ -638,23 +665,22 @@ function set_cookie!(
     end
 
     if isnothing(final_expires)
-        ex_input = Base.get(merged_attrs, :expires, config.expires)
+        ex_input = expires
         if !isnothing(ex_input)
             final_expires = _normalize_expires(ex_input)
         end
     end
 
-    final_httponly = _normalize_bool(Base.get(merged_attrs, :httponly, config.httponly), "httponly")
-    final_secure = _normalize_bool(Base.get(merged_attrs, :secure, config.secure), "secure")
+    final_httponly = _normalize_bool(httponly, "httponly")
+    final_secure = _normalize_bool(secure, "secure")
     
-    ss_input = Base.get(merged_attrs, :samesite, config.samesite)
-    final_samesite = isnothing(ss_input) ? "Lax" : _samesite_to_mode(string(ss_input))
+    final_samesite = isnothing(samesite) ? "Lax" : _samesite_to_mode(string(samesite))
     if isnothing(final_samesite)
         final_samesite = "Lax" # fallback
     end
     
     # 3. Handle Encryption
-    final_secret = isnothing(secret_key) ? config.secret_key : _cookie_secret(secret_key)
+    final_secret = isnothing(secret_key) ? config.cookie_key : _cookie_secret(secret_key)
     is_encrypted = isnothing(encrypted) ? !isnothing(final_secret) : encrypted
     str_value = string(value)
 
@@ -680,17 +706,12 @@ function set_cookie!(
         str_value
     end
     
-    cookie_str = format_cookie(
-        string(name), 
-        final_value; 
-        path=final_path, 
-        domain=final_domain, 
-        expires=final_expires isa DateTime ? final_expires : nothing, 
-        maxage=final_maxage, 
-        httponly=final_httponly, 
-        secure=final_secure, 
-        samesite=final_samesite
-    )
+    # Every attribute is normalized above, so only the name and value are left to check:
+    # `format_cookie` would normalize all of them a second time (#563).
+    cookie_name = _validate_cookie_name(string(name))
+    cookie_str = _write_cookie(cookie_name, _validate_cookie_value(final_value), final_path,
+                               final_domain, final_expires isa DateTime ? final_expires : nothing,
+                               final_maxage, final_httponly, final_secure, final_samesite)
     
     if length(cookie_str) > 4096
         @warn "Set-Cookie header for '$name' exceeds 4096 bytes. Some browsers may reject it."
