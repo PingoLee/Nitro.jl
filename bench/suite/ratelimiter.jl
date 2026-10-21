@@ -16,7 +16,8 @@
 # `getip(req)`, and `HTTP.Request` construction otherwise dominates every number here
 # and swamps the signal. Windows are short and limits huge on purpose — the point is
 # the per-request bookkeeping, never the 429 path, and a short window keeps the
-# sliding limiter's timestamp vector small so `filter!` does not dominate.
+# sliding limiter's timestamp vector small. The `sliding_full_bucket_*` rows at the end
+# are the exception: they measure the 429 path with a full bucket, on purpose (#564).
 
 using Sockets
 using Base.Threads: @spawn
@@ -82,4 +83,19 @@ for k in (1, 8, 64)
     paths = ["/exempt$(i)/" for i in 1:k]
     mw = rl_build(:fixed_window; exempt_paths = paths)
     SUITE["ratelimiter"]["exempt_miss_k$(k)"] = @benchmarkable $mw(RL_REQS[1])
+end
+
+# Sliding limiter with one client's bucket kept FULL (#564): every timed request is refused
+# after the prune and the oldest-timestamp read, both of which run under the stripe lock. Read
+# it as a delta across `rate_limit`. It used to grow ~0.4 ns per stored timestamp (`filter!`
+# plus `minimum`); a sorted bucket makes both O(1), so the three rows should match. A 10-minute
+# window, so nothing ages out during the run and the bucket stays at `rate_limit`.
+for n in (100, 1000, 10_000)
+    mw = Nitro.RateLimiter(; strategy = :sliding_window, auto_extract_ip = false,
+                           rate_limit = n, window = Dates.Minute(10)).middleware(RL_HANDLER)
+    req = rl_req(IPv4("203.0.113.$(n % 250 + 1)"))
+    for _ in 1:n
+        mw(req)
+    end
+    SUITE["ratelimiter"]["sliding_full_bucket_$(n)"] = @benchmarkable $mw($req)
 end

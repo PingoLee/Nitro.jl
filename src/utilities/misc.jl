@@ -419,8 +419,13 @@ end
 
 Case-insensitive comparison of two HTTP header field names. Replaces
 `HTTP.Messages.field_name_isequal`, which was removed in HTTP.jl v2.
+
+Only ASCII letters fold, as in HTTP.jl's own `header`/`hasheader`: a field name is a `token`
+(RFC 9110 §5.1), and HTTP.jl refuses any other name on the wire. It allocates nothing. It used to
+be `lowercase(a) == lowercase(b)`, which built two Strings per compare, and every caller compares
+once per header of the message (#542).
 """
-header_name_isequal(a::AbstractString, b::AbstractString) = lowercase(a) == lowercase(b)
+header_name_isequal(a::AbstractString, b::AbstractString) = _ascii_casefold_eq(a, b)
 
 # Header values are BYTES: HTTP.jl passes anything >= 0x80 through unvalidated, so a value can
 # hold malformed UTF-8 a client chose. Base `strip` asks `isspace` and `lowercase` asks the
@@ -430,11 +435,10 @@ header_name_isequal(a::AbstractString, b::AbstractString) = lowercase(a) == lowe
 # category.
 #
 # Internal, not exported: import what you need, e.g. `using ...Util: _ows_strip, _auth_credential`.
-# They live here because `ExtractIP` (`_ows_strip`, `_ascii_lower_eq`), `CrossOriginProtection`
+# They live here because `ExtractIP` (`_ows_strip`, `_ascii_casefold_eq`), `CrossOriginProtection`
 # (`_ows_strip`), and `CSRFMiddleware`, `BearerAuth`, `extract_auth_token` (`_auth_credential`)
 # all read header values.
 _ows_strip(s::AbstractString) = strip(c -> c == ' ' || c == '\t', s)
-_ascii_lower_eq(s::AbstractString, lower::String) = all(isascii, s) && lowercase(s) == lower
 
 # RFC 9110 §5.6.2 `tchar`, the alphabet of a `token`: ASCII letters, digits and these 15 marks.
 # One predicate for both readers of that grammar -- `ExtractIP` (a `Forwarded` parameter name)
@@ -456,8 +460,9 @@ _is_tchar(b::UInt8) = b < 0x80 && @inbounds _TCHAR_TABLE[b + 1]
 _is_tchar(c::AbstractChar) = isascii(c) && _is_tchar(UInt8(c))
 
 # Code unit by code unit, folding only A-Z: any other byte, including every byte of a multibyte
-# or malformed character, must match exactly. Unlike `_ascii_lower_eq` it compares two arbitrary
-# strings, so an app-configured scheme need not be lowercase, or even ASCII.
+# or malformed character, must match exactly. It compares two arbitrary strings, so an
+# app-configured scheme need not be lowercase, or even ASCII. It replaced `_ascii_lower_eq`, which
+# folded through `lowercase` and built a String per call (#542).
 function _ascii_casefold_eq(a::AbstractString, b::AbstractString)::Bool
     ncodeunits(a) == ncodeunits(b) || return false
     for i in 1:ncodeunits(a)

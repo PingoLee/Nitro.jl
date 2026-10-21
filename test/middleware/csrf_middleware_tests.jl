@@ -1152,8 +1152,8 @@ end
     cookie = cookie_value(minted, "__Host-csrf_token")
     layer = bound_layer(SESSION_A)
     get_req() = request("GET", Dict("__Host-csrf_token" => cookie))
-    # `Cookie` first: `_bearer_only` still lowercases each header name until it meets `Cookie`
-    # (#542), and that cost must not decide whether this bound holds.
+    # `Cookie` first: `_bearer_only` walks the header names until it meets `Cookie`. That walk
+    # stopped allocating in #542, but these bounds price the HMAC, not the header order.
     post_req() = HTTP.Request("POST", "/form", ["Cookie" => "__Host-csrf_token=$cookie",
                                                 "X-CSRF-Token" => masked])
     @test layer(get_req()).status == 200

@@ -500,3 +500,67 @@ end
 end
 
 end
+
+# #564. The sliding limiter pruned with `filter!` and found the oldest with `minimum`: two passes
+# over every live timestamp, inside the stripe lock, on every request. A bucket is now kept sorted
+# (`_record!` inserts a stepped-back reading in place), so the expired timestamps are a prefix and
+# the oldest and newest are its ends. These pin that the prefix form decides exactly what the
+# passes did, and what a clock step back does. The time it saves is measured, not asserted:
+# flat across `rate_limit` 100/1000/10000, where it grew ~0.4 ns per stored timestamp.
+@testitem "Sliding limiter: a bucket stays sorted and prunes its prefix (#564)" tags=[:middleware] setup=[NitroCommon] begin
+using Dates
+using Random
+using Test
+using Nitro
+const RLM = Nitro.Core.RateLimiterMiddleware
+
+t = DateTime(2026, 10, 21, 12)
+
+@testset "the prefix drop keeps exactly what filter! kept" begin
+    b = [t, t + Second(1), t + Second(2), t + Second(3)]
+    @test RLM._drop_expired_prefix!(copy(b), t + Second(1)) == [t + Second(2), t + Second(3)]
+    @test RLM._drop_expired_prefix!(copy(b), t - Second(1)) == b          # none expired
+    @test isempty(RLM._drop_expired_prefix!(copy(b), t + Second(3)))      # at the cutoff: gone
+    @test isempty(RLM._drop_expired_prefix!(DateTime[], t))
+    # Sorted buckets with repeats, against the old `filter!` as the oracle. A fresh RNG: a
+    # testset reseeds the global one, so its draws would repeat on every run.
+    rng = Random.RandomDevice()
+    for _ in 1:200
+        bucket = sort!(t .+ Millisecond.(rand(rng, 0:50, rand(rng, 0:40))))
+        cutoff = t + Millisecond(rand(rng, -5:55))
+        @test RLM._drop_expired_prefix!(copy(bucket), cutoff) ==
+              filter(ts -> ts > cutoff, bucket)
+    end
+end
+
+@testset "a clock step back records in place, so the bucket is what push! built, sorted" begin
+    b = DateTime[]
+    RLM._record!(b, t + Second(5))
+    RLM._record!(b, t)                       # the wall clock stepped back 5 s
+    RLM._record!(b, t + Second(7))
+    @test b == [t, t + Second(5), t + Second(7)]
+    # The stepped-back request expires when its own window ends, as it did before #564. Clamping
+    # it to t+5 instead held a client to one quota per window plus the step (review of #564).
+    @test RLM._drop_expired_prefix!(copy(b), t + Second(4)) == [t + Second(5), t + Second(7)]
+    # Any sequence of readings, steps back included: the same multiset as a plain `push!`, so
+    # the same count, oldest and newest -- which is what the old `filter!`/`minimum`/`maximum`
+    # computed from it.
+    rng = Random.RandomDevice()
+    for _ in 1:200
+        readings = t .+ Millisecond.(rand(rng, 0:50, rand(rng, 0:40)))
+        kept = DateTime[]
+        foreach(r -> RLM._record!(kept, r), readings)
+        cutoff = t + Millisecond(rand(rng, -5:55))
+        @test issorted(kept) && kept == sort(readings)
+        @test RLM._drop_expired_prefix!(kept, cutoff) == sort!(filter(r -> r > cutoff, readings))
+    end
+end
+
+@testset "a bucket's expiry reads its newest timestamp" begin
+    b = [t, t + Second(10)]
+    @test !RLM._is_expired(b, Second(5), t + Second(12))    # t+10 is still live
+    @test RLM._is_expired(b, Second(5), t + Second(15))
+    @test RLM._expires_at(b, Second(5)) == t + Second(15)
+    @test RLM._is_expired(DateTime[], Second(5), t)
+end
+end
