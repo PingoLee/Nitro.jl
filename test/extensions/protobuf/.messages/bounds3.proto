@@ -1,0 +1,26 @@
+syntax = "proto2";
+
+// Fixture for the bounded decoder (#691): shapes of proto2 `required` message fields that
+// `bounds2.proto` lacks. Generated with `protojl("bounds3.proto", ".", "."; parametrize_oneofs=true)`,
+// which turns a message holding a oneof into a parametric struct, so `protobuf(req, Choice)` is
+// handed a `UnionAll` whose oneof field is a type variable.
+
+message Mark {
+    optional int32 v = 1;
+}
+
+// A parametric struct: the oneof is `T1`, and `mark` is still a plain required field.
+message Choice {
+    oneof pick {
+        int32 n = 1;
+        Mark m = 2;
+    }
+    required Mark mark = 3;
+}
+
+// A required group, itself holding a required message.
+message Grouped {
+    required group G = 1 {
+        required Mark gm = 2;
+    }
+}

@@ -1,7 +1,7 @@
 ﻿@testitem "Protobuf extension" tags=[:extension] setup=[NitroCommon] begin
 using HTTP
 using ProtoBuf
-using Nitro: Nitro, protobuf
+using Nitro: Nitro, protobuf, App, urlpatterns, path, internalrequest, ProtoBuffer
 
 include(".messages/people_pb.jl");
 using .people_pb: People, Person
@@ -87,6 +87,8 @@ include(".messages/bounds_pb.jl");
 using .bounds_pb: Blob, Node, Holder
 include(".messages/bounds2_pb.jl");      # proto2, for `required` message fields
 using .bounds2_pb: Point, Line, Drawing, Tag, Labeled, Row, Table, Bag, Box
+include(".messages/bounds3_pb.jl");      # proto2, `parametrize_oneofs = true`
+using .bounds3_pb: Mark, Choice, Grouped
 
 @testset "Protobuf bounded decoding (#325)" begin
     req(bytes) = HTTP.Request("POST", "/data", [], bytes)
@@ -272,7 +274,7 @@ using .bounds2_pb: Point, Line, Drawing, Tag, Labeled, Row, Table, Bag, Box
         d = ext._BoundedDecoder(IOBuffer(protobuf(table).body))
         back = ProtoBuf.Codecs.decode(d, Table)
         @test [r.item.k for r in back.rows] == 1:1_000
-        @test isempty(d.filled) && d.level[] == 0 && d.depth[] == 0
+        @test isempty(d.filled) && d.level[] == 0 && d.depth[] == 0 && d.pending == [0]
     end
 
     @testset "a proto2 required sub-message that can hold a vector is still capped" begin
@@ -282,6 +284,66 @@ using .bounds2_pb: Point, Line, Drawing, Tag, Labeled, Row, Table, Bag, Box
         @test protobuf(req(box(17)), Box).bag.v == fill(UInt32(1), 17)
         @test refused(box(18), Box) ==
               "protobuf body merges repeated singular sub-message fields more than 16 times"
+    end
+
+    @testset "a body that omits a proto2 required sub-message is refused (#691)" begin
+        # Generated code reads a required field's `Ref{T}()` when the message ends, sent or not.
+        # For `Row.item`, inline and pointer-free, that is memory nothing wrote, and `show` on the
+        # result segfaulted at -O0 and -O2 alike; `Box.bag` holds a vector and threw
+        # `UndefRefError`. No assertion here reads a value decoded from a body that omits a field,
+        # so none of them depends on what that memory held.
+        MISSING = "protobuf message is missing a required sub-message field"
+        @test refused(UInt8[], Row) == MISSING
+        @test refused(UInt8[], Box) == MISSING
+        @test refused(UInt8[], Line) == MISSING
+        # `Line` needs `a` (field 1) and `b` (field 2). A repeat of `a` is a merge, not `b`.
+        @test refused(UInt8[0x0a, 0x00], Line) == MISSING
+        @test refused(UInt8[0x0a, 0x00, 0x0a, 0x00], Line) == MISSING
+        @test refused(UInt8[0x12, 0x00], Line) == MISSING
+        @test decoded(UInt8[0x0a, 0x00, 0x12, 0x00], Line) == Line(Point(0, 0), Point(0, 0))
+        # At any depth: a `Table` row that is itself missing its `item`.
+        @test refused(UInt8[0x0a, 0x00], Table) == MISSING
+        @test [r.item.k for r in decoded(UInt8[0x0a, 0x02, 0x0a, 0x00], Table).rows] == [0]
+        # The group form on a decoder built directly: a group that closes at once.
+        ext = Base.get_extension(Nitro, :ProtoBufExt)
+        group_row() = ProtoBuf.Codecs.decode(ext._BoundedDecoder(IOBuffer(UInt8[0x04])),
+                                             Ref{Row}, Val{:group})
+        @test_throws ArgumentError(MISSING) group_row()
+
+        # What each message must receive. If this drifts from the codegen, valid bodies are
+        # refused (a count too high) or a missing field passes again (too low): fixtures with
+        # none, one and two required sub-messages, an optional one, and repeated ones.
+        @test [ext._required_count(T) for T in (Row, Line, Box)] == [1, 2, 1]
+        @test all(iszero ∘ ext._required_count,
+                  (Labeled, Table, Drawing, Point, Tag, Bag, Node, Holder, Blob, People, Person))
+        # A parametric message is named by its `UnionAll`; its oneof is never required.
+        @test [ext._required_count(T) for T in (Choice, Choice{Nothing}, Choice{OneOf{Int32}})] ==
+              [1, 1, 1]
+
+        # `Choice` with a oneof and its required `mark`, and without the oneof: both decode
+        # through the `UnionAll`. Each body leaves out `mark`, then everything.
+        c = decoded(UInt8[0x08, 0x03, 0x1a, 0x02, 0x08, 0x01], Choice)
+        @test c.mark == Mark(1) && c.pick.name === :n && c.pick[] == 3
+        @test decoded(UInt8[0x1a, 0x02, 0x08, 0x01], Choice).mark == Mark(1)
+        @test refused(UInt8[0x08, 0x03], Choice) == MISSING
+        @test refused(UInt8[], Choice) == MISSING
+        # A required group, holding a required message: the group form of the first-occurrence
+        # count, which a valid body needs to reach zero. Then the group without `gm`, and no group.
+        @test decoded(UInt8[0x0b, 0x12, 0x02, 0x08, 0x01, 0x04], Grouped).g.gm == Mark(1)
+        @test refused(UInt8[0x0b, 0x04], Grouped) == MISSING
+        @test refused(UInt8[], Grouped) == MISSING
+
+        # Through the extractor, which turns the refusal into a 400.
+        app = App(mod = @__MODULE__)
+        urlpatterns(app, "",
+            path("/row", function(req, data::ProtoBuffer{Row})
+                return string(data.payload.item.k)
+            end, method = "POST"),
+        )
+        post(body) = internalrequest(app, HTTP.Request("POST", "/row", [], body))
+        @test post(UInt8[]).status == 400
+        r = post(protobuf(Row(Labeled(nothing, 5))).body)
+        @test r.status == 200 && String(r.body) == "5"
     end
 
     @testset "a packed run after an unpacked element keeps both" begin
