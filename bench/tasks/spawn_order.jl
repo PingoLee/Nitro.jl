@@ -196,7 +196,7 @@ function measure()
     modes = split(get(ENV, "MODES", "spawn pool"))
     clients = Symbol.(split(get(ENV, "CLIENTS", "interactive default")))
     Threads.nthreads(:interactive) == 0 && filter!(!=(:interactive), clients)
-    labels = (string(VERSION), Base.GIT_VERSION_INFO.commit_short,
+    labels = (string(VERSION), MULTIQ_BUILD,
               string(Threads.nthreads(:default), ",", Threads.nthreads(:interactive)),
               GUARD_TIMER === nothing ? "0" : "1", MULTIQ_VARIANT, get(ENV, "ROUND", "1"))
     handler_pool = fetch(Threads.@spawn :interactive fetch(Threads.@spawn Threads.threadpool()))

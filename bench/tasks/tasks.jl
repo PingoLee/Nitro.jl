@@ -19,7 +19,9 @@
 #           handlers) and once on `:interactive` (where HTTP.jl runs connection tasks). A third
 #           pass has the spinners `yield()` about every millisecond.
 #
-# Every line is `kind <TAB> runtime <TAB> ...`, the format go/ prints, so run.sh can keep both.
+# Every line is `kind <TAB> runtime <TAB> ...`, the format go/ prints, so run.sh can keep both. The
+# micro and queued rows end with `build=<commit>[/<scheduler backend>]` (multiq_variant.jl's label),
+# which tells two builds of one commit apart.
 include(joinpath(@__DIR__, "multiq_variant.jl"))
 using BenchmarkTools
 
@@ -46,7 +48,7 @@ end
 function report(name, trial; per = 1, unit = "op")
     m = median(trial)
     println("micro\tjulia\t", name, "\tns_per_", unit, "=", round(m.time / per; digits = 1),
-            "\tbytes_per_op=", m.memory, "\tallocs_per_op=", m.allocs)
+            "\tbytes_per_op=", m.memory, "\tallocs_per_op=", m.allocs, "\tbuild=", MULTIQ_BUILD)
 end
 
 function micro()
@@ -110,7 +112,8 @@ function queued()
         mid = (QUEUED_REPS + 1) ÷ 2
         println("queued\tjulia\tQueued", n, "\tspawn_ns_per_task=", round(spawn[mid]; digits = 1),
                 "\tdrain_ns_per_task=", round(drain[mid]; digits = 1),
-                "\tdrain_min=", round(drain[1]; digits = 1), "\tdrain_max=", round(drain[end]; digits = 1))
+                "\tdrain_min=", round(drain[1]; digits = 1), "\tdrain_max=", round(drain[end]; digits = 1),
+                "\tbuild=", MULTIQ_BUILD)
     end
 end
 
