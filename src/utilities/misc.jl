@@ -252,7 +252,13 @@ end
 The fallback case for parsing parameters.
 Tries to parse the type as is, if this fails then we assume it's a json string
 """
-function parseparam(::Type{T}, str::String) where {T}
+parseparam(::Type{T}, str::String) where {T} = _parseparam_fallback(T, str)
+
+# The fallback's body, named so the float method below can reach it with a static call. It used
+# to get there through `invoke(parseparam, Tuple{Type{T}, String} where {T}, T, str)`, whose
+# `UnionAll` signature is looked up at run time on every call: 5.4 µs and 19 allocations for
+# `parseparam(Float64, "1.5")`, against ≈100 ns and none for `Int` (#631).
+function _parseparam_fallback(::Type{T}, str::String) where {T}
     try
         return parse(T, str)
     catch e
@@ -289,7 +295,7 @@ function parseparam(::Type{T}, str::String) where {T <: AbstractFloat}
     # back to that method, which tries each member in turn: the fallback's `parse(T, str)` on a
     # union recurses in Base's `tryparse` until the stack overflows (#327 review).
     T isa Union && return invoke(parseparam, Tuple{Union, String}, T, str)
-    value = invoke(parseparam, Tuple{Type{T}, String} where {T}, T, str)
+    value = _parseparam_fallback(T, str)
     isfinite(value) || throw(ArgumentError("not a finite number"))
     return value
 end

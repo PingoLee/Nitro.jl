@@ -847,3 +847,27 @@ end
     @test generated.count <= 5
 end
 end
+
+@testitem "a float parameter parses with no runtime method lookup (#631)" tags=[:core] setup=[NitroCommon] begin
+using Test
+using Nitro
+
+# The float method reached the generic fallback through `invoke` with a `UnionAll` signature,
+# which is resolved at run time on every call: 19 allocations for `parseparam(Float64, "1.5")`
+# against none for `Int`. It now calls the fallback's body by name. The old `invoke` is the
+# positive control, so a bound of 0 cannot pass by measuring nothing.
+fallback_by_invoke(T, s) = invoke(Nitro.parseparam, Tuple{Type{T}, String} where {T}, T, s)
+@test allocs(() -> fallback_by_invoke(Float64, "1.5")).count >= 10
+@test allocs(() -> Nitro.parseparam(Float64, "1.5")).count == 0
+@test allocs(() -> Nitro.parseparam(Float32, "1.5")).count == 0
+
+# What the float method is for stays exactly as it was: the value, the finite-only rule (#327),
+# a float union handed to the union method, and the JSON fall-through for text `parse` refuses.
+@test Nitro.parseparam(Float64, "1.5") === 1.5
+@test Nitro.parseparam(Float32, "-2.25") === -2.25f0
+@test_throws ArgumentError Nitro.parseparam(Float64, "NaN")
+@test_throws ArgumentError Nitro.parseparam(Float64, "1e999")
+@test Nitro.parseparam(Union{Float32, Float64}, "1.5") === 1.5f0
+@test_throws ValidationError Nitro.parseparam(Union{Float32, Float64}, "inf")
+@test_throws ArgumentError Nitro.parseparam(Float64, "abc")   # the bounded JSON parse refuses it
+end

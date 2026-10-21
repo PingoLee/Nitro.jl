@@ -1323,9 +1323,10 @@ end
 # `create_param_parser` therefore infers `String` instead of `Any` — one dynamic dispatch fewer
 # on the request path, not a new instability. Do not "restore" the old shape.
 #
-# The decode cannot be done in place, so this builds a Dict — but it is built ONCE per request
-# and cached by the `pathparams` wrapper below (#38), which makes `getparams(req)` a live handle
-# rather than a snapshot: mutating it is visible to every later read. Treat it as read-only and
+# The decode cannot be done in place, so a value that needs one costs a new Dict (see #558 below
+# for the values that do not) — but the map is built ONCE per request and cached by the
+# `pathparams` wrapper below (#38), which makes `getparams(req)` a live handle rather than a
+# snapshot: mutating it is visible to every later read. Treat it as read-only and
 # use `req.context` to pass values down a request. `getjson`/`getform` have always behaved
 # this way; this accessor and `queryvars` were the outliers.
 #
@@ -1339,9 +1340,21 @@ end
 # carries almost nothing -- `unescapeuri` fails inside `parse(UInt8, "ZZ"; base=16)` (the two hex
 # digits) or as a message-free `EOFError` -- but the rule is uniform: since #130 none of `showerror`,
 # `show` or `JSON.lower` renders a cause by default, at any of the four sites that attach one.
+#
+# Most segments carry no escape, and `unescapeuri` returns a value with no `%` unchanged, so for
+# them the decoded map has exactly the router's contents. That map is returned AS the decoded one
+# instead of copied pair by pair -- a second `Dict` per parametrized request, 576 bytes for one
+# parameter (#558). It is the router's own per-request `Params` (`HTTP.Handlers.gethandler`
+# builds a fresh one per call), so `getparams(req)` and `HTTP.getparams(req)` are then the same
+# object; the read-only rule above covers both. Never an empty one: an exact route's params are the
+# shared `RouterHOF.EMPTY_PARAMS`, which the router does not store but which must not reach an app
+# as a mutable handle if it ever were.
 function _pathparams_uncached(req::HTTP.Request)
     raw = HTTP.getparams(req)
     raw === nothing && return nothing
+    if raw isa Dict{String,String} && !isempty(raw) && _pathparams_verbatim(raw)
+        return raw
+    end
     decoded = Dict{String,String}()
     for (k, v) in raw
         value = try
@@ -1359,6 +1372,16 @@ function _pathparams_uncached(req::HTTP.Request)
         decoded[k] = value
     end
     return decoded
+end
+
+# True when decoding would change nothing and refuse nothing: no value carries a `%`, and every
+# value is already valid UTF-8 (a raw byte >= 0x80 in the target arrives undecoded and still has
+# to be refused). Anything else takes the copying loop above, which owns both error messages.
+function _pathparams_verbatim(raw::Dict{String,String})
+    for v in values(raw)
+        (occursin('%', v) || !isvalid(v)) && return false
+    end
+    return true
 end
 # Upper bound on how much of a client-supplied query-parameter NAME may be echoed into a
 # `ValidationError.msg`, which is reachable from the `@debug` line in `handlerequest` (#72).
