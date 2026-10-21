@@ -64,12 +64,12 @@ const MAX_PROTOBUF_MERGES = 16
 
 # `io` is the field name `PBC.get_stream` reads. `endpos`/`group` are only used by code from an
 # older ProtoBuf.jl, which asks the decoder itself where a sub-message ends (`message_done(d)`);
-# current code passes both as arguments instead. The two counters, `filled` and `level` are
-# SHARED by every nested decoder, so one count covers current code (same decoder all the way
-# down), older code (a fresh one per level), and group skips alike. They are never unwound on a
-# throw, and need not be: the decoder is private to one `_decode_bounded` call, and nothing in
-# ProtoBuf.jl catches an error partway through a decode, so a throw ends the only use of them.
-# `filled` and `level` are explained at `_repeat`.
+# current code passes both as arguments instead. The two counters and `filled`, `level` and
+# `pending` are SHARED by every nested decoder, so one count covers current code (same decoder
+# all the way down), older code (a fresh one per level), and group skips alike. They are never
+# unwound on a throw, and need not be: the decoder is private to one `_decode_bounded` call, and
+# nothing in ProtoBuf.jl catches an error partway through a decode, so a throw ends the only use
+# of them. `filled` and `level` are explained at `_repeat`, `pending` at `_required_count`.
 struct _BoundedDecoder{I<:IO} <: PBC.AbstractProtoDecoder
     io::I
     endpos::Int
@@ -78,11 +78,15 @@ struct _BoundedDecoder{I<:IO} <: PBC.AbstractProtoDecoder
     merges::Base.RefValue{Int}
     filled::Vector{Base.RefValue}
     level::Base.RefValue{Int}
+    pending::Vector{Int}
 end
 
-_BoundedDecoder(io::IO) = _BoundedDecoder(io, 0, false, Ref(0), Ref(0), Base.RefValue[], Ref(0))
+# `pending` starts with the outermost message's entry, `0` here; `_decode_bounded` sets it from
+# the type it decodes. A decoder built directly therefore suits a single field's `decode!`, or a
+# message with no required sub-message at its top level: one with any is refused.
+_BoundedDecoder(io::IO) = _BoundedDecoder(io, 0, false, Ref(0), Ref(0), Base.RefValue[], Ref(0), [0])
 _nested(d::_BoundedDecoder, endpos::Int, group::Bool) =
-    _BoundedDecoder(d.io, endpos, group, d.depth, d.merges, d.filled, d.level)
+    _BoundedDecoder(d.io, endpos, group, d.depth, d.merges, d.filled, d.level, d.pending)
 
 # Fixed messages that never quote the body, so `safe_extract`'s 400 carries nothing the sender
 # wrote -- the convention `MAX_JSON_DEPTH` set for JSON (#314).
@@ -95,16 +99,19 @@ function _read_prefix(io::IO)::Int
     return Int(len)
 end
 
-# Entering a level also opens its slice of `filled`; leaving drops it (see `_repeat`). `_enter!`
-# returns the enclosing level's start, for `_leave!` to restore.
-function _enter!(d::_BoundedDecoder)::Int
+# Entering a level also opens its slice of `filled` and its `pending` entry, `required` being
+# what that level's message must receive (see `_repeat` and `_required_count`); leaving drops
+# both. `_enter!` returns the enclosing level's start, for `_leave!` to restore.
+function _enter!(d::_BoundedDecoder, required::Int)::Int
     (d.depth[] += 1) <= MAX_PROTOBUF_DEPTH ||
         _throw_protobuf("protobuf message nests deeper than $MAX_PROTOBUF_DEPTH levels")
     outer = d.level[]
     d.level[] = length(d.filled)
+    push!(d.pending, required)
     return outer
 end
 function _leave!(d::_BoundedDecoder, outer::Int)
+    pop!(d.pending)
     resize!(d.filled, d.level[])
     d.level[] = outer
     d.depth[] -= 1
@@ -117,8 +124,11 @@ function _merged!(d::_BoundedDecoder)
     return nothing
 end
 
-_decode_bounded(bytes::AbstractVector{UInt8}, ::Type{T}) where {T} =
-    PBC.decode(_BoundedDecoder(IOBuffer(bytes)), T)
+function _decode_bounded(bytes::AbstractVector{UInt8}, ::Type{T}) where {T}
+    d = _BoundedDecoder(IOBuffer(bytes))
+    d.pending[1] = _required_count(T)
+    return PBC.decode(d, T)
+end
 
 # -- Length-prefixed scalars -------------------------------------------------------------------
 
@@ -171,7 +181,7 @@ _current_codegen(::Type{T}) where {T} =
 function PBC.decode(d::_BoundedDecoder, ::Type{Ref{T}}) where {T}
     io = d.io
     endpos = _read_prefix(io) + position(io)
-    outer = _enter!(d)
+    outer = _enter!(d, _required_count(T))
     out = _current_codegen(T) ? PBC.decode(d, T, endpos, false) :
                                 PBC.decode(_nested(d, endpos, false), T)
     _leave!(d, outer)
@@ -181,7 +191,7 @@ function PBC.decode(d::_BoundedDecoder, ::Type{Ref{T}}) where {T}
 end
 
 function PBC.decode(d::_BoundedDecoder, ::Type{Ref{T}}, ::Type{Val{:group}}) where {T}
-    outer = _enter!(d)
+    outer = _enter!(d, _required_count(T))
     out = _current_codegen(T) ? PBC.decode(d, T, 0, true) : PBC.decode(_nested(d, 0, true), T)
     _leave!(d, outer)
     return out
@@ -191,14 +201,19 @@ end
 # 3-argument method reads a `message_done` field this struct does not carry, and its
 # length-delimited 1-argument method stops only on `==`, so a field that overruns its parent's
 # end reads on into the parent. `>=` stops it, and the `Ref` methods above then refuse it.
+# A message that ends still owing a required sub-message is refused here, before the generated
+# code reads that field's buffer (see `_required_count`).
 function PBC.message_done(d::_BoundedDecoder, endpos::Int, group::Bool)
     io = d.io
     if group
         done = peek(io) == UInt8(PBC.END_GROUP)
         done && skip(io, 1)
-        return done
+    else
+        done = eof(io) || (endpos > 0 && position(io) >= endpos)
     end
-    return eof(io) || (endpos > 0 && position(io) >= endpos)
+    done && d.pending[end] != 0 &&
+        _throw_protobuf("protobuf message is missing a required sub-message field")
+    return done
 end
 PBC.message_done(d::_BoundedDecoder) = PBC.message_done(d, d.endpos, d.group)
 
@@ -208,7 +223,7 @@ function Base.skip(d::_BoundedDecoder, wire_type::PBC.WireType)
     if wire_type == PBC.LENGTH_DELIMITED
         skip(d.io, _read_prefix(d.io))
     elseif wire_type == PBC.START_GROUP
-        outer = _enter!(d)
+        outer = _enter!(d, 0)
         invoke(Base.skip, Tuple{PBC.AbstractProtoDecoder, PBC.WireType}, d, wire_type)
         _leave!(d, outer)
     else
@@ -216,6 +231,40 @@ function Base.skip(d::_BoundedDecoder, wire_type::PBC.WireType)
     end
     return nothing
 end
+
+# -- Absent required sub-messages (#691) -------------------------------------------------------
+#
+# Generated code ends a message with `return T(field[])` whether or not a `required` field ever
+# arrived, so a body that leaves one out reads that field's `Ref{T}()` unwritten: memory nothing
+# wrote for an inline pointer-free `T` (a `show` of the result can segfault), `UndefRefError` for
+# any other. The decoder never sees a field that does not arrive, so it counts the ones that do.
+# Each open message has a `pending` entry, set on entry to its number of required sub-message
+# fields; the FIRST occurrence of one decrements it (a repeat is a merge, not a new field), and
+# `message_done` refuses a message that ends with it not at zero. That check runs before the loop
+# exits, so the final reads never happen. Field numbers from `decode_tag` would not do: upstream's
+# map-entry decode reads its key and value tags (1 and 2) through it in the PARENT message.
+#
+# A field is a required sub-message when its type is not `>: Nothing` (optional fields are) and
+# is not a scalar, enum, string, repeated field, map or oneof -- upstream's own split between
+# scalar, vector and struct fields in `_merge_structs!`. Every such field is held in a plain
+# `Ref{T}()`, which is what reaches the two plain `decode!` methods below. The check is `!= 0`
+# rather than `> 0` so that if this classification and the generated code ever disagree, the test
+# fixtures fail loudly instead of a missing field passing.
+#
+# Code generated with `parametrize_oneofs = true` makes a message holding a oneof parametric, and
+# the type a caller names is then the `UnionAll` (`Choice`, not `Choice{…}`): its fields are read
+# from the unwrapped body, where the oneof is a type variable, and a concrete instance's oneof is
+# a bare `OneOf`. `F` is an untyped argument because those field types can hold free type
+# variables, which a `::Type{F}` signature cannot match.
+_required_message(F) = !(F isa TypeVar) && !(Nothing <: F) &&
+    !(F <: Union{Number, Enum, AbstractString, AbstractVector, AbstractDict, ProtoBuf.OneOf})
+function _required_count(::Type{T}) where {T}
+    U = Base.unwrap_unionall(T)
+    U isa DataType && isstructtype(U) || return 0
+    return count(_required_message, fieldtypes(U))
+end
+
+_received!(d::_BoundedDecoder) = (d.pending[end] -= 1; nothing)
 
 # -- Merges of a repeated singular sub-message field -------------------------------------------
 
@@ -271,6 +320,7 @@ function PBC.decode!(d::_BoundedDecoder, buffer::Base.RefValue{T}) where {T}
     end
     buffer[] = PBC.decode(d, Ref{T})
     _filled!(d, buffer)
+    _received!(d)
     return nothing
 end
 function PBC.decode!(d::_BoundedDecoder, buffer::Base.RefValue{S},
@@ -287,6 +337,7 @@ function PBC.decode!(d::_BoundedDecoder, buffer::Base.RefValue{T}, ::Type{Val{:g
     end
     buffer[] = PBC.decode(d, Ref{T}, Val{:group})
     _filled!(d, buffer)
+    _received!(d)
     return nothing
 end
 
@@ -302,6 +353,7 @@ refused with an `ArgumentError` that never quotes it if:
   prefix claiming more bytes than the body has left;
 - sub-messages and groups nest deeper than 100 levels;
 - repeated singular sub-message fields cause more than 16 merges in the body as a whole;
+- a message, at any depth, omits a proto2 `required` sub-message field;
 - a packed fixed-width field's length is not a multiple of its element size.
 
 Other malformed bodies still fail with ProtoBuf.jl's own errors, for example an `EOFError` for
