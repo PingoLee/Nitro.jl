@@ -1841,3 +1841,81 @@ end
 end
 
 end
+
+@testitem "SessionMiddleware snapshots a loaded session once, and only when it must (#547)" tags=[:middleware] setup=[NitroCommon] begin
+using Test
+using HTTP
+using Dates
+using Nitro
+using Nitro: SessionMiddleware
+using Nitro.Core.Types: MemoryStore, AbstractSessionStore, SessionPayload
+import Nitro.Core.Types: set_session!, update_session!, delete_session!
+
+const SID = "11111111-1111-4111-8111-111111111111"
+const TTL = 7200       # neither the full nor the unconfirmed lifetime: a load forces no write
+
+# A store that hands back its LIVE payload and rewrites it in place. The contract allows it, and it
+# is why only `MemoryStore` -- which stores a private copy and only ever replaces it -- may skip the
+# snapshot: comparing against this store's live dict would let another request's write move the
+# baseline under a running request.
+struct InPlaceStore <: AbstractSessionStore{String, Dict{String,Any}}
+    data::Dict{String, SessionPayload{Dict{String,Any}}}
+end
+InPlaceStore() = InPlaceStore(Dict{String, SessionPayload{Dict{String,Any}}}())
+Base.get(s::InPlaceStore, id::String, default) = get(s.data, id, default)
+function set_session!(s::InPlaceStore, id::String, v::Dict{String,Any}; ttl::Int = 3600)
+    now = Dates.now(Dates.UTC)
+    s.data[id] = SessionPayload(deepcopy(v), now + Dates.Second(ttl), now)
+    return v
+end
+function update_session!(s::InPlaceStore, id::String, v::Dict{String,Any}; ttl::Int = 3600)
+    payload = get(s.data, id, nothing)
+    payload === nothing && return false
+    merge!(empty!(payload.data), deepcopy(v))
+    return true
+end
+delete_session!(s::InPlaceStore, id::String) = (delete!(s.data, id); nothing)
+
+request() = HTTP.Request("GET", "/", ["Cookie" => "sid=$SID"])
+
+@testset "a request that changed nothing never writes back over a concurrent update ($(nameof(typeof(store))))" for store in
+        (MemoryStore{String, Dict{String,Any}}(), InPlaceStore())
+    set_session!(store, SID, Dict{String,Any}("cart" => Any[1]); ttl = TTL)
+    # The handler reads the session and changes nothing; meanwhile another request of the same
+    # session adds to the cart. This request must not write its stale copy back.
+    reader(req) = (getsession(req); update_session!(store, SID, Dict{String,Any}("cart" => Any[1, 2]); ttl = TTL);
+                   HTTP.Response(200, "ok"))
+    layer = SessionMiddleware(cookie_name = "sid", store = store).middleware(reader)
+    @test layer(request()).status == 200
+    @test Base.get(store, SID, nothing).data["cart"] == [1, 2]
+end
+
+@testset "a nested change is still detected and written (#452)" begin
+    store = MemoryStore{String, Dict{String,Any}}()
+    set_session!(store, SID, Dict{String,Any}("cart" => Any[1]); ttl = TTL)
+    pusher(req) = (push!(getsession(req)["cart"], 2); HTTP.Response(200, "ok"))
+    layer = SessionMiddleware(cookie_name = "sid", store = store).middleware(pusher)
+    layer(request())
+    @test Base.get(store, SID, nothing).data["cart"] == [1, 2]
+end
+
+@testset "one deep copy per loaded MemoryStore session" begin
+    # The handler's copy and a second snapshot to compare it against cost ~19 (`-O2`) to ~24
+    # (`-O0`) allocations each on this session; the snapshot is now the store's own private
+    # payload. Measured 35 at `-O2` and 40 at `-O0`; 54 and 64 before. The positive control
+    # prices the copy that went away.
+    store = MemoryStore{String, Dict{String,Any}}()
+    set_session!(store, SID, Dict{String,Any}("cart" => Any[1, 2, 3], "user_id" => 7); ttl = TTL)
+    layer = SessionMiddleware(cookie_name = "sid", store = store).middleware(req -> HTTP.Response(200, "ok"))
+    @test layer(request()).status == 200
+    reqs = [request() for _ in 1:11]       # a fresh request per call: `allocs` makes 11
+    next = Ref(0)
+    @testset let loaded = allocs(() -> layer(reqs[next[] += 1])),
+                 copy = let d = Base.get(store, SID, nothing).data
+                     allocs(() -> deepcopy(d))
+                 end
+        @test loaded.count <= 50
+        @test loaded.count + copy.count > 50
+    end
+end
+end

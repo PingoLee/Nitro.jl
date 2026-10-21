@@ -129,6 +129,13 @@ end
     @test !("PUT" in CSRF.SAFE_METHODS)
     @test !("PATCH" in CSRF.SAFE_METHODS)
     @test !("DELETE" in CSRF.SAFE_METHODS)
+    # The per-request check folds ASCII case only (#562): HTTP.jl keeps `get` as `get`.
+    for m in ("GET", "get", "Head", "options", "TRACE")
+        @test CSRF._is_safe_method(m)
+    end
+    for m in ("POST", "post", "PUT", "patch", "DELETE", "", "GETX", "optıons")
+        @test !CSRF._is_safe_method(m)
+    end
 end
 
 @testset "_binding reads the session id, and only a string one" begin
@@ -1101,6 +1108,67 @@ end
     @test res.status == 200
     @test !isempty(cookie_value(res, "__Host-csrf_token"))
     @test session_count(store) == 1
+end
+
+@testset "a rotation re-verifies a cookie the pre-handler check accepted (#544)" begin
+    # The post-handler check reuses the pre-handler verification while the binding is unchanged.
+    # A handler that rotates the session changes it, and the client's still-valid cookie then has
+    # to be checked again -- under the new id, where it fails -- or the response would carry no
+    # replacement and the client would hold an orphaned token.
+    store = MemoryStore{String, Dict{String,Any}}()
+    Nitro.Types.set_session!(store, SESSION_A, Dict{String,Any}("user_id" => 7); ttl = 3600)
+    rotating(req) = (regenerate_session!(req, store); HTTP.Response(200, "ok"))
+    layer = SessionMiddleware(cookie_name = "unit_session", store = store).middleware(
+        CSRFMiddleware(SECRET)(rotating))
+    minted = HTTP.Response(200, "ok")
+    issue_csrf_token!(minted, SECRET; binding = SESSION_A)
+    old_token = cookie_value(minted, "__Host-csrf_token")
+
+    res = layer(request("GET", Dict("unit_session" => SESSION_A, "__Host-csrf_token" => old_token)))
+    @test any(startswith("__Host-csrf_token="), set_cookie_headers(res))    # re-issued at all
+    new_session = cookie_value(res, "unit_session")
+    new_token = cookie_value(res, "__Host-csrf_token")
+    @test new_session != SESSION_A
+    @test new_token != old_token
+    @test CSRF._verify_signed_token(SECRET, new_token, new_session) !== nothing
+
+    # Without a rotation the same cookie is still valid: nothing is re-issued.
+    plain = SessionMiddleware(cookie_name = "unit_session", store = store).middleware(
+        CSRFMiddleware(SECRET)(ok_handler))
+    minted_b = HTTP.Response(200, "ok")
+    issue_csrf_token!(minted_b, SECRET; binding = new_session)
+    res_b = plain(request("GET", Dict("unit_session" => new_session,
+                                      "__Host-csrf_token" => cookie_value(minted_b, "__Host-csrf_token"))))
+    @test !any(h -> startswith(h, "__Host-csrf_token="), set_cookie_headers(res_b))
+end
+
+@testset "the cookie's signature is verified once per request (#544)" begin
+    # It was verified before the handler and again after it, under the same binding: an HMAC and
+    # ~15 allocations that re-derived what the first one proved; a POST paid two extra. The GET
+    # bound sits below "one more verification", which the positive control prices. Measured 36
+    # (GET) and 57 (POST) once the method check stopped allocating (#562); 60 and 97 before both.
+    minted = HTTP.Response(200, "ok")
+    masked = issue_csrf_token!(minted, SECRET; binding = SESSION_A)
+    cookie = cookie_value(minted, "__Host-csrf_token")
+    layer = bound_layer(SESSION_A)
+    get_req() = request("GET", Dict("__Host-csrf_token" => cookie))
+    # `Cookie` first: `_bearer_only` still lowercases each header name until it meets `Cookie`
+    # (#542), and that cost must not decide whether this bound holds.
+    post_req() = HTTP.Request("POST", "/form", ["Cookie" => "__Host-csrf_token=$cookie",
+                                                "X-CSRF-Token" => masked])
+    @test layer(get_req()).status == 200
+    @test layer(post_req()).status == 200
+    gets = [get_req() for _ in 1:11]
+    posts = [post_req() for _ in 1:11]
+    next_get = Ref(0); next_post = Ref(0)     # a fresh request per call: `allocs` makes 11
+    @testset let get = allocs(() -> layer(gets[next_get[] += 1])),
+                 post = allocs(() -> layer(posts[next_post[] += 1])),
+                 verify = allocs(() -> CSRF._verify_signed_token(SECRET, cookie, SESSION_A))
+        @test get.count <= 45
+        @test post.count <= 65
+        # A second verification would break the GET bound on its own.
+        @test get.count + verify.count > 45
+    end
 end
 
 end

@@ -1970,3 +1970,44 @@ end
     @test startswith(HTTP.header(res, "Set-Cookie"), "$name=v")
 end
 end
+
+@testitem "get_cookie walks the headers without allocating per header (#543)" tags=[:core] setup=[NitroCommon] begin
+using Nitro
+using HTTP
+using Test
+const Cookies = Nitro.Cookies
+
+# 15 headers, the Cookie one last: every lookup walks past the other 14 names first.
+filler = ["Host" => "a.example", "User-Agent" => "probe/1.0", "Accept" => "*/*",
+          "Accept-Language" => "en", "Accept-Encoding" => "gzip", "Connection" => "keep-alive",
+          "Cache-Control" => "no-cache", "Pragma" => "no-cache", "Referer" => "https://a.example/",
+          "Sec-Fetch-Dest" => "empty", "Sec-Fetch-Mode" => "cors", "DNT" => "1",
+          "X-One" => "1", "X-Two" => "2"]
+req = HTTP.Request("GET", "/", vcat(filler, ["Cookie" => "theme=dark; sid=abc; csrf=xyz"]))
+
+@testset "the header-name match is ASCII case-insensitive, and nothing looser" begin
+    @test Cookies.get_cookie(req, "sid") == "abc"
+    @test Cookies.get_cookie(["cOoKiE" => "sid=abc"], "sid") == "abc"
+    @test Cookies.parse_cookies(["COOKIE" => "sid=abc"])["sid"] == "abc"
+    res = HTTP.Response(200, ["SET-COOKIE" => "sid=abc; Path=/"])
+    @test Cookies.get_cookie(res, "sid") == "abc"
+    @test Cookies.parse_cookies(res)["sid"] == "abc"
+    # KELVIN SIGN lowercases to 'k', so `lowercase(k) == "cookie"` used to accept this name.
+    # A header name is an ASCII token; only A-Z fold.
+    @test Cookies.get_cookie(["CooKie" => "sid=abc"], "sid") === nothing
+    @test isempty(Cookies.parse_cookies(["CooKie" => "sid=abc"]))
+end
+
+@testset "a lookup costs what the value costs, not a String per header" begin
+    # `lowercase(k)` per header was 7 allocations each -- ~90 on this request, paid by every
+    # cookie-reading middleware on every request. The positive control does exactly that walk
+    # and must break the bound.
+    # `r`, a local: a closure over the untyped testitem global would allocate on its own.
+    @testset let r = req,
+                 lookup = allocs(() -> Cookies.get_cookie(r, "csrf")),
+                 lowercasing = allocs(() -> count(h -> lowercase(h.first) == "cookie", r.headers))
+        @test lookup.count <= 5
+        @test lowercasing.count > 5
+    end
+end
+end

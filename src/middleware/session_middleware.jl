@@ -424,7 +424,7 @@ function SessionMiddleware(;
         return function(req::HTTP.Request)
             # Load the current payload and remember the auth marker before the handler runs.
             session_id = _get_session_id(req, session_cookie)
-            session_data, is_new, created, unconfirmed =
+            session_data, is_new, created, unconfirmed, baseline =
                 _load_session(store, session_id, absolute_max_age, unconfirmed_max_age, warned_bare)
             # A signed-in session whose user has since been signed out everywhere (#391) is
             # ended the way a session past its absolute lifetime is: deleted, and this request
@@ -433,10 +433,14 @@ function SessionMiddleware(;
             if !is_new && session_auth_hash !== nothing &&
                _auth_hash_stale(session_data, session_id, auth_key, validator, session_auth_hash)
                 _end_session!(store, session_id, "whose sign-in was revoked")
-                session_data, is_new, created, unconfirmed =
-                    Dict{String,Any}(), true, Dates.now(Dates.UTC), false
+                session_data, is_new, created, unconfirmed, baseline =
+                    Dict{String,Any}(), true, Dates.now(Dates.UTC), false, nothing
             end
-            original_session = deepcopy(session_data)
+            # What the change check at the end compares against (#452). Only a LOADED session is
+            # ever compared, so a new one takes no snapshot; a store whose stored payload nothing
+            # mutates hands `_load_session`'s baseline back instead of a second deep copy (#547).
+            original_session = is_new ? nothing :
+                               baseline !== nothing ? baseline : deepcopy(session_data)
             original_auth_marker = _auth_marker(session_data, session_id, auth_key, validator)
 
             # New visitors start with a fresh random session identifier.
@@ -611,20 +615,32 @@ function _generate_session_id()
     return string(secure_uuid4())
 end
 
-# Returns `(data, is_new, created, unconfirmed)`. `created` is the loaded session's creation
-# instant, or now for a new one -- the instant its absolute lifetime will be measured from once it
-# is saved. `unconfirmed` is whether a loaded session is still on its unconfirmed lifetime (#440).
+# Whether the payload `Base.get(store, id, nothing)` returns is one nothing will ever mutate in
+# place, so the middleware may compare the handler's session against it rather than against a
+# second deep copy (#547). `MemoryStore` stores a private deep copy on every write and only ever
+# replaces it (#318); a custom store promises nothing of the kind -- one that hands back a live
+# object it later mutates would move the baseline under a running request and lose its update --
+# so it keeps the copy. It also relies on no caller mutating the `SessionPayload` that
+# `Base.get(::MemoryStore, …)` hands out, which #318 already forbids.
+_payload_is_private(::AbstractSessionStore) = false
+_payload_is_private(::MemoryStore) = true
+
+# Returns `(data, is_new, created, unconfirmed, baseline)`. `created` is the loaded session's
+# creation instant, or now for a new one -- the instant its absolute lifetime will be measured from
+# once it is saved. `unconfirmed` is whether a loaded session is still on its unconfirmed lifetime
+# (#440). `baseline` is the stored data itself when the store keeps it private
+# (`_payload_is_private`), else `nothing` and the caller snapshots `data`.
 function _load_session(store::AbstractSessionStore{String, Dict{String,Any}}, session_id::Nullable{String},
                        absolute_max_age::Nullable{Int}, unconfirmed_max_age::Nullable{Int},
                        warned_bare::Threads.Atomic{Bool})
     now = Dates.now(Dates.UTC)
     if isnothing(session_id)
-        return Dict{String,Any}(), true, now, false
+        return Dict{String,Any}(), true, now, false, nothing
     end
 
     payload = _store_call(Base.get, store, session_id, nothing)
     if isnothing(payload)
-        return Dict{String,Any}(), true, now, false
+        return Dict{String,Any}(), true, now, false, nothing
     end
 
     # DEEP copies (#318). A shallow `copy` shared every nested value -- the docs' `cart` vector,
@@ -633,7 +649,7 @@ function _load_session(store::AbstractSessionStore{String, Dict{String,Any}}, se
     # request. `PormGSessionStore` decodes fresh JSON per read and never had the bug.
     if payload isa SessionPayload
         if is_expired(payload, now)
-            return Dict{String,Any}(), true, now, false
+            return Dict{String,Any}(), true, now, false, nothing
         end
         if _past_absolute_age(payload.created, absolute_max_age, now)
             # Past its absolute lifetime (#362): absent, like an expired session, whatever its
@@ -646,10 +662,11 @@ function _load_session(store::AbstractSessionStore{String, Dict{String,Any}}, se
             # middleware's cap bind them all -- which is why two middlewares sharing a store
             # should share a cap too.
             _end_session!(store, session_id, "past its absolute lifetime")
-            return Dict{String,Any}(), true, now, false
+            return Dict{String,Any}(), true, now, false, nothing
         end
         return deepcopy(payload.data), false, payload.created,
-               _unconfirmed_payload(payload, unconfirmed_max_age)
+               _unconfirmed_payload(payload, unconfirmed_max_age),
+               _payload_is_private(store) ? payload.data : nothing
     end
 
     # A store whose `Base.get` hands back bare data breaks the contract (it must return a
@@ -661,7 +678,7 @@ function _load_session(store::AbstractSessionStore{String, Dict{String,Any}}, se
               "`absolute_max_age` and the session is treated as absent. Return a " *
               "`SessionPayload(data, expires, created)` from `Base.get` (#362), or pass " *
               "`absolute_max_age = nothing`." store_type = typeof(store) maxlog = 1
-        return Dict{String,Any}(), true, now, false
+        return Dict{String,Any}(), true, now, false, nothing
     end
     # A bare payload carries no lifetime, so it cannot be recognised as unconfirmed: it reads as
     # confirmed and is never promoted. Every anonymous session in such a store therefore lapses at
@@ -676,7 +693,7 @@ function _load_session(store::AbstractSessionStore{String, Dict{String,Any}}, se
               "`unconfirmed_max_age = nothing` (#440)." store_type = typeof(store)
     end
     data = payload isa AbstractDict ? deepcopy(payload) : payload
-    return data, false, now, false
+    return data, false, now, false, nothing
 end
 
 # Whether a stored session is still UNCONFIRMED (#440): saved anonymous by the request that created
