@@ -80,8 +80,9 @@ The `secure=false` example is only for local HTTP development. Keep `secure=true
    [Anonymous Sessions and Floods](#Anonymous-Sessions-and-Floods)).
 4. Writes the cookie when a session is saved or its ID rotates, and marks that response
    `Cache-Control: private` with `Vary: Cookie`, so a shared cache or CDN never hands one
-   visitor's session to another. `private` replaces a `public` directive; `max-age` and the
-   other directives are kept.
+   visitor's session to another. `private` replaces a `public` directive and any qualified
+   `private="…"` (which still lets a shared cache store the rest of the response); `max-age` and
+   the other well-formed directives are kept, and a malformed one is dropped.
 
 The cookie contains an opaque session identifier, not the session payload itself. With `SessionMiddleware`, you do not need to encrypt the session ID to keep user data off the client.
 
