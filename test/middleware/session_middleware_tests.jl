@@ -1919,3 +1919,62 @@ end
     end
 end
 end
+
+# #563: `_mark_private!` built a `lowercase` String per response header and `String[]` lists of
+# every Vary and Cache-Control element -- ~40 allocations on every response that sets a session
+# or CSRF cookie. It now reads each element in place and allocates only what it writes.
+@testitem "_mark_private! reads the headers in place (#563)" tags=[:middleware] setup=[NitroCommon] begin
+using Nitro
+using HTTP
+using Test
+using Nitro.Util: _mark_private!
+
+marked(headers...) = [string(k, ": ", v) for (k, v) in _mark_private!(HTTP.Response(200, collect(Pair{String,String}, headers))).headers]
+
+@testset "the headers it writes are the ones the list-building version wrote" begin
+    # Each expected list is what main (23a86dce) produced for the same headers.
+    @test marked() == ["Vary: Cookie", "Cache-Control: private"]
+    @test marked("vary" => "Accept, cookie") == ["vary: Accept, cookie", "Cache-Control: private"]
+    @test marked("VARY" => "*") == ["VARY: *", "Cache-Control: private"]
+    @test marked("Vary" => " , Cookie ,") == ["Vary:  , Cookie ,", "Cache-Control: private"]
+    @test marked("Cache-Control" => "public, max-age=31536000, immutable") ==
+          ["Cache-Control: private, max-age=31536000, immutable", "Vary: Cookie"]
+    @test marked("cache-control" => "PRIVATE") == ["cache-control: PRIVATE", "Vary: Cookie"]
+    @test marked("Cache-Control" => " , ,") == ["Cache-Control: private", "Vary: Cookie"]
+    @test marked("Cache-Control" => "no-cache=\"a, b\", public") == ["Cache-Control: private, no-cache=\"a, b\"", "Vary: Cookie"]
+    @test marked("Cache-Control" => "Public=1") == ["Cache-Control: private", "Vary: Cookie"]
+    @test marked("Cache-Control" => "private=\"x\"") == ["Cache-Control: private=\"x\"", "Vary: Cookie"]
+    # Several Cache-Control lines collapse into one `private` line in order (`setheader`).
+    response = HTTP.Response(200, ["Cache-Control" => "max-age=0"])
+    push!(response.headers, "X-Other" => "1", "cache-control" => "Public , s-maxage=5")
+    _mark_private!(response)
+    @test [h for h in response.headers if lowercase(h.first) == "cache-control"] ==
+          ["Cache-Control" => "private, max-age=0, s-maxage=5"]
+    # Names that merely contain the field names are not them.
+    @test marked("X-Vary" => "cookie", "Cache-Controls" => "private") ==
+          ["X-Vary: cookie", "Cache-Controls: private", "Vary: Cookie", "Cache-Control: private"]
+end
+
+@testset "names fold ASCII only, and a malformed value cannot throw" begin
+    # KELVIN SIGN lowercases to 'k': `lowercase` read this token as `cookie`. Adding a second
+    # `Vary: Cookie` is the conservative answer.
+    @test lowercase("cooKie") == "cookie"
+    @test "Vary: Cookie" in marked("Vary" => "cooKie")
+    # Invalid UTF-8 in a value: `strip`/`lowercase` threw `InvalidCharError` here.
+    bad = String(UInt8[0x70, 0xff, 0x2c, 0x20, 0x70, 0x75, 0x62, 0x6c, 0x69, 0x63])   # "p\xff, public"
+    @test marked("Cache-Control" => bad)[1] == "Cache-Control: private, p\xff"
+end
+
+@testset "a response that needs both lines costs only those lines" begin
+    # The positive control is the old walk: a `lowercase` per header.
+    @testset let fresh = allocs(() -> HTTP.Response(200, ["Content-Type" => "text/plain", "Content-Length" => "5",
+                                                         "Date" => "x", "X-Request-Id" => "y"])),
+                 mark = allocs(() -> _mark_private!(HTTP.Response(200, ["Content-Type" => "text/plain", "Content-Length" => "5",
+                                                                      "Date" => "x", "X-Request-Id" => "y"]))),
+                 control = allocs(() -> count(h -> lowercase(h.first) == "vary",
+                                              ["Content-Type" => "text/plain", "Content-Length" => "5", "Date" => "x", "X-Request-Id" => "y"]))
+        @test mark.count - fresh.count <= 4
+        @test control.count > 4 + 1
+    end
+end
+end

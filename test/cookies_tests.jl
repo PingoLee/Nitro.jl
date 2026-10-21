@@ -2138,3 +2138,104 @@ end
     end
 end
 end
+
+# #563: `set_cookie!` built a `Dict{Symbol,Any}` and a closure per write, normalized every
+# attribute, then handed them to `format_cookie`, which normalized them again and joined a
+# `parts` vector: ~44 allocations per Set-Cookie, paid by every session save, CSRF re-send and
+# auth cookie. It now resolves the keywords directly and writes the line once.
+@testitem "set_cookie! normalizes once and writes the line once (#563)" tags=[:core] setup=[NitroCommon] begin
+using Nitro
+using Nitro.Types: CookieConfig
+using HTTP
+using Test
+using Dates
+const Cookies = Nitro.Cookies
+
+set(cfg = CookieConfig(); kw...) =
+    HTTP.header(Cookies.set_cookie!(HTTP.Response(200), "sid", "v"; config = cfg, encrypted = false, kw...), "Set-Cookie")
+
+@testset "the bytes are the ones the old two-pass path wrote" begin
+    # Each expected line is what main (23a86dce) wrote for the same call.
+    app = CookieConfig(httponly = false, secure = false, samesite = "strict", path = "/app",
+                       domain = "Example.COM", maxage = 60)
+    @test set() == "sid=v; Path=/; HttpOnly; SameSite=Lax; Secure"
+    @test set(app) == "sid=v; Path=/app; Domain=example.com; Max-Age=60; SameSite=Strict"
+    @test set(app; maxage = 3600) == "sid=v; Path=/app; Domain=example.com; Max-Age=3600; SameSite=Strict"
+    @test set(; expires = "2025-06-09T10:18:14Z") == "sid=v; Path=/; Expires=Mon, 09 Jun 2025 10:18:14 GMT; HttpOnly; SameSite=Lax; Secure"
+    @test set(CookieConfig(expires = DateTime(2030, 1, 2, 3, 4, 5))) ==
+          "sid=v; Path=/; Expires=Wed, 02 Jan 2030 03:04:05 GMT; HttpOnly; SameSite=Lax; Secure"
+    @test set(; maxage = 0) == "sid=v; Path=/; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT; HttpOnly; SameSite=Lax; Secure"
+    @test set(; maxage = -5) == "sid=v; Path=/; Max-Age=-5; HttpOnly; SameSite=Lax; Secure"
+    @test set(; path = "rel") == "sid=v; Path=/; HttpOnly; SameSite=Lax; Secure"
+    @test set(; samesite = "weird") == "sid=v; Path=/; HttpOnly; SameSite=Lax; Secure"
+    # `lowercase` maps 'İ' to 'i', so this spelling has always read as Strict; it still does.
+    @test set(CookieConfig(samesite = "strİct")) == "sid=v; Path=/; HttpOnly; SameSite=Strict; Secure"
+    @test set(; attrs = Dict("Max-Age" => "30", "SameSite" => "strict", "http_only" => "false")) ==
+          "sid=v; Path=/; Max-Age=30; SameSite=Strict; Secure"
+    @test set(; attrs = Dict(:path => "/a", :domain => "x.org", :secure => 0), path = "/kw") ==
+          "sid=v; Path=/kw; Domain=x.org; HttpOnly; SameSite=Lax"
+    @test_logs (:warn, r"SameSite=None cookies must also be Secure") match_mode = :any begin
+        @test set(CookieConfig(samesite = "NONE", secure = false)) == "sid=v; Path=/; HttpOnly; SameSite=None; Secure"
+    end
+    # An `attrs` entry that is `nothing` still overrides the config, as it always has: it is how
+    # one cookie drops a configured Max-Age or Expires.
+    dated = CookieConfig(maxage = 60, expires = DateTime(2030, 1, 1))
+    @test set(dated; attrs = Dict(:maxage => nothing)) ==
+          "sid=v; Path=/; Expires=Tue, 01 Jan 2030 00:00:00 GMT; HttpOnly; SameSite=Lax; Secure"
+    @test set(CookieConfig(expires = DateTime(2030, 1, 1)); attrs = Dict(:expires => nothing)) ==
+          "sid=v; Path=/; HttpOnly; SameSite=Lax; Secure"
+    @test set(CookieConfig(samesite = "Strict"); attrs = Dict(:samesite => nothing)) ==
+          "sid=v; Path=/; HttpOnly; SameSite=Lax; Secure"
+    @test_throws ArgumentError("domain: expected String, got Nothing") set(; attrs = Dict(:domain => nothing))
+    @test_throws ArgumentError("path: expected String, got Nothing") set(; attrs = Dict(:path => nothing))
+    # With both invalid, the path's error is the one reported, from either branch.
+    @test_throws ArgumentError("path: expected String, got Nothing") set(; attrs = Dict(:path => nothing, :domain => nothing))
+    @test_throws ArgumentError("path: contains invalid character: ';'") set(; path = "/a;b", domain = "bad;d")
+    # A `nothing` keyword defers to an `attrs` entry for the same attribute.
+    @test set(; attrs = Dict(:maxage => 3), maxage = nothing) == "sid=v; Path=/; Max-Age=3; HttpOnly; SameSite=Lax; Secure"
+    # ... while a keyword left `nothing` means "the config's".
+    @test set(dated; maxage = nothing) == "sid=v; Path=/; Max-Age=60; HttpOnly; SameSite=Lax; Secure"
+    @test_throws ArgumentError set(; domain = "bad;domain")
+    @test_throws ArgumentError set(; path = "/a;b")
+    @test_throws ArgumentError Cookies.set_cookie!(HTTP.Response(200), "bad name", "v"; encrypted = false)
+    @test_throws ArgumentError Cookies.set_cookie!(HTTP.Response(200), "sid", "bad value"; encrypted = false)
+end
+
+@testset "format_cookie still validates everything, through the same writer" begin
+    @test Cookies.format_cookie("n", "v"; samesite = "  STRICT ") == "n=v; Path=/; HttpOnly; SameSite=Strict; Secure"
+    @test Cookies.format_cookie("n", "v"; samesite = "nope") == "n=v; Path=/; HttpOnly; Secure"
+    # `uppercasefirst` maps 'ſ' (LONG S) to 'S', so format_cookie has always read this as Strict.
+    @test Cookies.format_cookie("n", "v"; samesite = "ſtrict") == "n=v; Path=/; HttpOnly; SameSite=Strict; Secure"
+    @test Cookies.format_cookie("n", "v", CookieConfig(maxage = 0)) ==
+          "n=v; Path=/; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT; HttpOnly; SameSite=Lax; Secure"
+    @test Cookies.format_cookie("n", "v"; domain = "A.b", maxage = 5, expires = DateTime(2030, 1, 1)) ==
+          "n=v; Path=/; Domain=a.b; Max-Age=5; HttpOnly; SameSite=Lax; Secure"
+    @test_throws ArgumentError Cookies.format_cookie("n", "v"; path = "")
+    @test_throws ArgumentError Cookies.format_cookie("n", "v"; path = "rel")
+    @test_throws ArgumentError Cookies.format_cookie("n", "v"; domain = "a b")
+    # Max-Age is written digit by digit now, so hold it to `string` at the edges.
+    for n in (7, 10, 86400, -1, -10, typemax(Int), typemin(Int))
+        @test Cookies.format_cookie("n", "v"; maxage = n, httponly = false, samesite = "") == "n=v; Path=/; Max-Age=$n; Secure"
+    end
+end
+
+@testset "a framework cookie write costs a handful of allocations" begin
+    # The session middleware's call. The bound sits far below the ~44 the two-pass path cost;
+    # the positive control is a copy of the work that path did per write -- the Dict, the
+    # SameSite `lowercase`, and the joined `parts` -- and must break it.
+    @testset let cfg = CookieConfig(),
+                 fresh = allocs(() -> HTTP.Response(200, ["Content-Type" => "text/plain", "Date" => "x"])),
+                 write = allocs(() -> Cookies.set_cookie!(HTTP.Response(200, ["Content-Type" => "text/plain", "Date" => "x"]),
+                                                         "__Host-nitro_session", "0123456789abcdef";
+                                                         config = cfg, encrypted = false, maxage = 86400)),
+                 old_work = allocs(() -> begin
+                     d = Dict{Symbol, Any}(); d[:maxage] = 86400
+                     ss = uppercasefirst(lowercase(strip("Lax")))
+                     join(["__Host-nitro_session=0123456789abcdef", "Path=/", "Max-Age=$(d[:maxage])",
+                           "HttpOnly", "SameSite=$ss", "Secure"], "; ")
+                 end)
+        @test write.count - fresh.count <= 10
+        @test old_work.count > 10
+    end
+end
+end
