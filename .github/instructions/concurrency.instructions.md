@@ -176,9 +176,30 @@ lives in the code comment it names, and that comment is canonical.
     with it.
   - **The bench masks it unless told not to:** `bench/socket/server.jl` parks on a `Timer` by
     default, which is itself a guard; `wake.sh` runs it with `PARK=event`.
+- **A Nitro primitive that can run more than about 1 ms on a request thread reaches a safepoint on
+  a budget**: every N KiB or N items, at a natural boundary in its own loop. This covers
+  framework code, not the application's (the bullets above). Below the knee, what a large body
+  costs every other request is the collector: a collection stops every thread and then waits for the one still in
+  a call with no safepoint. Measured in #588 with four in flight on 8 threads: a 100 MiB
+  whole-file read made each collection wait 43 ms, and a 64 MiB multipart parse 20 ms; the
+  minimal route's p99 went from 3 ms to 51–75 ms.
+  - **A `GC.safepoint()` is enough; a `yield()` is optional.** Past the knee a yield bounds p99
+    but adds no throughput (#467's `/cpu_yield`), and it costs a scheduler round trip per budget.
+    Code that allocates as it goes already reaches safepoints: the JSON parses waited 0.4–3.5 ms
+    per collection.
+  - **A file goes through the streamed path.** `Res.file(req, path)` streams over
+    `Constants.FILE_STREAM_THRESHOLD` (8 MiB), like the mounts. A streamed body's socket writes
+    give the thread up whenever the client is slower than the server.
+  - **Instances:** `multipart()` copies each part in 1 MiB chunks with a safepoint between them
+    (`_read_part`, `src/utilities/bodyparsers.jl`). HTTP.jl's boundary scan before it has none
+    (about 33 ms at 64 MiB), which only an upstream change or a cap on `max_body_bytes` bounds.
+  - **Check one with a time-to-safepoint probe, not a timing:** one thread runs the call in a
+    loop while another forces `GC.gc(false)`, and read the `Base.gc_num()`
+    `total_time_to_safepoint` delta per collection. An idle thread reads about 0.03 ms.
 - The measurements and the user-facing rule live in `docs/src/tutorial/deployment.md` (*Handlers
-  that compute*) and `docs/src/tutorial/workers.md` (*CPU-Bound Jobs*); the `nitro-usage` skill
-  carries the same rule for application code. Change all of them together, or none.
+  that compute*, and the paragraphs on Nitro's own primitives after it) and
+  `docs/src/tutorial/workers.md` (*CPU-Bound Jobs*); the `nitro-usage` skill carries the same rule
+  for application code. Change all of them together, or none.
 
 ## 6. Julia 1.14: changes to plan for
 
