@@ -87,8 +87,9 @@ end
 
 # ── `Res.file` of a file already in page cache ──────────────────────────────────────────────────
 #
-# `file_100mib` is the default, non-streamed path: `read(path)` of the whole file, then
-# `servecontent`. An `IOStream` read does not yield, so all of it is one hold.
+# `file_100mib` is the non-streamed path, `stream = false`: `read(path)` of the whole file, then
+# `servecontent`. It was the default until #588 made a file over 8 MiB stream. An `IOStream` read
+# does not yield, so all of it is one hold.
 #
 # `file_100mib_stream_read` is `stream = true` plus the READ side of the write loop
 # (`_write_fixed_body!`): one `body_read!` per 64 KiB chunk. On a socket each chunk's `write` sits
@@ -119,13 +120,13 @@ function _holds_drain(resp::HTTP.Response)
     return total
 end
 
-let resp = Res.file(HTTP.Request("GET", "/bench/file"), HOLDS_FILE)
+let resp = Res.file(HTTP.Request("GET", "/bench/file"), HOLDS_FILE; stream = false)
     resp.status == 200 && HTTP.header(resp, "Content-Length") == string(HOLDS_FILE_BYTES) ||
         error("holds: file_100mib does not serve the whole file")
 end
 _holds_drain(Res.file(HTTP.Request("GET", "/bench/file"), HOLDS_FILE; stream = true))   # checks the length
 
-SUITE["holds"]["file_100mib"] = @benchmarkable Res.file(req, HOLDS_FILE) setup=(
+SUITE["holds"]["file_100mib"] = @benchmarkable Res.file(req, HOLDS_FILE; stream = false) setup=(
     req = HTTP.Request("GET", "/bench/file")) evals=1
 SUITE["holds"]["file_100mib_stream_read"] = @benchmarkable _holds_drain(Res.file(req, HOLDS_FILE; stream = true)) setup=(
     req = HTTP.Request("GET", "/bench/file")) evals=1

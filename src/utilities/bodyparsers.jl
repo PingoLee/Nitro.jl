@@ -894,6 +894,33 @@ function json(res::HTTP.Response, class_type::Type{T}; kwargs...) where {T}
 end
 
 
+# Copy one part's bytes out of the body in 1 MiB chunks, reaching a safepoint between them (#588).
+# `read(part.data)` copies the whole part in one call with no safepoint: at 64 MiB that is ~35 ms
+# during which a collection, once requested, waits with every other thread already stopped
+# (28 ms per GC, measured). Chunked, the wait is one chunk's copy (0.3 ms) and the copy itself is no
+# slower -- its cost is faulting in the fresh pages, not the loop. One allocation either way.
+const _PART_COPY_CHUNK = 1 << 20
+
+# HTTP.jl hands each part over as an `IOBuffer` on a view of the body, so `bytesavailable` is the
+# whole part. Any other `IO` (a future HTTP.jl shape) falls back to the plain read rather than risk
+# a truncated part.
+_read_part(io::IO)::Vector{UInt8} = read(io)
+
+function _read_part(io::Base.GenericIOBuffer)::Vector{UInt8}
+    n = bytesavailable(io)
+    out = Vector{UInt8}(undef, n)
+    off = 0
+    while off < n
+        GC.safepoint()
+        want = min(_PART_COPY_CHUNK, n - off)
+        got = readbytes!(io, view(out, off+1:off+want), want)
+        got == 0 && break
+        off += got
+    end
+    off == n || resize!(out, off)
+    return out
+end
+
 """
     multipart(request::HTTP.Request) :: Dict{String, Union{FormFile, Vector{FormFile}, String, Vector{String}}}
 
@@ -961,9 +988,9 @@ function multipart(req::HTTP.Request) :: Dict{String, Union{FormFile, Vector{For
         name = part.name
         if !isnothing(part.filename) && !isempty(part.filename)
             push!(get!(() -> FormFile[], files, name),
-                  FormFile(name, part.filename, part.contenttype, read(part.data)))
+                  FormFile(name, part.filename, part.contenttype, _read_part(part.data)))
         else
-            push!(get!(() -> String[], texts, name), String(read(part.data)))
+            push!(get!(() -> String[], texts, name), String(_read_part(part.data)))
         end
     end
 

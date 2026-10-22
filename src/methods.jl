@@ -173,10 +173,10 @@ is explicit introspection, not accidental disclosure.)
 - `read_timeout`, `write_timeout`: **off** by default, forwarded to `HTTP.listen!`.
   `read_timeout` is one deadline for the body *and* every read the handler makes, counted from
   the end of the head, and answers **408** when it fires. `write_timeout`
-  limits each write to the socket. A streamed body — `Res.file(...; stream = true)`, a mounted
-  file over `stream_threshold` — is written in 64 KiB chunks, so it bounds each chunk: a long
-  download is cut only when the client takes longer than `write_timeout` to accept one of them.
-  For `Res.sse` it bounds each event. An in-memory body with a length (`Res.json`, `Res.send`, a
+  limits each write to the socket. A streamed body — `Res.file(req, path)` of a file over 8 MiB
+  or with `stream = true`, a mounted file over `stream_threshold` — is written in 64 KiB chunks,
+  so it bounds each chunk: a long download is cut only when the client takes longer than
+  `write_timeout` to accept one of them. For `Res.sse` it bounds each event. An in-memory body with a length (`Res.json`, `Res.send`, a
   buffered `Res.file`) goes out as one write on HTTP/1.1, so there it bounds the whole body —
   size it for the largest such response to the slowest client.
 
@@ -435,7 +435,7 @@ staticfiles(
     etag = :weak_stat,
     cache_control::Union{Nothing,AbstractString}=nothing,
     cache::Symbol=:eager,
-    stream_threshold::Integer=Nitro.Core.MOUNT_STREAM_THRESHOLD,
+    stream_threshold::Integer=Nitro.Core.Constants.FILE_STREAM_THRESHOLD,
     cache_max_bytes::Integer=Nitro.Core.MOUNT_CACHE_MAX_BYTES
 ) = Nitro.Core.staticfiles(CONTEXT[], CONTEXT[].service.router, folder, mountdir; headers, loadfile, include_hidden, allow_symlink_escape, etag, cache_control, cache, stream_threshold, cache_max_bytes)
 
@@ -527,7 +527,7 @@ spafiles(
     etag = :weak_stat,
     cache_control::Union{Nothing,AbstractString}=nothing,
     cache::Symbol=:eager,
-    stream_threshold::Integer=Nitro.Core.MOUNT_STREAM_THRESHOLD,
+    stream_threshold::Integer=Nitro.Core.Constants.FILE_STREAM_THRESHOLD,
     cache_max_bytes::Integer=Nitro.Core.MOUNT_CACHE_MAX_BYTES
 ) = Nitro.Core.spafiles(CONTEXT[], CONTEXT[].service.router, folder, mountdir; headers, loadfile, include_hidden, allow_symlink_escape, etag, cache_control, cache, stream_threshold, cache_max_bytes)
 
@@ -613,7 +613,7 @@ dynamicfiles(
     etag = :weak_stat,
     cache_control::Union{Nothing,AbstractString}=nothing,
     cache::Symbol=:none,
-    stream_threshold::Integer=Nitro.Core.MOUNT_STREAM_THRESHOLD,
+    stream_threshold::Integer=Nitro.Core.Constants.FILE_STREAM_THRESHOLD,
     cache_max_bytes::Integer=Nitro.Core.MOUNT_CACHE_MAX_BYTES
 ) = Nitro.Core.dynamicfiles(CONTEXT[], CONTEXT[].service.router, folder, mountdir; headers, loadfile, include_hidden, allow_symlink_escape, etag, cache_control, cache, stream_threshold, cache_max_bytes)
 
@@ -673,8 +673,8 @@ which is usually what a test asserting on it wants.
 
 !!! warning "A streamed response body is yours to close"
     This runs the whole pipeline **minus the socket layer**, so it never reaches the write path
-    that drains and closes a streaming body. A handler using `Res.file(req, path; stream = true)`,
-    or a mounted file above `stream_threshold`, therefore hands back a response whose body is an
+    that drains and closes a streaming body. A handler using `Res.file(req, path)` on a file over
+    8 MiB (or with `stream = true`), or a mounted file above `stream_threshold`, therefore hands back a response whose body is an
     **open cursor**. Drain it with `HTTP.body_read!` until it returns `0`, or call
     `HTTP.body_close!` — otherwise the file handle stays open, which on Windows also blocks
     deleting the file. Over a real socket this never applies: the write path always closes.

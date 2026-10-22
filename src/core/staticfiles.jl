@@ -128,15 +128,8 @@ function _lookup_mount(table::Dict{String,V}, target::AbstractString, n_prefix::
     return get(table, key, nothing)
 end
 
-# Default size above which a mounted file is STREAMED rather than held in memory (#41).
-#
-# `staticfiles` used to read every mounted file at startup and hold it for the process lifetime,
-# with no cap: a folder holding a 500 MB video pinned 500 MB resident whether or not anything ever
-# asked for it, and `Res.file` then materialised the whole body again per response, so N concurrent
-# downloads cost N × filesize. 8 MiB is comfortably above any realistic SPA bundle — which is the
-# case the capture exists to make fast — and far below the sizes where holding the bytes is the
-# problem rather than the solution.
-const MOUNT_STREAM_THRESHOLD = 8 * 1024 * 1024
+# The default size above which a mounted file is STREAMED rather than held in memory (#41) is
+# `Constants.FILE_STREAM_THRESHOLD`, which `Res.file(req, path)` shares (#588).
 
 # Default budget for `cache = :lazy`. Bytes, across the whole mount.
 const MOUNT_CACHE_MAX_BYTES = 64 * 1024 * 1024
@@ -361,7 +354,7 @@ function staticfiles(
     etag = :weak_stat,
     cache_control::Union{Nothing,AbstractString}=nothing,
     cache::Symbol=:eager,
-    stream_threshold::Integer=MOUNT_STREAM_THRESHOLD,
+    stream_threshold::Integer=Constants.FILE_STREAM_THRESHOLD,
     cache_max_bytes::Integer=MOUNT_CACHE_MAX_BYTES,
 )
     files  = Dict{String,String}()
@@ -410,7 +403,7 @@ function spafiles(
     etag = :weak_stat,
     cache_control::Union{Nothing,AbstractString}=nothing,
     cache::Symbol=:eager,
-    stream_threshold::Integer=MOUNT_STREAM_THRESHOLD,
+    stream_threshold::Integer=Constants.FILE_STREAM_THRESHOLD,
     cache_max_bytes::Integer=MOUNT_CACHE_MAX_BYTES,
 )
     files  = Dict{String,String}()
@@ -507,7 +500,7 @@ function dynamicfiles(
     etag = :weak_stat,
     cache_control::Union{Nothing,AbstractString}=nothing,
     cache::Symbol=:none,
-    stream_threshold::Integer=MOUNT_STREAM_THRESHOLD,
+    stream_threshold::Integer=Constants.FILE_STREAM_THRESHOLD,
     cache_max_bytes::Integer=MOUNT_CACHE_MAX_BYTES,
 )
     # Which files exist here is decided once, at mount time. Serving a directory whose contents an

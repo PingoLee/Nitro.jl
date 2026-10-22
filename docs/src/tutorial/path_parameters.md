@@ -349,7 +349,7 @@ The rules:
   handler returned, so a smaller body on `HEAD` would announce the wrong length. To avoid building
   the body at all, use an explicit `HEAD` route that returns an empty one (above). Without any
   branch the handler runs in full and only the body is discarded. A streamed body (`Res.sse`,
-  `Res.file(...; stream=true)`) is closed, never read.
+  a `Res.file(req, path)` of a file over 8 MiB or with `stream=true`) is closed, never read.
 - **The `GET` route's middleware and guards apply to its `HEAD`.** A route behind
   `GuardMiddleware(login_required())` refuses an anonymous `HEAD` exactly as it refuses the `GET`.
   An explicit `HEAD` route uses only its own `middleware=`.

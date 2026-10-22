@@ -249,11 +249,37 @@ Julia 1.12.7:
 - Parsing a 10 MB multipart upload takes about 6 ms.
 - A buffered `Res.file` of a 100 MiB file is a single 53 ms `read`.
 
-**Serve large files with `Res.file(req, path; stream = true)`.** It reads 64 KiB per chunk
-(about 6 µs each), and each chunk's socket write is a point where the task can give its thread
-up. Static mounts already stream above `stream_threshold`. Whether the larger JSON and multipart
-holds matter under load is what #588's stall pass will decide; until then, the rule above applies
-to them: a body large enough to take longer than your latency budget is computing.
+Below the knee, the hold itself is not what other requests feel; the garbage collector is. #588's
+stall pass kept 1–4 of these operations in flight on an 8-thread server. A minimal route lost
+22–76% of its throughput, against at most 6% for a handler computing 200 ms without allocating.
+Two things made the difference:
+
+- **Allocation.** A large body allocates in proportion to its size, so collections come more
+  often: 21–41% of the time went to GC, against about 7% with no large bodies. Only allocating
+  less moves that.
+- **Waiting for a safepoint.** A collection first stops every thread, and a thread inside a call
+  that never reaches a safepoint keeps all the others waiting until the call returns. With four in
+  flight, a buffered 100 MiB `Res.file` made each collection wait 43 ms and took the minimal
+  route's p99 from 3 ms to 75 ms. A 64 MiB multipart upload made each collection wait 20 ms, for a
+  p99 of 51 ms.
+
+What Nitro does about each operation:
+
+- **Large files stream by default.** `Res.file(req, path)` sends a file over 8 MiB in 64 KiB
+  chunks, as static mounts do above `stream_threshold`. A chunk reads in about 6 µs, and the
+  collector's wait stays under 0.1 ms. A streamed download gives its thread up whenever the client
+  is slower than the server: eight downloads capped at 200 MiB/s each kept the minimal route at
+  90% of its throughput. `stream = false` brings back the whole-file read for the cases that need
+  the bytes in memory.
+- **A multipart upload is copied out in chunks**, with a safepoint every 1 MiB. HTTP.jl's boundary
+  scan, which comes first, still has no safepoint: about 33 ms for 64 MiB. Until that changes, a
+  large upload delays every collection while it is scanned. If that is too much for your latency
+  budget, lower `serve(max_body_bytes = …)` to the largest upload you need.
+- **JSON** reaches safepoints as it allocates (0.4–3.5 ms per collection in the same run). Its cost
+  is the allocation, and the default `max_fields` cap refuses a body with more than 1000 keys
+  before parsing it.
+
+Past the knee, a large body behaves like any other computing handler: the rule above applies.
 
 ### Long-Running Handlers
 
@@ -457,7 +483,8 @@ serve(app; max_concurrent_requests = 64, read_timeout = 60, write_timeout = 30)
 ```
 
 `write_timeout` bounds each write to the socket, which is not the same unit for every response. A
-streamed file — `Res.file(...; stream = true)`, or a mounted file over `stream_threshold` — writes
+streamed file — `Res.file(req, path)` over 8 MiB or with `stream = true`, or a mounted file over
+`stream_threshold` — writes
 once per 64 KiB chunk, so however large the file, only a client that takes longer than
 `write_timeout` to accept one chunk is cut — about 2 KiB/s at `write_timeout = 30`. An
 `Res.sse` stream writes once per event, so only an event that stalls is cut. An in-memory response

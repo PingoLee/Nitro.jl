@@ -387,6 +387,23 @@ end
     @test isempty(result)
 end
 
+@testset "multipart() - a part is copied whole across its copy chunks (#588)" begin
+    # Parts are copied out in chunks with a safepoint between them; every size around a chunk
+    # edge must come back byte-identical, for a file part and a text part alike.
+    chunk = Nitro.Core.Util.BodyParsers._PART_COPY_CHUNK
+    for n in (0, 1, chunk - 1, chunk, chunk + 1, 3chunk + 7)
+        data = rand(UInt8, n)
+        text = repeat("é", n ÷ 2)
+        body, ct = build_multipart(parts=[
+            Dict(:name => "upload", :filename => "data.bin", :data => data),
+            Dict(:name => "note", :data => text),
+        ])
+        result = multipart(Request("POST", "/upload", ["Content-Type" => ct], body))
+        @test result["upload"].data == data
+        @test result["note"] == text
+    end
+end
+
 end
 
 # -- #314, #254 -------------------------------------------------------------------------------
