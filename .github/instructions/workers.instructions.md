@@ -204,7 +204,7 @@ set_queue_authorizer!(persistent_store, my_queue_authorizer)
 # every submit, run start, finish, cancel and zombie verdict on that key takes,
 # and which a share of the other keys hash to (#711) — so make it a pure
 # in-memory predicate. No DB queries, no worker-API calls (one on another key
-# takes a second stripe, and two such hooks deadlock), and never `fetch` a
+# throws `ConcurrencyViolationError`: a section is about one key, #717), and never `fetch` a
 # spawned task that touches the same store: the child cannot take a
 # ReentrantLock its parent holds, and any key it touches may hash to that
 # stripe, so that deadlocks.
@@ -332,9 +332,14 @@ decide.
   takes the id's stripe. What it orders is in-process and per id: one writer of a record's
   `run_id`, a run's handle registered against the record it claimed, no zombie verdict between a
   claim and its handle. A store-wide lock held across database statements capped a process at
-  ≈ 1 / (3 × round trip) cycles a second (#548), so a section is about **one** key: never take
-  two stripes at once, never `queue_lock` inside one, and never widen a section back to a batch
-  (the zombie sweep and the shutdown abandon take one key's stripe per item). The one count
+  ≈ 1 / (3 × round trip) cycles a second (#548), so a section is about **one** key: never a
+  second key inside it, never `queue_lock` inside one, and never widen a section back to a batch
+  (the zombie sweep and the shutdown abandon take one key's stripe per item). The first is
+  enforced: `lock_tasks` on another key inside a section throws `ConcurrencyViolationError`
+  before taking anything, even when the two keys share a stripe, so a nesting refactor fails its
+  first test rather than deadlocking by hash in production
+  ([#717](https://github.com/PingoLee/Nitro.jl/issues/717)). The marker is `task_local_storage`,
+  not a `ScopedValue` — a spawned child does not hold its parent's lock. The one count
   across keys, an external queue's submit-time bounds, takes `TaskLocks.admission` inside the
   key's stripe, around the count and the write it admits (`_mint_run!`), only when a bound is set.
 - **`set_task!` writes state; `replace_task!` writes the whole record.** `set_task!` must never

@@ -14,11 +14,13 @@
 # most-held stripe was taken. A store-wide lock reads the same number in both columns. The external
 # queues' admission lock is not on this path: the bench submits no external runs.
 #
-#   julia --project=<env> -t 4 bench/workers/store_throughput.jl [store] [seconds] [ks]
+#   julia --project=<env> -t 4 bench/workers/store_throughput.jl [store] [seconds] [ks] [stripes]
 #
 # `store` is `memory` (the default), `sqlite` (a temporary file) or `postgres`, which connects to
 # the libpq conninfo in `NITRO_BENCH_POSTGRES` (`host=… port=… user=… dbname=…`) and empties its
-# `nitro_task` table before each k: point it at a throwaway database. `ks` is a comma list, default `1,4,16`. The two
+# `nitro_task` table before each k: point it at a throwaway database. `ks` is a comma list, default `1,4,16`.
+# `stripes` is the number of `TaskLocks` stripes, default `TASK_LOCK_STRIPES`: the wrapper store
+# holds its own `TaskLocks` of that size, which is every lock the runtime takes (#717). The two
 # database stores need PormG, SQLite and LibPQ, which the bench env does not carry: run it from an
 # env that adds them to a `Pkg.develop`ed Nitro, as `bench/consumer/heartbeat_lateness.jl` says.
 using Nitro, Nitro.Workers, Dates, Printf
@@ -27,6 +29,7 @@ const W = Nitro.Workers
 backend = length(ARGS) >= 1 ? ARGS[1] : "memory"
 seconds = length(ARGS) >= 2 ? parse(Float64, ARGS[2]) : 10.0
 ks = length(ARGS) >= 3 ? parse.(Int, split(ARGS[3], ",")) : [1, 4, 16]
+nstripes = length(ARGS) >= 4 ? parse(Int, ARGS[4]) : W.TASK_LOCK_STRIPES
 
 backend in ("memory", "sqlite", "postgres") || error("store must be memory, sqlite or postgres, got $backend")
 backend == "memory" || @eval using PormG, SQLite, LibPQ
@@ -49,16 +52,19 @@ function pormg_store(n::Int)
 end
 
 # Forwards every store call, times `lock_tasks`, and wakes the client waiting on a task when its
-# COMPLETED write lands.
+# COMPLETED write lands. Holds its own `TaskLocks`, `nstripes` wide: stores never take their locks
+# themselves, so these are the only ones the runtime takes.
 struct LockTimedStore{S <: W.AbstractWorkerStore} <: W.AbstractWorkerStore
     inner::S
+    locks::W.TaskLocks
     waits::Vector{Float64}
     holds::Vector{Float64}
     stripe_holds::Dict{Int, Float64}
     stats_lock::ReentrantLock
     done::Dict{String, Base.Event}
 end
-LockTimedStore(inner) = LockTimedStore(inner, Float64[], Float64[], Dict{Int, Float64}(), ReentrantLock(),
+LockTimedStore(inner) = LockTimedStore(inner, W.TaskLocks([ReentrantLock() for _ in 1:nstripes], ReentrantLock()),
+                                       Float64[], Float64[], Dict{Int, Float64}(), ReentrantLock(),
                                        Dict{String, Base.Event}())
 
 for (f, n) in ((:get_task_info, 1), (:set_task!, 2), (:replace_task!, 2), (:add_watcher!, 2),
@@ -70,7 +76,7 @@ for (f, n) in ((:get_task_info, 1), (:set_task!, 2), (:replace_task!, 2), (:add_
     @eval W.$f(s::LockTimedStore, $(args...); kw...) = W.$f(s.inner, $(args...); kw...)
 end
 W._visible_across_processes(s::LockTimedStore) = W._visible_across_processes(s.inner)
-W.task_locks(s::LockTimedStore) = W.task_locks(s.inner)
+W.task_locks(s::LockTimedStore) = s.locks
 
 function W.try_transition!(s::LockTimedStore, id, from, to; kw...)
     won = W.try_transition!(s.inner, id, from, to; kw...)
@@ -82,11 +88,12 @@ function W.try_transition!(s::LockTimedStore, id, from, to; kw...)
 end
 
 # More specific than Nitro's own `lock_tasks(cb, ::AbstractWorkerStore, ::String)`, so every
-# section reaches it; it takes the inner store's stripe for the same id.
+# section reaches it; it then runs that generic method on this store, so the timed path is the
+# real one, its one-id guard included.
 function W.lock_tasks(cb::Function, s::LockTimedStore, task_id::String)
     asked = time()
-    stripe = W._stripe_index(W.task_locks(s.inner), task_id)
-    return W.lock_tasks(s.inner, task_id) do
+    stripe = W._stripe_index(s.locks, task_id)
+    timed = function ()
         got = time()
         try
             cb()
@@ -99,6 +106,7 @@ function W.lock_tasks(cb::Function, s::LockTimedStore, task_id::String)
             end
         end
     end
+    return invoke(W.lock_tasks, Tuple{Function, W.AbstractWorkerStore, String}, timed, s, task_id)
 end
 
 trivial() = nothing
@@ -154,5 +162,5 @@ function run_once(k::Int)
             1e6 * sum(waits; init = 0.0) / max(length(waits), 1), 1e6 * pct(waits, 0.99), held, 100 * busiest)
 end
 
-println("# store_throughput: julia $(VERSION), threads $(Threads.nthreads()), $(seconds) s per k, store $backend")
+println("# store_throughput: julia $(VERSION), threads $(Threads.nthreads()), $(seconds) s per k, store $backend, $nstripes stripes")
 foreach(run_once, ks)

@@ -1437,8 +1437,9 @@ which the hook sees when a `watchers=` grant is checked, it is the submitter alo
     Every submit, run start, finish, cancel and zombie verdict on that task id takes the same
     lock, and so do the other ids that share its stripe, so blocking inside the hook stalls all
     of them. Make it a pure in-memory predicate: no database queries, no calls into the worker
-    API (a `submit_task` or `cancel_task` on another id takes that id's lock too, and two such
-    hooks deadlock each other), and never `fetch` a spawned task that touches the same store —
+    API (a `submit_task` or `cancel_task` on another id would take that id's lock too, and two
+    such hooks deadlock each other, so a call that takes another id's lock throws
+    `ConcurrencyViolationError` instead), and never `fetch` a spawned task that touches the same store —
     the child cannot take a `ReentrantLock` its parent holds, and any id it touches may share
     that stripe, so that deadlocks. Resolve
     org/tenant membership into memory before installing the hook.
