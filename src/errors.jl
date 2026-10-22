@@ -442,8 +442,8 @@ signature instead sounds stricter and is worse: a contract method is written
 `(::MyStore{K,V}, ::K, ::V)` as often as `(::MyStore, ::String, ::Any)`, and a probe pinned to
 either shape reports the other as missing.
 
-`store_index` is 1-based over the *arguments*, so it is 2 for a callback-first method such as
-`lock_tasks(callback, store)`.
+`store_index` is 1-based over the *arguments*. Every contract method takes the store first today,
+so it is 1, but the probe does not assume that: a callback-first method would pass 2.
 
 It errs toward **over**-reporting, never under-reporting, which is the safe direction for a
 conformance check: a method typed on a union that reaches outside the contract's hierarchy —

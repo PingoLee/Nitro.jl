@@ -122,9 +122,9 @@ you add anything:
 | `submit_queued_task` | Execution on a declared queue: items start in FIFO order, at most the queue's concurrency `k` at once (`queues = ["email", "compute" => 6]`; a bare name is `k = 1`). Was `submit_sequential_task` until [#513](https://github.com/PingoLee/Nitro.jl/issues/513). A queue's runs count toward `max_runs_per_owner`, never `max_concurrent_runs` |
 | `get_task_status`, `cancel_task` | Read and cancel. A task the authority may not see answers **exactly** like a missing one (`:status => "NOT_FOUND"`), never `AuthorizationError` — that difference was a task-existence oracle ([#323](https://github.com/PingoLee/Nitro.jl/issues/323)). `AuthorizationError` is left to the submit paths, and `handle_error` answers it with a 403 |
 | `release_task!` | **Admin only**, takes `System()`: deletes a *finished* record through the fenced `try_delete_task!`, so a squatted `:global` key can be reused |
-| `WorkerRuntime(store; max_concurrent_runs = 64, max_runs_per_owner = nothing, allow_undeclared_queues = false, queues)`, `WorkerCapacityError` | Limits ([#324](https://github.com/PingoLee/Nitro.jl/issues/324)). A submit past a limit is refused **before anything is written** — `:runtime`/`:queue` a 503, `:owner` a 429 — and a full queue never blocks in `put!`. Only declared queue names get a queue (else `AuthorizationError`). A run holds its reservation until its callback *returns*, a timed-out one included (`_RunHandoff`, one per attempt); a timed-out *queued* callback then counts against the runtime cap, and queues hold their next item only while such abandoned callbacks *alone* fill it (never on async load: an async run waiting on a queued item would deadlock). Every other exit releases the reservation exactly once, by `run_id`. `reservation_lock` is a leaf, and `queue_lock` is never taken inside `lock_tasks` |
-| *(not exported)* `get_task_info`, `add_watcher!`, `set_task!`, `replace_task!`, `try_transition!`, `try_delete_task!`, `delete_task!`, `cleanup_tasks!`, `clear_records!`, `list_running_task_refs`, `RunningTaskRef`, `lock_tasks`, `get_active_task[_info]`, `register_run!`, `WorkerQueue`, `QueueItem`, `get_worker_queues`, `get_queue_lock` | The store contract and the run/queue internals. Backends extend them qualified; they perform no authorization, so they must not become application API again (#323) |
-| *(not exported)* `claim_next!`, `renew_leases!`, `release_claim!`, `requeue_expired!`, `count_external_runs`, `LeaseRenewal`, `LeasePolicy`; *(exported)* `missing_claim_methods` | The optional claim capability (#514). Each of the first four is one fenced store statement, never a read-modify-write under `lock_tasks`, and **never called under `lock_tasks`** (a SQLite claim transaction takes the database write lock). `count_external_runs` is a plain read, the one the submit path calls under `lock_tasks`. `release_claim!` takes the queue's `policy` and records a run `FAILED` at its attempt bound, so the bound holds for any consumer, not only a well-behaved one |
+| `WorkerRuntime(store; max_concurrent_runs = 64, max_runs_per_owner = nothing, allow_undeclared_queues = false, queues)`, `WorkerCapacityError` | Limits ([#324](https://github.com/PingoLee/Nitro.jl/issues/324)). A submit past a limit is refused **before anything is written** — `:runtime`/`:queue` a 503, `:owner` a 429 — and a full queue never blocks in `put!`. Only declared queue names get a queue (else `AuthorizationError`). A run holds its reservation until its callback *returns*, a timed-out one included (`_RunHandoff`, one per attempt); a timed-out *queued* callback then counts against the runtime cap, and queues hold their next item only while such abandoned callbacks *alone* fill it (never on async load: an async run waiting on a queued item would deadlock). Every other exit releases the reservation exactly once, by `run_id`. `reservation_lock` is a leaf, and `queue_lock` is never taken inside a `lock_tasks` stripe |
+| *(not exported)* `get_task_info`, `add_watcher!`, `set_task!`, `replace_task!`, `try_transition!`, `try_delete_task!`, `delete_task!`, `cleanup_tasks!`, `clear_records!`, `list_running_task_refs`, `RunningTaskRef`, `task_locks`, `TaskLocks`, `get_active_task[_info]`, `register_run!`, `WorkerQueue`, `QueueItem`, `get_worker_queues`, `get_queue_lock` | The store contract and the run/queue internals. Backends extend them qualified; they perform no authorization, so they must not become application API again (#323) |
+| *(not exported)* `claim_next!`, `renew_leases!`, `release_claim!`, `requeue_expired!`, `count_external_runs`, `LeaseRenewal`, `LeasePolicy`; *(exported)* `missing_claim_methods` | The optional claim capability (#514). Each of the first four is one fenced store statement, never a read-modify-write under `lock_tasks`, and **never called under `lock_tasks`** (a SQLite claim transaction takes the database write lock). `count_external_runs` is a plain read, the one the submit path calls under `lock_tasks` (the key's stripe plus the admission lock, #711). `release_claim!` takes the queue's `policy` and records a run `FAILED` at its attempt bound, so the bound holds for any consumer, not only a well-behaved one |
 | `External`, `declare_queues!` | A queue's placement (#514). `declare_queues!(app, [...])` writes the **App's** declarations (extension slot `:workers_queues`), which `worker_startup`/`start!` merge and a consumer reads; an `External(…)` passed anywhere else is refused with a pointer to it. An external queue gets no processor and no channel; its submit records an `external = true` row and **reserves nothing in this runtime**, because no local run would ever release it — `max_pending` and `max_runs_per_owner` are counted in the store instead (`_admit_external!`). It refuses a closure and a submit's own `options` (those live on `External(…; options)`). A store with no claim capability, or one `_visible_across_processes` says no consumer can read (`InMemoryWorkerStore`), is refused before anything is installed |
 | `scoped_task_key`, `DEFAULT_QUEUE_NAME` | Resolve a `(task_key, user_id, scope)` to its stored id; the queue name `submit_task` authorizes against |
 | `get_queue_status` | Queue-wide introspection — **admin only**, takes `System()`; an `Owner` is a `MethodError` |
@@ -200,11 +200,14 @@ end
 set_queue_authorizer!(persistent_store, my_queue_authorizer)
 
 # Gates joining or reusing an existing key the caller does not already watch.
-# `watchers` is a copy. The hook runs under the store's task lock, which also
-# serializes set_task!, cancel_task, and zombie recovery — so make it a pure
-# in-memory predicate. No DB queries, and never `fetch` a spawned task that
-# touches the same store: the child cannot take a ReentrantLock its parent
-# holds, so that deadlocks.
+# `watchers` is a copy. The hook runs under the key's `lock_tasks` stripe, which
+# every submit, run start, finish, cancel and zombie verdict on that key takes,
+# and which a share of the other keys hash to (#711) — so make it a pure
+# in-memory predicate. No DB queries, no worker-API calls (one on another key
+# takes a second stripe, and two such hooks deadlock), and never `fetch` a
+# spawned task that touches the same store: the child cannot take a
+# ReentrantLock its parent holds, and any key it touches may hash to that
+# stripe, so that deadlocks.
 set_watch_authorizer!(persistent_store, function(task_key, watchers, user_id)
     return ORG_OF[first(watchers)] == ORG_OF[user_id]
 end)
@@ -248,8 +251,10 @@ is also what keeps a genuine process crash recoverable.
 **The sweep is bounded, and paged listings are keyset in SQL**
 ([#236](https://github.com/PingoLee/Nitro.jl/issues/236),
 [#237](https://github.com/PingoLee/Nitro.jl/issues/237)). It reads `list_running_task_refs`, a
-three-column projection, never the listing, and walks it `ZOMBIE_SWEEP_BATCH` records at a time
-under one `lock_tasks`.
+three-column projection, never the listing, and walks it `ZOMBIE_SWEEP_BATCH` records at a time.
+No lock is held across the listing: each record's verdict (the live-handle check and the fenced
+write) takes that key's `lock_tasks` stripe, which is all that orders it against a run registering
+in this process ([#711](https://github.com/PingoLee/Nitro.jl/issues/711)).
 
 Paging is keyset on the id (`id > after ORDER BY id LIMIT n`), never offset: the sweep moves every
 row it adjudicates out of `RUNNING`, so an offset page would skip rows.
@@ -297,7 +302,7 @@ always `spared_live`.
 
 **The boot sweep's completion line is unconditional**
 ([#238](https://github.com/PingoLee/Nitro.jl/issues/238)). `"Nitro.Workers: scanning for zombie
-tasks"` goes out before `lock_tasks`, and `"… zombie recovery complete"` goes out after, with
+tasks"` goes out before the first read, and `"… zombie recovery complete"` goes out after, with
 `recovered = 0` included. On a read failure, an `@error` carrying the same counts replaces it. The
 sweep runs after the banner and before the first request, which is the window where silence cost an
 incident, so never make that line conditional. Counts only, never a `result` or `error` payload.
@@ -315,12 +320,23 @@ decide.
 > **Strict core isolation**: Never import `PormG` or run DB queries in `src/Workers`. Database logic belongs in `ext/NitroPormGExt.jl`.
 
 - **`lock_tasks` is process-local, so never build a read-modify-write on it.** For a
-  database-backed store it is a plain `ReentrantLock` in the struct: two processes sharing one
-  database each take their own and neither sees the other
+  database-backed store it is a `ReentrantLock` stripe of the store's `TaskLocks`: two processes
+  sharing one database each take their own and neither sees the other
   ([#88](https://github.com/PingoLee/Nitro.jl/issues/88)). A write that must not lose a concurrent
   update belongs in the store as a single atomic *intent* operation — `add_watcher!` (a
   compare-and-set on the stored document) and `try_transition!` (a conditional status change) are
   the pattern. Composing `get_task_info` + mutate + `set_task!` under the lock is exactly the bug.
+- **`lock_tasks` orders one task id, never the store**
+  ([#711](https://github.com/PingoLee/Nitro.jl/issues/711)). A store holds a `TaskLocks` and
+  returns it from `task_locks`; Nitro implements `lock_tasks(callback, store, task_id)` once, and
+  takes the id's stripe. What it orders is in-process and per id: one writer of a record's
+  `run_id`, a run's handle registered against the record it claimed, no zombie verdict between a
+  claim and its handle. A store-wide lock held across database statements capped a process at
+  ≈ 1 / (3 × round trip) cycles a second (#548), so a section is about **one** key: never take
+  two stripes at once, never `queue_lock` inside one, and never widen a section back to a batch
+  (the zombie sweep and the shutdown abandon take one key's stripe per item). The one count
+  across keys, an external queue's submit-time bounds, takes `TaskLocks.admission` inside the
+  key's stripe, around the count and the write it admits (`_mint_run!`), only when a bound is set.
 - **`set_task!` writes state; `replace_task!` writes the whole record.** `set_task!` must never
   write `watchers`, **`run_id`**, or the claim fields (`external`, `claimed_by`,
   `lease_expires_at`, `attempt`, #514) — none is volatile state, and carrying them on every
@@ -399,8 +415,9 @@ decide.
     - **Set `draining` → close → collect, in that order.** `put!` on a closed channel throws, so
       collecting after the close is airtight; collecting first leaves a window for a submit.
     - **The abandon write happens OUTSIDE `queue_lock`.** It is a store write, and the processor
-      takes the store lock (`_finish_task!`) and then `queue_lock` (its `finally`) — holding
-      `queue_lock` across a store write is that pair inverted. One `lock_tasks` for the batch.
+      takes a key's stripe (`_finish_task!`) and then `queue_lock` (its `finally`) — holding
+      `queue_lock` across a store write is that pair inverted. Each item under its own key's
+      `lock_tasks` stripe, never one lock for the batch (#711).
 
     It is **unconditional, including at `drain_timeout = 0`**: that keyword means *do not wait*,
     and abandoning a backlog costs no wait. It is the one respect in which `0` is no longer

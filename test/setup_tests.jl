@@ -488,9 +488,12 @@ struct SharedStore <: AbstractWorkerStore
     # lease stamped from the clock read when the call began, and the call has not returned, as a
     # first PormG claim still committing and compiling its way out (#666). A test sleeps in it.
     claimed_hook::Base.RefValue{Any}
+    # Run inside every `count_external_runs`, before it reads: a test sleeps in it to hold a
+    # submit between its bound's count and its write (#711).
+    count_hook::Base.RefValue{Any}
 end
 SharedStore() = SharedStore(InMemoryWorkerStore(), Ref{Any}(nothing), Ref{Any}(nothing), Ref{Any}(nothing),
-                            Ref{Any}(nothing), Ref{Any}(nothing))
+                            Ref{Any}(nothing), Ref{Any}(nothing), Ref{Any}(nothing))
 
 # Each forward with the contract's own arity: a varargs forward can be ambiguous with the
 # generated fixed-arity fallbacks on `AbstractWorkerStore`.
@@ -498,13 +501,17 @@ for (f, n) in ((:set_task!, 2), (:replace_task!, 2), (:add_watcher!, 2),
                (:try_transition!, 3), (:delete_task!, 1), (:try_delete_task!, 2), (:cleanup_tasks!, 1),
                (:get_all_tasks, 1), (:get_queue_authorizer, 0), (:set_queue_authorizer!, 1),
                (:get_watch_authorizer, 0), (:set_watch_authorizer!, 1), (:get_error_redactor, 0),
-               (:set_error_redactor!, 1), (:release_claim!, 2),
-               (:count_external_runs, 1), (:clear_records!, 0),
+               (:set_error_redactor!, 1), (:release_claim!, 2), (:clear_records!, 0),
                (:list_running_task_refs, 0))
     args = [Symbol("a", i) for i in 1:n]
     @eval _W.$f(s::SharedStore, $(args...); kw...) = _W.$f(s.inner, $(args...); kw...)
 end
-_W.lock_tasks(cb::Function, s::SharedStore) = _W.lock_tasks(cb, s.inner)
+_W.task_locks(s::SharedStore) = _W.task_locks(s.inner)
+function _W.count_external_runs(s::SharedStore, statuses; kw...)
+    hook = s.count_hook[]
+    hook === nothing || Base.invokelatest(hook)
+    return _W.count_external_runs(s.inner, statuses; kw...)
+end
 _W._visible_across_processes(::SharedStore) = true
 function _W.get_task_info(s::SharedStore, id; kw...)
     hook = s.read_hook[]

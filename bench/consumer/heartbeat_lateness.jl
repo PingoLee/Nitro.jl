@@ -57,7 +57,7 @@ for (f, n) in ((:get_task_info, 1), (:set_task!, 2), (:replace_task!, 2), (:add_
     args = [Symbol("a", i) for i in 1:n]
     @eval W.$f(s::TimedStore, $(args...); kw...) = W.$f(s.inner, $(args...); kw...)
 end
-W.lock_tasks(cb::Function, s::TimedStore) = W.lock_tasks(cb, s.inner)
+W.task_locks(s::TimedStore) = W.task_locks(s.inner)
 W._visible_across_processes(::TimedStore) = true
 function W.renew_leases!(s::TimedStore, consumer::String, runs; kw...)
     out = W.renew_leases!(s.inner, consumer, runs; kw...)

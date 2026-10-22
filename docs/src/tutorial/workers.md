@@ -1191,10 +1191,10 @@ A task's return value is stored as JSON, and may nest at most **512** levels, th
     [`upgrade_guide`](@ref Nitro.upgrade_guide) for the `ALTER TABLE` if you provision the table
     yourself.
 
-    The store's `lock_tasks` is a plain `ReentrantLock` and therefore **process-local** —
-    it orders writes within one process and gives you nothing across processes. Do not
-    build a read-modify-write on top of it and assume it is safe; use the atomic store
-    operations, or add one.
+    The store's task locks (`Nitro.Workers.TaskLocks`, one `ReentrantLock` per stripe of task
+    ids) are **process-local**: they order writes to one task within one process and give you
+    nothing across processes. Do not build a read-modify-write on top of them and assume it is
+    safe; use the atomic store operations, or add one.
 
 !!! warning "Nitro owns the format of the `watchers` column"
     `nitro_task.watchers` holds a JSON array written by `JSON.json`, and its exact byte
@@ -1433,11 +1433,14 @@ Without this hook, cross-user submission of an existing `:global` key is refused
 is a copy, so mutating it has no effect. It is never empty: for a key that does not exist yet,
 which the hook sees when a `watchers=` grant is checked, it is the submitter alone.
 
-!!! warning "The hook runs under the store's task lock"
-    That lock also serializes `set_task!`, `cancel_task`, and zombie recovery, so blocking
-    inside the hook stalls the whole worker subsystem. Make it a pure in-memory predicate:
-    no database queries, and never `fetch` a spawned task that touches the same store — the
-    child cannot take a `ReentrantLock` its parent holds, so that deadlocks. Resolve
+!!! warning "The hook runs under the task's lock"
+    Every submit, run start, finish, cancel and zombie verdict on that task id takes the same
+    lock, and so do the other ids that share its stripe, so blocking inside the hook stalls all
+    of them. Make it a pure in-memory predicate: no database queries, no calls into the worker
+    API (a `submit_task` or `cancel_task` on another id takes that id's lock too, and two such
+    hooks deadlock each other), and never `fetch` a spawned task that touches the same store —
+    the child cannot take a `ReentrantLock` its parent holds, and any id it touches may share
+    that stripe, so that deadlocks. Resolve
     org/tenant membership into memory before installing the hook.
 
 !!! note "Re-running a finished shared key resets its watchers"

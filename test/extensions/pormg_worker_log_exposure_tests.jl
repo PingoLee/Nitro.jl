@@ -4,7 +4,7 @@ using Test
 using Dates
 using Nitro
 using Nitro.Workers
-using Nitro.Workers: lock_tasks, try_transition!, cleanup_tasks!, list_running_task_refs
+using Nitro.Workers: task_locks, try_transition!, cleanup_tasks!, list_running_task_refs
 import PormG
 
 # #646 gave `PormGWorkerStore`'s own warnings the `loggable` shape, and then rethrew. Every caller
@@ -52,7 +52,7 @@ for f in (:get_task_info, :set_task!, :replace_task!, :add_watcher!, :delete_tas
     @eval Nitro.Workers.$f(s::LeakyStore, args...; kw...) = Nitro.Workers.$f(s.inner, args...; kw...)
 end
 Nitro.Workers.clear_records!(s::LeakyStore) = Nitro.Workers.clear_records!(s.inner)
-Nitro.Workers.lock_tasks(f::Function, s::LeakyStore) = lock_tasks(f, s.inner)
+Nitro.Workers.task_locks(s::LeakyStore) = task_locks(s.inner)
 function Nitro.Workers.list_running_task_refs(s::LeakyStore; kw...)
     _failing!(s, :read)
     return list_running_task_refs(s.inner; kw...)
@@ -67,7 +67,7 @@ function Nitro.Workers.try_transition!(s::LeakyStore, task_id::String, from, to:
 end
 
 function seed_running!(s::LeakyStore, id::String)
-    lock(s.inner.task_lock) do
+    lock(s.inner.registry_lock) do
         t = TaskInfo(id)
         t.status = RUNNING
         s.inner.task_registry[id] = t

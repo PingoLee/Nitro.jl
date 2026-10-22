@@ -731,7 +731,7 @@ end
 # the same `_execute_queued_task`, so the claim, the `run_id` fences, cancellation, deadlines and the
 # teardown drain hold per item exactly as they do for one. A stale item and its successor can now
 # execute side by side on two processors of one queue, which is the async path's ordinary case and
-# is what `_claim_run!` takes `lock_tasks` for (#191, #198).
+# is what `_claim_run!` takes the key's `lock_tasks` stripe for (#191, #198).
 #
 # There used to be an `exec_lock` held around each execution. With one processor it serialized
 # nothing that the processor loop did not already serialize, and with `k` it would serialize the

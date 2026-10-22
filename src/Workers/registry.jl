@@ -67,7 +67,12 @@ Each is a plain slot the application writes and the framework reads through `Bas
 
 | Method | Contract |
 |---|---|
-| `lock_tasks(callback::Function, store)` | **Callback-first**, so it is called `lock_tasks(store) do … end` |
+| [`task_locks`](@ref)`(store)` | The store's own [`TaskLocks`](@ref), constructed once with it and returned on every call |
+
+A store does not implement any locking itself: it holds one `TaskLocks` and hands it out. Nitro
+takes it for each section that orders an in-process writer of one task id
+([#711](https://github.com/PingoLee/Nitro.jl/issues/711)), so the lock is the **store's** —
+two runtimes over one store contend on it — while two sections on different ids do not contend.
 
 # What a store is NOT asked for
 
@@ -125,7 +130,7 @@ submit path calls it under `lock_tasks`, where it decides to mint a run.
   See [`TaskInfo`](@ref).
 - **`watchers` is populated on every read path.** Authorization reads it off whatever
   `get_task_info` returns, so a store that omits it silently denies everyone.
-- **`lock_tasks` is process-local.** For a database-backed store it guards this process only, so
+- **`TaskLocks` is process-local.** For a database-backed store it guards this process only, so
   never build a read-modify-write on it; express such a write as a single atomic store operation.
 
 # `TaskInfo.error` is application-controlled free text
@@ -615,11 +620,15 @@ already exists and that the caller does not already watch is therefore refused w
 
 `watchers` is a copy, so mutating it has no effect.
 
-**The hook runs while the store's task lock is held.** That lock also serializes
-`set_task!`, `cancel_task`, and zombie recovery, so blocking in the hook stalls the whole
-worker subsystem — make it a pure in-memory predicate over data the app already has.
-Do not query a database from it, and never `fetch` a spawned task that touches the same
-store: the child cannot take a `ReentrantLock` its parent holds, so that deadlocks.
+**The hook runs while the task key's lock is held** — one stripe of the store's
+[`TaskLocks`](@ref), which every submit, run start, finish, cancel and zombie verdict on that
+key takes, and which a fixed share of the *other* keys hash to as well. Blocking in the hook
+stalls all of them, so make it a pure in-memory predicate over data the app already has.
+Do not query a database from it, never call the worker API from it (`submit_task`,
+`cancel_task`, … on another key take that key's stripe, and two such hooks deadlock each
+other), and never `fetch` a spawned task that touches the same store: the child cannot take a
+`ReentrantLock` its parent holds, and any key it touches may hash to that stripe, so that
+deadlocks.
 
 **Re-running a finished key resets its watcher list to the submitter.** An authorized
 reuse therefore drops the previous watchers, who must be re-authorized to rejoin. Hand out
@@ -682,7 +691,83 @@ after the worker started is still seen.
 function set_error_redactor! end
 
 # -- Locking --
-function lock_tasks end
+
+"""
+    TaskLocks()
+
+The process-local locks Nitro takes around a worker store's sections, owned by the store
+([#711](https://github.com/PingoLee/Nitro.jl/issues/711)). A backend constructs one with itself
+and returns it from [`task_locks`](@ref); it never takes them itself.
+
+```julia
+struct MyWorkerStore <: AbstractWorkerStore
+    # … the backend's own fields
+    locks::TaskLocks
+end
+Nitro.Workers.task_locks(store::MyWorkerStore) = store.locks
+```
+
+What they order is **in-process, per task id**: one in-process writer of a record's `run_id` at
+a time, a run's live handle registered against the record it was claimed from, and no zombie
+verdict between a claim and its handle. Those are per-id facts, so the locks are a fixed set of
+`ReentrantLock` stripes picked by the id's hash: two sections on the same id serialize, two on
+different ids almost always do not. A store-wide lock here capped one process at one database
+round trip at a time, whatever its connection pool.
+
+One more lock covers what is not per id: an external queue's submit-time bounds count every
+record of the queue, and a count followed by a write must not interleave with another submit's
+in this process. It is taken inside a stripe, never the other way round.
+
+Never two stripes at once, and never `queue_lock` inside either: a section is about one id.
+That is also why an application hook that runs under a stripe — the watch authorizer — must not
+call back into the worker API: a call about another id takes a second stripe, and two such calls
+on two threads deadlock each other.
+None of this spans processes; cross-process correctness is the store's atomic operations'.
+"""
+struct TaskLocks
+    stripes::Vector{ReentrantLock}
+    admission::ReentrantLock
+
+    function TaskLocks(stripes::Vector{ReentrantLock}, admission::ReentrantLock)
+        # A stripe is a mask of the hash, which spreads evenly only over a power of two.
+        ispow2(length(stripes)) ||
+            throw(ArgumentError("`TaskLocks` needs a power-of-two number of stripes, got $(length(stripes))"))
+        return new(stripes, admission)
+    end
+end
+
+# A power of two, so a stripe is a mask of the hash. Well above any connection pool a process
+# runs, so distinct keys rarely share one.
+const TASK_LOCK_STRIPES = 64
+
+TaskLocks() = TaskLocks([ReentrantLock() for _ in 1:TASK_LOCK_STRIPES], ReentrantLock())
+
+_stripe_index(locks::TaskLocks, task_id::String) =
+    Int(hash(task_id) & UInt(length(locks.stripes) - 1)) + 1
+_stripe(locks::TaskLocks, task_id::String) = locks.stripes[_stripe_index(locks, task_id)]
+
+"""
+    task_locks(store) -> TaskLocks
+
+The store's [`TaskLocks`](@ref): the same object on every call, constructed with the store.
+Required by [`AbstractWorkerStore`](@ref); a backend implements it as a field read.
+"""
+function task_locks end
+
+"""
+    lock_tasks(callback, store, task_id::String)
+
+Run `callback()` holding `task_id`'s stripe of `store`'s [`TaskLocks`](@ref). Implemented once
+here for every store; a backend provides [`task_locks`](@ref), not this.
+"""
+function lock_tasks(callback::Function, store::AbstractWorkerStore, task_id::String)
+    return lock(callback, _stripe(task_locks(store), task_id))
+end
+
+# The external-submit admission lock: taken inside a key's stripe, around a bound's count and the
+# write it admits. See `TaskLocks`.
+_lock_admission(callback::Function, store::AbstractWorkerStore) =
+    lock(callback, task_locks(store).admission)
 
 # ============================================================================
 # The contract, as data
@@ -726,8 +811,8 @@ const WORKER_STORE_INTERFACE = (
     (set_watch_authorizer!,         (AbstractWorkerStore, Any)),
     (get_error_redactor,            (AbstractWorkerStore,)),
     (set_error_redactor!,           (AbstractWorkerStore, Any)),
-    # -- Process-local serialization of store operations --
-    (lock_tasks,                    (Function, AbstractWorkerStore)),
+    # -- Process-local ordering of a task id's sections (#711) --
+    (task_locks,                    (AbstractWorkerStore,)),
 )
 
 """
@@ -854,7 +939,11 @@ It owns no queues, no scheduler and no run handles; those belong to [`WorkerRunt
 """
 mutable struct InMemoryWorkerStore <: AbstractWorkerStore
     task_registry::Dict{String, TaskInfo}
-    task_lock::ReentrantLock
+    # Guards `task_registry` alone, around each operation's own reads and writes: a leaf, taken
+    # under a task's stripe and never across a callback. The ordering of a task's sections is
+    # `locks`' job (#711); before that one lock did both.
+    registry_lock::ReentrantLock
+    locks::TaskLocks
     queue_authorizer::Ref{Any}
     watch_authorizer::Ref{Any}
     error_redactor::Ref{Any}
@@ -863,6 +952,7 @@ mutable struct InMemoryWorkerStore <: AbstractWorkerStore
         return new(
             Dict{String, TaskInfo}(),
             ReentrantLock(),
+            TaskLocks(),
             Ref{Any}(nothing),
             Ref{Any}(nothing),
             Ref{Any}(nothing),
@@ -873,13 +963,13 @@ end
 # -- Implement interface methods for InMemoryWorkerStore --
 
 function get_task_info(store::InMemoryWorkerStore, task_id::String)
-    lock(store.task_lock) do
+    lock(store.registry_lock) do
         return get(store.task_registry, task_id, nothing)
     end
 end
 
 function set_task!(store::InMemoryWorkerStore, task_id::String, task_info::TaskInfo)
-    lock(store.task_lock) do
+    lock(store.registry_lock) do
         existing = Base.get(store.task_registry, task_id, nothing)
         # Callers almost always save the very object they read, so there is nothing to
         # reconcile and the record simply stands.
@@ -917,14 +1007,14 @@ function set_task!(store::InMemoryWorkerStore, task_id::String, task_info::TaskI
 end
 
 function replace_task!(store::InMemoryWorkerStore, task_id::String, task_info::TaskInfo)
-    lock(store.task_lock) do
+    lock(store.registry_lock) do
         store.task_registry[task_id] = task_info
     end
     return task_info
 end
 
 function add_watcher!(store::InMemoryWorkerStore, task_id::String, user_id::String)
-    lock(store.task_lock) do
+    lock(store.registry_lock) do
         task_info = Base.get(store.task_registry, task_id, nothing)
         task_info === nothing && return false
         # Mutating the registered object *is* the store write — no round-trip, and so
@@ -946,7 +1036,7 @@ function try_transition!(store::InMemoryWorkerStore, task_id::String, from, to::
                          started_at::Union{Nothing, DateTime}=nothing,
                          result=UNSUPPLIED,
                          progress::Union{Nothing, Real}=nothing)
-    lock(store.task_lock) do
+    lock(store.registry_lock) do
         task_info = Base.get(store.task_registry, task_id, nothing)
         task_info === nothing && return false
         task_info.status in from || return false
@@ -964,7 +1054,7 @@ function try_transition!(store::InMemoryWorkerStore, task_id::String, from, to::
 end
 
 function delete_task!(store::InMemoryWorkerStore, task_id::String)
-    lock(store.task_lock) do
+    lock(store.registry_lock) do
         delete!(store.task_registry, task_id)
     end
     return nothing
@@ -972,7 +1062,7 @@ end
 
 function try_delete_task!(store::InMemoryWorkerStore, task_id::String, from;
                           run_id::Union{Nothing, UUID})
-    lock(store.task_lock) do
+    lock(store.registry_lock) do
         task_info = Base.get(store.task_registry, task_id, nothing)
         task_info === nothing && return false
         task_info.status in from || return false
@@ -986,7 +1076,7 @@ function cleanup_tasks!(store::InMemoryWorkerStore, retain_days::Int)
     cutoff = current_time_utc() - Dates.Day(retain_days)
     removed = String[]
 
-    lock(store.task_lock) do
+    lock(store.registry_lock) do
         for (task_id, task_info) in store.task_registry
             if task_info.completed_at !== nothing && task_info.completed_at < cutoff && task_info.status in (COMPLETED, FAILED, CANCELLED)
                 push!(removed, task_id)
@@ -1013,15 +1103,15 @@ end
 
 function _in_memory_listing(store::InMemoryWorkerStore, authority::TaskAuthority, status, queue_name)
     # Snapshot under the lock, filter OUTSIDE it (#324). The scan used to run while holding
-    # `task_lock` -- the lock every submit, claim, finish and cancel needs -- so one owner listing
-    # a 200k-record registry stalled the whole worker subsystem for its duration. Copying the
+    # the store's one lock -- which every submit, claim, finish and cancel then needed -- so one owner
+    # listing a 200k-record registry stalled the whole worker subsystem for its duration. Copying the
     # values is a pointer copy; the per-record work below then contends with nothing.
     #
     # Reading a record outside the lock is the same thing `get_task_status` already does with a
     # live object: `status` is a plain field written whole, and `watchers` is swapped
     # copy-on-write by `add_watcher!`, never grown in place, so the vector `_is_authorized`
     # iterates cannot be resized under it.
-    snapshot = lock(() -> collect(values(store.task_registry)), store.task_lock)
+    snapshot = lock(() -> collect(values(store.task_registry)), store.registry_lock)
     tasks = TaskInfo[]
     for task_info in snapshot
         if status !== nothing && task_info.status != status
@@ -1044,7 +1134,7 @@ end
 function list_running_task_refs(store::InMemoryWorkerStore; after::Union{Nothing, String}=nothing,
                                  limit::Union{Nothing, Int}=nothing)
     paged = _check_page(after, limit)
-    refs = lock(store.task_lock) do
+    refs = lock(store.registry_lock) do
         RunningTaskRef[_running_ref(t) for t in values(store.task_registry) if t.status == RUNNING]
     end
     return paged ? _keyset_page(refs, after, limit) : refs
@@ -1065,7 +1155,7 @@ function claim_next!(store::InMemoryWorkerStore, queue_name::String, consumer_id
     _check_claim_queue(queue_name)
     _check_consumer_id(consumer_id)
     lease = _lease_period(lease_seconds)
-    lock(store.task_lock) do
+    lock(store.registry_lock) do
         head = nothing
         for t in values(store.task_registry)
             (t.status == PENDING && t.external && t.queue_name == queue_name) || continue
@@ -1091,7 +1181,7 @@ function renew_leases!(store::InMemoryWorkerStore, consumer_id::String,
     _check_consumer_id(consumer_id)
     expires = now + _lease_period(lease_seconds)
     renewed = UUID[]
-    lock(store.task_lock) do
+    lock(store.registry_lock) do
         for r in runs
             t = get(store.task_registry, r.id, nothing)
             (t !== nothing && t.run_id == r.run_id && t.status == RUNNING &&
@@ -1106,7 +1196,7 @@ end
 
 function release_claim!(store::InMemoryWorkerStore, task_id::String, run_id::UUID;
                         policy::LeasePolicy, now::DateTime=current_time_utc())
-    lock(store.task_lock) do
+    lock(store.registry_lock) do
         t = get(store.task_registry, task_id, nothing)
         # `external` too: handing back a run this process executes itself would strand it at
         # PENDING, since no channel holds it and `claim_next!` takes only external rows.
@@ -1127,7 +1217,7 @@ end
 function count_external_runs(store::InMemoryWorkerStore, statuses::AbstractVector{TaskStatus};
                              queue_name::Union{Nothing, String}=nothing,
                              submitter::Union{Nothing, String}=nothing)
-    lock(store.task_lock) do
+    lock(store.registry_lock) do
         return count(values(store.task_registry)) do t
             t.external && t.status in statuses &&
                 (queue_name === nothing || t.queue_name == queue_name) &&
@@ -1144,7 +1234,7 @@ function requeue_expired!(store::InMemoryWorkerStore, now::DateTime;
     skip_unknown = _check_on_unknown_queue(on_unknown_queue) === :skip
     # The counts live inside the closure and come back as its value: assigned from inside it, they
     # would be captured in a `Core.Box` (#364).
-    return lock(store.task_lock) do
+    return lock(store.registry_lock) do
         requeued = failed = unknown = 0
         expired = [t for t in values(store.task_registry)
                    if t.status == RUNNING && t.lease_expires_at !== nothing && t.lease_expires_at < now &&
@@ -1208,10 +1298,6 @@ function set_watch_authorizer!(store::InMemoryWorkerStore, authorizer)
 end
 
 # The registry is process state, so a reset may discard it -- see `clear_records!`.
-clear_records!(store::InMemoryWorkerStore) = (lock(() -> empty!(store.task_registry), store.task_lock); nothing)
+clear_records!(store::InMemoryWorkerStore) = (lock(() -> empty!(store.task_registry), store.registry_lock); nothing)
 
-function lock_tasks(callback::Function, store::InMemoryWorkerStore)
-    return lock(store.task_lock) do
-        callback()
-    end
-end
+task_locks(store::InMemoryWorkerStore) = store.locks

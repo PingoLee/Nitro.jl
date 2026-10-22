@@ -71,11 +71,13 @@ It walks the `RUNNING` records `batch_size` at a time, by keyset on the id
 ([#237](https://github.com/PingoLee/Nitro.jl/issues/237)), so no step of it materializes the
 whole backlog. That backlog is exactly what a crash leaves: every task in flight at a `SIGKILL`
 stays `RUNNING`, and nothing but this sweep ever retires it. Each batch is adjudicated before the
-next is read. The store's task lock is still held for the whole sweep, as it was before, because
-the lock is what orders the sweep against runs registering in this process.
+next is read. Each record's verdict is taken under that task's lock, which is what orders it
+against a run registering in this process; nothing is held across the listing, so submissions and
+runs of other tasks proceed while the sweep works through a backlog
+([#711](https://github.com/PingoLee/Nitro.jl/issues/711)).
 
 It logs twice at `@info` ([#238](https://github.com/PingoLee/Nitro.jl/issues/238)).
-`"Nitro.Workers: scanning for zombie tasks"` goes out before it takes the lock, and
+`"Nitro.Workers: scanning for zombie tasks"` goes out before its first read, and
 `"Nitro.Workers: zombie recovery complete"` goes out when it finishes, **always**, including when
 it recovered nothing. The completion line carries `candidates`, `recovered`, `spared_live`,
 `too_recent`, `lost_race` and `leased`. If a read fails, an `@error` with the same counts replaces the
@@ -128,62 +130,61 @@ function _recover_zombie_tasks!(runtime::WorkerRuntime, zombie_min_age::Union{No
     # the moment the sweep began, however long the backlog takes to walk.
     cutoff = zombie_min_age === nothing ? nothing : current_time_utc() - zombie_min_age
 
-    # Before the lock, not inside it (#238). The boot sweep runs at every `start!`, AFTER the banner
-    # has announced the server and before the first request can be served, so a hang here used to
-    # read as a server that said it was up and then went silent. Logging before `lock_tasks` also
-    # separates "waiting for the lock" from "working through the backlog".
+    # First, before any read (#238). The boot sweep runs at every `start!`, AFTER the banner has
+    # announced the server and before the first request can be served, so a hang here used to read
+    # as a server that said it was up and then went silent. The sweep holds no lock across the
+    # listing since #711 -- each verdict takes its own key's stripe -- so this line now separates
+    # "never started" from "working through the backlog".
     if periodic
         @debug "Nitro.Workers: scanning for zombie tasks" zombie_min_age batch_size
     else
         @info "Nitro.Workers: scanning for zombie tasks" zombie_min_age batch_size
     end
     tally = _ZombieTally()
-    return lock_tasks(runtime) do
-        cursor = nothing
-        while true
-            # A failed read costs this sweep, never the boot that runs it: before #236 the PormG
-            # listing swallowed the error into an empty result, so startup carried on regardless,
-            # and that stays true. What changes is that it now says so -- and that batches already
-            # adjudicated keep their outcome.
-            page = try
-                list_running_task_refs(runtime.store; after=cursor, limit=batch_size)
-            catch e
-                e isa InterruptException && rethrow()
-                @error "Nitro.Workers: zombie recovery could not read the RUNNING tasks; stopping early" _tally_kwargs(tally)... exception=(loggable(e), catch_backtrace())
-                return tally.recovered
-            end
-            try
-                _recover_zombie_page!(tally, runtime, page, cutoff)
-            catch e
-                # A WRITE that throws still escapes, exactly as before #238. Unlike a failed read,
-                # it leaves the sweep not knowing whether that transition landed, which is not a
-                # state to boot past quietly. What it no longer does is escape without the tally,
-                # so the log shows how far the sweep got.
-                e isa InterruptException && rethrow()
-                @error "Nitro.Workers: zombie recovery failed mid-sweep" _tally_kwargs(tally)... exception=(loggable(e), catch_backtrace())
-                # The periodic sweep stops here instead (#266). The rethrow exists so a boot does
-                # not carry on quietly, and a tick carries on either way: its caller would only
-                # log this same exception a second time, on every tick of a persistent fault.
-                periodic && return tally.recovered
-                rethrow()
-            end
-            # Short means exhausted: an implementation returns fewer than `limit` only when
-            # nothing is left. A LONGER page is the default method's whole remainder, and the
-            # next read past it comes back empty.
-            if length(page) < batch_size
-                # UNCONDITIONAL, `recovered = 0` included: silence must stop being ambiguous
-                # between "ran and found nothing" and "never got there" (#238). Counts only --
-                # never a task's `result` or `error`, which are application data. The periodic
-                # re-sweep (#266) is the exception, and says so only when it recovered something.
-                if !periodic || tally.recovered > 0
-                    @info "Nitro.Workers: zombie recovery complete" _tally_kwargs(tally)...
-                else
-                    @debug "Nitro.Workers: zombie recovery complete" _tally_kwargs(tally)...
-                end
-                return tally.recovered
-            end
-            cursor = last(page).id
+    cursor = nothing
+    while true
+        # A failed read costs this sweep, never the boot that runs it: before #236 the PormG
+        # listing swallowed the error into an empty result, so startup carried on regardless,
+        # and that stays true. What changes is that it now says so -- and that batches already
+        # adjudicated keep their outcome.
+        page = try
+            list_running_task_refs(runtime.store; after=cursor, limit=batch_size)
+        catch e
+            e isa InterruptException && rethrow()
+            @error "Nitro.Workers: zombie recovery could not read the RUNNING tasks; stopping early" _tally_kwargs(tally)... exception=(loggable(e), catch_backtrace())
+            return tally.recovered
         end
+        try
+            _recover_zombie_page!(tally, runtime, page, cutoff)
+        catch e
+            # A WRITE that throws still escapes, exactly as before #238. Unlike a failed read,
+            # it leaves the sweep not knowing whether that transition landed, which is not a
+            # state to boot past quietly. What it no longer does is escape without the tally,
+            # so the log shows how far the sweep got.
+            e isa InterruptException && rethrow()
+            @error "Nitro.Workers: zombie recovery failed mid-sweep" _tally_kwargs(tally)... exception=(loggable(e), catch_backtrace())
+            # The periodic sweep stops here instead (#266). The rethrow exists so a boot does
+            # not carry on quietly, and a tick carries on either way: its caller would only
+            # log this same exception a second time, on every tick of a persistent fault.
+            periodic && return tally.recovered
+            rethrow()
+        end
+        # Short means exhausted: an implementation returns fewer than `limit` only when
+        # nothing is left. A LONGER page is the default method's whole remainder, and the
+        # next read past it comes back empty.
+        if length(page) < batch_size
+            # UNCONDITIONAL, `recovered = 0` included: silence must stop being ambiguous
+            # between "ran and found nothing" and "never got there" (#238). Counts only --
+            # never a task's `result` or `error`, which are application data. The periodic
+            # re-sweep (#266) is the exception, and says so only when it recovered something.
+            if !periodic || tally.recovered > 0
+                @info "Nitro.Workers: zombie recovery complete" _tally_kwargs(tally)...
+            else
+                @debug "Nitro.Workers: zombie recovery complete" _tally_kwargs(tally)...
+            end
+            return tally.recovered
+        end
+        cursor = last(page).id
     end
 end
 
@@ -231,23 +232,31 @@ function _recover_zombie_page!(tally::_ZombieTally, runtime::WorkerRuntime, page
             tally.too_recent += 1
             continue
         end
-        if !isnothing(get_active_task(runtime, task.id))
-            tally.spared_live += 1
-            continue
+        # The verdict and its write under the key's stripe, one key at a time (#711). That is
+        # what keeps this process's own runs safe: `_claim_run!` publishes a run's handle under
+        # the same stripe before its RUNNING claim, so a row this sweep reads as RUNNING either
+        # has its handle by now or belongs to no run here. A sweep-wide lock bought nothing
+        # more, and it held every submit in the process for the length of the backlog.
+        verdict = lock_tasks(runtime, String(task.id)) do
+            isnothing(get_active_task(runtime, task.id)) || return :spared_live
+            # `get_active_task` is process-local, so in a multi-process deployment this
+            # sweep sees another node's genuinely-running task as a zombie. Claiming the
+            # transition rather than saving a decision means that if the task finishes
+            # (or is cancelled) between the read and the write, the real outcome stands
+            # and this sweep writes nothing — the same rule every other terminal write
+            # now follows (#88).
+            # Addressed to the run this sweep actually inspected. Between the read above
+            # and this write the key may have been re-run (#108), and declaring someone else's
+            # live run dead is the same defect as clobbering its result.
+            won = try_transition!(runtime.store, task.id, (RUNNING,), FAILED;
+                                  run_id=task.run_id,
+                                  error="Worker process terminated unexpectedly mid-execution.",
+                                  completed_at=current_time_utc())
+            return won ? :recovered : :lost_race
         end
-        # `get_active_task` is process-local, so in a multi-process deployment this
-        # sweep sees another node's genuinely-running task as a zombie. Claiming the
-        # transition rather than saving a decision means that if the task finishes
-        # (or is cancelled) between the read and the write, the real outcome stands
-        # and this sweep writes nothing — the same rule every other terminal write
-        # now follows (#88).
-        # Addressed to the run this sweep actually inspected. Between the read above
-        # and this write the key may have been re-run (#108), and declaring someone else's
-        # live run dead is the same defect as clobbering its result.
-        if try_transition!(runtime.store, task.id, (RUNNING,), FAILED;
-                           run_id=task.run_id,
-                           error="Worker process terminated unexpectedly mid-execution.",
-                           completed_at=current_time_utc())
+        if verdict === :spared_live
+            tally.spared_live += 1
+        elseif verdict === :recovered
             tally.recovered += 1
         else
             tally.lost_race += 1
@@ -789,7 +798,7 @@ function _register_or_watch!(runtime::WorkerRuntime, task_key::String, owner::Ow
                              job_args::Union{Nothing, String}=nothing,
                              external::Union{Nothing, External}=nothing)
     uid = owner.user_id
-    return lock_tasks(runtime) do
+    return lock_tasks(runtime, task_key) do
         # The DURABLE read, not the live-preferring one, by the rule in `get_task_info`: this is
         # a CLAIMING call -- it decides whether to build a new run and replace the record. It
         # consults only `status` and `watchers`, both of which the row carries authoritatively,
@@ -848,51 +857,73 @@ function _register_or_watch!(runtime::WorkerRuntime, task_key::String, owner::Ow
             return nothing
         end
 
-        # Re-running a finished key replaces the record and resets its watchers to the
-        # resubmitter — the one place a whole record, watchers included, is written.
-        # The record we are about to discard may still have a live run behind it. `run_id`
-        # stops that run from writing (#108); this is the only thing that can reclaim the
-        # thread it is sitting on. In-process only -- a run hosted on another node is
-        # unreachable from here and will keep going until its callback returns.
-        #
-        # The new run reserves its capacity FIRST (#324), before the predecessor is asked to
-        # stop and before the record is replaced, so a refused submit changes nothing: no record,
-        # and no superseded run.
-        #
-        # An external run (#514) reserves nothing here: no process-local run will ever release it,
-        # because a consumer process runs it. It is admitted against counts the store keeps instead.
-        task_info = TaskInfo(task_key; queue_name, external = external !== nothing, job_name, job_args)
-        if external === nothing
-            _reserve_capacity!(runtime, queue, task_info.run_id, uid)
-        else
-            _admit_external!(runtime, external, something(queue_name), uid)
-        end
-        try
-            previous = get_active_task_info(runtime, task_key)
-            previous === nothing || _request_cancel!(previous, :superseded)
-
-            push!(task_info.watchers, uid)
-            for grant in grants
-                grant.user_id in task_info.watchers || push!(task_info.watchers, grant.user_id)
+        # A bound counts every record of its queue, so its count and the write it admits must
+        # not interleave with another key's submit in this process. The key's stripe does not
+        # cover that (#711); the admission lock does, and only on the path that counts.
+        if _admission_counts(runtime, external)
+            return _lock_admission(runtime.store) do
+                _mint_run!(runtime, task_key, uid, grants, queue, queue_name, job_name, job_args, external)
             end
-            # Through the RUNTIME: publishing a successor also evicts the run it displaced from
-            # the live caches, so nothing later reads a run that no longer owns this key.
-            replace_task!(runtime, task_key, task_info)
-        catch
-            # A store write that throws leaves no run to release it later.
-            external === nothing && _release_capacity!(runtime, queue, task_info.run_id)
-            rethrow()
         end
-        return task_info.run_id
+        return _mint_run!(runtime, task_key, uid, grants, queue, queue_name, job_name, job_args, external)
     end
 end
 
+# Whether minting this run reads a count `_admit_external!` bounds, and so needs the admission lock.
+_admission_counts(runtime::WorkerRuntime, external::Union{Nothing, External}) =
+    external !== nothing && (external.max_pending !== nothing || runtime.max_runs_per_owner !== nothing)
+
+# Mint a new run of `task_key` and publish it: `_register_or_watch!`'s replace branch, under the
+# key's stripe and, when a bound counts, the admission lock. Returns the new `run_id`.
+function _mint_run!(runtime::WorkerRuntime, task_key::String, uid::String, grants::AbstractVector{Owner},
+                    queue::Union{Nothing, WorkerQueue}, queue_name::Union{Nothing, String},
+                    job_name::Union{Nothing, String}, job_args::Union{Nothing, String},
+                    external::Union{Nothing, External})
+    # Re-running a finished key replaces the record and resets its watchers to the
+    # resubmitter — the one place a whole record, watchers included, is written.
+    # The record we are about to discard may still have a live run behind it. `run_id`
+    # stops that run from writing (#108); this is the only thing that can reclaim the
+    # thread it is sitting on. In-process only -- a run hosted on another node is
+    # unreachable from here and will keep going until its callback returns.
+    #
+    # The new run reserves its capacity FIRST (#324), before the predecessor is asked to
+    # stop and before the record is replaced, so a refused submit changes nothing: no record,
+    # and no superseded run.
+    #
+    # An external run (#514) reserves nothing here: no process-local run will ever release it,
+    # because a consumer process runs it. It is admitted against counts the store keeps instead.
+    task_info = TaskInfo(task_key; queue_name, external = external !== nothing, job_name, job_args)
+    if external === nothing
+        _reserve_capacity!(runtime, queue, task_info.run_id, uid)
+    else
+        _admit_external!(runtime, external, something(queue_name), uid)
+    end
+    try
+        previous = get_active_task_info(runtime, task_key)
+        previous === nothing || _request_cancel!(previous, :superseded)
+
+        push!(task_info.watchers, uid)
+        for grant in grants
+            grant.user_id in task_info.watchers || push!(task_info.watchers, grant.user_id)
+        end
+        # Through the RUNTIME: publishing a successor also evicts the run it displaced from
+        # the live caches, so nothing later reads a run that no longer owns this key.
+        replace_task!(runtime, task_key, task_info)
+    catch
+        # A store write that throws leaves no run to release it later.
+        external === nothing && _release_capacity!(runtime, queue, task_info.run_id)
+        rethrow()
+    end
+    return task_info.run_id
+end
+
 # The submit-time bounds of an external queue (#514), read from the store, because the runs they
-# bound are claimed and executed by other processes and hold nothing in this one. Called under
-# `lock_tasks`, where the run is about to be minted, so joining a live run is never refused by
-# them; `count_external_runs` is a plain read, the one claim-capability method allowed there. Both
-# are approximate under concurrent submits: they bound the backlog against runaway callers (the
-# #324 class), they are not quotas.
+# bound are claimed and executed by other processes and hold nothing in this one. Called under the
+# key's `lock_tasks` stripe and the admission lock, where the run is about to be minted, so joining
+# a live run is never refused by them; `count_external_runs` is a plain read, the one
+# claim-capability method allowed there. The admission lock makes them exact against this
+# process's own submits; against other processes' they are approximate: they bound the backlog
+# against runaway callers (the #324 class), they are not quotas.
 function _admit_external!(runtime::WorkerRuntime, placement::External, queue_name::String, uid::String)
     cap = placement.max_pending
     if cap !== nothing && count_external_runs(runtime.store, [PENDING]; queue_name) >= cap
@@ -946,7 +977,7 @@ function _execute_task_async(runtime::WorkerRuntime, task_key::String, callback:
     # scope, or `_claim_run!` below writes on the submitter's open PormG transaction (#209).
     task = _spawn_detached() do
         # The durable read, the #191 identity check against the CARRIED `run_id`, and the handle
-        # publish, as one critical section under the store lock -- `_claim_run!` (`queue.jl`)
+        # publish, as one critical section under the key's stripe -- `_claim_run!` (`queue.jl`)
         # owns the rationale. Runs INSIDE the spawned task, because the handle it publishes is
         # `current_task()`.
         #
@@ -959,8 +990,8 @@ function _execute_task_async(runtime::WorkerRuntime, task_key::String, callback:
         # nothing serializes them and the interleaving in which one stole the other's handles was
         # the ordinary case rather than an edge. A queue with concurrency `k > 1` (#513) is in the
         # same position, since two of its processors can hold the two items at once. A concurrent
-        # `cancel_task` plus re-submit needs only `lock_tasks` -- which is exactly why the claim
-        # takes it (#191, #198).
+        # `cancel_task` plus re-submit needs only the key's `lock_tasks` stripe -- which is exactly
+        # why the claim takes it (#191, #198).
         #
         # Every way out gives back the run's capacity reservation (#324) exactly once, except a
         # timed-out callback, which keeps it until it actually returns (`_RunHandoff`).
@@ -1211,8 +1242,8 @@ function _submit_queued_task(runtime::WorkerRuntime, queue_name::AbstractString,
     # raises. Resolving it first widens the window a teardown can land in (it now spans the
     # record write), but it stays loud: the `put!` below still hits the closed channel.
     #
-    # Outside `lock_tasks`, deliberately: `get_queue_status` holds `queue_lock` while it lists
-    # under the store's lock, so taking `queue_lock` inside `lock_tasks` would be that pair inverted.
+    # Outside `lock_tasks`, deliberately: `queue_lock` is never taken inside a stripe (`TaskLocks`),
+    # because `get_queue_status` holds `queue_lock` across a store listing.
     queue = _start_queue_processor(runtime, queue_id)
     run_id = _register_or_watch!(runtime, key, owner; queue_name=queue_id, grants=watchers, queue, job_name, job_args)
     if run_id !== nothing
@@ -1296,16 +1327,18 @@ Like [`get_task_status`](@ref), a task `authority` may not see is answered exact
 one, with `:status => "NOT_FOUND"` ([#323](https://github.com/PingoLee/Nitro.jl/issues/323)).
 """
 function cancel_task(task_id::AbstractString, authority::TaskAuthority; runtime::WorkerRuntime=default_runtime())
-    return lock_tasks(runtime) do
+    id = String(task_id)
+    return lock_tasks(runtime, id) do
         # Several rounds, only for an EXTERNAL submission a consumer process claimed, released or
         # requeued between this read and the claim below (#514). Each of those publishes a new
         # run of the same submission under a fresh `run_id`, so the fenced claim loses -- and the
         # cancel the caller asked for would be lost with it, answered as a re-submit it was not.
         # Every round starts again from `_visible_record`, so it re-authorizes against the record
-        # it is about to cancel. `lock_tasks` already orders every in-process writer of `run_id`
-        # against this, so for a submission this process runs itself there is only ever one round.
+        # it is about to cancel. The key's stripe already orders every in-process writer of its
+        # `run_id` against this, so for a submission this process runs itself there is only ever
+        # one round.
         for _ in 1:_CANCEL_CLAIM_ROUNDS
-            outcome = _cancel_once(runtime, authority, String(task_id))
+            outcome = _cancel_once(runtime, authority, id)
             outcome === nothing || return outcome
         end
         return Dict{Symbol, Any}(
@@ -1450,7 +1483,7 @@ still be served that run meanwhile. Its terminal write finds no record and store
 """
 function release_task!(task_id::AbstractString, ::System; runtime::WorkerRuntime=default_runtime())
     id = String(task_id)
-    return lock_tasks(runtime) do
+    return lock_tasks(runtime, id) do
         # The DURABLE read: this decides whether to destroy a record, which is a claiming call
         # (workers §2), and the live object may be a predecessor of what the row now holds.
         task_info = get_task_info(runtime.store, id)
@@ -1657,11 +1690,11 @@ The bound works by age alone, so choose it as you would for the boot sweep: long
 legitimately runs. `Second(0)` passes validation but bounds nothing, which on a timer is exactly
 the unbounded periodic sweep described above.
 
-The zombie sweep holds the store's task lock for the whole scan, as the boot sweep does, and
-here that happens while requests are being served. Submissions, run starts and run completions
-in this process wait for it. Each tick re-reads every `RUNNING` record, including other
-processes' live runs, which it counts `too_recent` and leaves alone. At the daily default that
-cost is negligible; a short `interval_hours` pays it on every tick.
+The zombie sweep runs while requests are being served. It locks one task at a time, for its
+verdict on that task, so submissions and runs of other tasks do not wait for the scan
+([#711](https://github.com/PingoLee/Nitro.jl/issues/711)). Each tick re-reads every `RUNNING`
+record, including other processes' live runs, which it counts `too_recent` and leaves alone. At
+the daily default that cost is negligible; a short `interval_hours` pays it on every tick.
 
 Idempotent while a scheduler is running: a second call returns the running one, and its
 arguments, `zombie_min_age` included, are ignored. Stop it with `stop_cleanup_scheduler!`
@@ -1774,10 +1807,10 @@ function _cleanup_scheduler_loop(runtime::WorkerRuntime, stop_signal::Channel{No
             # record it fails carries a fresh `completed_at` and so is never retired on the same
             # tick either way; the order is only about which failure the log reports first.
             #
-            # Gated on a bound, never unconditional: see the docstring. It takes `lock_tasks` for
-            # the whole sweep, as the boot sweep does, and this runtime's own runs are spared by
-            # `get_active_task`, because `_claim_run!` publishes a run's handle before its RUNNING
-            # claim.
+            # Gated on a bound, never unconditional: see the docstring. Each verdict takes its key's
+            # `lock_tasks` stripe, as the boot sweep does, and this runtime's own runs are spared by
+            # `get_active_task`, because `_claim_run!` publishes a run's handle under that stripe
+            # before its RUNNING claim.
             if zombie_min_age !== nothing
                 try
                     _recover_zombie_tasks!(runtime, zombie_min_age, ZOMBIE_SWEEP_BATCH; periodic=true)

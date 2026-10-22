@@ -8,6 +8,12 @@
 # round trips, flat throughput in `k` with hold ≈ the cycle time says the lock, not the database,
 # is the ceiling.
 #
+# Since #711 the lock is one stripe per task id, not one per store, so "lock busy" is reported two
+# ways: `held` is the sum of every section's hold over the window -- how many sections were open at
+# once, on average, which a single lock caps at 1.0 -- and `busiest` is the share of the window the
+# most-held stripe was taken. A store-wide lock reads the same number in both columns. The external
+# queues' admission lock is not on this path: the bench submits no external runs.
+#
 #   julia --project=<env> -t 4 bench/workers/store_throughput.jl [store] [seconds] [ks]
 #
 # `store` is `memory` (the default), `sqlite` (a temporary file) or `postgres`, which connects to
@@ -48,10 +54,12 @@ struct LockTimedStore{S <: W.AbstractWorkerStore} <: W.AbstractWorkerStore
     inner::S
     waits::Vector{Float64}
     holds::Vector{Float64}
+    stripe_holds::Dict{Int, Float64}
     stats_lock::ReentrantLock
     done::Dict{String, Base.Event}
 end
-LockTimedStore(inner) = LockTimedStore(inner, Float64[], Float64[], ReentrantLock(), Dict{String, Base.Event}())
+LockTimedStore(inner) = LockTimedStore(inner, Float64[], Float64[], Dict{Int, Float64}(), ReentrantLock(),
+                                       Dict{String, Base.Event}())
 
 for (f, n) in ((:get_task_info, 1), (:set_task!, 2), (:replace_task!, 2), (:add_watcher!, 2),
                (:delete_task!, 1), (:try_delete_task!, 2), (:cleanup_tasks!, 1),
@@ -62,6 +70,7 @@ for (f, n) in ((:get_task_info, 1), (:set_task!, 2), (:replace_task!, 2), (:add_
     @eval W.$f(s::LockTimedStore, $(args...); kw...) = W.$f(s.inner, $(args...); kw...)
 end
 W._visible_across_processes(s::LockTimedStore) = W._visible_across_processes(s.inner)
+W.task_locks(s::LockTimedStore) = W.task_locks(s.inner)
 
 function W.try_transition!(s::LockTimedStore, id, from, to; kw...)
     won = W.try_transition!(s.inner, id, from, to; kw...)
@@ -72,9 +81,12 @@ function W.try_transition!(s::LockTimedStore, id, from, to; kw...)
     return won
 end
 
-function W.lock_tasks(cb::Function, s::LockTimedStore)
+# More specific than Nitro's own `lock_tasks(cb, ::AbstractWorkerStore, ::String)`, so every
+# section reaches it; it takes the inner store's stripe for the same id.
+function W.lock_tasks(cb::Function, s::LockTimedStore, task_id::String)
     asked = time()
-    return W.lock_tasks(s.inner) do
+    stripe = W._stripe_index(W.task_locks(s.inner), task_id)
+    return W.lock_tasks(s.inner, task_id) do
         got = time()
         try
             cb()
@@ -83,6 +95,7 @@ function W.lock_tasks(cb::Function, s::LockTimedStore)
             lock(s.stats_lock) do
                 push!(s.waits, got - asked)
                 push!(s.holds, held)
+                s.stripe_holds[stripe] = get(s.stripe_holds, stripe, 0.0) + held
             end
         end
     end
@@ -121,7 +134,7 @@ function run_once(k::Int)
         sleep(0.05)
     end
     warm[] = true; wait(t)
-    lock(() -> (empty!(s.waits); empty!(s.holds)), s.stats_lock)
+    lock(() -> (empty!(s.waits); empty!(s.holds); empty!(s.stripe_holds)), s.stats_lock)
     cycles[] = 0
     stop = Threads.Atomic{Bool}(false)
     t0 = time()
@@ -131,13 +144,14 @@ function run_once(k::Int)
     foreach(wait, tasks)
     elapsed = time() - t0
     W.shutdown!(rt)
-    waits, holds = lock(() -> (copy(s.waits), copy(s.holds)), s.stats_lock)
+    waits, holds, by_stripe = lock(() -> (copy(s.waits), copy(s.holds), copy(s.stripe_holds)), s.stats_lock)
     rate = cycles[] / elapsed
-    busy = sum(holds; init = 0.0) / elapsed
-    @printf("%-8s k=%-3d  %9.1f cycles/s | lock sections %8d (%5.1f/cycle) | hold mean %8.1f µs p99 %8.1f µs | wait mean %9.1f µs p99 %9.1f µs | lock busy %5.1f%%\n",
+    held = sum(holds; init = 0.0) / elapsed
+    busiest = maximum(values(by_stripe); init = 0.0) / elapsed
+    @printf("%-8s k=%-3d  %9.1f cycles/s | lock sections %8d (%5.1f/cycle) | hold mean %8.1f µs p99 %8.1f µs | wait mean %9.1f µs p99 %9.1f µs | held %5.2f | busiest stripe %5.1f%%\n",
             backend, k, rate, length(holds),
             length(holds) / max(cycles[], 1), 1e6 * sum(holds; init = 0.0) / max(length(holds), 1), 1e6 * pct(holds, 0.99),
-            1e6 * sum(waits; init = 0.0) / max(length(waits), 1), 1e6 * pct(waits, 0.99), 100 * busy)
+            1e6 * sum(waits; init = 0.0) / max(length(waits), 1), 1e6 * pct(waits, 0.99), held, 100 * busiest)
 end
 
 println("# store_throughput: julia $(VERSION), threads $(Threads.nthreads()), $(seconds) s per k, store $backend")
