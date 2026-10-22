@@ -325,15 +325,16 @@ end
 
 # `enabled = false` (`serialize = false`) is a pass-through: the handler's own return value comes
 # back unformatted, and nothing is caught. Built either way so the pipeline's type does not
-# depend on the flag (#572).
+# depend on the flag (#572). A named `Types.Serializer` rather than a closure, so the handler a
+# route chain continues into has a type `Types.RouteNext` can name (#718).
 function DefaultSerializer(catch_errors::Bool; show_errors::Bool, enabled::Bool=true)
-    return function(handle)
-        return function(req::HTTP.Request)
-            enabled || return handle(req)
-            return handlerequest(catch_errors; show_errors) do
-                format_response(handle(req))
-            end
-        end
+    return handle -> Types.Serializer(catch_errors, show_errors, enabled, handle)
+end
+
+function (s::Types.Serializer)(req::HTTP.Request)
+    s.enabled || return s.handle(req)
+    return handlerequest(s.catch_errors; show_errors = s.show_errors) do
+        format_response(s.handle(req))
     end
 end
 

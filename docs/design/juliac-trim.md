@@ -17,8 +17,12 @@ wall was cleared in [#571](https://github.com/PingoLee/Nitro.jl/issues/571), and
 > ([#572](https://github.com/PingoLee/Nitro.jl/issues/572)): `setupmiddleware` builds one type
 > whatever the `serve` flags, and `serve` builds its listener from it without a dynamic call. The
 > count went *up*, 22 to 40, because the verifier now reaches `startserver` and the banner, code
-> it never looked at before (§3). The next wall on the request path is `HTTP.listen!`'s keyword
-> call, then the per-route chain ([#718](https://github.com/PingoLee/Nitro.jl/issues/718)).
+> it never looked at before (§3). The route boundary of §3.2 is done
+> ([#718](https://github.com/PingoLee/Nitro.jl/issues/718)): one `RouteEndpoint` per route chain and
+> per handler, a direct call under the JIT and a `ccall` to an exported thunk in a trimmed image.
+> Measured on the request-path probe (§1), it clears every error on the route path, 22 of them. The
+> next walls are `HTTP.listen!`'s keyword call in front of the request path, and, on it, what
+> follows a handler's `Any` result (`format_response`, the security-header layer).
 
 ## 1. How to measure
 
@@ -26,10 +30,20 @@ wall was cleared in [#571](https://github.com/PingoLee/Nitro.jl/issues/571), and
 bench/juliac/build.sh unsafe-warn        # julia +1.12; log under bench/results/ (gitignored)
 ```
 
+```bash
+ENTRY=probe bench/juliac/build.sh unsafe-warn   # the request path, without the listener (#718)
+julia bench/juliac/frames.jl bench/results/juliac-<stamp>-<entry>-<mode>.log
+```
+
 The verifier reports **the first dynamic call on each path** and does not look past it. A low
 count therefore means "the first wall is close", not "nearly done". Each fix can expose code that
-was never verified before. Count the errors by the first frame inside `src/`, not by the raw
-total: one line of Nitro can account for hundreds of Base frames (§2).
+was never verified before. Count the errors by the first frame inside `src/` (`frames.jl` does),
+not by the raw total: one line of Nitro can account for hundreds of Base frames (§2).
+
+`app.jl` reaches the request path only through `serve` and `HTTP.listen!`, so while any wall stands
+in front of the listener the route path is never verified at all. `probe.jl` builds the pipeline
+with `setupmiddleware` and calls it on requests (an exact route, a converter route, three
+middleware stacks), so the request path is measured whatever the listener does.
 
 ## 2. Cleared: the lifecycle wall (#571)
 
@@ -81,7 +95,7 @@ What #572 changed:
 | Where | What | Kind |
 |---|---|---|
 | `_serve_pipeline`'s `start` closure → `HTTP.listen!` | keyword call splatting a `Dict{Symbol,Any}` | next; small |
-| `compose` → the route's cached chain | a route table of differently typed chains | the route boundary (§3.2), [#718](https://github.com/PingoLee/Nitro.jl/issues/718) |
+| `compose` → the route's cached chain | a route table of differently typed chains | the route boundary (§3.2), **cleared** in [#718](https://github.com/PingoLee/Nitro.jl/issues/718) |
 | `isopen(::Service)`, `close(::Service)`, `wait` | `Service.server` holds `HTTP.Server{F}`, a UnionAll | **the server field (§3.3)** |
 | `startup`/`shutdown` | `LifecycleMiddleware.on_startup`/`on_shutdown` are `Union{Function,Nothing}`-typed | lifecycle only (§3.4), [#719](https://github.com/PingoLee/Nitro.jl/issues/719) |
 | the banner | `IO`-typed `stdout`, a runtime `DateFormat` | startup only; not designed yet |
@@ -168,22 +182,85 @@ concrete, the outer fold needed three things, and each landed as written:
   valid, but a `Vector` of mixed closures is folded dynamically. A `LifecycleMiddleware` member is
   abstract either way, because its `middleware` field is typed `Function`.
 
-Behind that sits **the route boundary**, now [#718](https://github.com/PingoLee/Nitro.jl/issues/718). Per-route and group middleware chains are composed and
-cached per route (`compose`, `ChainCache` in `src/routerhof.jl`), and a route table holding
-different chain types hands back an abstract value. Typing the outer fold moves the wall to that
-line. It does not remove it:
+Behind that sat **the route boundary**, [#718](https://github.com/PingoLee/Nitro.jl/issues/718).
+Per-route and group middleware chains were composed and cached per route (`compose`, `ChainCache`
+in `src/routerhof.jl`), and a route table holding different chain types hands back an abstract
+value. The leaf the router terminal calls has the same problem: HTTP.jl types `Leaf.handler` as
+`Any`, and every route's handler is a closure of its own type. The chain was also *folded* on the
+request path, from a `Vector{Function}`, which no compiler can type.
 
-| Goal | Boundary shape | Cost |
+**Done in #718: one erasure point per route, Nitro-built.** Prior art: Tower/axum type each layered
+stack fully and erase it at the router with `BoxCloneService`. So every route has a
+`RouteEndpoint` (`src/routeendpoint.jl`) for its chain and one for its handler:
+
+- **The chain is folded once, at registration** (`publish_route_middleware!`), around `RouteNext`,
+  which continues into the pipeline running it through the request's `RouteResolution`. That
+  handler has one concrete type, `PipelineHandler`, since the serializer and the router entry
+  became named structs. Registration is top-level code, which under `juliac` runs at build time,
+  so the untyped fold is never verified; only the call through the endpoint is. Chains are recorded
+  beside the entry they were folded from and published under one lock, so a request never runs a
+  chain under an entry it was not folded from.
+- **Under the JIT the endpoint is a direct call**, `obj(req)`: the one dynamic call per route the
+  untyped table made.
+- **In a `--trim` build it is a `ccall`.** The verifier rejects a call it cannot resolve; a
+  `foreigncall` is not one. Registration `Core.eval`s a concrete thunk method per chain type and
+  request shape, roots it with `Base.Experimental.entrypoint`, exports it with `Base._ccallable`,
+  and redefines `_trimmed()` to `true`, so inference folds the endpoint to one branch per build.
+  A pointer does not survive an image, so the first call looks the symbol up through `jl_dlsym`
+  on the executable's handle. The thunk catches what the handler throws and hands it back, so no
+  exception unwinds through the C frame. `test/juliac_internals_contract_tests.jl` pins the Base
+  calls on 1.12 and 1.13.
+- **A leaf not registered through Nitro is refused** (`serve` will not start; a request reaching
+  one gets a `500`): a call to an arbitrary leaf is exactly the dynamic call this removes.
+
+The candidates, measured on the probe and in a scratch spike (Julia 1.12.7):
+
+| Candidate | `--trim=safe` | Why |
 |---|---|---|
-| JIT performance only | **one function barrier per request** into a concretely typed per-route chain (the trade #516 made for `json_bind`) | about one dynamic call per request. `--trim=safe` rejects it |
-| `--trim=safe` | **no unresolved call**: dispatch unrolled over a tuple of routes, or an erasure point Nitro builds itself. A `FunctionWrapper{HTTP.Response, Tuple{HTTP.Request}}` is ruled out: it fails the verifier and crashes the trimmed binary (#625, §3.1) | unrolled dispatch makes compile time grow with the route count; a Nitro-built erasure point is undesigned and unmeasured |
+| `FunctionWrapper{HTTP.Response, Tuple{HTTP.Request}}` | fails | #625 Phase 1: its pointer is nulled in the image and re-derived through a dynamic `gen_fptr` |
+| dispatch unrolled over a tuple of routes, typed at `serve` | not prototyped: cannot pass | `main` knows the tuple's type only if it is part of `App`'s, which §3.1 decided against; built at `serve` from the `Vector{Function}` table it is itself a dynamic fold; a route registered after `serve` (#71) needs a dynamic fallback |
+| `Core.OpaqueClosure{Tuple{Req},Resp}` | fails | the call is an "unresolved call" (`verifytrim.jl` resolves only builtins and `invoke`s), and building one is flagged too |
+| a closed set of Nitro's own layer types (union-splitting) | does not help | route middleware is user code, union-splitting stops at four types, and the leaf is always a user closure |
+| **`RouteEndpoint`: an exported thunk per type, called with `ccall`** | **passes** | a scratch program with three differently typed chains builds under `--trim=safe` with 0 errors and serves all three; on the Nitro probe the route path clears (below) |
 
-Prior art: Tower/axum type each layered stack fully and erase it at the router with
-`BoxCloneService`. That is one deliberate dynamic boundary per route. Even a fully static stack
-accepts one erasure point, so the question is where it goes, not whether there is one.
+Verifier on `bench/juliac/probe.jl`, `unsafe-warn`, Julia 1.12.7, counted by first frame in `src/`:
 
-Still to measure: build time and first-request time at 10, 100 and 1000 routes with mixed group
-middleware, since a concrete chain type is one compiled type per distinct stack.
+| First frame in `src/` | `main` | #718 |
+|---|---:|---:|
+| `routerhof.jl` `foldlayers` (the fold on the request path) | 10 | 0 |
+| `types.jl` `cache_chain!` | 2 | 0 |
+| `routerhof.jl` `compose`: the cached and the fresh chain call | 4 | 0 |
+| `pipeline.jl` the leaf call (`_dispatch_resolved`, `_route_unresolved`, `_route_rerouted`) | 6 | 0 |
+| `framework_middleware.jl` / `misc.jl` serializer: `format_response(::Any)`, `handle_error` | 6 | 10 |
+| `middleware/security_headers.jl` (a response typed `Any`) | 12 | 12 |
+| `pipeline.jl` `_app_context_seed` (`ScopedValue` HAMT) | 6 | 6 |
+| `types.jl` `pathparams` on `LazyRequest` (newly reached, inside a handler) | – | 2 |
+| outside `src/`: `probe.jl`'s own `main`, Base's `string`, the libuv read callback | 6 | 6 |
+| **total** | **52** | **36** |
+
+The route path is clear: what remains starts after a handler returns, whose result is `Any` by
+design, or in layers outside the route boundary. The trimmed probe binary shows the same: on
+`main` it dies inside `foldlayers`; with #718 the request reaches the route's handler through the
+endpoint, which builds its response, and the binary stops at `format_response`, the next wall.
+`app.jl` stays at 40: its request path is still behind `HTTP.listen!`'s keyword call.
+
+What it asks of an application: nothing in code, but a route middleware factory now runs once per
+route at registration, so what it creates is shared by `serve` and every `internalrequest`; a
+direct `HTTP.register!` is refused. The `upgrading/` entry carries both.
+
+**The JIT build does not pay for it** (§4's rule), measured behind `bench/socket/quiet.sh` on
+Julia 1.13.2 against `main`:
+
+- `bench/socket/run.sh`, 5 × 6 s interleaved, c=50, `--threads=8`, over `/plaintext`, `/json` and
+  `/mw` (group plus route middleware), in both mode orders. Every route's sign follows the order,
+  the known order effect: +0.61 / −0.02 / +0.08% with `main` first, −0.99 / −1.30 / −0.91% with
+  the branch first. Nothing loses ≥ 2% in both orders.
+- Start-up is faster, not slower: with `FILLER_ROUTES` routes over three middleware stacks, time to
+  listen is 4.2 / 7.8 / 45 s at 10 / 100 / 1000 routes against `main`'s 6.4 / 19 / 146 s, and the
+  trimmed build 14 / 18 / 56 s against 14 / 21 / 101 s. Both grow linearly. The first request is
+  unchanged (≈ 1.4 s). Every leaf now has the one type `RouteEndpoint`, so `HTTP.register!` no
+  longer compiles a specialization per handler type, which is the likely source; #726 measures
+  registration on its own.
 
 ### 3.3 The server field
 
@@ -233,8 +310,8 @@ The order:
 3. **§3.3, the server field**, and `HTTP.listen!`'s keyword call in front of the request path.
    The field's type parameter is the pipeline's, fixed at `serve` time, not at `App`
    construction, so it needs its own shape. One candidate, not designed yet: a typed handle that
-   `serve` returns and `terminate` takes. Then **§3.2's route boundary (#718)**, where the
-   per-route erasure point is chosen.
+   `serve` returns and `terminate` takes. **§3.2's route boundary is done (#718)**: one
+   `RouteEndpoint` per route chain and per handler.
 4. **The request path:** #537, #538, #546, #566. Those four also help the JIT build, so they need
    not wait for 1–3.
 5. **§3.4, the lifecycle hooks ([#719](https://github.com/PingoLee/Nitro.jl/issues/719)).**

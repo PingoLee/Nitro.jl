@@ -147,6 +147,20 @@ Pass it wherever middleware is accepted:
 serve(app; middleware = [TraceRequests])
 ```
 
+### When Nitro calls it
+
+The outer function runs when Nitro **builds** a chain, not per request:
+
+- for **route and group** middleware (`path(...; middleware)`, `include_routes(...; middleware)`),
+  once per route, when `urlpatterns` registers it. Every server and every `internalrequest` then
+  runs that one chain;
+- for **global** middleware (`serve(middleware = ...)`), once per pipeline: once for `serve`, and
+  once for each `internalrequest` call.
+
+So anything the outer function creates is shared by every request that chain serves, and for a
+route middleware, by `serve` and `internalrequest` alike. Keep per-request state inside the
+function it returns.
+
 ### Configurable middleware
 
 To take options, write a **factory** — a function whose *return value* is the middleware above.

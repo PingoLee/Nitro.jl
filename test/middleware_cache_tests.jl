@@ -409,52 +409,61 @@ import Nitro: App, path, text
 #   * a `"*"` route is a `DeclaredMethodHandler` leaf (#282) and keys on `"*"` — one chain,
 #     whatever the request says;
 #   * a bare leaf that matches any token keys on `req.method`, so only methods Nitro knows are
-#     cached, and anything else is composed for that one request.
+#     cached, and anything else is looked up again for that one request.
 #
-# Observed through a counting ROUTE factory, called once per chain composition. (This used to
-# count a GLOBAL factory, which every composition re-folded; since #291 global middleware wraps
-# route selection and is folded once per pipeline, so it no longer sees compositions.) A leaf
-# with no entry composes to the bare handler and calls no factory, so every leaf here gets one.
+# Observed by swapping a route's chain behind the cache (#718). A chain is folded once, at
+# registration, into `route_chains`, so folds no longer count compositions. `swap!` replaces the
+# chain recorded for a route with one that answers "swapped", under the SAME entry, so the
+# generation does not move: a request served from the pipeline's cache still gets the old chain,
+# and one that looks the chain up again gets the new one.
 
-folds = Ref(0)
-counting = handler -> (folds[] += 1; req::HTTP.Request -> handler(req))
+using Nitro.Core.Types: snapshot, publish!, RouteChainRecord, RouteEndpoint
 
 ctx = App()
 Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
-    path("/any", (req::HTTP.Request) -> Res.send("any"), method = "*", middleware = [counting]),
+    path("/any", (req::HTTP.Request) -> Res.send("any"), method = "*",
+         middleware = [handler -> (req::HTTP.Request -> handler(req))]),
 ])
 # A bare any-method leaf, registered on the router directly so no `DeclaredMethodHandler` wraps
 # it -- the shape the method guard exists for. It keys on `req.method`, so it has an entry for
-# each method this item sends it.
-HTTP.register!(ctx.service.router, "*", "/raw", (req::HTTP.Request) -> HTTP.Response(200, "raw"))
+# each method this item sends it. Wrapped the way `registerhandler` wraps every leaf (#718).
+HTTP.register!(ctx.service.router, "*", "/raw",
+               RouteEndpoint((req::HTTP.Request) -> HTTP.Response(200, "raw")))
 for m in ["POST"; ["X-JUNK-$i" for i in 1:5]]
-    Nitro.Core.RouterHOF.publish_route_middleware!(ctx, "$m|/raw", (nothing, Function[counting]))
+    Nitro.Core.RouterHOF.publish_route_middleware!(ctx, "$m|/raw",
+        (nothing, Function[handler -> (req::HTTP.Request -> handler(req))]))
 end
 p = Nitro.Core.setupmiddleware(ctx; catch_errors = false)
-@test folds[] == 0
+
+function swap!(key)
+    rec = snapshot(ctx.service.route_chains)[key]
+    publish!(ctx.service.route_chains, key,
+             RouteChainRecord(rec.entry, RouteEndpoint((req::HTTP.Request) -> HTTP.Response(200, "swapped"))))
+end
 
 @testset "a \"*\" route caches ONE chain for every method token" begin
+    @test text(p(HTTP.Request("X-JUNK-1", "/any"))) == "any"
+    swap!("*|/any")
     for _ in 1:2, i in 1:5
-        @test text(p(HTTP.Request("X-JUNK-$i", "/any"))) == "any"
+        @test text(p(HTTP.Request("X-JUNK-$i", "/any"))) == "any"   # keyed on the declared "*"
     end
     @test text(p(HTTP.Request("POST", "/any"))) == "any"
-    @test folds[] == 1                  # keyed on the declared "*", not on what was sent
 end
 
 @testset "a bare any-method leaf never caches an unknown method" begin
-    before = folds[]
-    for _ in 1:2, i in 1:5
+    for i in 1:5
         @test text(p(HTTP.Request("X-JUNK-$i", "/raw"))) == "raw"
+        swap!("X-JUNK-$i|/raw")
+        @test text(p(HTTP.Request("X-JUNK-$i", "/raw"))) == "swapped"   # looked up again
     end
-    @test folds[] == before + 10        # composed per request, never retained
 end
 
 @testset "...but still caches a known one" begin
-    before = folds[]
+    @test text(p(HTTP.Request("POST", "/raw"))) == "raw"
+    swap!("POST|/raw")
     for _ in 1:3
-        @test text(p(HTTP.Request("POST", "/raw"))) == "raw"
+        @test text(p(HTTP.Request("POST", "/raw"))) == "raw"            # served from the cache
     end
-    @test folds[] == before + 1
 end
 end
 
@@ -470,8 +479,10 @@ import Nitro: App, path, text
 # into it. When the cache lived on `ctx.service` and was keyed on the route alone, the FIRST
 # pipeline to warm a route won permanently and every later pipeline's kwargs were silently
 # ignored. #79 put the settings in the key (`cachetag`); #255 made the cache per pipeline, so a
-# chain can only ever be served to the pipeline whose settings it baked in. The assertions below
-# are about behavior and hold for either mechanism.
+# chain can only ever be served to the pipeline whose settings it baked in. Since #718 a chain is
+# folded once, at registration, and shared by every pipeline: it bakes in no settings, and its
+# innermost layer (`RouteNext`) continues into the handler of the pipeline running it. The
+# assertions below are about behavior and hold for all three mechanisms.
 
 mw() = handler -> (req::HTTP.Request -> handler(req))
 
@@ -520,7 +531,7 @@ end
         @test text(p1(HTTP.Request("GET", "/v"))) == "h"
         @test text(p2(HTTP.Request("GET", "/v"))) == "h"
     end
-    @test builds[] == 2              # one per pipeline: both are warm before the registration
+    @test builds[] == 1              # one fold, at registration, shared by both pipelines (#718)
 
     Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
         path("/v", (req::HTTP.Request) -> Res.send("h"),
