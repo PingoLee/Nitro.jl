@@ -9,11 +9,19 @@ using Nitro
 mode, outdir = ARGS[1], ARGS[2]
 const L = ReentrantLock()
 
+# The parent polls for these files and reads them while this process runs. A plain `write`
+# creates the file before filling it, so a poll in between read `""` (#707); a rename is atomic.
+function mark(name, value)
+    path = joinpath(outdir, name)
+    write(path * ".tmp", value)
+    mv(path * ".tmp", path; force = true)
+end
+
 # The shape of a consumer's heartbeat caught mid-renewal: a store's write lock held, the task
 # parked inside it. Released four seconds later, if the task is still allowed to run.
 function holder()
     lock(L) do
-        write(joinpath(outdir, "holding"), string(Threads.threadid()))
+        mark("holding", string(Threads.threadid()))
         sleep(4)
     end
 end
@@ -27,7 +35,7 @@ atexit() do
         unlock(L)
     end
     timedwait(() -> got[], 8.0; pollint = 0.05)
-    write(joinpath(outdir, "hook"), got[] ? "acquired" : "blocked")
+    mark("hook", got[] ? "acquired" : "blocked")
 end
 
 if mode == "pinned"

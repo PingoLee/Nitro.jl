@@ -24,8 +24,15 @@ Base.@kwdef struct E2EWork
     outdir::String
 end
 
+# The parent polls for these marker files and reads them while the child runs. A plain `write`
+# creates the file before filling it, so a poll in between read `""` (#707); a rename is atomic.
+function e2e_write(path::AbstractString, value)
+    write(path * ".tmp", string(value))
+    mv(path * ".tmp", path; force = true)
+end
+
 e2e_mark(w::E2EWork, name::AbstractString, value = "") =
-    write(joinpath(w.outdir, "$(w.tag).$name"), string(value))
+    e2e_write(joinpath(w.outdir, "$(w.tag).$name"), value)
 
 # `hold`: report the attempt, set progress, then loop on `checkpoint!` until stopped, and record
 # why. From the second attempt on it completes at once, which is what a re-queued run must do.
