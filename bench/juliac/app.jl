@@ -1,5 +1,5 @@
 # The smallest Nitro app `juliac` can be pointed at (#570): one exact route, no middleware, no
-# access log, no banner.
+# access log, no banner. `FILLER_ROUTES`/`ROUTE_MW` grow it for #718's measurements.
 #
 # Routes are registered at TOP LEVEL on purpose. Under `juliac` this file is `include`d into the
 # build process, so registration -- and the reflection `parse_func_params` needs -- runs at build
@@ -13,6 +13,10 @@ const PLAINTEXT = "Hello, World!"
 const app = App()
 
 urlpatterns(app, "", path("/plaintext", req -> Res.send(PLAINTEXT); method = "GET"))
+# FILLER_ROUTES / ROUTE_MW (#718): a larger table with mixed middleware stacks, read here at
+# build time; both default off, and then the app is the minimal one above. See the file.
+include(joinpath(@__DIR__, "..", "route_table.jl"))
+bench_routes!(app)
 
 function (@main)(args::Vector{String})::Cint
     port = parse(Int, get(ENV, "PORT", "8080"))
