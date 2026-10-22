@@ -67,7 +67,7 @@ function AccessLogMiddleware(; log_query::Bool=false, skip::Union{Nothing,Functi
             _console_skips(skip, req, response) && return response
             ip = Base.get(req.context, :ip, nothing)
             target = _log_escape(log_query ? req.target : _log_target_path(req.target))
-            @info "$(_iso_seconds(now())) - $ip - \"$(req.method) $target\" $(response.status)"
+            @info "$(_console_stamp()) - $ip - \"$(req.method) $target\" $(response.status)"
             return response
         end
     end
@@ -95,6 +95,40 @@ function _iso_seconds(ts::DateTime)::String
     buf[14] = UInt8(':'); put2!(15, minute(ts))
     buf[17] = UInt8(':'); put2!(18, second(ts))
     return String(buf)
+end
+
+# The console line's local-time stamp, formatted once per wall-clock second (#701). `Dates.now()`
+# is glibc `localtime_r`, which takes a process-wide lock: `now()` alone measured ~70 ns per call
+# with one task and ~750 ns with four calling it at once (#561, #701), so every request thread
+# queued on it once per line. The whole stamp, `_iso_seconds(now())`, was ~820 ns at four tasks;
+# cached it is ~30 ns at one or four, worth ~2% of `/plaintext` throughput with
+# `access_log = true` at `-t 4` (bench/socket/, #701).
+#
+# The cache is keyed on the integer Unix second and the string is built from `localtime` of that
+# same second, so a hit is exactly what `now()` would have printed, across a DST change included.
+# The `@atomic` field holds one pointer, to an object whose fields are `const`: an inline
+# (Int, String) pair in an `@atomic` field is read with `lock cmpxchg16b`, which contends as badly
+# as the lock it replaces. A thread delayed between reading the clock and storing can write an
+# older second over a newer one; that costs the next caller a miss, never a wrong string.
+mutable struct _StampSnapshot
+    const sec::Int64
+    const str::String
+end
+
+mutable struct _StampSlot
+    @atomic snap::_StampSnapshot
+end
+
+const _CONSOLE_STAMP = _StampSlot(_StampSnapshot(typemin(Int64), ""))
+
+function _console_stamp()::String
+    sec = Libc.TimeVal().sec
+    snap = @atomic :acquire _CONSOLE_STAMP.snap
+    snap.sec == sec && return snap.str
+    tm = Libc.TmStruct(sec)
+    str = _iso_seconds(DateTime(tm.year + 1900, tm.month + 1, tm.mday, tm.hour, tm.min, tm.sec))
+    @atomic :release _CONSOLE_STAMP.snap = _StampSnapshot(sec, str)
+    return str
 end
 
 # One or more `/segment`s, each a run of RFC 3986 `pchar`s: unreserved, sub-delims, ':' and '@',

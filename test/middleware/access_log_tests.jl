@@ -716,6 +716,79 @@ end
                string(only(logger.logs).message))
 end
 
+# #701: the console stamp is formatted once per second and shared between request threads, so
+# `localtime_r`'s process-wide lock is taken once a second instead of once a line. It must still
+# print what `_iso_seconds(now())` prints at that instant, on every thread, past the second it was
+# cached in.
+@testitem "Console access stamp is cached per second, never stale (#701)" tags=[:middleware] setup=[NitroCommon] begin
+using Dates
+using Nitro
+
+stamp = Nitro.Core._console_stamp
+local_now() = Nitro.Core._iso_seconds(now())
+
+# Within one second a stamp is the cached string itself, not a copy. Compared by `pointer`:
+# `===` on two `String`s compares their content, so it would pass without any cache. Retried in
+# case a pair of calls straddles a second boundary.
+shared = Ref(false)
+for _ in 1:100
+    t0 = Libc.TimeVal().sec
+    a, b = stamp(), stamp()
+    if Libc.TimeVal().sec == t0
+        shared[] = pointer(a) == pointer(b)
+        break
+    end
+end
+@test shared[]
+
+# Every stamp falls between `now()` read just before and just after it, on every thread, for long
+# enough to cross at least one second: a cache that is never refreshed fails here.
+out_of_window = Threads.Atomic{Int}(0)
+deadline = time() + 1.5
+@sync for _ in 1:max(2, Threads.nthreads())
+    Threads.@spawn while time() < deadline
+        before = local_now(); s = stamp(); after = local_now()
+        before <= s <= after || Threads.atomic_add!(out_of_window, 1)
+    end
+end
+@test out_of_window[] == 0
+end
+
+# #701, where a zone can be set (#561's reasoning: CI runners are UTC, so local time and UTC agree
+# in-process). At UTC+14 a stamp that slipped to UTC would be 14 hours behind `now()`.
+@testitem "Console access stamp is local time whatever the zone (#701)" tags=[:middleware, :slow] setup=[NitroCommon] begin
+    using Test
+    using Nitro
+
+    code = """
+    using Nitro, Dates
+    before = Nitro.Core._iso_seconds(now())
+    s = Nitro.Core._console_stamp()
+    after = Nitro.Core._iso_seconds(now())
+    print(before <= s <= after, " ", Dates.value(now() - now(UTC)))
+    """
+    # The child-process pattern of the #561 item below.
+    cmd = addenv(`$(Base.julia_cmd()) --code-coverage=none --startup-file=no
+                  --project=$(Base.active_project()) -e $code`, "TZ" => "UTC-14")
+    out, err = IOBuffer(), IOBuffer()
+    p = run(pipeline(ignorestatus(cmd); stdout = out, stderr = err))
+    stdout_text, stderr_text = String(take!(out)), String(take!(err))
+    failure = (p.exitcode, p.termsignal) == (0, 0) ? nothing :
+        "child exit $(p.exitcode), signal $(p.termsignal); stderr: $(stderr_text)"
+    @test failure === nothing
+
+    fields = split(strip(stdout_text))
+    @test length(fields) == 2
+    if length(fields) == 2
+        @test fields[1] == "true"                            # the stamp is `now()`, local time
+        offset = tryparse(Int, fields[2])
+        @test offset isa Int
+        # Proof the zone took, so the line above could have failed. Windows' CRT reads `TZ` in
+        # its own grammar, so only a POSIX libc is held to it.
+        Sys.iswindows() || @test offset isa Int && offset > 13 * 3_600_000
+    end
+end
+
 # #649: AccessLog's catches made no #254 carve-out, so Ctrl-C in a `skip` or `annotate` hook became
 # a warning and the request carried on, and an overflow in a hook was reported as a buggy hook.
 @testitem "AccessLog does not swallow an interrupt or an overflow (#649)" tags=[:middleware] setup=[NitroCommon] begin
