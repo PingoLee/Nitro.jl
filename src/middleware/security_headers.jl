@@ -185,12 +185,14 @@ end
 function (sh::SecurityHeaders)(handle::Function)
     frozen = sh.headers
 
-    # Everything was disabled. Hand back a pass-through rather than rebuilding each response to
-    # add nothing: `add_response_headers` allocates a new `HTTP.Response` on every call, and doing
-    # that for an empty header list is pure cost on the request hot path.
-    isempty(frozen) && return handle
-
     return function(req::HTTP.Request)
+        # Everything was disabled: pass the response through rather than rebuilding it to add
+        # nothing, since `add_response_headers` allocates a new `HTTP.Response` on every call.
+        # Decided per request, not by returning `handle` itself, so this layer has one type
+        # whatever its headers: `setupmiddleware` installs an empty one when
+        # `serve(security_headers = …)` is not given, and the pipeline's type must not depend
+        # on that (#572).
+        isempty(frozen) && return handle(req)
         resp = handle(req)
 
         # A NEW response, never a mutation of the one the inner layer returned. That response

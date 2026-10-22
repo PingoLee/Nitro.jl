@@ -35,12 +35,13 @@ using Test
 using HTTP
 using Nitro
 using Nitro.Core: PrefixStripMiddleware, _normalize_prefix
+using Nitro.Core.Types: MissResponses
 
 # Drive the layer directly: (status, the target the next layer saw).
 function strip_through(target; prefix = "/api")
     seen = Ref{Union{String, Nothing}}(nothing)
     inner = req -> (seen[] = req.target; HTTP.Response(200))
-    res = PrefixStripMiddleware(prefix, HTTP.Response(404))(inner)(HTTP.Request("GET", target))
+    res = PrefixStripMiddleware(prefix, MissResponses(HTTP.Response(404), HTTP.Response(405)))(inner)(HTTP.Request("GET", target))
     return (res.status, seen[])
 end
 
@@ -73,7 +74,7 @@ end
     # multi-byte prefix was cut mid-character. On the wire it is percent-encoded, and that works.
     @test strip_through("/caf%C3%A9/menu"; prefix = "/caf%C3%A9") == (200, "/menu")
     @test strip_through("/caf%C3%A9x/menu"; prefix = "/caf%C3%A9") == (404, nothing)
-    @test_throws ArgumentError PrefixStripMiddleware("/café", HTTP.Response(404))
+    @test_throws ArgumentError PrefixStripMiddleware("/café", MissResponses(HTTP.Response(404), HTTP.Response(405)))
 end
 
 @testset "_normalize_prefix" begin

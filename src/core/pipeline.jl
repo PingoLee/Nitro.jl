@@ -276,26 +276,57 @@ function _collect_leaf_methods!(acc::Vector{String}, node::HTTP.Handlers.Node,
     return nothing
 end
 
-function setupmiddleware(ctx::App; middleware::Vector=[], serialize::Bool=true, catch_errors::Bool=true, show_errors::Bool=true, access_log=false, access_log_query::Bool=false, access_log_skip::Union{Nothing,Function}=nothing, security_headers::Union{Nothing,SecurityHeaders}=nothing)::Function
+# The `security_headers = nothing` layer: no headers, so a pass-through (#572). Shared by every
+# pipeline; `SecurityHeaders` only ever reads its vector.
+const NO_SECURITY_HEADERS = SecurityHeaders(Pair{String,String}[])
+
+"""
+    setupmiddleware(ctx; middleware = (), serialize, catch_errors, show_errors, access_log,
+                    access_log_query, access_log_skip, security_headers) -> Function
+
+Build the app-wide request pipeline: every layer `serve` installs, around `compose`'s route
+selection and the router terminal.
+
+**Its type is a function of the argument types alone** (#572), which is what lets `juliac --trim`
+follow a request through it (docs/design/juliac-trim.md §3.2):
+
+- the layers are nested by direct calls, not folded over a `Vector`, whose element type is `Any`;
+- every framework layer is always installed, and a flag that turns one off makes it a
+  pass-through, one predictable branch per request, rather than leaving it out. Leaving it out
+  made the type depend on five runtime `Bool`s;
+- user `middleware` is folded through a `Tuple`. A `Vector` is still accepted and converted once,
+  here, which is dynamic. The `Tuple` form is the typed one.
+"""
+function setupmiddleware(ctx::App; middleware::Union{Tuple,Vector}=(), serialize::Bool=true, catch_errors::Bool=true, show_errors::Bool=true, access_log=false, access_log_query::Bool=false, access_log_skip::Union{Nothing,Function}=nothing, security_headers::Union{Nothing,SecurityHeaders}=nothing)::Function
     # `normalize_middleware`, NOT `process_middleware`: this runs once per `serve` but ONCE
     # PER CALL from `internalrequest`, so it must have no registration side effect. `serve`
     # registers explicitly, just before it calls this. (#68)
     #
-    # In list order, NOT reversed: `foldlayers` owns the order now and runs every level
+    # In list order, NOT reversed: `compose` owns the order now and runs every level
     # top-down (#312). This `reverse` was the only thing that made the global list run
     # top-down, and route/router lists had no such step, so they ran bottom-up.
-    processed_middleware = normalize_middleware(middleware)
+    #
+    # A `Vector` becomes a `Tuple` here, once per pipeline. That conversion cannot be inferred,
+    # so a `Vector` of middleware leaves the pipeline's type to runtime; only the `Tuple` form
+    # keeps it predictable (#572).
+    processed_middleware = Tuple(normalize_middleware(middleware))
 
-    global_prefix_middleware = !isnothing(ctx.service.prefix[]) ? [PrefixStripMiddleware(ctx.service.prefix[], ctx.not_found)] : []
-    serializer = serialize ? [DefaultSerializer(catch_errors; show_errors)] : []
-    # The outer half of error handling (#256) -- see `ErrorBoundary`. Gated exactly like the
-    # serializer's catch: `serialize=false` still means Nitro installs no error or format layer at
-    # all, and `catch_errors=false` would make it a pass-through, so it is left out rather than
-    # paid for per request.
-    error_boundary = serialize && catch_errors ? [ErrorBoundary(catch_errors; show_errors)] : []
+    # Every layer below is built whatever the flags, and a disabled one passes the request
+    # through (#572). The pipeline's type therefore does not depend on `serialize`,
+    # `catch_errors`, `access_log`, `security_headers` or the prefix.
+    # One value, typed `MissResponse` field by field, for both layers that answer a miss (#625).
+    misses = Types.MissResponses(ctx.not_found, ctx.method_not_allowed)
+    global_prefix_middleware = PrefixStripMiddleware(ctx.service.prefix[], misses)
+    serializer = DefaultSerializer(catch_errors; show_errors, enabled = serialize)
+    # The outer half of error handling (#256) -- see `ErrorBoundary`. Enabled exactly like the
+    # serializer's catch: `serialize=false` still means Nitro runs no error or format layer at
+    # all, and with `catch_errors=false` it would only rethrow, so both leave it a pass-through.
+    error_boundary = ErrorBoundary(catch_errors; show_errors, enabled = serialize && catch_errors)
     # Accept `true` to enable; `nothing`/`false` (or the old logfmt value) disable it.
-    access_log_middleware = access_log === true ? [AccessLogMiddleware(; log_query=access_log_query, skip=access_log_skip)] : []
-    security_layer = security_headers === nothing ? [] : [security_headers]
+    access_log_middleware = AccessLogMiddleware(; log_query=access_log_query, skip=access_log_skip,
+                                                enabled = access_log === true)
+    # An empty `SecurityHeaders` adds nothing, and has the type a configured one has.
+    security_layer = something(security_headers, NO_SECURITY_HEADERS)
 
     # `compose` is installed UNCONDITIONALLY (#71). The old gate here — install it only if
     # `custommiddleware` was already non-empty — was evaluated once, and `serve` calls this
@@ -335,40 +366,40 @@ function setupmiddleware(ctx::App; middleware::Vector=[], serialize::Bool=true, 
     # construction (`Service` and `App` are immutable), so one closure over both values saves a
     # field-load chain per request. `Service.router` is the concrete `NitroRouter`, so this
     # closure's type is concrete too (#625). Under the old `HTTP.Router` field it was abstract,
-    # and so was every closure that captured it. Typing the fold below is #572's job.
-    router_entry = let r = ctx.service.router,
-                       misses = Types.MissResponses(ctx.not_found, ctx.method_not_allowed)
+    # and so was every closure that captured it.
+    router_entry = let r = ctx.service.router, misses = misses
         (req::HTTP.Request) -> _dispatch_resolved(r, misses, req)
     end
 
-    return reduce(|>, [
-        router_entry,
-        serializer...,
+    # Innermost first, each layer wrapping the chain built so far. This used to be
+    # `reduce(|>, [ … ])`: the same order, but over a `Vector` whose element type is `Any`, so
+    # neither inference nor `juliac --trim` could say what the pipeline was (#572).
+    return router_entry |>
+        serializer |>
         # The chains `compose` caches close over the serializer above, and so over
         # `catch_errors`/`show_errors`/`serialize`. They do not need to travel into `compose`
         # any more (#255): its cache is owned by THIS pipeline, so every chain in it was built
         # with this pipeline's settings. Before that, the cache lived on `ctx.service` and the
         # three had to be in its key, or a second `internalrequest` with different kwargs was
         # served the first one's chain (#79).
-        compose(ctx.service.router, processed_middleware, ctx.service.custommiddleware),
-        global_prefix_middleware...,
+        compose(ctx.service.router, processed_middleware, ctx.service.custommiddleware) |>
+        global_prefix_middleware |>
         # Installed on every pipeline, prefix or not (#341): it makes `req.target` the path the
         # router will match, so a global gate keyed on the URL is not bypassed by `//admin/…`
         # or absolute-form. OUTSIDE the prefix strip, which only understands origin-form, so
         # `http://h/api/x` is reduced and then stripped rather than refused as a 404.
-        OriginFormMiddleware(),
+        OriginFormMiddleware() |>
         # Outside every layer that can throw, inside the access log so that log line records
         # the 500 this produces (#256).
-        error_boundary...,
+        error_boundary |>
         # `serve(security_headers = …)` (#402). Outside every layer that builds its own response
         # -- the error boundary's 500, OriginForm's 400, the prefix strip's 404 -- so an app that
         # opts in gets the headers on all of them, not only on what comes back through `compose`.
         # The 400 is a shared `const` and the 404 the app's shared `not_found` (#650);
         # `SecurityHeaders` rebuilds, never mutates.
-        security_layer...,
-        access_log_middleware...,
-        _app_context_seed(ctx),
-    ])
+        security_layer |>
+        access_log_middleware |>
+        _app_context_seed(ctx)
 end
 
 # NOTE on STREAMING response bodies (#41). This runs the whole pipeline *minus* the socket layer,
@@ -378,7 +409,7 @@ end
 # owns it: drain it with `HTTP.body_read!` until it reports 0, or call `HTTP.body_close!`. Until
 # then the file handle stays open, which on Windows also blocks deleting the file. Over a real
 # socket none of this applies — the write path always closes.
-function internalrequest(ctx::App, req::HTTP.Request; middleware::Vector=[], serialize::Bool=true, catch_errors=true, context=missing,
+function internalrequest(ctx::App, req::HTTP.Request; middleware::Union{Tuple,Vector}=(), serialize::Bool=true, catch_errors=true, context=missing,
                          security_headers::Union{Nothing,SecurityHeaders}=nothing)::HTTP.Response
     # Loopback only when the request carries no address (#330). Overwriting one handed every
     # internal call the one address loopback-trusting checks accept, including a call made on
