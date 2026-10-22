@@ -27,7 +27,9 @@
 #                is a failure
 #   MICRO_TIMEOUT_S  each tasks.jl process is killed after this many seconds (default TIMEOUT_S); a kill
 #                appends a `killed` row (`<round> <julia> <layout> <variant> killed julia <what>
-#                timeout=<s>`) to MICRO_OUT and the script goes on, exiting 2 at the end
+#                timeout=<s>`) to MICRO_OUT and the script goes on, exiting 2 at the end; `<julia>` is
+#                the version plus `/<scheduler backend>` on a build with a selectable one, so a killed
+#                row names its build
 #
 # The real julia binary is run, not the juliaup launcher, so that the timeout's SIGKILL reaches it.
 set -uo pipefail
@@ -52,7 +54,7 @@ for ch in $CHANNELS; do
     *)   jl="$(julia +"$ch" -e 'print(joinpath(Sys.BINDIR, "julia"))')" || { echo "spawn_order.sh: no julia +$ch" >&2; exit 1; } ;;
   esac
   mm="$("$jl" -e 'print(VERSION.major, ".", VERSION.minor)')"
-  ver="$("$jl" -e 'print(VERSION)')"
+  ver="$("$jl" -e 'print(VERSION, isdefined(Base, :Scheduler) ? "/" * String(Base.JULIA_SCHEDULER) : "")')"
   for layout in $LAYOUTS; do
     for variant in $VARIANTS; do
       cells="${CELLS:-}"
@@ -67,7 +69,7 @@ for ch in $CHANNELS; do
       if [ -n "$MICRO_OUT" ]; then
         VARIANT="$variant" timeout -s KILL "$MICRO_TIMEOUT_S" taskset -c "$CPUS" "$jl" \
           --project="${MICRO_PROJECT//\{mm\}/$mm}" --threads="$layout" "$HERE/tasks.jl" $MICRO_WHAT |
-          sed "s/^/$ROUND\t$ver\t$layout\t$variant\t/" >>"$MICRO_OUT"
+          sed "s|^|$ROUND\t$ver\t$layout\t$variant\t|" >>"$MICRO_OUT"
         rc="${PIPESTATUS[0]}"
         if [ "$rc" = 137 ]; then
           echo "spawn_order.sh: tasks.jl $MICRO_WHAT $ch --threads=$layout VARIANT=$variant killed after ${MICRO_TIMEOUT_S}s" >&2
