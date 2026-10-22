@@ -82,7 +82,9 @@ _SU.liftkey(::NitroReadStyle, ::Type{Symbol}, x) = throw(ArgumentError(_SYMBOL_R
 
 # A float field must receive a finite value (#327). JSON itself has no NaN or Infinity, but it has
 # no size limit either: JSON.jl reads `1e999`, or a 400-digit integer, as a `BigFloat`/`BigInt`,
-# and converting that to a `Float64` field is `Inf`. The `Union` bound also covers a
+# and converting that to a `Float64` field is `Inf`. Since JSON.jl 1.12 a `Float32`/`Float16`
+# field reads the number at its own precision instead, so it arrives here already `Inf` -- the
+# same check refuses it. The `Union` bound also covers a
 # `Nullable{Float64}` field, which is lifted with its union type, not the float alone.
 #
 # Base's own float types only, not every `AbstractFloat`: an app's `StructUtils.lift(::StructStyle,
@@ -854,8 +856,8 @@ message never quotes the body; the parse error is kept on `.cause`. Calling this
 
 The body is client input, so it is always parsed with Nitro's read style, which never interns a
 client string as a `Symbol` (#306): an enum field binds by name or by integer. A float field
-must receive a finite value (#327): `1e999`, which JSON.jl reads as a `BigFloat` and would
-convert to `Inf`, is rejected. A `T` that would bind a `Symbol` anywhere (see
+must receive a finite value (#327): `1e999`, which overflows the field's float type to `Inf`, is
+rejected. A `T` that would bind a `Symbol` anywhere (see
 `interns_client_strings`) is refused, and so is passing `style` or `allownan = true`; all three
 are an `ArgumentError`.
 """

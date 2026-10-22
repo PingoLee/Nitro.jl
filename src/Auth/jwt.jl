@@ -224,10 +224,11 @@ function _decode_jwt(token::AbstractString, secret_or_keyset; issuer=nothing, au
     # getting exceptions the API does not document.
     #
     # A full parse into a Dict, although only three members are read below. Parsing into a
-    # struct of those three is ~8 allocations cheaper and was tried for #449, but a struct
-    # target skips the members it does not read without validating them -- a bad escape in
-    # `typ` parsed -- and RFC 7515 §5.2 requires the header to be a completely valid JSON
-    # object. A test pins that refusal.
+    # struct of those three is ~8 allocations cheaper and was tried for #449, but up to
+    # JSON.jl 1.11 a struct target skipped the members it does not read without checking
+    # their escapes -- a bad escape in `typ` parsed -- and RFC 7515 §5.2 requires the header
+    # to be a completely valid JSON object. JSON.jl 1.12 checks escapes in a skip too (#721);
+    # the Dict parse stays until a struct target is shown to refuse every row the test pins.
     header isa AbstractDict || throw(AuthError("Invalid JWT header"))
 
     # Same class, one level down: a JSON `kid` is whatever the token's author typed --
