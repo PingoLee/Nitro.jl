@@ -20,6 +20,7 @@
 #   BASE_ROOT=/path/to/other/checkout bench/socket/run.sh "baseline nitro"
 #   RATE=20000 bench/socket/run.sh "nitro@8,1 nitro@8,0"  # fixed request rate, not saturation
 #   JULIA="julia +1.12" bench/socket/run.sh               # another Julia (juliaup channel)
+#   ROUTES="/health DELETE:/health" bench/socket/run.sh nitro   # a route with its method (#712)
 #
 # RATE sets oha's `-q` (requests per second across all connections) with `--latency-correction`,
 # so a server that falls behind is charged the time requests spent waiting to be sent: p50/p99 at
@@ -132,9 +133,13 @@ wait_up() {
 RATE_ARGS=()
 [ -n "$RATE" ] && RATE_ARGS=(-q "$RATE" --latency-correction)
 
-oha_json() {
-  taskset -c "$CLIENT_CPUS" oha -z "$1" -c "$CONNS" ${RATE_ARGS[@]+"${RATE_ARGS[@]}"} --no-tui --disable-compression \
-    --output-format json "$2" 2>/dev/null
+# A route may name its method, `DELETE:/health` (#712: a 405 against the hit it misses); a bare
+# path is a GET.
+oha_json() {   # duration port route
+  local method=GET path="$3"
+  case "$3" in [A-Z]*:/*) method="${3%%:*}"; path="${3#*:}" ;; esac
+  taskset -c "$CLIENT_CPUS" oha -z "$1" -c "$CONNS" -m "$method" ${RATE_ARGS[@]+"${RATE_ARGS[@]}"} \
+    --no-tui --disable-compression --output-format json "http://127.0.0.1:$2$path" 2>/dev/null
 }
 
 echo "socket bench: server CPUs $SERVER_CPUS (--threads=$THREADS unless mode@threads), client CPUs $CLIENT_CPUS, $RUNS x $DUR interleaved, c=$CONNS${RATE:+, rate=$RATE/s}"
@@ -184,7 +189,7 @@ done
 # Warm every route on every server before anything is recorded: compiles the route and fills
 # HTTP.jl's connection paths.
 for mode in "${MODE_LIST[@]}"; do
-  for route in $ROUTES; do oha_json 3s "http://127.0.0.1:${PORT_OF[$mode]}$route" >/dev/null; done
+  for route in $ROUTES; do oha_json 3s "${PORT_OF[$mode]}" "$route" >/dev/null; done
 done
 
 slug() { printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_'; }
@@ -203,7 +208,7 @@ for run in $(seq 1 "$RUNS"); do
   for route in $ROUTES; do
     for mode in "${MODE_LIST[@]}"; do
       [ "$GC_SNAPSHOTS" = 1 ] && gc_snapshot "$mode" "$route" "$run" before
-      js=$(oha_json "$DUR" "http://127.0.0.1:${PORT_OF[$mode]}$route")
+      js=$(oha_json "$DUR" "${PORT_OF[$mode]}" "$route")
       [ "$GC_SNAPSHOTS" = 1 ] && gc_snapshot "$mode" "$route" "$run" after
       [ "$KEEP_JSON" = 1 ] && printf '%s\n' "$js" >"$RAW/r$run-$(slug "$mode")-$(slug "$route").json"
       RPS[$mode$route]+="$(jq -r '.summary.requestsPerSec|floor' <<<"$js") "
