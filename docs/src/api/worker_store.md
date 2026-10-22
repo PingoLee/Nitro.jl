@@ -17,6 +17,7 @@ Nitro.Workers.InMemoryWorkerStore
 Nitro.Workers.missing_store_methods
 Nitro.Workers.TaskLocks
 Nitro.Workers.task_locks
+Nitro.Workers.lock_tasks
 Nitro.Workers.get_task_info
 Nitro.Workers.set_task!
 Nitro.Workers.replace_task!

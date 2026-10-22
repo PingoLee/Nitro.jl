@@ -625,8 +625,9 @@ already exists and that the caller does not already watch is therefore refused w
 key takes, and which a fixed share of the *other* keys hash to as well. Blocking in the hook
 stalls all of them, so make it a pure in-memory predicate over data the app already has.
 Do not query a database from it, never call the worker API from it (`submit_task`,
-`cancel_task`, … on another key take that key's stripe, and two such hooks deadlock each
-other), and never `fetch` a spawned task that touches the same store: the child cannot take a
+`cancel_task`, … on another key would take that key's lock, and two such hooks deadlock each
+other, so a call that takes another key's lock throws `ConcurrencyViolationError` instead), and never
+`fetch` a spawned task that touches the same store: the child cannot take a
 `ReentrantLock` its parent holds, and any key it touches may hash to that stripe, so that
 deadlocks.
 
@@ -718,10 +719,12 @@ One more lock covers what is not per id: an external queue's submit-time bounds 
 record of the queue, and a count followed by a write must not interleave with another submit's
 in this process. It is taken inside a stripe, never the other way round.
 
-Never two stripes at once, and never `queue_lock` inside either: a section is about one id.
-That is also why an application hook that runs under a stripe — the watch authorizer — must not
-call back into the worker API: a call about another id takes a second stripe, and two such calls
-on two threads deadlock each other.
+A section is about one id: never a second id inside it, and never `queue_lock` inside either.
+The first is enforced — [`lock_tasks`](@ref) on another id inside a section throws
+`ConcurrencyViolationError` ([#717](https://github.com/PingoLee/Nitro.jl/issues/717)), because
+two such calls on two threads deadlock each other, and whether they do depends on the ids' hash.
+That is why an application hook that runs under a stripe — the watch authorizer — must not call
+back into the worker API.
 None of this spans processes; cross-process correctness is the store's atomic operations'.
 """
 struct TaskLocks
@@ -759,9 +762,33 @@ function task_locks end
 
 Run `callback()` holding `task_id`'s stripe of `store`'s [`TaskLocks`](@ref). Implemented once
 here for every store; a backend provides [`task_locks`](@ref), not this.
+
+A section is about one task id. Inside one, `lock_tasks` on the same id re-enters; on any other
+id it throws `ConcurrencyViolationError` before taking anything
+([#717](https://github.com/PingoLee/Nitro.jl/issues/717)), even when the two ids share a stripe.
 """
 function lock_tasks(callback::Function, store::AbstractWorkerStore, task_id::String)
-    return lock(callback, _stripe(task_locks(store), task_id))
+    held = get(task_local_storage(), _HELD_TASK_ID, nothing)::Union{Nothing, String}
+    held === nothing || held == task_id || _throw_second_task_id(held, task_id)
+    return lock(_stripe(task_locks(store), task_id)) do
+        task_local_storage(callback, _HELD_TASK_ID, task_id)
+    end
+end
+
+# The id whose section the current task is inside. Task-local, not a `ScopedValue`: it marks the
+# task that holds the lock, and a child spawned inside the section does not hold it (#717).
+const _HELD_TASK_ID = :nitro_workers_lock_tasks_held
+
+# Refused on the id, not the stripe: two ids on one stripe would re-enter today, but whether they
+# share one depends on their hash and on `TASK_LOCK_STRIPES`, so the same app code would pass or
+# deadlock by chance. On the id, it fails on its first call.
+@noinline function _throw_second_task_id(held::String, task_id::String)
+    throw(ConcurrencyViolationError(
+        "`lock_tasks` for task \"$task_id\" inside the section of task \"$held\": a section is " *
+        "about one task id, and two sections on two ids from two threads can deadlock each other. " *
+        "The usual caller is a watch authorizer (`set_watch_authorizer!`) that calls the worker " *
+        "API (`submit_task`, `cancel_task`, `release_task!`, ...); it runs under the submitted " *
+        "key's section, so resolve what it needs before installing it."))
 end
 
 # The external-submit admission lock: taken inside a key's stripe, around a bound's count and the

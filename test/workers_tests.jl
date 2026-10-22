@@ -510,6 +510,80 @@ end
     end
 end
 
+# A key of `owner` on the same stripe as `key`, so a test can show the refusal is about the id.
+function same_stripe_key(locks::TaskLocks, key::String, owner::String)
+    i = Nitro.Workers._stripe_index(locks, key)
+    return first(k for k in ("$owner::k$j" for j in 1:10_000)
+                 if k != key && Nitro.Workers._stripe_index(locks, k) == i)
+end
+
+@testset "a section refuses a second task id, whatever its stripe (#717)" begin
+    store = InMemoryWorkerStore()
+    locks = task_locks(store)
+    a = "user::a"
+    for b in (other_stripe_key(locks, a, "user"), same_stripe_key(locks, a, "user"))
+        # Spawned, so a regression to a nested lock that waits fails here rather than hanging.
+        t = Threads.@spawn lock_tasks(store, a) do
+            lock_tasks(() -> :second, store, b)
+        end
+        @test wait_for(() -> istaskdone(t); timeout = 10.0) === :ok
+        err = try
+            fetch(t)
+        catch e
+            e isa TaskFailedException ? e.task.exception : e
+        end
+        @test err isa ConcurrencyViolationError
+        @test occursin(a, err.msg) && occursin(b, err.msg) && occursin("set_watch_authorizer!", err.msg)
+        # Refused before the lock was taken, and nothing is left held: both ids are free.
+        @test lock_tasks(() -> :free, store, b) === :free
+        @test lock_tasks(() -> :free, store, a) === :free
+    end
+
+    # The same id re-enters, as the `ReentrantLock` under it allows.
+    @test lock_tasks(() -> lock_tasks(() -> :inner, store, a), store, a) === :inner
+
+    # The marker goes with the section when its callback throws.
+    @test_throws ErrorException lock_tasks(() -> error("boom"), store, a)
+    @test lock_tasks(() -> :after, store, other_stripe_key(locks, a, "user")) === :after
+
+    # A child spawned inside a section does not hold its parent's lock, so it is not marked: it
+    # takes another id's section and finishes while the parent still holds `a`.
+    b = other_stripe_key(locks, a, "user")
+    @test lock_tasks(store, a) do
+        child = Threads.@spawn lock_tasks(() -> :child, store, b)
+        wait_for(() -> istaskdone(child); timeout = 10.0) === :ok && fetch(child)
+    end === :child
+end
+
+@testset "a watch authorizer that calls the worker API fails on its first call (#717)" begin
+    # The deadlock this replaces needed two such hooks on two threads whose keys hash to each
+    # other's stripes. The refusal needs neither: one submit, one thread, any hash.
+    store = InMemoryWorkerStore()
+    rt = WorkerRuntime(store)
+    try
+        gid = submit_task("shared", () -> "x", Owner("alice"); scope = :global, runtime = rt)
+        @test wait_for(() -> get_task_status(gid, Owner("alice"); runtime = rt)[:status] == "COMPLETED";
+                       timeout = 10.0) === :ok
+        set_watch_authorizer!(store, function (task_key, watchers, user_id)
+            submit_task("audit-$user_id", () -> nothing, Owner(user_id); runtime = rt)
+            return true
+        end)
+        t = Threads.@spawn submit_task("shared", () -> "y", Owner("bob"); scope = :global, runtime = rt)
+        @test wait_for(() -> istaskdone(t); timeout = 10.0) === :ok
+        err = try
+            fetch(t)
+        catch e
+            e isa TaskFailedException ? e.task.exception : e
+        end
+        @test err isa ConcurrencyViolationError
+        # Refused before anything was written: no audit record, and the key is still alice's.
+        @test get_task_info(store, "bob::audit-bob") === nothing
+        @test get_task_info(store, gid).watchers == ["alice"]
+    finally
+        reset_runtime!(rt)
+    end
+end
+
 # -- The claim capability (#514) ----------------------------------------------------------------
 
 # A store that forwards to an `InMemoryWorkerStore` and runs `hook(inner)` just before each
