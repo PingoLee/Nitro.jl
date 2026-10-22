@@ -711,9 +711,10 @@ Nitro.Workers.task_locks(store::MyWorkerStore) = store.locks
 What they order is **in-process, per task id**: one in-process writer of a record's `run_id` at
 a time, a run's live handle registered against the record it was claimed from, and no zombie
 verdict between a claim and its handle. Those are per-id facts, so the locks are a fixed set of
-`ReentrantLock` stripes picked by the id's hash: two sections on the same id serialize, two on
-different ids almost always do not. A store-wide lock here capped one process at one database
-round trip at a time, whatever its connection pool.
+`ReentrantLock` stripes picked by the id's hash: two sections on the same id serialize, and two
+on different ids serialize only when the ids share a stripe (one chance in 64 per pair). A
+store-wide lock here capped one process at one database round trip at a time, whatever its
+connection pool.
 
 One more lock covers what is not per id: an external queue's submit-time bounds count every
 record of the queue, and a count followed by a write must not interleave with another submit's
@@ -739,8 +740,10 @@ struct TaskLocks
     end
 end
 
-# A power of two, so a stripe is a mask of the hash. Well above any connection pool a process
-# runs, so distinct keys rarely share one.
+# A power of two, so a stripe is a mask of the hash. With 64, two of 4 concurrent keys share a
+# stripe 9% of the time, of 8 37%, of 16 87% -- which costs throughput only: those two serialize,
+# as every key did before #711. 256 stripes measured no faster at 16 and 32 clients on SQLite or
+# PostgreSQL, where the database, not the stripe, is the ceiling (#717).
 const TASK_LOCK_STRIPES = 64
 
 TaskLocks() = TaskLocks([ReentrantLock() for _ in 1:TASK_LOCK_STRIPES], ReentrantLock())
@@ -768,15 +771,30 @@ id it throws `ConcurrencyViolationError` before taking anything
 ([#717](https://github.com/PingoLee/Nitro.jl/issues/717)), even when the two ids share a stripe.
 """
 function lock_tasks(callback::Function, store::AbstractWorkerStore, task_id::String)
-    held = get(task_local_storage(), _HELD_TASK_ID, nothing)::Union{Nothing, String}
+    tls = task_local_storage()
+    held = get(tls, _HELD_TASK_ID, nothing)::Union{Nothing, String}
     held === nothing || held == task_id || _throw_second_task_id(held, task_id)
-    return lock(_stripe(task_locks(store), task_id)) do
-        task_local_storage(callback, _HELD_TASK_ID, task_id)
+    stripe = _stripe(task_locks(store), task_id)
+    lock(stripe)
+    try
+        # Re-entry: the outermost section owns the marker.
+        held === nothing || return callback()
+        tls[_HELD_TASK_ID] = task_id
+        try
+            return callback()
+        finally
+            # Overwritten, never deleted: a delete and re-insert per section churns the task's
+            # `IdDict` into rehashing, which cost every section ~150 ns and an allocation.
+            tls[_HELD_TASK_ID] = nothing
+        end
+    finally
+        unlock(stripe)
     end
 end
 
-# The id whose section the current task is inside. Task-local, not a `ScopedValue`: it marks the
-# task that holds the lock, and a child spawned inside the section does not hold it (#717).
+# The id whose section the current task is inside, or `nothing`. Task-local, not a
+# `ScopedValue`: it marks the task that holds the lock, and a child spawned inside the section
+# does not hold it (#717).
 const _HELD_TASK_ID = :nitro_workers_lock_tasks_held
 
 # Refused on the id, not the stripe: two ids on one stripe would re-enter today, but whether they
