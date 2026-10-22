@@ -1323,13 +1323,13 @@ end
 
 # -- #577 -----------------------------------------------------------------------------------
 #
-# JSON.jl checks a string's escapes only when it materializes the string, and a typed parse skips
-# a member `T` does not declare without materializing it. So an invalid escape in an undeclared
-# member binds, while the same escape in a declared member -- or anywhere, through `getjson` --
-# is refused. That is the documented behavior (*Request Body* guide), not a target: if a JSON.jl
-# bump turns a "binds" row red, the validating skip landed upstream. Update the guide and flip
-# the row; do not work around it to keep the row green.
-@testitem "Json{T} skips undeclared members without checking their escapes (#577)" tags=[:core] setup=[NitroCommon] begin
+# A typed parse skips a member `T` does not declare without materializing it. Up to JSON.jl 1.11
+# the skip did not check string escapes, so an invalid escape in an undeclared member bound, and
+# this item pinned that as documented behavior. JSON.jl 1.12.0 (JuliaIO/JSON.jl#516) checks every
+# escape in a skip, and Nitro's floor is now 1.12.1 (#721): `Json{T}`, `getjson` and
+# `JsonFragment{T}` agree on every body in the table below. The undeclared-member row is now the
+# guard against a regression to the old, non-validating skip.
+@testitem "Json{T} refuses an invalid escape in an undeclared member (#577, #721)" tags=[:core] setup=[NitroCommon] begin
 using Test
 using HTTP
 using Nitro
@@ -1363,15 +1363,30 @@ still_checked = ("\"a\x01b\"", "01", "1e", "-", "nul", "[1,2,]", "["^513 * "]"^5
     end
 end
 
-@testset "an invalid escape in an undeclared member binds" begin
+@testset "an invalid escape in an undeclared member is a 400 (JSON.jl ≥ 1.12)" begin
     for target in ("/plain", "/kwdef"), value in bad_escapes
-        r = send(target, undeclared(value))
+        @test send(target, undeclared(value)).status == 400
+    end
+    # The control: the same body with a valid undeclared member binds.
+    for target in ("/plain", "/kwdef")
+        r = send(target, undeclared("\"fine\""))
         @test r.status == 200
         @test Nitro.text(r) == "item/3"
     end
 end
 
-@testset "everything but string escapes is still checked in an undeclared member" begin
+# Not new in 1.12 (which changed `isvalidjson`'s trailing-input check, not `JSON.parse`'s): the
+# root parse has always refused trailing input, and `json_bind` is pinned on it further up. Here
+# so the table covers all four readers.
+@testset "trailing input after the root is a 400 through every reader" begin
+    trailing = """{"name":"item","qty":3} x"""
+    @test send("/plain", trailing).status == 400
+    @test send("/kwdef", trailing).status == 400
+    @test Nitro.text(send("/getjson", trailing)) == "refused"
+    @test send("/fragment", """{"item":{"name":"item","qty":3}} x""").status == 400
+end
+
+@testset "the rest of the grammar is checked in an undeclared member too" begin
     for target in ("/plain", "/kwdef"), value in still_checked
         @test send(target, undeclared(value)).status == 400
     end

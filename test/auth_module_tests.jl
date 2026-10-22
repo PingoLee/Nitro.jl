@@ -590,8 +590,8 @@ end
 
     # RFC 7515 §5.2: the header must be a COMPLETELY valid JSON object, including the members
     # Nitro never reads. #449 tried parsing it into a struct of the three it does read, which
-    # skips the rest unvalidated -- every one of these then parsed. Each is validly signed,
-    # so the refusal is the parser's and nothing else's.
+    # (up to JSON.jl 1.11) skipped the rest without checking their escapes, so the escape rows
+    # here parsed. Each is validly signed, so the refusal is the parser's and nothing else's.
     for header in ("""{"alg":"HS256","typ":"J\\WT"}""",
                    """{"alg":"HS256","x":"\\u035"}""",
                    """{"alg":"HS256","x":[1,}""",
