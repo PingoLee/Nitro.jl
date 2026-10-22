@@ -62,8 +62,9 @@
 #                       sent `rows_body.jl`'s 12 MB body) and answers `ok <rows>`;
 #                       `POST /hold/multipart` parses the request's multipart body with `getfiles`
 #                       (the `multipart_64mib` row when it is sent a 64 MiB body) and answers
-#                       `ok <parts>`; `GET /hold/file` is `Res.file(req, HOLD_FILE)`, the whole-file
-#                       read (`file_100mib`), and `GET /hold/file_stream` the same with
+#                       `ok <parts>`; `GET /hold/file` is
+#                       `Res.file(req, HOLD_FILE; stream = false)`, the whole-file read
+#                       (`file_100mib`), and `GET /hold/file_stream` the same with
 #                       `stream = true`, the negative control (`file_100mib_stream_read`).
 #   STATIC=0|1          Nitro only: also mount a temp folder holding one 2 KiB `a.txt` with
 #                       `staticfiles(app, dir, "static")` (the default `:eager` cache), so
@@ -516,7 +517,7 @@ function hold_routes()
     hold_json = req -> Res.json(value)
     hold_json_typed = req -> Res.send(string("ok ", length(Nitro.json(req, HoldRows; max_fields = 0).rows)))
     hold_multipart = req -> Res.send(string("ok ", length(Nitro.getfiles(req))))
-    hold_file = req -> Res.file(req, file)
+    hold_file = req -> Res.file(req, file; stream = false)
     hold_file_stream = req -> Res.file(req, file; stream = true)
     return hold_json, hold_json_typed, hold_multipart, hold_file, hold_file_stream
 end

@@ -148,6 +148,18 @@ Override per server with `serve(max_fields = …)`; `0` means unlimited (#327).
 """
 const DEFAULT_MAX_FIELDS :: Int64 = 1000
 
+# Size above which a file is STREAMED rather than read into memory, by default: a mounted file
+# (#41) and `Res.file(req, path)` (#588) share it, so the two paths follow one rule.
+#
+# `staticfiles` used to read every mounted file at startup and hold it for the process lifetime,
+# with no cap: a folder holding a 500 MB video pinned 500 MB resident whether or not anything ever
+# asked for it, and `Res.file` then materialised the whole body again per response, so N concurrent
+# downloads cost N × filesize. 8 MiB is comfortably above any realistic SPA bundle — which is the
+# case the capture exists to make fast — and far below the sizes where holding the bytes is the
+# problem rather than the solution. A whole-file read is also one blocking call with no safepoint:
+# at 100 MiB it made every collection wait 43–66 ms for that thread (#588).
+const FILE_STREAM_THRESHOLD :: Int = 8 * 1024 * 1024
+
 """
     AbstractApp
 

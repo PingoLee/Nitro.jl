@@ -581,6 +581,91 @@ end
 
 end
 
+@testitem "Res.file streams a large file by default (#588)" tags=[:core] setup=[NitroCommon] begin
+using Test
+using HTTP
+using Nitro
+
+# The default follows the mounts' rule: over `FILE_STREAM_THRESHOLD` the body is a cursor over the
+# open file, at or under it the bytes. `loadfile` and a strong tag need the whole body, so they keep
+# the buffered read rather than throwing; only an explicit `stream = true` is refused with them.
+threshold = Nitro.Core.Constants.FILE_STREAM_THRESHOLD
+dir = mktempdir()
+large = joinpath(dir, "large.bin")
+write(large, rand(UInt8, threshold + 1))
+edge = joinpath(dir, "edge.bin")
+write(edge, rand(UInt8, threshold))
+req = HTTP.Request("GET", "/f")
+
+streamed(resp) = Nitro.Core._is_streaming_body(resp.body)
+bytes(resp) = Nitro.Core.Util.BodyParsers._body_view(resp.body)
+function release(resp)
+    streamed(resp) && Nitro.Core._release_response_body!(resp.body)
+    return nothing
+end
+
+@testset "over the threshold the default streams" begin
+    resp = Res.file(req, large)
+    try
+        @test streamed(resp)
+        @test HTTP.header(resp, "Content-Length") == string(threshold + 1)
+        @test startswith(HTTP.header(resp, "ETag"), "W/")
+    finally
+        release(resp)
+    end
+end
+
+@testset "at the threshold the default reads the file" begin
+    resp = Res.file(req, edge)
+    @test !streamed(resp)
+    @test bytes(resp) == read(edge)
+end
+
+@testset "what needs the whole body keeps the buffered read" begin
+    resp = Res.file(req, large; loadfile = read)
+    @test !streamed(resp)
+    @test bytes(resp) == read(large)
+
+    resp = Res.file(req, large; etag = :strong)
+    @test !streamed(resp)
+    @test !startswith(HTTP.header(resp, "ETag"), "W/")
+end
+
+@testset "every other etag streams by default" begin
+    for (etag, tag) in ((nothing, ""), ("\"v1\"", "\"v1\""))
+        resp = Res.file(req, large; etag = etag)
+        try
+            @test streamed(resp)
+            @test HTTP.header(resp, "ETag") == tag
+        finally
+            release(resp)
+        end
+    end
+    # An unknown strategy is refused before anything is sent, the streamed path included.
+    @test_throws ArgumentError Res.file(req, large; etag = :bogus)
+end
+
+@testset "an explicit choice wins over the size" begin
+    resp = Res.file(req, large; stream = false)
+    @test !streamed(resp)
+    @test bytes(resp) == read(large)
+
+    resp = Res.file(req, edge; stream = true)
+    try
+        @test streamed(resp)
+    finally
+        release(resp)
+    end
+
+    @test_throws ArgumentError Res.file(req, large; stream = true, loadfile = read)
+    @test_throws ArgumentError Res.file(req, large; stream = true, etag = :strong)
+end
+
+@testset "a missing file still fails on the read" begin
+    @test_throws SystemError Res.file(req, joinpath(dir, "missing.bin"))
+end
+end
+
 @testitem "Response builders on the wire" tags=[:core, :network] setup=[NitroCommon] begin
 using Test
 using HTTP
@@ -613,6 +698,10 @@ const BODY_JSON = Dict("gruß" => "wörld")
 const STREAM_BYTES = rand(UInt8, 300_000)
 const STREAM_PATH  = joinpath(mktempdir(), "big.bin")
 write(STREAM_PATH, STREAM_BYTES)
+# One byte over the default threshold, so `/large` streams with no `stream` keyword (#588).
+const LARGE_BYTES = rand(UInt8, Nitro.Core.Constants.FILE_STREAM_THRESHOLD + 1)
+const LARGE_PATH  = joinpath(mktempdir(), "large.bin")
+write(LARGE_PATH, LARGE_BYTES)
 
 # Returned by reference on every request, the way the auth middleware's `const` rejections are.
 # The HEAD fix must build a new response rather than add its header to this one (nitro-core §4).
@@ -627,6 +716,7 @@ Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
     path("/data",  (req::HTTP.Request) -> Res.json(BODY_JSON)),
     path("/stream", (req::HTTP.Request) -> Res.file(req, STREAM_PATH; stream = true)),
     path("/buffered", (req::HTTP.Request) -> Res.file(req, STREAM_PATH)),
+    path("/large", (req::HTTP.Request) -> Res.file(req, LARGE_PATH)),
     # Registered for both methods, so each HEAD can be compared against its own GET.
     path("/h/page",   (req::HTTP.Request) -> Res.html(BODY_HTML);  methods = ["GET", "HEAD"]),
     path("/h/plain",  (req::HTTP.Request) -> Res.send(BODY_TEXT);  methods = ["GET", "HEAD"]),
@@ -791,6 +881,20 @@ try
             HTTP.get("http://$HOST:$port/stream", ["If-None-Match" => etag]; status_exception = false)
         end
         @test HTTP.get("http://$HOST:$port/stream").body == STREAM_BYTES
+    end
+
+    @testset "a large file streams by default and reaches the client whole (#588)" begin
+        for _ in 1:2
+            r = HTTP.get("http://$HOST:$port/large")
+            @test r.status == 200
+            @test r.body == LARGE_BYTES
+            @test HTTP.header(r, "Content-Length") == string(length(LARGE_BYTES))
+        end
+        last_kib = length(LARGE_BYTES) - 1023
+        ranged = HTTP.get("http://$HOST:$port/large", ["Range" => "bytes=$(last_kib - 1)-"];
+                          status_exception = false)
+        @test ranged.status == 206
+        @test ranged.body == LARGE_BYTES[last_kib:end]
     end
 finally
     Nitro.Core.terminate(ctx)

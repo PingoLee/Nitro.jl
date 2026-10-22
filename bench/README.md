@@ -156,9 +156,9 @@ julia bench/socket/probe_report.jl bench/results/fairness-<stamp>-raw  # the PRO
   largest holds of #588's inventory to the Nitro modes as routes: `GET /hold/json` (`Res.json` of a
   ~12 MB untyped value), `POST /hold/json_typed` (`json(req, T; max_fields = 0)` of the request
   body; `socket/rows_body.jl` writes a 12 MB one), `POST /hold/multipart` (`getfiles` of the
-  request body; `socket/multipart_body.jl` writes a 64 MiB one), `GET /hold/file` (`Res.file`, the
-  whole-file read) and `GET /hold/file_stream` (the same with `stream = true`, the negative
-  control). Both file routes serve `HOLD_FILE`, by default `results/hold-100mib.bin`, written when
+  request body; `socket/multipart_body.jl` writes a 64 MiB one), `GET /hold/file` (`Res.file` with
+  `stream = false`, the whole-file read) and `GET /hold/file_stream` (the same with
+  `stream = true`, the negative control). Both file routes serve `HOLD_FILE`, by default `results/hold-100mib.bin`, written when
   missing and read once at startup so it is in page cache. `/gc` answers every field of
   `Base.gc_num()`.
 - `run.sh` pins the server (`-t 8`) and the load generator to disjoint physical cores, warms each

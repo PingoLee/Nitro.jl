@@ -996,7 +996,7 @@ end
     mktempdir() do dir
         p = joinpath(dir, "a.weird")          # an extension no MIME table knows
         write(p, repeat("a", 2048))
-        policy = C.MountPolicy(:eager, C.MOUNT_STREAM_THRESHOLD, C.MOUNT_CACHE_MAX_BYTES, :weak_stat)
+        policy = C.MountPolicy(:eager, C.Constants.FILE_STREAM_THRESHOLD, C.MOUNT_CACHE_MAX_BYTES, :weak_stat)
         mf = C.MountedFile(p, policy; loadfile = nothing)
         req = HTTP.Request("GET", "/static/a.weird")
         none = Any[]

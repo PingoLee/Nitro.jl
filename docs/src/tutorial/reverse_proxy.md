@@ -46,8 +46,8 @@ from an endpoint that calls `csrf_token!` instead; see
 
 ### Large files hold a descriptor, and `proxy_buffering` is why that is fine
 
-A mounted file over `stream_threshold` (8 MiB by default), and any `Res.file(req, path;
-stream = true)`, is sent in chunks from an open handle rather than buffered in memory. Peak memory
+A mounted file over `stream_threshold` (8 MiB by default), a `Res.file(req, path)` of a file over
+8 MiB, and any `Res.file(req, path; stream = true)`, is sent in chunks from an open handle rather than buffered in memory. Peak memory
 stops scaling with file size — but the handle stays open for as long as the transfer takes, so a
 slow client now costs a **file descriptor** where it used to cost RAM.
 

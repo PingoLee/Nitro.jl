@@ -457,7 +457,8 @@ serve(app; max_concurrent_requests = 64, read_timeout = 60, write_timeout = 30)
 ```
 
 `write_timeout` bounds each write to the socket, which is not the same unit for every response. A
-streamed file — `Res.file(...; stream = true)`, or a mounted file over `stream_threshold` — writes
+streamed file — `Res.file(req, path)` over 8 MiB or with `stream = true`, or a mounted file over
+`stream_threshold` — writes
 once per 64 KiB chunk, so however large the file, only a client that takes longer than
 `write_timeout` to accept one chunk is cut — about 2 KiB/s at `write_timeout = 30`. An
 `Res.sse` stream writes once per event, so only an event that stalls is cut. An in-memory response

@@ -198,9 +198,10 @@ TLS that check needs to be told the client's scheme — see
 
 ## Streaming a large file
 
-Unrelated to SSE, but the same neighbourhood: `Res.file(req, path; stream = true)` sends a file in
-64 KiB chunks so peak memory is a buffer rather than the file. Static mounts do it automatically
-above `stream_threshold` (8 MiB by default). See [`Res.file`](@ref) and [`staticfiles`](@ref).
+Unrelated to SSE, but the same neighbourhood: `Res.file(req, path)` sends a file over 8 MiB in
+64 KiB chunks, so peak memory is a buffer rather than the file; `stream = true` streams a smaller
+one too, and `stream = false` reads any file whole. Static mounts follow the same rule above
+`stream_threshold` (8 MiB by default). See [`Res.file`](@ref) and [`staticfiles`](@ref).
 
 ## Recipe: worker progress over SSE
 

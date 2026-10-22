@@ -41,6 +41,7 @@ import JSON
 # The SSE producer is application code, so its failure is logged as `loggable(err)`, never the
 # live exception (#648, the #613 rule).
 using ..Errors: loggable
+using ..Constants: FILE_STREAM_THRESHOLD
 
 function apply_headers!(target::Union{HTTP.Response,HTTP.Headers}, headers)
     for header in headers
@@ -330,7 +331,7 @@ _file_response(status, h::HTTP.Headers, body) = HTTP.Response(status; body = bod
 
 """
     file(req, path; headers=[], filename=nothing, disposition=nothing, loadfile=nothing,
-         etag=:weak_stat, cache_control=nothing, allow_ranges=true, stream=false)
+         etag=:weak_stat, cache_control=nothing, allow_ranges=true, stream=nothing)
 
 Serve a file **for a specific request**, with conditional-GET and byte-range handling.
 
@@ -346,14 +347,21 @@ preconditions call for it.
 | `cache_control` | emitted verbatim when given. **No default**: a `max-age` guessed on your behalf is wrong more often than it is right |
 | `allow_ranges` | `false` suppresses `Accept-Ranges` and serves the whole body |
 | `loadfile` | as in [`file(path)`](@ref) — decides the body, and therefore the validators |
-| `stream` | `true` sends the file in 64 KiB chunks — peak memory is a buffer, not the file |
+| `stream` | `nothing` (default) streams a file over 8 MiB; `true` always sends the file in 64 KiB chunks, `false` always reads it whole |
 
-**`stream = true` is what makes a large download safe.** Without it the whole file is read into
-memory before the first byte goes out, so N concurrent downloads of an N-gigabyte file need N×
-that resident. With it, memory is bounded by the chunk buffer regardless of file size or
-concurrency. The trade is that a streamed response is **single-use** — it is a cursor over an open
-file, not a buffer — so it can never be cached or shared, and `etag = :strong` is refused because
-hashing the body would mean reading all of it, which is the thing being avoided.
+**A large file is streamed by default**, above the same 8 MiB threshold the static mounts use
+(`stream_threshold`). A buffered read puts the whole file in memory before the first byte goes
+out, so N concurrent downloads of an N-gigabyte file need N× that resident, and the read is one
+blocking call that holds its thread and delays every garbage collection until it returns (#588
+measured 43–66 ms per collection for a 100 MiB file). A streamed body bounds memory by the chunk
+buffer regardless of file size or concurrency, and gives its thread up whenever the client is
+slower than the server. The trade is that a streamed response is **single-use** — it is a cursor
+over an open file, not a buffer — so it can never be cached or shared.
+
+The default stays buffered when `loadfile` is given (it produces the body in memory) or
+`etag = :strong` is (a strong tag hashes the whole body): those are what streaming avoids, so
+`stream = true` with either of them is refused. Pass `stream = false` to keep a large file's
+response reusable.
 
 `Content-Disposition` is opt-in exactly as in [`file(path)`](@ref), and caller `headers` are
 applied last so they override anything computed here.
@@ -372,13 +380,19 @@ end)
 function file(req::HTTP.Request, path::String; headers::Vector=NO_HEADERS, filename=nothing,
               disposition::Union{Nothing,String}=nothing, loadfile=nothing,
               etag = :weak_stat, cache_control::Union{Nothing,AbstractString}=nothing,
-              allow_ranges::Bool=true, stream::Bool=false)
-    if stream && !isnothing(loadfile)
+              allow_ranges::Bool=true, stream::Union{Bool,Nothing}=nothing)
+    if stream === true && !isnothing(loadfile)
         throw(ArgumentError("Res.file: `stream=true` and `loadfile` are mutually exclusive — `loadfile` produces the whole body in memory, which is what streaming avoids"))
     end
-    if stream && etag === :strong
+    if stream === true && etag === :strong
         throw(ArgumentError("Res.file: `stream=true` and `etag=:strong` are mutually exclusive — a strong tag hashes the whole body, which is what streaming avoids. Use `:weak_stat`, or pass a tag you computed yourself"))
     end
+    # The default streams only what it can: `loadfile` and a strong tag both need the whole body,
+    # so they keep the buffered read instead of throwing. A missing file has `filesize` 0 and
+    # reaches `read`, which reports it as before.
+    streamed = stream === nothing ?
+        (isnothing(loadfile) && etag !== :strong && filesize(path) > FILE_STREAM_THRESHOLD) :
+        stream
 
     # An `HTTP.Headers`, which `servecontent`'s `mkheaders` takes as is: a `Vector` of pairs would
     # be converted into one first (#549). Built per call, never shared — `servecontent` copies it
@@ -398,7 +412,7 @@ function file(req::HTTP.Request, path::String; headers::Vector=NO_HEADERS, filen
 
     # No `name =` below: `servecontent` reads it only when `content_type` is missing, and
     # `file_content_type` always returns one (#549).
-    if stream
+    if streamed
         io = open(path, "r")
         try
             tag, modtime = file_validators(path; etag = etag)

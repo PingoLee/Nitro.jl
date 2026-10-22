@@ -410,9 +410,9 @@ end
         precompile(Core._write_response_body!, (stream, String))
         precompile(Core._write_response_body!, (stream, Vector{UInt8}))
         # The two streaming bodies (#551), ~120 ms each on a first request: a streamed file
-        # (`Res.file(req, path; stream = true)`, and a mount's files over its threshold), whose
-        # body type is whatever `servecontent` builds over an `IO`, so it is read off a real
-        # call rather than named; and `Res.sse`'s `SSEStream`, with the builder itself.
+        # (`Res.file(req, path)` over 8 MiB or with `stream = true`, and a mount's files over its
+        # threshold), whose body type is whatever `servecontent` builds over an `IO`, so it is
+        # read off a real call rather than named; and `Res.sse`'s `SSEStream`, with the builder itself.
         mktempdir() do dir
             file = joinpath(dir, "streamed.bin")
             write(file, "precompile")
