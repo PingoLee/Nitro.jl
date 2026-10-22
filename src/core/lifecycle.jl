@@ -154,8 +154,11 @@ Base.show(io::IO, ::MIME"text/plain", s::Server{<:NitroStreamHandler}) = show(io
 # are the types `serve` builds. HTTP.jl specializes its connection loop on the listener's type,
 # and every closure here is typed by what it captures, so a hand-copied chain that differs in one
 # layer caches code no server ever runs. test/precompilation_test.jl asserts the two agree.
-function _serve_listener(pipeline::Function, handler, body_limit::Int64, request_limit::Int64,
-                         upgraded_limit::Int64, security_headers)
+#
+# `P`/`H` force specialization on both: `pipeline` is only passed on here, never called, so a
+# `::Function` argument would be compiled for `Function` alone (#572).
+function _serve_listener(pipeline::P, handler::H, body_limit::Int64, request_limit::Int64,
+                         upgraded_limit::Int64, security_headers) where {P<:Function, H}
     request_handler = handler === stream_handler ?
         stream_handler(pipeline; max_body_bytes = body_limit,
                        max_concurrent_requests = request_limit,
@@ -172,7 +175,7 @@ end
 # `serve`'s defaults that alters a type here makes test/precompilation_test.jl fail rather than
 # leaving the workload silently caching the old shape.
 _default_serve_listener(ctx::App) =
-    _serve_listener(setupmiddleware(ctx; middleware = [], serialize = true, catch_errors = true,
+    _serve_listener(setupmiddleware(ctx; middleware = (), serialize = true, catch_errors = true,
                                     show_errors = true, access_log = true,
                                     access_log_query = false, access_log_skip = nothing,
                                     security_headers = nothing),
@@ -181,8 +184,10 @@ _default_serve_listener(ctx::App) =
 # Documented on the public `Nitro.serve` (src/methods.jl), which is the binding users call and
 # the one `docs/` renders. A docstring here is a second copy Documenter counts as missing (#186).
 function serve(ctx::App;
-    middleware=[],
-    handler=stream_handler,
+    middleware::Union{Tuple,Vector}=(),
+    # `::H`, a type parameter: `serve` only compares and passes `handler`, never calls it, so a
+    # plain keyword is compiled for `Function` and the call into `_serve_pipeline` is dynamic (#572).
+    handler::H=stream_handler,
     host="127.0.0.1",
     port=8080,
     async=false,
@@ -207,7 +212,7 @@ function serve(ctx::App;
     max_fields=DEFAULT_MAX_FIELDS,
     max_concurrent_requests=nothing,
     max_upgraded_connections=nothing,
-    kwargs...)::Union{Server, Nothing}
+    kwargs...)::Union{Server, Nothing} where {H}
 
     # FIRST, before any validation or context mutation, so a rejected call leaves the context
     # byte-for-byte untouched. `startserver` assigns `ctx.service.server[]` unconditionally, so
@@ -380,8 +385,6 @@ function serve(ctx::App;
         if ctx.mod === nothing
             @warn "`revise` was requested but this App tracks no module, so code in `Main` may not be revised. Construct it as `App(mod = @__MODULE__)` from the module you want tracked."
         end
-        middleware = convert(Vector{Any}, middleware)
-        insert!(middleware, 1, ReviseHandler())
     end
 
     # Lifecycle registration lives HERE — once per server — not in `setupmiddleware`, which
@@ -394,13 +397,9 @@ function serve(ctx::App;
     # SERVE-owned (#82): this list belongs to this server run, so `terminate` clears it. Route
     # middleware registers itself as route-owned at `urlpatterns()` time instead, and survives.
     #
-    # Placed after the `revise` block above so it operates on the final `middleware` vector.
-    # (Inert today — `ReviseHandler()` is a plain closure, not a `LifecycleMiddleware`, so
-    # the resulting `Set` is the same either way — but the ordering is the correct default.)
+    # The user's list only: `ReviseHandler()`, prepended below, is a plain closure, not a
+    # `LifecycleMiddleware`, so it has nothing to register.
     register_serve_lifecycle!(ctx, middleware)
-
-    configured_middelware = setupmiddleware(ctx; middleware, serialize, catch_errors, show_errors, access_log, access_log_query, access_log_skip,
-                                            security_headers)
 
     # No warning for running on one thread (#149): single-threaded is a valid deployment, not a
     # misconfiguration, and the banner already reports the thread count. `preprocesskwargs` drops
@@ -409,6 +408,37 @@ function serve(ctx::App;
         @warn "Deprecated: serve() ignores `queuesize`; remove the argument."
     end
 
+    # One `setupmiddleware` call per branch, each handing its pipeline to `_serve_pipeline`
+    # (#572). Prepending `ReviseHandler()` to `middleware` and building once made the list's type
+    # a `Union` of the two, and a keyword call over a `Union` is one `juliac --trim` cannot
+    # resolve, so the production path lost its typed pipeline to a dev-only option. Split like
+    # this, the `revise = :none` branch is concrete all the way to `HTTP.listen!`.
+    pipeline_kwargs = (; serialize, catch_errors, show_errors, access_log, access_log_query,
+                       access_log_skip, security_headers)
+    if revise == :none
+        return _serve_pipeline(ctx, setupmiddleware(ctx; middleware, pipeline_kwargs...),
+                               handler, body_limit, request_limit, upgraded_limit, security_headers,
+                               revise, host, port, show_banner, async, kwargs)
+    end
+    # Prepended without `insert!`, so the `Tuple` form works too. Dev-only, and dynamic on
+    # purpose: `ReviseHandler` reaches the revised world through `invokelatest`.
+    return _serve_pipeline(ctx, setupmiddleware(ctx; middleware = (ReviseHandler(), middleware...),
+                                                pipeline_kwargs...),
+                           handler, body_limit, request_limit, upgraded_limit, security_headers,
+                           revise, host, port, show_banner, async, kwargs)
+end
+
+# The rest of `serve`, once the pipeline exists: a function barrier, so everything below is
+# specialized on the pipeline's concrete type (#572). `listener` and the `start` closure that
+# captures it are typed by it.
+#
+# `P` and `H` are type parameters, not `::Function`, because Julia does not specialize a method
+# on a `Function` argument it only passes on and never calls: this one would be compiled for
+# `::Function` alone, and the call into `_serve_listener` would be dynamic again.
+function _serve_pipeline(ctx::App, configured_middelware::P, handler::H, body_limit::Int64,
+                         request_limit::Int64, upgraded_limit::Int64, security_headers,
+                         revise::Symbol, host, port, show_banner, async,
+                         kwargs) where {P<:Function, H}
     # Once-assigned, because the `start` closure below captures it: a name reassigned before
     # capture is boxed (#364).
     listener = first(_serve_listener(configured_middelware, handler, body_limit, request_limit,

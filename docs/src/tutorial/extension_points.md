@@ -223,6 +223,14 @@ Authenticate at the same level as the guard, or at an outer one.
     so `[BearerAuth(v), GuardMiddleware(...)]` checked its guards before authenticating. If you
     reversed a list to work around that, put it back in the order you mean.
 
+!!! note "The global list can be a `Tuple`"
+    `serve(app; middleware = (A, B))` runs exactly like `[A, B]`. The difference is the type: a
+    `Tuple` keeps each middleware's own type, so the type of the whole request pipeline is known
+    before the server starts. A `Vector` of different middleware is converted once at startup,
+    and its type is only known then. Under the JIT both run the same. The `Tuple` is the form
+    for an application compiled ahead of time with `juliac --trim`, which has to know every
+    type in advance.
+
 Global middleware runs on **every** request, including ones that match no route (404) and ones
 whose path matches but whose method does not (405). A route cannot opt out of it: passing
 `middleware = []` on a `path()` call means "no *extra* middleware", not "skip the global chain".

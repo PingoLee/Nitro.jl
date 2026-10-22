@@ -14,7 +14,7 @@ function resetstate()
 end
 
 """
-    serve(; middleware=[], host="127.0.0.1", port=8080, kwargs...) -> Union{Server, Nothing}
+    serve(; middleware=(), host="127.0.0.1", port=8080, kwargs...) -> Union{Server, Nothing}
 
 Start the Nitro HTTP server with the registered routes. Runs until `terminate()`
 (or `Ctrl-C`); pass `async=true` to return immediately and serve in the background.
@@ -29,7 +29,11 @@ interpolation, or logging. (`dump` bypasses `show` and still walks raw fields; t
 is explicit introspection, not accidental disclosure.)
 
 # Keyword arguments
-- `middleware=[]`: global middleware applied to every request, outermost first. It sees
+- `middleware=()`: global middleware applied to every request, outermost first. A `Tuple`
+  (`middleware = (Cors(), SessionMiddleware(store))`) or a `Vector`. They behave the same, but
+  only a `Tuple` keeps the pipeline's type known before it runs, which an application compiled
+  with `juliac --trim` needs (#572); a `Vector` of mixed middleware is converted once at
+  startup, dynamically. It sees
   `req.target` in the form the router matches (#341): an absolute-form target
   (`http://host/users`) arrives reduced to its path and query (`/users`), and a path with an
   empty or dot segment (`//admin/…`, `/a/../admin/…`) is answered `400` before any middleware
@@ -642,7 +646,7 @@ function url(name::String; kwargs...)
 end
 
 """
-    internalrequest(req::Nitro.Request; middleware::Vector=[], serialize::Bool=true, catch_errors=true, context=missing, security_headers=nothing)
+    internalrequest(req::Nitro.Request; middleware=(), serialize::Bool=true, catch_errors=true, context=missing, security_headers=nothing)
     internalrequest(app::App, req::Nitro.Request; kwargs...)
 
 Sends an internal request to the server, allowing for communication between different parts of the application.
@@ -675,7 +679,7 @@ which is usually what a test asserting on it wants.
     `HTTP.body_close!` — otherwise the file handle stays open, which on Windows also blocks
     deleting the file. Over a real socket this never applies: the write path always closes.
 """
-internalrequest(req::Nitro.Request; middleware::Vector=[], serialize::Bool=true, catch_errors=true, context=missing,
+internalrequest(req::Nitro.Request; middleware::Union{Tuple,Vector}=(), serialize::Bool=true, catch_errors=true, context=missing,
                 security_headers=nothing) =
     Nitro.Core.internalrequest(CONTEXT[], req; middleware, serialize, catch_errors, context, security_headers)
 
@@ -950,7 +954,7 @@ end
 
 url(app::App, name::String; kwargs...) = Nitro.Core.Routing.url(app, name; kwargs...)
 
-internalrequest(app::App, req::Nitro.Request; middleware::Vector=[], serialize::Bool=true,
+internalrequest(app::App, req::Nitro.Request; middleware::Union{Tuple,Vector}=(), serialize::Bool=true,
                 catch_errors=true, context=missing, security_headers=nothing) =
     Nitro.Core.internalrequest(app, req; middleware, serialize, catch_errors, context, security_headers)
 

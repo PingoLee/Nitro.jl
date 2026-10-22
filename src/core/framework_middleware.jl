@@ -58,11 +58,17 @@ is known; return `true` to write no line for that request (#401). It is the same
 `AccessLog(sink; skip = …)` takes, so one predicate can quiet both, e.g. scanner probes no route
 answered: `(req, resp) -> route_missed(req)`. A hook that throws is warned about and
 the line is written anyway. The exception is an `InterruptException`, which propagates (#649).
+
+`enabled = false` builds the same layer as a pass-through that logs nothing and checks no `skip`.
+`setupmiddleware` always installs the layer, so `serve(access_log = …)` changes what the pipeline
+does and never its type (#572).
 """
-function AccessLogMiddleware(; log_query::Bool=false, skip::Union{Nothing,Function}=nothing)
-    _check_access_log_skip(skip, "serve(access_log_skip = …)")
+function AccessLogMiddleware(; log_query::Bool=false, skip::Union{Nothing,Function}=nothing,
+                             enabled::Bool=true)
+    enabled && _check_access_log_skip(skip, "serve(access_log_skip = …)")
     return function(handle)
         return function(req::HTTP.Request)
+            enabled || return handle(req)
             response = handle(req)
             _console_skips(skip, req, response) && return response
             ip = Base.get(req.context, :ip, nothing)
@@ -290,28 +296,40 @@ function OriginFormMiddleware()
     end
 end
 
-# `not_found` is the app's `App(not_found = …)` (#650): a path outside the prefix is a miss like
-# any other, so it gets the same answer the router gives one. It is returned as-is, shared by
+# `misses.not_found` is the app's `App(not_found = …)` (#650): a path outside the prefix is a miss
+# like any other, so it gets the same answer the router gives one. It is returned as-is, shared by
 # every miss; the transport hands HTTP.jl a copy (`_handoff_copy`, #628).
-function PrefixStripMiddleware(prefix::AbstractString, not_found::Types.MissResponse)
+#
+# The `MissResponses` value, not the bare response, because a closure's field takes the runtime
+# type of what it captures: the response alone made the layer's type depend on which of the three
+# `MissResponse` bodies the app's 404 has. `MissResponses`' fields are the declared union (#572).
+#
+# `prefix = nothing` is a pass-through, so the pipeline has this layer, and one type, with or
+# without `serve(prefix = …)` (#572).
+function PrefixStripMiddleware(prefix::Nullable{<:AbstractString}, misses::Types.MissResponses)
     # Normalized here as well as in `serve`: `internalrequest` builds this layer straight from
     # `service.prefix[]`, so this is the one point every path to it shares.
-    p = _normalize_prefix(prefix)::String
+    p = prefix === nothing ? "" : _normalize_prefix(prefix)::String
     n = ncodeunits(p)
     return function(handler)
         return function(req::HTTP.Request)
+            n == 0 && return handler(req)
             stripped = _strip_prefix(req.target, p, n)
             # Outside the prefix is outside every route: a miss, for `route_missed` (#401).
-            stripped === nothing && (_mark_route_miss!(req); return not_found)
+            stripped === nothing && (_mark_route_miss!(req); return misses.not_found)
             req.target = stripped
             return handler(req)
         end
     end
 end
 
-function DefaultSerializer(catch_errors::Bool; show_errors::Bool)
+# `enabled = false` (`serialize = false`) is a pass-through: the handler's own return value comes
+# back unformatted, and nothing is caught. Built either way so the pipeline's type does not
+# depend on the flag (#572).
+function DefaultSerializer(catch_errors::Bool; show_errors::Bool, enabled::Bool=true)
     return function(handle)
         return function(req::HTTP.Request)
+            enabled || return handle(req)
             return handlerequest(catch_errors; show_errors) do
                 format_response(handle(req))
             end
@@ -352,9 +370,14 @@ end
 # restating it. The no-argument `rethrow()` re-raises the exception being handled here with its
 # ORIGINAL backtrace, so the `catch_backtrace()` that `handlerequest` logs still points into the
 # middleware that threw, not at this layer.
-function ErrorBoundary(catch_errors::Bool; show_errors::Bool)
+#
+# `enabled = false` is a pass-through with no `try` at all, for a pipeline built with
+# `serialize = false` or `catch_errors = false`. Built either way so the pipeline's type does not
+# depend on those flags (#572).
+function ErrorBoundary(catch_errors::Bool; show_errors::Bool, enabled::Bool=true)
     return function(handle)
         return function(req::HTTP.Request)
+            enabled || return handle(req)
             try
                 return handle(req)
             catch e

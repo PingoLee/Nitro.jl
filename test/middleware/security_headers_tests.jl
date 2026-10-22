@@ -152,8 +152,13 @@ end
     @test ("Content-Security-Policy" => "default-src 'self'") in sh.headers
     off = SecurityHeaders(content_type_options = nothing, frame_options = nothing,
                           referrer_policy = nothing)
-    inner = _ -> HTTP.Response(200, "ok")
-    @test off(inner) === inner                     # still a pass-through when nothing is on
+    shared = HTTP.Response(200, "ok")
+    inner = _ -> shared
+    # Still a pass-through when nothing is on: the inner response itself comes back, not a rebuilt
+    # copy. It is a closure rather than `inner` itself, so the layer has one type whatever its
+    # headers (#572).
+    @test off(inner)(HTTP.Request("GET", "/")) === shared
+    @test typeof(off(inner)) == typeof(sh(inner))
 end
 
 end

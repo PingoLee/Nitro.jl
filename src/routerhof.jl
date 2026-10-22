@@ -149,6 +149,12 @@ function normalize_middleware(middleware::Vector) :: Vector{Function}
     return processed
 end
 
+# The `serve(middleware = (…))` form (#572): a `Tuple` keeps each element's type, so the global
+# fold in `compose` is typed. A `LifecycleMiddleware` member still unwraps to its `Function`-typed
+# `.middleware`, which is abstract either way.
+normalize_middleware(middleware::Tuple) =
+    map(mw -> mw isa LifecycleMiddleware ? mw.middleware : mw, middleware)
+
 """
     register_route_lifecycle!(ctx::App, middleware::Vector) -> App
 
@@ -220,7 +226,7 @@ function register_route_lifecycle!(ctx::App, middleware::Vector)
 end
 
 """
-    register_serve_lifecycle!(ctx::App, middleware::Vector) -> App
+    register_serve_lifecycle!(ctx::App, middleware::Union{Tuple,Vector}) -> App
 
 Register every `LifecycleMiddleware` in `middleware` as **serve-owned** — declared by this
 server run, from the `serve(middleware = ...)` list. `terminate()` clears these, so
@@ -239,7 +245,7 @@ Route is the winning side because the entry then survives `terminate()`, which i
 #82 exists to restore — a shared object passed both to a route and to `serve(middleware = ...)`
 is still, in the app's own terms, that route's middleware.
 """
-function register_serve_lifecycle!(ctx::App, middleware::Vector)
+function register_serve_lifecycle!(ctx::App, middleware::Union{Tuple,Vector})
     lock(ctx.service.lifecycle_lock) do
         for mw in middleware
             mw isa LifecycleMiddleware || continue
@@ -384,8 +390,9 @@ list was `reverse`d first and ran top-down, while route and router lists were no
 bottom-up, so the documented `[BearerAuth(v), GuardMiddleware(...)]` checked its guards before
 authenticating.
 
-Both fold sites go through here: [`buildmiddleware`](@ref) folds `router, route` around the
-pipeline's handler, and `compose` folds `global` once around its route-selection step (#291).
+[`buildmiddleware`](@ref) folds `router, route` around the pipeline's handler through here.
+`compose` folds `global` once around its route-selection step (#291) in the same order, but over
+a `Tuple` with `_foldtuple`, so that fold keeps the layers' types (#572).
 """
 function foldlayers(handler::Function, layers::Vector...) :: Function
     # Wrap from the innermost element outward. `reverse` of the varargs tuple is free, and
@@ -448,7 +455,7 @@ a `404` into a guarded route's `200`.
 Each pipeline gets its own [`ChainCache`](@ref) (#255), so a route's chain is composed once per
 registration generation rather than per request.
 """
-function compose(router::HTTP.Router, globalmiddleware::Vector{Function},
+function compose(router::HTTP.Router, globalmiddleware::Tuple,
                  custommiddleware::CopyOnWriteDict{RouteMiddleware})
     return function (handler)
         # This pipeline's chains — created HERE, once per `handler`, never shared (#255). Every
@@ -592,10 +599,20 @@ function compose(router::HTTP.Router, globalmiddleware::Vector{Function},
 
         # Global middleware outermost, AROUND route selection (#291), top-down in list order
         # like every other level (#312). Folded once per pipeline; with no global middleware
-        # `foldlayers` returns `select` itself.
-        return foldlayers(select, globalmiddleware)
+        # this is `select` itself. Over the `Tuple` rather than through `foldlayers`, so the
+        # result has the layers' own types, which `foldlayers`' `Vector{Function}` erases
+        # (#572). The assert keeps a broken middleware (one that returns something other than
+        # a function) failing here, when the pipeline is built, as `foldlayers`' return type
+        # made it fail before, rather than on every request.
+        return _foldtuple(select, globalmiddleware)::Function
     end
 end
+
+# `first(layers)(…(last(layers)(handler)))`: the first element outermost, as `foldlayers` orders
+# a list (#312), but typed through a `Tuple`. Each step shrinks the tuple and leaves `handler`'s
+# type alone, so inference follows it to the end, which the fold `setupmiddleware` builds on (#572).
+_foldtuple(handler, ::Tuple{}) = handler
+_foldtuple(handler, layers::Tuple) = first(layers)(_foldtuple(handler, Base.tail(layers)))
 
 
 """
