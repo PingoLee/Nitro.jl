@@ -32,6 +32,12 @@ wall was cleared in [#571](https://github.com/PingoLee/Nitro.jl/issues/571), and
 > That reaches the per-request task behind `HTTP.listen!`, so `app.jl` now shows the request
 > path while the listener's wall still stands. And the probe's path-parameter read gets through
 > to `_pathparams_uncached`, where `HTTP.getparams` is `Any`.
+>
+> **The request path Nitro owns is typed (§3.6)**: path parameters, the serializer and the
+> error response, and the app-context read. On 1.13 the probe goes from 70 errors to 20 and the
+> app from 96 to 87, and the trimmed probe now serves `GET /plaintext` through the whole
+> pipeline. What is left on the probe's request path is the security-header layer, Base's
+> `ScopedValue` HAMT, and the probe's own `main`.
 
 ## 1. How to measure
 
@@ -90,27 +96,28 @@ route and no middleware, so the probe stays the measure of the route path.
 The lesson that generalizes: **`repr`/`string` of an un-inferred value is the most expensive single
 trim mistake**, and that includes a `Symbol`. Type the value, then `print` it.
 
-## 3. Remaining (40 errors on the minimal app on Julia 1.12.7, 96 on 1.13)
+## 3. Remaining (40 errors on the minimal app on Julia 1.12.7, 96 on 1.13, 87 after §3.6)
 
 Measured 2026-10-22 on Julia 1.12.7, before and after #572. Each error is printed twice, so 20
 sites. `main` before #572 had **22**: the 20 below plus `CookieKey`'s, which arrived with a later
-merge. The last column is the 1.13 recount (§3.5), 2026-10-23 at `dea736f0`, with JuliaC; a
-1.12.7 control at the same commit gives the After #572 column again, total 40.
+merge. The `1.13` column is the recount (§3.5), 2026-10-23 at `dea736f0`, with JuliaC; a
+1.12.7 control at the same commit gives the After #572 column again, total 40. The last count
+column is the same build after the request-path change (§3.6).
 
-| First frame in `src/` | Before #572 | After #572 | 1.13 | What |
-|---|---:|---:|---:|---|
-| `src/core/pipeline.jl` `setupmiddleware` | 4 | 0 | 0 | the fold (§3.2), **cleared** |
-| `src/core/lifecycle.jl` `serve` → `_serve_listener`, `startserver` | 4 | 0 | 0 | the pipeline's type through `serve`, **cleared** |
-| `src/core/lifecycle.jl` `_serve_pipeline`, the `start` closure | | 4 | 4 | `HTTP.listen!(…; kwargs...)` over the `Dict{Symbol,Any}` `startserver` passes: **the next wall in front of the request path** |
-| `src/core/lifecycle.jl` `serverwelcome`, `startserver` | | 16 | 14 | the banner and the blocking wait's `println`: `Dates.format(now(), "yyyy-mm-dd HH:MM:SS")` builds a `DateFormat` from a runtime string (4 of the 16 surface inside Dates' own `io.jl`), `IO`-typed `stdout`, `join` over `VersionNumber` fields. The control counts this row 18 (2 of them at `startserver`'s wait), which is where its 40 comes from |
-| `src/context.jl` `close`, `isopen`, `wait` | 6 | 8 | 8 | **the server field (§3.3)** |
-| `src/context.jl` `_try_cancel`; on 1.13 also `lifecycle.jl:118` | 2 | 2 | 3 | the `revise = :eager` watcher's `invokelatest`: dev-only and dynamic on purpose, so it stays |
-| `src/types.jl` `startup`/`shutdown` | 2 | 4 | 4 | the lifecycle hooks (§3.4) |
-| `src/crypto.jl` `CookieKey` | 2 | 2 | 2 | `NTuple{32,UInt8}` from a `Vector` |
-| `src/core/transport.jl`: the stream handler's body read (`_http_stream_request`, `_swallow_request_body!`), the response write and release | | | 18 | **new on 1.13**: the per-request task, reached past the `HTTP.listen!` wall (§3.5) |
-| `src/middleware/security_headers.jl` | | | 20 | **new on 1.13**: a response typed `Any`, the same rows as on the probe (§3.2) |
-| `src/core/pipeline.jl` `_app_context_seed`; serializer `format_response`, `handle_error` | | | 11 | **new on 1.13**: the probe's rows of the same name (§3.2) |
-| outside `src/` (OpenSSL.jl, a Base `string`, the libuv read callback; on 1.13 also Base's `errormonitor` task, `printstyled`'s closure, `showerror`, the TLS read) | 2 | 2 | 12 | upstream |
+| First frame in `src/` | Before #572 | After #572 | 1.13 | 1.13, §3.6 | What |
+|---|---:|---:|---:|---:|---|
+| `src/core/pipeline.jl` `setupmiddleware` | 4 | 0 | 0 | 0 | the fold (§3.2), **cleared** |
+| `src/core/lifecycle.jl` `serve` → `_serve_listener`, `startserver` | 4 | 0 | 0 | 0 | the pipeline's type through `serve`, **cleared** |
+| `src/core/lifecycle.jl` `_serve_pipeline`, the `start` closure | | 4 | 4 | 4 | `HTTP.listen!(…; kwargs...)` over the `Dict{Symbol,Any}` `startserver` passes: **the next wall in front of the request path** |
+| `src/core/lifecycle.jl` `serverwelcome`, `startserver` | | 16 | 14 | 14 | the banner and the blocking wait's `println`: `Dates.format(now(), "yyyy-mm-dd HH:MM:SS")` builds a `DateFormat` from a runtime string (4 of the 16 surface inside Dates' own `io.jl`), `IO`-typed `stdout`, `join` over `VersionNumber` fields. The control counts this row 18 (2 of them at `startserver`'s wait), which is where its 40 comes from |
+| `src/context.jl` `close`, `isopen`, `wait` | 6 | 8 | 8 | 8 | **the server field (§3.3)** |
+| `src/context.jl` `_try_cancel`; on 1.13 also `lifecycle.jl:118` | 2 | 2 | 3 | 3 | the `revise = :eager` watcher's `invokelatest`: dev-only and dynamic on purpose, so it stays |
+| `src/types.jl` `startup`/`shutdown` | 2 | 4 | 4 | 4 | the lifecycle hooks (§3.4) |
+| `src/crypto.jl` `CookieKey` | 2 | 2 | 2 | 2 | `NTuple{32,UInt8}` from a `Vector` |
+| `src/core/transport.jl`: the stream handler's body read (`_http_stream_request`, `_swallow_request_body!`), the response write and release | | | 18 | 18 | **new on 1.13**: the per-request task, reached past the `HTTP.listen!` wall (§3.5) |
+| `src/middleware/security_headers.jl` | | | 20 | 20 | **new on 1.13**: a response typed `Any`, the same rows as on the probe (§3.2) |
+| `src/core/pipeline.jl` `_app_context_seed`; serializer `format_response`, `handle_error` | | | 11 | 2 | **new on 1.13**: the probe's rows of the same name (§3.2). §3.6 clears all but the seed's `@with`, which is inside Base |
+| outside `src/` (OpenSSL.jl, a Base `string`, the libuv read callback; on 1.13 also Base's `errormonitor` task, `printstyled`'s closure, `showerror`, the TLS read) | 2 | 2 | 12 | 12 | upstream |
 
 The verifier reports **the first dynamic call on each path**, so a cleared wall raises the count
 when it exposes code that was never verified. Every row #572 added is code that ran before #572
@@ -262,21 +269,22 @@ The candidates, measured on the probe and in a scratch spike (Julia 1.12.7):
 | **`RouteEndpoint`: an exported thunk per type, called with `ccall`** | **passes** | a scratch program with three differently typed chains builds under `--trim=safe` with 0 errors and serves all three; on the Nitro probe the route path clears (below) |
 
 Verifier on `bench/juliac/probe.jl`, `unsafe-warn`, Julia 1.12.7, counted by first frame in `src/`.
-The last column is #718 again, recounted on Julia 1.13 with JuliaC (§3.5):
+The `#718, 1.13` column is #718 again, recounted on Julia 1.13 with JuliaC (§3.5), and the last one
+is the request-path change on the same toolchain (§3.6):
 
-| First frame in `src/` | `main` | #718 | #718, 1.13 |
-|---|---:|---:|---:|
-| `routerhof.jl` `foldlayers` (the fold on the request path) | 10 | 0 | 0 |
-| `types.jl` `cache_chain!` | 2 | 0 | 0 |
-| `routerhof.jl` `compose`: the cached and the fresh chain call | 4 | 0 | 0 |
-| `pipeline.jl` the leaf call (`_dispatch_resolved`, `_route_unresolved`, `_route_rerouted`) | 6 | 0 | 0 |
-| `framework_middleware.jl` / `misc.jl` serializer: `format_response(::Any)`, `handle_error` | 6 | 10 | 12 |
-| `middleware/security_headers.jl` (a response typed `Any`) | 12 | 12 | 10 |
-| `pipeline.jl` `_app_context_seed` (`ScopedValue` HAMT) | 6 | 6 | 6 |
-| `types.jl` `pathparams` on `LazyRequest` (newly reached, inside a handler) | – | 2 | 0 |
-| `types.jl` `_pathparams_uncached`: `HTTP.getparams` returns `Any` | – | – | 36 |
-| outside `src/`: `probe.jl`'s own `main`, Base's `string`, the libuv read callback | 6 | 6 | 6 |
-| **total** | **52** | **36** | **70** |
+| First frame in `src/` | `main` | #718 | #718, 1.13 | §3.6, 1.13 |
+|---|---:|---:|---:|---:|
+| `routerhof.jl` `foldlayers` (the fold on the request path) | 10 | 0 | 0 | 0 |
+| `types.jl` `cache_chain!` | 2 | 0 | 0 | 0 |
+| `routerhof.jl` `compose`: the cached and the fresh chain call | 4 | 0 | 0 | 0 |
+| `pipeline.jl` the leaf call (`_dispatch_resolved`, `_route_unresolved`, `_route_rerouted`) | 6 | 0 | 0 | 0 |
+| `framework_middleware.jl` / `misc.jl` serializer: `format_response(::Any)`, `handle_error` | 6 | 10 | 12 | 0 |
+| `middleware/security_headers.jl` (a response typed `Any`) | 12 | 12 | 10 | 10 |
+| `pipeline.jl` `_app_context_seed`: the `ScopedValue` HAMT, and on 1.13 the `Ref{Any}` read | 6 | 6 | 6 | 4 |
+| `types.jl` `pathparams` on `LazyRequest` (newly reached, inside a handler) | – | 2 | 0 | 0 |
+| `types.jl` `_pathparams_uncached`: `HTTP.getparams` returns `Any` | – | – | 36 | 0 |
+| outside `src/`: `probe.jl`'s own `main`, Base's `string`, the libuv read callback | 6 | 6 | 6 | 6 |
+| **total** | **52** | **36** | **70** | **20** |
 
 The route path is clear: what remains starts after a handler returns, whose result is `Any` by
 design, or in layers outside the route boundary. The trimmed probe binary shows the same: on
@@ -361,6 +369,14 @@ stops there (2). On 1.13 the stack shows the call resolved to
 path of every route with a path parameter.** It is recorded here, not fixed: it is `src/` work
 for the request-path step of §4.
 
+**What §3.6 did with these.** The path-parameter wall is cleared: `HTTP.getparams` is tested against
+the router's `Params` where it is read, and the decode runs on that type. The seed's 6 errors were two walls. 2 were Nitro's: the
+`Ref{Any}` read of the app context, now through a concrete type. The other 4 are inside Base:
+`@with` inserts into the `ScopedValue` HAMT, whose `insert!` builds a `HashState` from a
+`Leaf{AbstractScopedValue,Any}` key and calls `next` on the resulting `HashState{K}` UnionAll
+(`hamt.jl:204`, `:219`). That holds for any key, so it is an upstream candidate, beside the
+`ScopedValue` row of the upstream list, and nothing in Nitro works around it.
+
 Two smaller moves on the probe: the serializer and security-header rows trade 2 errors (16 in
 both versions), and the OpenSSL site outside `src/` reports its first frame as Base's
 `getproperty` rather than `string`.
@@ -386,6 +402,67 @@ does not: about 60 times faster and 40% less memory. The likely cause is the clo
 The per-request task body is now compiled into the image, where 1.12.7 compiled it at the first
 request. That has not been checked further. The build took 183 s (indicative); with
 `FILLER_ROUTES=1000` it took 235 s and made a 402 MB exe, a reference point for #726.
+
+### 3.6 The request path Nitro owns
+
+Built 2026-10-23 on the toolchain of §3.5 (Julia 1.13.2, JuliaC 0.3.12, gcc 13.3.0, Linux
+x86-64), from `main` at `96524d3c` and the change on top of it.
+
+| Build | `main` | path params | + app context | + error response | + format at the leaf |
+|---|---:|---:|---:|---:|---:|
+| `ENTRY=probe`, `unsafe-warn` | 70 | 34 | 32 | 26 | 20 |
+| `ENTRY=app`, `unsafe-warn` | 96 | 96 | 92 | – | 87 |
+
+Each step cleared its own rows and exposed nothing new. Four changes, each an `Any` on the JIT's
+request path too (nitro-core §7):
+
+- **Path parameters.** `_pathparams_uncached` decodes on a concrete `HTTP.Handlers.Params`, the
+  type every writer of `:params` Nitro knows stores; a row in
+  `test/http_internals_contract_tests.jl` pins that. A map of another type, which only application
+  code would put there, goes to an out-of-line fallback (`_pathparams_foreign`): decoded as before
+  under the JIT, refused in a trimmed image.
+- **The app-context read.** `App.app_context` is declared `Ref{Any}`, an abstract type, so its
+  `getindex` was dynamic. Both reads (`_app_context_seed`, `internalrequest`) assert it to
+  `Base.RefValue{Any}`. Declaring the field that way, as the `Service` slots were in #571, makes
+  the assertion redundant.
+- **The error response.** `handlerequest` called `handle_error` on the caught exception, an `Any`.
+  `_error_response` chooses by a closed set of `isa` tests over the types that have a method.
+- **The serializer boundary.** Below.
+
+**The serializer boundary: format at the leaf.** A handler may return a `Response`, a `String`, a
+`Dict`, a number, and `format_response` turns it into a response, so a call on a value of unknown
+type cannot disappear. It can only move to where the type is known. That is the leaf: each handler's
+endpoint (`leaf_endpoint`, src/routeendpoint.jl) also carries `FormattedLeaf(handler)`, behind a
+`RouteEndpoint` of its own, so in a trimmed image it is one more exported thunk pair per handler
+(the probe's 14 symbols become 24). The serializer passes `Val(true)` down the terminal, which calls
+that half, so the terminal returns an `HTTP.Response` whatever the route. With `serialize = false`
+it calls the handler itself, and the raw value comes back as before. Route and global middleware
+sit outside the serializer (`compose` → chain → `RouteNext` → serializer → terminal), so what they
+receive does not change.
+
+| Candidate | Probe after it | Why not |
+|---|---:|---|
+| **Format at the leaf** | **20** | chosen |
+| A closed `format_response`: `isa` tests over the documented shapes, one `JSON.json(::Any)` fallback | 22 | the fallback is still a dynamic call, exactly where a route returning a `Dict` goes; under the JIT it moves the dispatch, not removes it |
+| Format at the leaf even under `serialize = false` | – | breaks that flag's contract, the handler's own value |
+
+Under the JIT the leaf makes one dynamic call per request where the serializer made two (the
+handler, then `format_response`). Allocations per request through `setupmiddleware` are unchanged
+for a plain, a JSON, a path-parameter and a route-middleware route (1008, 2272, 1680 and 944 bytes
+on both). Throughput is pending, to be measured as §4 asks.
+
+**How far the trimmed probe gets.** `GET /plaintext` now goes through the whole pipeline: the
+endpoint's `ccall`, the formatted half, the error boundary and the security-header layer. The
+response, `200` with `"Hello, World!"`, gets back to `probe.jl`'s `main`, which dies at its own
+`res.status`, an `Any` there. That is the `probe.jl main` row outside `src/`.
+
+**The next walls on the request path:**
+- `middleware/security_headers.jl`, 10 on the probe and 20 on the app: what it gets from the
+  inner layers is still `Any`, because `compose` returns what a route **chain** returns, and route
+  middleware may return anything;
+- the transport's body reads and response write on the app (18, §3.5), behind the same `Any`;
+- `pathparams(::LazyRequest)` makes one dynamic call under the JIT, because `LazyRequest.req` is
+  declared as the `HTTP.Request` UnionAll. The trimmed build resolves it (§3.5).
 
 ## 4. The decision: `--trim=safe` is a target
 
@@ -427,10 +504,11 @@ The order:
    construction, so it needs its own shape. One candidate, not designed yet: a typed handle that
    `serve` returns and `terminate` takes. **§3.2's route boundary is done (#718)**: one
    `RouteEndpoint` per route chain and per handler.
-4. **The request path.** The audit's four (#537, #538, #546, #566) are closed. What the verifier
-   shows there now: `format_response` on a handler's `Any` result, the security-header layer,
-   `_app_context_seed`, and on 1.13 `_pathparams_uncached`'s untyped `HTTP.getparams` and the
-   transport's response write (§3.5). Like the four, these need not wait for 1–3.
+4. **The request path.** The audit's four (#537, #538, #546, #566) are closed. The path
+   parameters, the serializer, the error response and the app-context read are typed (§3.6). What
+   the verifier shows there now: the security-header layer and the transport's response write,
+   both on a route chain's `Any` result, and Base's `ScopedValue` HAMT behind `@with`. Like the
+   four, these need not wait for 1–3.
 5. **§3.4, the lifecycle hooks ([#719](https://github.com/PingoLee/Nitro.jl/issues/719)).**
 6. **Outside Nitro:** OpenSSL.jl and the libuv read callback, reported upstream.
 
