@@ -19,6 +19,7 @@ export get_free_port
 export jwtkey
 export raw_exchange, read_failed, abort_with_reset!
 export allocs, Allocs
+export dynamic_calls
 
 # ── Constants ────────────────────────────────────────────────────────
 
@@ -282,6 +283,30 @@ function allocs(f::F; runs::Int = 5, calls::Int = 1) where {F}
         bytes = min(bytes, @allocated(for _ in 1:calls; Base.donotdelete(f()); end))
     end
     return Allocs(count / calls, bytes / calls, runs, calls)
+end
+
+# ── Inference (trim) ─────────────────────────────────────────────────
+
+"""
+    dynamic_calls(f, types) -> Vector{String}
+
+The calls in the optimized code of `f` on `types` that dispatch at runtime: every `:call`
+statement whose callee is not a builtin. A call inference resolved is an `:invoke`, or inlined,
+so what is left is what `juliac --trim` reports as an unresolved call, and what the JIT pays a
+dynamic dispatch for (docs/design/juliac-trim.md). An empty result is the pin.
+
+It sees only `f`'s own body after inlining. A dynamic call inside a callee that was not inlined
+shows up in that callee, so pin the function that owns the value.
+"""
+function dynamic_calls(f, types)
+    found = String[]
+    for (ci, _) in code_typed(f, types; optimize = true), st in ci.code
+        st isa Expr && st.head === :call || continue
+        g = st.args[1]
+        callee = g isa GlobalRef ? getglobal(g.mod, g.name) : g isa QuoteNode ? g.value : g
+        callee isa Core.Builtin || push!(found, sprint(show, st))
+    end
+    return found
 end
 
 end # module NitroCommon
@@ -606,3 +631,11 @@ function run_child(root::String, script::String; timeout::Real = 540)
     return ok
 end
 end # module ExampleHarness
+
+@testitem "NitroCommon: dynamic_calls finds a runtime dispatch and only that" tags=[:core] setup=[NitroCommon] begin
+    using Test
+    untyped(r::Ref{Any}) = r[] + 1                  # `Ref{Any}` is abstract: `getindex` and `+` dispatch
+    typed(r::Base.RefValue{Any}) = (r[]::Int) + 1   # concrete field, asserted value: both resolve
+    @test length(dynamic_calls(untyped, (Ref{Any},))) == 2
+    @test isempty(dynamic_calls(typed, (Base.RefValue{Any},)))
+end
