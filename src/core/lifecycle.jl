@@ -849,14 +849,21 @@ function startserver(ctx::App; host, port, show_banner=false, async=false, kwarg
     return ctx.service.server[]
 end
 
-function preprocesskwargs(kwargs)
+# The keywords `serve` hands `HTTP.listen!`, as a `NamedTuple`. `serve`'s `kwargs...` already have
+# a concrete type, and a `NamedTuple` keeps it all the way into the keyword call: a `Dict{Symbol,Any}`
+# made the call `juliac --trim` cannot resolve, the last wall in front of the request path
+# (docs/design/juliac-trim.md §3). Every key the caller passed still reaches `listen!`, so a keyword
+# it does not take is still refused by its own `MethodError` (#525), and every value still meets its
+# own type checks. Each step below is a function of the key NAMES alone, which are part of the type,
+# so inference folds every branch.
+function preprocesskwargs(kwargs::Base.Pairs)
     # HTTP.jl v2's `listen!` is already Stream-based, so the v1 `stream=true` flag is
     # gone. Access logging (the old `logfmt`/`access_log` default) is now handled by
     # `AccessLogMiddleware` in the middleware chain instead.
-    kwargs_dict = Dict{Symbol,Any}(kwargs)
+    #
     # `listen!` rejects unknown keyword arguments. Drop v1-only server kwargs that Nitro
     # still tolerates for back-compat (a deprecation warning is emitted in `serve`).
-    delete!(kwargs_dict, :queuesize)
+    kw = Base.structdiff(values(kwargs), NamedTuple{(:queuesize,)})
     # `SO_REUSEADDR` means something fundamentally different on Windows. On POSIX it only lets
     # you bind over sockets in TIME_WAIT, which is load-bearing for restarting onto a port you
     # just shut down. On Windows it lets a second process bind a port another process is
@@ -864,8 +871,8 @@ function preprocesskwargs(kwargs)
     # Microsoft had to add SO_EXCLUSIVEADDRUSE. HTTP.jl defaults it to `true` everywhere, so on
     # Windows an orphaned Nitro process turns "port already taken" from a loud bind failure into
     # a silent split-brain where some requests are answered by the corpse, out of *its* router.
-    # `get!` writes only when the key is absent, so an explicit `serve(reuseaddr = …)` wins.
-    Base.get!(kwargs_dict, :reuseaddr, !Sys.iswindows())
+    # Merged in FIRST, so an explicit `serve(reuseaddr = …)` overrides it.
+    kw = merge((reuseaddr = !Sys.iswindows(),), kw)
     # HTTP.jl disables every server timeout by default, which leaves a half-sent head or a silent
     # connection holding its socket forever (#316). Nitro defaults the two that cannot cut a
     # legitimate stream; `read_timeout` and `write_timeout` stay opt-in. The values, and why
@@ -875,11 +882,10 @@ function preprocesskwargs(kwargs)
     # or nanoseconds (`X_ns`) and throws when it gets both, so defaulting `X` next to a caller's
     # `X_ns` would turn a valid call into an error. An explicit `0` or `nothing` is a value, so it
     # wins — both mean "disabled" to HTTP.jl.
-    for (name, default) in ((:read_header_timeout, DEFAULT_READ_HEADER_TIMEOUT_SECONDS),
-                            (:idle_timeout, DEFAULT_IDLE_TIMEOUT_SECONDS))
-        haskey(kwargs_dict, name) || haskey(kwargs_dict, Symbol(name, :_ns)) ||
-            (kwargs_dict[name] = default)
-    end
+    kw = _default_timeout(kw, Val(:read_header_timeout), Val(:read_header_timeout_ns),
+                          DEFAULT_READ_HEADER_TIMEOUT_SECONDS)
+    kw = _default_timeout(kw, Val(:idle_timeout), Val(:idle_timeout_ns),
+                          DEFAULT_IDLE_TIMEOUT_SECONDS)
     # Nitro speaks HTTP/1.1 only (#375). HTTP.jl serves a plaintext connection that opens with the
     # cleartext HTTP/2 (h2c) prior-knowledge preface as HTTP/2 unless told otherwise, and Nitro's
     # stream-level code was written for HTTP/1.1: on an h2 stream a 413 or 503 refusal cannot bound
@@ -894,8 +900,15 @@ function preprocesskwargs(kwargs)
     # connection closed. Before 2.9 there was no switch, and Nitro overrode HTTP's private preface
     # probe instead. Written unconditionally: `_validate_allow_h2c` has already refused a caller
     # who asked for anything else.
-    kwargs_dict[:allow_h2c] = false
-    return kwargs_dict
+    return merge(kw, (allow_h2c = false,))
+end
+
+# `kw` with `name = default` added, unless the caller passed `name` or `ns_name`. The names travel
+# as `Val`s so the test is on the type: it folds, and so does the shape of the result.
+@inline function _default_timeout(kw::NamedTuple{names}, ::Val{name}, ::Val{ns_name},
+                                  default) where {names, name, ns_name}
+    (name in names || ns_name in names) && return kw
+    return merge(NamedTuple{(name,)}((default,)), kw)
 end
 
 # Refuse `serve(allow_h2c = true)` at the call, rather than quietly overriding it in
