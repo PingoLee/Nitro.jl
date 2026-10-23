@@ -61,8 +61,14 @@ elseif SHAPE == "multipart"
     body = string("--", bnd, "\r\n",
                   "Content-Disposition: form-data; name=\"f\"\r\n\r\nv\r\n",
                   "--", bnd, "--\r\n")
-    (() -> hit("POST", "/x", ["Content-Type" => "multipart/form-data; boundary=$bnd"],
-               body; catch_errors = false)), "\"n\":1"
+    # Captured through `let`, never read as the globals above: a closure that refers to a
+    # non-const global infers it as `Any`, so compiling it infers `internalrequest` over the ABSTRACT
+    # `HTTP.Request`. Since the pipeline is typed (#572), that walks every layer, ~75–140 ms that
+    # no concretely typed request pays. The shape would measure that instead of itself (#736).
+    (let bnd = bnd, body = body
+        () -> hit("POST", "/x", ["Content-Type" => "multipart/form-data; boundary=$bnd"],
+                  body; catch_errors = false)
+    end), "\"n\":1"
 # The #551 shapes. POST bodies are `Vector{UInt8}`, as a socket delivers them.
 elseif SHAPE == "cookie_ext"
     reg("/x", (r::HTTP.Request, sid::Nitro.Cookie{String}) -> Res.send(sid.value))
@@ -74,8 +80,10 @@ elseif SHAPE == "files_ext"
     body = string("--", bnd, "\r\n",
                   "Content-Disposition: form-data; name=\"doc\"; filename=\"r.txt\"\r\n",
                   "Content-Type: text/plain\r\n\r\nv\r\n", "--", bnd, "--\r\n")
-    (() -> hit("POST", "/x", ["Content-Type" => "multipart/form-data; boundary=$bnd"],
-               Vector{UInt8}(body); catch_errors = false)), "r.txt"
+    (let bnd = bnd, body = Vector{UInt8}(body)   # `let`, as in `multipart` above (#736)
+        () -> hit("POST", "/x", ["Content-Type" => "multipart/form-data; boundary=$bnd"],
+                  body; catch_errors = false)
+    end), "r.txt"
 elseif SHAPE == "payload"
     reg("/x", (r::HTTP.Request) -> Res.send(string(length(Nitro.payload(r)))), method = "POST")
     (() -> hit("POST", "/x", ["Content-Type" => "application/x-www-form-urlencoded"],
