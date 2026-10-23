@@ -366,7 +366,7 @@ only on `T`. Filed as #493.
 **The `@kwdef` path makes a large body parse slower than `getjson` does, at half the
 allocations.** For a `@kwdef` type, `json_bind` first parses the whole body into
 `Dict{String, JSON.JSONText}` (#294): that pass validates the body's structure (not its string
-escapes, see #577) and copies its text, 38.6 µs at
+escapes before JSON.jl 1.12, see #577) and copies its text, 38.6 µs at
 10 KB for 6 allocations. Only then does it parse each field. At 250 rows that is 108 µs against 65
 for the plain struct. On a small body the extra cost is one `binds_by_keyword` per field plus
 `kw_construct`'s dynamic keyword call (1.2 µs, 12 allocations), so 6.2 µs against 1.5. The
@@ -401,8 +401,10 @@ earlier occurrence (`{"a":"bad","a":5}`) refuses the body where the `Dict` kept 
 
 Two costs above sit in JSON.jl, not in Nitro: the `Object` writer, and the absence of a skip that
 still validates. Both were measured against JSON.jl 1.10.0 (`a69c082`, the tree Nitro's manifest
-resolves), Julia 1.12.7, HTTP 2.9.0, StructUtils 2.9.2, one thread. The prototype lived in a scratch
-clone of JSON.jl and is not part of Nitro.
+resolved then), Julia 1.12.7, HTTP 2.9.0, StructUtils 2.9.2, one thread. The prototype lived in a
+scratch clone of JSON.jl and is not part of Nitro. Every number in this section, and in the #474
+and #475 sections above, is pre-1.12: both candidates have since shipped in JSON.jl 1.12.0 (see
+*Landed* below), and none of these rows has been re-measured on it.
 
 **The `Object` writer: the candidate fix halves the 250-row echo's writing, and is worth taking
 upstream.** The prototype is one method beside the generic
@@ -444,30 +446,44 @@ then discarded. Allocations per call, minimum of five runs of 1,000:
 - **`Json{T}`:** a plain struct already skips undeclared members for free. A `@kwdef` struct pays
   one allocation per undeclared member. The skip's value here is not speed but strictness.
 
-**Today, `Json{T}` does not check the string escapes of a member it does not declare (#577).** A
-body whose undeclared member holds an invalid escape (`{"name":"item","qty":3,"note":"bad \q
-escape"}`, or `"\uZZZZ"`) binds for a plain struct and for a `@kwdef` struct alike. The same escape
-in a declared member is refused, and `getjson` refuses the whole body. Numbers, literals, structure
-and control characters are still checked. Only escapes get through, because JSON.jl validates a
-string's escapes when it materializes the string. This predates #493: the `@kwdef` path's old
-`Dict{String, JSON.JSONText}` pass accepted the same bodies, and so does `JSON.isvalidjson`. #449
-refused this skip for the JWT header. A validating skip would let `Json{T}` refuse such a body
-without materializing anything.
+**Up to JSON.jl 1.11, `Json{T}` did not check the string escapes of a member it does not declare
+(#577).** A body whose undeclared member held an invalid escape (`{"name":"item","qty":3,"note":"bad
+\q escape"}`, or `"\uZZZZ"`) bound for a plain struct and for a `@kwdef` struct alike. The same
+escape in a declared member was refused, and `getjson` refused the whole body. Numbers, literals,
+structure and control characters were still checked. Only escapes got through, because JSON.jl
+validated a string's escapes only when it materialized the string. This predated #493: the
+`@kwdef` path's old `Dict{String, JSON.JSONText}` pass accepted the same bodies, and so did
+`JSON.isvalidjson`. #449 refused this skip for the JWT header.
 
-**Decided.** Neither candidate changes Nitro's `src/`:
+**Decided then (#496).** Neither candidate changed Nitro's `src/`:
 
-- **The `Object` writer goes upstream.** The method is rebuilt against JSON.jl's current `main`
-  and the PR is tracked in #578, which records its number once it is opened. When a JSON.jl
-  release ships it, Nitro raises its `[compat]` and re-runs the `write_dict_*` and `echo_*_served`
-  rows. `getjson` already returns an `Object`, so handlers pick up the change without any edit.
-- **`Json{T}` keeps the skip, and the guide says so (#577).** A Nitro-side pre-check would give
-  back most of `Json{T}`'s advantage. `isvalidjson` misses these escapes, so the only
-  pre-checks left would be an untyped parse or a hand-written scan duplicating JSON.jl's grammar. The
-  *Request Body* guide states what the skip checks and what it does not.
-  `test/extractor_tests.jl` pins both sides. A JSON.jl release that adds a validating skip turns
-  that test red, and the guide changes with it.
-- **The `isvalidjson` false positive goes upstream as its own report.** It is a separate bug
-  from the missing skip, and the easier of the two to fix.
+- **The `Object` writer went upstream**, tracked in #578, with Nitro to raise its `[compat]` and
+  re-run the `write_dict_*` and `echo_*_served` rows once a release shipped it.
+- **`Json{T}` kept the skip, and the guide said so (#577).** A Nitro-side pre-check would have
+  given back most of `Json{T}`'s advantage, and `isvalidjson` missed these escapes, so the only
+  pre-checks left were an untyped parse or a hand-written scan duplicating JSON.jl's grammar.
+  `test/extractor_tests.jl` pinned both sides, so that a JSON.jl release adding a validating skip
+  would turn it red.
+- **The `isvalidjson` false positive went upstream as its own report.**
+
+**Landed (#721).** All three items #578 sent upstream shipped in JSON.jl 1.12.0:
+
+- [JuliaIO/JSON.jl#511](https://github.com/JuliaIO/JSON.jl/issues/511) → fixed by
+  [#516](https://github.com/JuliaIO/JSON.jl/pull/516): every escape is checked, so `isvalidjson`
+  and every skip validate escapes (and `isvalidjson` also rejects trailing input after the root).
+  `Json{T}` now refuses an invalid escape in an undeclared member, like `getjson` and
+  `JsonFragment{T}`; the *Request Body* guide says so, and `test/extractor_tests.jl` flipped its
+  row to a `400`, which now guards against a regression to the old skip.
+- [#512](https://github.com/JuliaIO/JSON.jl/pull/512): writing an `Object{K,Any}` no longer builds
+  a `Pair` per entry — the `Object` writer measured above.
+- [#513](https://github.com/JuliaIO/JSON.jl/issues/513) → fixed by
+  [#519](https://github.com/JuliaIO/JSON.jl/pull/519): `sort_keys` lowers each key to text once.
+
+Nitro's floor is `JSON = "1.12.1"`, not `1.12.0`: 1.12.0 parsed a document with many 2000+-digit
+integers in time proportional to the whole document per integer, which 1.12.1 fixes
+([#523](https://github.com/JuliaIO/JSON.jl/pull/523)). A request body is
+client input, so that is a floor, not a preference. The `write_dict_*` and `echo_*_served` rows
+have not been re-measured on 1.12.1.
 
 ## 4. Reference facts
 
