@@ -26,16 +26,27 @@
 # field cap (#327). The `RequestScope` is built ONCE, here, outside the per-request closure: every
 # request binds the same heap object, which is one scope insert and no box (#444). See
 # `RequestScope` (src/constants.jl) for why its shape is what costs.
+#
+# The `@with` itself is still dynamic under `juliac --trim`, inside Base: the `ScopedValue` HAMT
+# insert hashes a key of the abstract type `AbstractScopedValue`. That is upstream's, and nothing
+# here works around it (docs/design/juliac-trim.md §3.5).
 function _app_context_seed(ctx::App)
     scope = Constants.RequestScope(ctx, ctx.service.max_fields, ctx.service.shutting_down[])
     return function(handler::Function)
         return function(req::HTTP.Request)
             haskey(req.context, REQUEST_CONTEXT_KEY) ||
-                (req.context[REQUEST_CONTEXT_KEY] = ctx.app_context[])
+                (req.context[REQUEST_CONTEXT_KEY] = _app_context_value(ctx))
             return @with Constants.REQUEST_SCOPE => scope handler(req)
         end
     end
 end
+
+# `App.app_context` is declared `Ref{Any}`, which is abstract, so a bare `ctx.app_context[]` is a
+# dynamic `getindex` on every request (2 `juliac --trim` errors at each read). What it holds is a
+# `Base.RefValue{Any}`: that is what the field's default, `Ref{Any}(missing)`, constructs, and
+# nothing passes another. This assertion is redundant once the field itself is declared
+# `Base.RefValue{Any}`, as the `Service` slots were in #571.
+@inline _app_context_value(ctx::App) = (ctx.app_context::Base.RefValue{Any})[]
 
 """
     serving_app() -> Union{App, Nothing}
@@ -475,7 +486,7 @@ function internalrequest(ctx::App, req::HTTP.Request; middleware::Union{Tuple,Ve
     # defect this commit exists to remove — a request observing a context that is not its own —
     # just reached by reuse rather than by a data race. Covered by the "a reused request object
     # does not inherit a previous call's context" item in test/appcontext_race_tests.jl.
-    req.context[REQUEST_CONTEXT_KEY] = ismissing(context) ? ctx.app_context[] : Context(context)
+    req.context[REQUEST_CONTEXT_KEY] = ismissing(context) ? _app_context_value(ctx) : Context(context)
 
     # A request a route chain is still running on (a middleware that calls `internalrequest` with
     # its own `req`) carries that chain's stash, and the call below writes its own over it. Put the

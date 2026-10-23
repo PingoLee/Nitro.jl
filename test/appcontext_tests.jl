@@ -200,3 +200,14 @@ end
     end
 end
 end
+
+@testitem "The app-context seed reads the context cell without a dynamic call" tags=[:core] setup=[NitroCommon] begin
+    using Test
+    using Nitro
+    # `App.app_context` is declared `Ref{Any}`, which is abstract, so `ctx.app_context[]` was a
+    # dynamic `getindex` on every request at both of its reads, `_app_context_seed` and
+    # `internalrequest` (docs/design/juliac-trim.md §3.5). Both go through this accessor.
+    @test isempty(dynamic_calls(Nitro.Core._app_context_value, (App,)))
+    app = App()
+    @test Nitro.Core._app_context_value(app) === missing
+end
