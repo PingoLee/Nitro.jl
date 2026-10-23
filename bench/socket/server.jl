@@ -99,6 +99,8 @@ const MODE       = get(ENV, "MODE", "nitro")
 # Only where it is used, so a `bare_*` process has no Nitro in it at all: `rss.sh` reports that
 # mode as the HTTP.jl-only floor (#451), and a loaded-but-idle Nitro would be counted in it.
 MODE in ("nitro", "nitro_log") && @eval using Nitro
+# FILLER_ROUTES / ROUTE_MW: the route table's size and middleware shape (#718); see the file.
+MODE in ("nitro", "nitro_log") && include(joinpath(@__DIR__, "..", "route_table.jl"))
 
 const PORT      = parse(Int, get(ENV, "PORT", "8080"))
 const ACCESS_LOG = get(ENV, "ACCESS_LOG", "0") == "1" || MODE == "nitro_log"
@@ -436,6 +438,7 @@ function start_nitro()
         )
     end
     urlpatterns(app, "", path("/aggregate", aggregate_route(agg_job); method = "GET"))
+    bench_routes!(app)
     # PROBE=1: Nitro's own `stream_handler`, at its defaults as `serve` builds it, wrapped to stamp
     # the request's task at its start, after the pipeline and after the write. It runs on the task
     # `serve` spawns per request, so `conn` stays 0 here.

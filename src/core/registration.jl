@@ -298,6 +298,10 @@ function registerhandler(ctx::App, router::Types.NitroRouter, httpmethod::String
         end
     end
 
+    # The route's one erasure point for its handler (#718), wrapped once here so every shape below
+    # -- the plain leaf, a `DeclaredMethodHandler`, the auto-`HEAD` -- carries the same endpoint.
+    handle = Types.RouteEndpoint(handle)
+
     resolved_methods = if httpmethod == STREAM
         [GET, POST]
     else
@@ -361,6 +365,50 @@ end
 # resolved `HEAD` to this leaf, so it never took the miss path that would have marked it.
 (h::RetiredHeadHandler)(req::HTTP.Request) =
     (_mark_route_miss!(req); _method_not_allowed(h.router, h.misses, req))
+
+# A leaf Nitro registered: a `RouteEndpoint` (#718), alone or in a `DeclaredMethodHandler`, or the
+# `RetiredHeadHandler` the `HEAD` table leaves behind. `_call_leaf` refuses anything else.
+_nitro_leaf(@nospecialize(handler))::Bool =
+    handler isa Types.RouteEndpoint ||
+    handler isa Types.DeclaredMethodHandler{Types.RouteEndpoint} ||
+    handler isa RetiredHeadHandler
+
+"""
+    _refuse_foreign_leaves(router)
+
+Throw if `router` holds a leaf Nitro did not register (#718), naming its method and path. Run by
+`serve` before it changes anything. Such a leaf comes from a direct `HTTP.register!` on the app's
+router, which the routing rules already exclude (nitro-core §3); it would be refused with a `500`
+on every request it matched, so `serve` refuses to start instead.
+"""
+function _refuse_foreign_leaves(router::Types.NitroRouter)::Nothing
+    leaf = _first_foreign_leaf(router.routes)
+    leaf === nothing && return nothing
+    throw(ArgumentError(
+        "The app's router holds `$(leaf.method) $(leaf.path)`, which was not registered through " *
+        "Nitro (a direct `HTTP.register!`?). Declare every route with `path()` and register it " *
+        "with `urlpatterns()` or `include_routes()`."))
+end
+
+function _first_foreign_leaf(node::HTTP.Handlers.Node)
+    for leaf in node.methods
+        _nitro_leaf(leaf.handler) || return leaf
+    end
+    for child in node.exact
+        found = _first_foreign_leaf(child)
+        found === nothing || return found
+    end
+    for child in node.conditional
+        found = _first_foreign_leaf(child)
+        found === nothing || return found
+    end
+    for child in (node.wildcard, node.doublestar)
+        child === nothing && continue
+        found = _first_foreign_leaf(child::HTTP.Handlers.Node)
+        found === nothing || return found
+    end
+    return nothing
+end
 
 """
     _route_shape(route) -> String

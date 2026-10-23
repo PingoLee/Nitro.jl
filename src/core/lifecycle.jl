@@ -242,6 +242,10 @@ function serve(ctx::App;
         throw(ArgumentError("`security_headers` must be a `SecurityHeaders(...)` value or " *
                             "`nothing`, got $(repr(security_headers))"))
 
+    # Before any mutation as well (#718): a leaf put on the router without `path()` would be
+    # refused on every request it matched, so the server is refused instead.
+    _refuse_foreign_leaves(ctx.service.router)
+
     # `:$revise`, not `repr(revise)` (#571): `repr` of a `Symbol` goes through Base's
     # `show_unquoted` on an `Any`, which pulled the whole `show` machinery into every compiled
     # `serve` -- 310 of the 408 errors in the first `juliac --trim` build. Interpolating the

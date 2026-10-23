@@ -367,6 +367,8 @@ between `main` and `--trim=safe` (#570). It is a readiness probe, not a benchmar
 bench/juliac/build.sh                                   # untrimmed exe: does HTTP + Reseau + Nitro serve from an image?
 bench/juliac/build.sh unsafe-warn                       # the warning list is the trim-readiness backlog
 bench/juliac/build.sh safe                              # the goal
+ENTRY=probe bench/juliac/build.sh unsafe-warn           # the request path, past whatever walls the listener
+julia bench/juliac/frames.jl bench/results/juliac-<stamp>-<entry>-<mode>.log   # errors by first frame in src/
 bench/juliac/smoke.sh bench/juliac/out/nitro-min-no     # first vs warm /plaintext, RSS, OS threads
 bench/juliac/smoke.sh jit                               # the same app under the JIT, as the baseline
 ```
@@ -375,9 +377,16 @@ bench/juliac/smoke.sh jit                               # the same app under the
   routes registered at **top level**, so registration (and the reflection it needs) runs in the
   build process while `main` only serves. It is both the compile input and, run as a script, the
   JIT baseline — `@main` runs when the file is the program.
+- `probe.jl` (#718) is the request path without the listener: its `@main` builds the pipeline with
+  `setupmiddleware` and calls it on requests to an exact route, a converter route and three
+  distinct middleware stacks (two through an `include_routes` group). The verifier reports only
+  the first dynamic call on each path, so `app.jl` sees the request path only once every wall in
+  front of `HTTP.listen!` is gone; the probe sees it now. `ENTRY=probe` selects it.
 - `build.sh` pins `--project` to `bench/juliac` (the driver compiles the *active* project),
-  instantiates it, and logs to `results/juliac-<stamp>-<mode>.log`; the exe lands in `juliac/out/`
-  (gitignored).
+  instantiates it, and logs to `results/juliac-<stamp>-<entry>-<mode>.log`; the exe lands in
+  `juliac/out/` (gitignored).
+- `frames.jl` counts a log's verifier errors by their first frame inside `src/`, the count
+  `docs/design/juliac-trim.md` §1 asks for.
 - `smoke.sh` exports `THREADS` as `JULIA_NUM_THREADS` for the exe — a compiled `main` does not
   parse Julia flags — and reports the OS thread count, which is how you see whether the layout took.
 - `JULIA="julia +1.12"` is the default: the driver lives in 1.12's `share/julia/juliac/`.

@@ -6,7 +6,7 @@ using HTTP: Server
 using ..Types
 # Unexported from `Types` on purpose: `CopyOnWriteDict` is internal plumbing for `compose`,
 # so it is named explicitly here rather than widened onto `Core`'s reexport surface.
-using ..Types: CopyOnWriteDict, RouteMiddleware, NamedRoute, NitroRouter, nitro_router,
+using ..Types: CopyOnWriteDict, RouteMiddleware, RouteChainRecord, NamedRoute, NitroRouter, nitro_router,
     MissResponse, miss_response
 using ..Constants: SHUTDOWN_TIMEOUT_SECONDS, DEFAULT_MAX_FIELDS, AbstractApp
 # The serve task, a shutdown and a Revise hook log what they caught as `loggable(e)`, never `e`:
@@ -83,6 +83,11 @@ end
     # `App`; see `NitroRouter` (src/types.jl).
     router              :: NitroRouter              = nitro_router()
     custommiddleware    :: CopyOnWriteDict{RouteMiddleware} = CopyOnWriteDict{RouteMiddleware}()
+    # Each route's chain, folded once at registration (#718), beside the entry it was folded from.
+    # Written only by `publish_route_middleware!`, which publishes here and then `custommiddleware`
+    # under `route_chains_lock`; `compose`'s `_route_chain` takes the same lock when the two disagree.
+    route_chains        :: CopyOnWriteDict{RouteChainRecord} = CopyOnWriteDict{RouteChainRecord}()
+    route_chains_lock   :: ReentrantLock            = ReentrantLock()
     named_routes        :: Dict{String, NamedRoute} = Dict{String, NamedRoute}()
     external_url        :: Base.RefValue{Nullable{String}} = Ref{Nullable{String}}(nothing)
     prefix              :: Base.RefValue{Nullable{String}} = Ref{Nullable{String}}(nothing)

@@ -84,8 +84,8 @@ import Nitro: App, path, text
 # `serve` injects `ReviseHandler`.
 #
 # Until #255 this shape cached nothing (`use_cache = isempty(globalmiddleware)`), so
-# `buildmiddleware` and its read of `custommiddleware` ran on EVERY request, forever. Each
-# pipeline now owns a `ChainCache`, so it builds once per route like every other shape.
+# `buildmiddleware` and its read of `custommiddleware` ran on EVERY request, forever. Since #718
+# a route's chain is folded once, at registration, and every pipeline runs that one.
 
 const K = 8
 mktag(tag) = handler -> (req::HTTP.Request -> Res.send(tag * "|" * text(handler(req))))
@@ -115,29 +115,29 @@ served_results = [text(served(HTTP.Request("GET", "/u/$i"))) for _ in 1:3 for i 
     @test served_results == expected
 end
 
-@testset "buildmiddleware runs once per route per pipeline, not once per request" begin
+@testset "a route's chain is folded once, at registration, whatever the pipelines (#718)" begin
+    # The rule since #718: one fold per route, when the route is registered. A pipeline that
+    # serves it (`serve`-shaped below) and every `internalrequest` (a new pipeline per call) run
+    # that one chain, so what a factory creates is shared by all of them. Before #718 it was one
+    # fold per route per pipeline (#255), and before #255 one per request.
     ctx2 = App()
+    factory_calls[] = 0
     Nitro.Core.Routing.urlpatterns(ctx2, "", Nitro.RouteDefinition[
         path("/counted", (req::HTTP.Request) -> Res.send("ok"), middleware = [counting_mw])
     ])
-    # `serve`-shaped: one pipeline, five requests, one build. This assertion used to read
-    # `== 5` — "uncached, forever" — and was flipped deliberately by #255, which is the change
-    # it existed to make someone confront.
-    factory_calls[] = 0
+    @test factory_calls[] == 1
+
     pipeline = Nitro.Core.setupmiddleware(ctx2; middleware = [global_mw], catch_errors = false)
     for _ in 1:5
         pipeline(HTTP.Request("GET", "/counted"))
     end
     @test factory_calls[] == 1
 
-    # `internalrequest` builds a new pipeline — and so a cold cache — per call. That is the
-    # stated trade-off of a pipeline-owned cache: the ~12 µs pipeline rebuild dwarfs one fold.
-    factory_calls[] = 0
     for _ in 1:5
         Nitro.Core.internalrequest(ctx2, HTTP.Request("GET", "/counted");
                                    middleware = [global_mw], catch_errors = false)
     end
-    @test factory_calls[] == 5
+    @test factory_calls[] == 1
 end
 
 @testset "a composed pipeline sees routes registered after it was composed" begin
@@ -451,19 +451,21 @@ end
     @test r.status == 405
     @test hits[] == 1
 
-    # No chain composed: the per-route middleware factory is never called for a 405. The global
-    # factory is folded once per pipeline whatever happens (#291), so its count is only a check
-    # that nothing folds it twice; `route_folds` is the assertion that matters.
-    route_folds, global_folds = Ref(0), Ref(0)
+    # No chain for it: the route's chain was folded once, at registration (#718), and a 405 neither
+    # folds another nor runs that one. The global factory is folded once per pipeline whatever
+    # happens (#291), so its count is only a check that nothing folds it twice.
+    route_folds, route_runs, global_folds = Ref(0), Ref(0), Ref(0)
     keyctx = App()
     Nitro.Core.Routing.urlpatterns(keyctx, "", Nitro.RouteDefinition[
         path("/only-get", (req::HTTP.Request) -> Res.send("ok"), method = "GET",
-             middleware = [h -> (route_folds[] += 1; q::HTTP.Request -> h(q))])
+             middleware = [h -> (route_folds[] += 1; q::HTTP.Request -> (route_runs[] += 1; h(q)))])
     ])
+    @test route_folds[] == 1
     p = Nitro.Core.setupmiddleware(keyctx; catch_errors = false,
                                    middleware = [h -> (global_folds[] += 1; q::HTTP.Request -> h(q))])
     @test p(HTTP.Request("POST", "/only-get")).status == 405
-    @test route_folds[] == 0
+    @test route_folds[] == 1
+    @test route_runs[] == 0
     @test global_folds[] == 1
 end
 
@@ -486,14 +488,16 @@ end
 @testset "an unmatched request composes nothing and leaves no stash" begin
     # This used to count GLOBAL folds against a prebuilt unmatched-path chain. Since #291 there is
     # no such chain — global middleware wraps route selection, folded once per pipeline — so that
-    # count was 1 whatever the 404 path did. A 404 that composed a route chain would call the
-    # route factory; one that stashed a resolution would leave the key on the request.
-    route_folds = Ref(0)
+    # count was 1 whatever the 404 path did. A route's chain is folded once, at registration
+    # (#718): a 404 that composed one would fold again, one that ran one would count a run, and one
+    # that stashed a resolution would leave the key on the request.
+    route_folds, route_runs = Ref(0), Ref(0)
     ctx = App()
     Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
         path("/has", (req::HTTP.Request) -> Res.send("ok"),
-             middleware = [h -> (route_folds[] += 1; q::HTTP.Request -> h(q))])
+             middleware = [h -> (route_folds[] += 1; q::HTTP.Request -> (route_runs[] += 1; h(q)))])
     ])
+    @test route_folds[] == 1
     p = Nitro.Core.setupmiddleware(ctx; catch_errors = false,
                                    middleware = [h -> (q::HTTP.Request -> h(q))])
     for _ in 1:3
@@ -501,7 +505,8 @@ end
         @test p(req).status == 404
         @test get(req.context, Nitro.Core.Types.ROUTE_RESOLUTION_KEY, nothing) === nothing
     end
-    @test route_folds[] == 0
+    @test route_folds[] == 1
+    @test route_runs[] == 0
 end
 end
 
@@ -519,8 +524,9 @@ import Nitro: App, path, text
 # Before #255 this was an explicit `delete!` of the route's key from an `App`-wide cache,
 # paired with the publish in `publish_route_middleware!`. Now nothing is deleted: the publish
 # moves `custommiddleware` to a new table, and each pipeline's `ChainCache` serves a chain only
-# to requests holding the table it was built from. Both shapes of pipeline are covered, since
-# the global-middleware one did not cache at all before #255.
+# to requests holding the table it was looked up in. Both shapes of pipeline are covered, since
+# the global-middleware one did not cache at all before #255. Since #718 the chain itself is
+# folded at registration; the cache holds the endpoint registration built.
 
 mktag(tag) = handler -> (req::HTTP.Request -> Res.send(tag * "|" * text(handler(req))))
 
@@ -551,13 +557,14 @@ mktag(tag) = handler -> (req::HTTP.Request -> Res.send(tag * "|" * text(handler(
     # Were the warm bare chain still served, this would be "h".
     @test text(pipeline(HTTP.Request("GET", "/warm"))) == "late|h"
     @test text(pipeline(HTTP.Request("GET", "/warm"))) == "late|h"
-    @test late_folds[] == 1          # composed once for the new table, then cached
+    @test late_folds[] == 1          # folded once, when it was registered (#718)
 end
 
-@testset "a registration rebuilds every route, and each still gets its own chain" begin
-    # Invalidation is by generation now, so a registration for ONE route rebuilds every route's
-    # chain on its next request. That is the accepted cost — registrations are rare — and this
-    # pins that the rebuild is correct, not just that it happens.
+@testset "a registration folds only its own route, and each still gets its own chain" begin
+    # A route's chain is folded once, when it is registered (#718). A pipeline's cache is still
+    # invalidated by generation, so a registration for ONE route makes every pipeline look each
+    # route up again; it does not fold any other route's chain again. This pins both: the counts,
+    # and that every route still gets its own chain afterwards.
     builds = Ref(0)
     keep = handler -> (builds[] += 1; req::HTTP.Request -> Res.send("keep|" * text(handler(req))))
     ctx = App()
@@ -565,6 +572,7 @@ end
         path("/keep", (req::HTTP.Request) -> Res.send("k"), middleware = [keep]),
         path("/drop", (req::HTTP.Request) -> Res.send("d")),
     ])
+    @test builds[] == 1
     pipeline = Nitro.Core.setupmiddleware(ctx; catch_errors = false)
     pipeline(HTTP.Request("GET", "/keep")); pipeline(HTTP.Request("GET", "/drop"))
     @test builds[] == 1
@@ -574,9 +582,8 @@ end
     ])
     @test text(pipeline(HTTP.Request("GET", "/keep"))) == "keep|k"
     @test text(pipeline(HTTP.Request("GET", "/drop"))) == "new|d"
-    @test builds[] == 2                  # /keep rebuilt once for the new generation...
     pipeline(HTTP.Request("GET", "/keep"))
-    @test builds[] == 2                  # ...and is cached again after that
+    @test builds[] == 1                  # /keep was never folded again
 end
 end
 
@@ -690,13 +697,17 @@ const MISSES = Nitro.Types.MissResponses(HTTP.Response(404), HTTP.Response(405))
 DISPATCH(r, req) = Nitro.Core._dispatch_resolved(r, MISSES, req)
 
 # `RouteResolution.router` is the concrete `NitroRouter`, so the stashed router is one too.
+# Every leaf Nitro registers is a `RouteEndpoint` (#718), and the terminal refuses any other, so
+# leaves put on the router by hand here are wrapped the way `registerhandler` wraps them.
+leaf(f) = Nitro.Core.Types.RouteEndpoint(f)
+
 function router_with(body::String)
     r = Nitro.Types.nitro_router()
-    HTTP.register!(r, "GET", "/x", (::HTTP.Request) -> HTTP.Response(200, body))
+    HTTP.register!(r, "GET", "/x", leaf((::HTTP.Request) -> HTTP.Response(200, body)))
     return r
 end
 
-stash_handler(body::String) = (::HTTP.Request) -> HTTP.Response(200, body)
+stash_handler(body::String) = leaf((::HTTP.Request) -> HTTP.Response(200, body))
 
 # Builds a stash that legitimately matches: THIS router, and this request's own method and
 # target objects. Each testset below then perturbs exactly one of the three guarded inputs, so
@@ -767,8 +778,8 @@ end
     # #80 the router resolved after every middleware layer, so such a rewrite changed which
     # handler ran; guarding on the method is what keeps that true.
     router = Nitro.Types.nitro_router()
-    HTTP.register!(router, "GET",  "/x", (::HTTP.Request) -> HTTP.Response(200, "GET-ROUTER"))
-    HTTP.register!(router, "POST", "/x", (::HTTP.Request) -> HTTP.Response(200, "POST-ROUTER"))
+    HTTP.register!(router, "GET",  "/x", leaf((::HTTP.Request) -> HTTP.Response(200, "GET-ROUTER")))
+    HTTP.register!(router, "POST", "/x", leaf((::HTTP.Request) -> HTTP.Response(200, "POST-ROUTER")))
 
     req = HTTP.Request("GET", "/x")
     stash!(req, router; handler = stash_handler("STASH"))
@@ -1441,10 +1452,12 @@ end
     @test !guarded[]
 end
 
-@testset "a reroute from a non-Function leaf is judged like any other" begin
+@testset "a non-Function leaf is judged like any other, and refused (#718)" begin
     # A callable struct registered on the router directly is not a `Function`. Its match used to
     # CLEAR the stash, which the terminal read as "no chain was chosen", so its route middleware
-    # could reroute onto a guarded leaf unchecked. Found in review.
+    # could reroute onto a guarded leaf unchecked. Found in review. Since #718 a leaf Nitro did not
+    # register is refused outright (`serve` will not start with one), but the match still stashes,
+    # so the reroute is still judged and the guarded leaf still never runs.
     guarded = Ref(false)
     app = App()
     urlpatterns(app, "",
@@ -1457,12 +1470,15 @@ end
     end
     @test r.status == 500
     @test !guarded[]
-    # Without the reroute it is served through the stash, wrapper and all.
+    # Without the reroute it reaches the terminal through the stash, which refuses it: the leaf
+    # never runs, whatever chain was chosen for it.
     Nitro.Core.RouterHOF.publish_route_middleware!(app, "GET|/raw",
         (nothing, Function[handle -> (req::HTTP.Request -> handle(req))]))
     req = HTTP.Request("GET", "/raw")
-    r = internalrequest(app, req)
-    @test r.status == 200 && text(r) == "raw"
+    r = Base.CoreLogging.with_logger(Base.CoreLogging.NullLogger()) do
+        internalrequest(app, req)
+    end
+    @test r.status == 500 && text(r) != "raw"
     @test req.context[Nitro.Core.Types.ROUTE_RESOLUTION_KEY] isa Nitro.Core.Types.RouteResolution
 end
 

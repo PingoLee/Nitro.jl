@@ -91,7 +91,11 @@ function _dispatch_resolved(r::HTTP.Router, misses::Types.MissResponses, req::HT
         if res.method === req.method && res.target === req.target
             req.context[:route] = res.route
             isempty(res.params) || (req.context[:params] = res.params)
-            return res.handler(req)
+            handler = res.handler
+            # The common leaf first, in line: crossing `_call_leaf`'s `@nospecialize` frame costs
+            # more than the call it guards.
+            handler isa Types.RouteEndpoint && return handler(req)
+            return _call_leaf(handler, req, res.route)
         end
         return _route_rerouted(r, misses, req, res)
     end
@@ -137,7 +141,7 @@ function _route_rerouted(r::HTTP.Router, misses::Types.MissResponses, req::HTTP.
 
     ran = get(res.table, RouterHOF.genkey(res.mw_method, res.route), Types.NO_ROUTE_MIDDLEWARE)
     mw_method = handler isa Types.DeclaredMethodHandler ? handler.method : req.method
-    needs = get(Types.snapshot(res.source), RouterHOF.genkey(mw_method, route), nothing)
+    needs = get(Types.snapshot(res.pipeline.source), RouterHOF.genkey(mw_method, route), nothing)
     (needs === nothing || needs === ran) && return _route_call(req, handler, route, params)
 
     @error "A router- or route-level middleware rerouted the request to a route with different middleware; refusing it. Rewrite req.method/req.target in global middleware (serve(middleware = [...])) instead, so the route is chosen after the rewrite." from = "$(res.mw_method) $(res.route)" to = "$(mw_method) $(route)"
@@ -189,11 +193,41 @@ function _route_miss(r::HTTP.Router, misses::Types.MissResponses, req::HTTP.Requ
     return _method_not_allowed(r, misses, req)
 end
 
+(e::Types.RouterEntry)(req::HTTP.Request) = _dispatch_resolved(e.router, e.misses, req)
+
 # `(r::Router)(req)`'s matched branch: `:route`, `:params` only when non-empty, then the handler.
-function _route_call(req::HTTP.Request, handler, route, params)
+# `@nospecialize`: the router hands the leaf back as `Any`, and a call that specializes on an `Any`
+# argument is a dynamic call (#718).
+function _route_call(req::HTTP.Request, @nospecialize(handler), route::String, params)
     req.context[:route] = route
     isempty(params) || (req.context[:params] = params)
-    return handler(req)
+    handler isa Types.RouteEndpoint && return handler(req)
+    return _call_leaf(handler, req, route)
+end
+
+"""
+    _call_leaf(handler, req, route) -> response
+
+Call a matched leaf. Every leaf Nitro registers is a `Types.RouteEndpoint` (#718), alone or in a
+`DeclaredMethodHandler`, or a `RetiredHeadHandler`, and each of those is a static call.
+
+A leaf put on the router another way (a direct `HTTP.register!`) is refused with a `500`, never
+called: routes are declared with `path()` (nitro-core §3), and a call to an arbitrary leaf is the
+dynamic call `juliac --trim=safe` rejects. `serve` refuses to start with one on the router; this
+covers `internalrequest` and a leaf added after `serve`.
+"""
+function _call_leaf(@nospecialize(handler), req::HTTP.Request, route::String)
+    # The branches `_nitro_leaf` (src/core/registration.jl) accepts, each with its static call.
+    handler isa Types.RouteEndpoint && return handler(req)
+    handler isa Types.DeclaredMethodHandler{Types.RouteEndpoint} && return handler.handler(req)
+    handler isa RetiredHeadHandler && return handler(req)
+    return _refuse_foreign_leaf(req, route)
+end
+
+# Out of line, so the log record and the response it builds stay out of every matched request's code.
+@noinline function _refuse_foreign_leaf(req::HTTP.Request, route::String)
+    @error "Refusing a route handler that was not registered through Nitro. Declare routes with path() and urlpatterns()." route = route method = req.method
+    return Res.json(("message" => "500: Internal Server Error"), status = 500)
 end
 
 """
@@ -362,27 +396,25 @@ function setupmiddleware(ctx::App; middleware::Union{Tuple,Vector}=(), serialize
     # installed it receives the accumulator directly, so without this adapter every
     # `serialize=false` app would fail at pipeline-construction time, before any request.
     #
-    # `let`-bound rather than closing over `ctx`: the router and the miss responses are fixed at
-    # construction (`Service` and `App` are immutable), so one closure over both values saves a
-    # field-load chain per request. `Service.router` is the concrete `NitroRouter`, so this
-    # closure's type is concrete too (#625). Under the old `HTTP.Router` field it was abstract,
-    # and so was every closure that captured it.
-    router_entry = let r = ctx.service.router, misses = misses
-        (req::HTTP.Request) -> _dispatch_resolved(r, misses, req)
-    end
+    # The router and the miss responses are fixed at construction (`Service` and `App` are
+    # immutable), so the entry holds both values rather than `ctx`, which saves a field-load chain
+    # per request. `Service.router` is the concrete `NitroRouter`, so its type is concrete too
+    # (#625). A named `Types.RouterEntry`, not a closure, so the serializer around it is the one
+    # `Types.PipelineHandler` every route chain continues into (#718).
+    router_entry = Types.RouterEntry(ctx.service.router, misses)
 
     # Innermost first, each layer wrapping the chain built so far. This used to be
     # `reduce(|>, [ … ])`: the same order, but over a `Vector` whose element type is `Any`, so
     # neither inference nor `juliac --trim` could say what the pipeline was (#572).
     return router_entry |>
         serializer |>
-        # The chains `compose` caches close over the serializer above, and so over
-        # `catch_errors`/`show_errors`/`serialize`. They do not need to travel into `compose`
-        # any more (#255): its cache is owned by THIS pipeline, so every chain in it was built
-        # with this pipeline's settings. Before that, the cache lived on `ctx.service` and the
-        # three had to be in its key, or a second `internalrequest` with different kwargs was
+        # A route's chain is folded once, at registration, and continues through `RouteNext`
+        # into the serializer above, which `compose` hands it on every request (#718). So
+        # `catch_errors`/`show_errors`/`serialize` stay with THIS pipeline without travelling
+        # into `compose` or into any cache key. Before #255 the cache lived on `ctx.service` and
+        # the three had to be in its key, or a second `internalrequest` with different kwargs was
         # served the first one's chain (#79).
-        compose(ctx.service.router, processed_middleware, ctx.service.custommiddleware) |>
+        compose(ctx.service, processed_middleware) |>
         global_prefix_middleware |>
         # Installed on every pipeline, prefix or not (#341): it makes `req.target` the path the
         # router will match, so a global gate keyed on the URL is not bypassed by `//admin/…`
@@ -445,5 +477,16 @@ function internalrequest(ctx::App, req::HTTP.Request; middleware::Union{Tuple,Ve
     # does not inherit a previous call's context" item in test/appcontext_race_tests.jl.
     req.context[REQUEST_CONTEXT_KEY] = ismissing(context) ? ctx.app_context[] : Context(context)
 
-    return req |> setupmiddleware(ctx; middleware, serialize, catch_errors, security_headers)
+    # A request a route chain is still running on (a middleware that calls `internalrequest` with
+    # its own `req`) carries that chain's stash, and the call below writes its own over it. Put the
+    # outer one back, so that when the chain continues, its `RouteNext` goes on into ITS pipeline,
+    # with its settings, and its terminal checks the route the chain was chosen for (#718).
+    outer = get(req.context, Types.ROUTE_RESOLUTION_KEY, nothing)
+    outer === nothing &&
+        return req |> setupmiddleware(ctx; middleware, serialize, catch_errors, security_headers)
+    try
+        return req |> setupmiddleware(ctx; middleware, serialize, catch_errors, security_headers)
+    finally
+        req.context[Types.ROUTE_RESOLUTION_KEY] = outer
+    end
 end

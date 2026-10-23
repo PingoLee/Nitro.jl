@@ -3,12 +3,14 @@
 using HTTP
 
 using ..Util: join_url_path, _canonical_route
-using ..AppContext: App
+using ..AppContext: App, Service
 using ..Constants: HTTP_METHODS
 using ..Types: Nullable, LifecycleMiddleware, CopyOnWriteDict, snapshot,
                 publish!, RouteResolution, ROUTE_RESOLUTION_KEY,
                 RouteMiddleware, NO_ROUTE_MIDDLEWARE, DeclaredMethodHandler,
-                ChainCache, cached_chain, cache_chain!
+                ChainCache, cached_chain, cache_chain!,
+                RouteEndpoint, RouteNext, RouteChainRecord, PipelineHandler, PipelineRoutes,
+                call_chain
 
 export router, compose, genkey, process_middleware, HOFRouter, OuterRouter, InnerRouter
 
@@ -360,11 +362,16 @@ one place.
 
 There is no separate invalidation step, and that is deliberate (#255). `publish!` allocates a new
 table, and every pipeline's [`ChainCache`](@ref) serves a chain only to a request whose
-`custommiddleware` snapshot is the exact table that chain was built from. So a chain composed
-before this call — including one a racing request is still composing — can never be served
-after it. This used to be publish-then-`delete!` against an `App`-wide cache (#71), and the
-`delete!` alone could not close the window where a request built its chain from the old table
-and published it after the `delete!` ran (#81); a read-time check has no such window.
+`custommiddleware` snapshot is the exact table it looked that chain up in. So nothing cached
+before this call can be served after it. This used to be publish-then-`delete!` against an
+`App`-wide cache (#71), and the `delete!` alone could not close the window where a request built
+its chain from the old table and published it after the `delete!` ran (#81); a read-time check
+has no such window.
+
+Since #718 the chain is folded HERE, and recorded beside `value` in `service.route_chains`. The
+chain is published first and the entry second, both under `route_chains_lock`, so a request that
+finds the two disagree is between them and waits on that lock ([`_route_chain`](@ref)): it never
+runs a chain under an entry it was not folded from.
 
 Scope: this covers *adding* or *changing* a route's middleware. It does not cover **removal** —
 re-running `urlpatterns` with no `middleware=` kwarg skips the registration branch entirely, so
@@ -372,7 +379,17 @@ a previously-published entry survives, and so do chains built from it. Pre-exist
 unchanged by #71 or #255.
 """
 function publish_route_middleware!(ctx::App, key::String, value::RouteMiddleware)
-    publish!(ctx.service.custommiddleware, key, value)
+    # The route's chain is folded HERE, once per registration, around `RouteNext` (#718): the
+    # pipelines that will run it may not exist yet, and `RouteNext` finds each one's handler on
+    # the request. Folded outside the lock, since a factory is user code and may take its time.
+    endpoint = RouteEndpoint(buildmiddleware(value, RouteNext(ctx.service.router)))
+    # The chain first, the entry second, under one lock. A request that reads the entry and finds
+    # an older or newer chain beside it knows a registration is between these two lines, and
+    # waits on this lock for it (`_route_chain`), so it never runs a chain its entry did not build.
+    lock(ctx.service.route_chains_lock) do
+        publish!(ctx.service.route_chains, key, RouteChainRecord(value, endpoint))
+        publish!(ctx.service.custommiddleware, key, value)
+    end
     return value
 end
 
@@ -390,7 +407,7 @@ list was `reverse`d first and ran top-down, while route and router lists were no
 bottom-up, so the documented `[BearerAuth(v), GuardMiddleware(...)]` checked its guards before
 authenticating.
 
-[`buildmiddleware`](@ref) folds `router, route` around the pipeline's handler through here.
+[`buildmiddleware`](@ref) folds `router, route` around `RouteNext` through here, once per route.
 `compose` folds `global` once around its route-selection step (#291) in the same order, but over
 a `Tuple` with `_foldtuple`, so that fold keeps the layers' types (#572).
 """
@@ -409,20 +426,17 @@ end
 """
     buildmiddleware(entry, handler) -> Function
 
-Compose one route's chain from `entry`, its `(router middleware, route middleware)` pair as the
-calling request's `custommiddleware` snapshot holds it. Runs on a [`ChainCache`](@ref) miss
-only: once per route per registration generation, per pipeline.
+Compose one route's chain from `entry`, its `(router middleware, route middleware)` pair.
+Called by [`publish_route_middleware!`](@ref) with a `RouteNext` as `handler`: once per route, at
+registration (#718), whatever the pipelines that will run it.
 
 Global middleware is not in here (#291): `compose` folds it *around* route selection instead, so
 it has already run by the time this chain is chosen.
 """
 function buildmiddleware(entry::RouteMiddleware, handler::Function) :: Function
 
-    # `entry` comes from the CALLER's per-request snapshot, and it must be that one rather than
-    # a fresh snapshot taken here (#255): `compose` stamps the resulting chain with the snapshot
-    # it looked `entry` up in, and `cached_chain` serves it only to requests holding that same
-    # table. Building from a later snapshot than the stamp would cache a chain under a generation
-    # it was not built from.
+    # `entry` is the value being published, and the chain is recorded beside it
+    # (`RouteChainRecord`), so `compose` can tell a chain from the entry it was folded from (#718).
     #
     # Both slots infer as `Union{Nothing, Vector{Function}}` since #76; before it, the table's
     # `Tuple` value type was abstract and the destructure inferred `Tuple{Any, Any}`.
@@ -437,7 +451,7 @@ function buildmiddleware(entry::RouteMiddleware, handler::Function) :: Function
 end
 
 """
-    compose(router, globalmiddleware, custommiddleware) -> (handler -> request function)
+    compose(service, globalmiddleware) -> (handler -> request function)
 
 The pipeline layer that applies per-route and per-router middleware, chosen per request from
 the route the request resolves to. Global middleware is applied here too, and **it wraps route
@@ -452,17 +466,27 @@ the terminal, which re-resolved it to a leaf whose guards had never been selecte
 `DELETE` answered a `GET` or `POST` carrying an override header, and a global path alias turned
 a `404` into a guarded route's `200`.
 
-Each pipeline gets its own [`ChainCache`](@ref) (#255), so a route's chain is composed once per
-registration generation rather than per request.
+A route's chain is folded once, at registration, and recorded in `service.route_chains` (#718).
+Each pipeline keeps its own [`ChainCache`](@ref) of the chains it has looked up (#255), so a request
+on a warm route looks nothing up by string. Takes `service` for the tables it reads; see
+`_route_chain` for how a lookup and a racing registration agree.
 """
-function compose(router::HTTP.Router, globalmiddleware::Tuple,
-                 custommiddleware::CopyOnWriteDict{RouteMiddleware})
+function compose(service::Service, globalmiddleware::Tuple)
+    # The three values the closures below need, not `service`: a `Service` is a wide immutable
+    # struct, and a closure captures it by value.
+    router = service.router
+    custommiddleware = service.custommiddleware
+    route_chains = (service.route_chains, service.route_chains_lock)
     return function (handler)
-        # This pipeline's chains — created HERE, once per `handler`, never shared (#255). Every
-        # chain closes over `handler`, so a cache that outlives or spans pipelines would need it
-        # in its key. Owned by the pipeline, the key only has to name the route and the
-        # registration generation. See `ChainCache` (src/types.jl).
+        # This pipeline's lookups — created HERE, once per `handler`, never shared (#255). The
+        # chains themselves are shared by every pipeline since #718; what stays per pipeline is
+        # which of them this one has already looked up, keyed on the route and the registration
+        # generation. See `ChainCache` (src/types.jl).
         chains = ChainCache()
+
+        # Built once per pipeline, and held by every stash it writes: the live table, and this
+        # pipeline's handler, where a route chain's `RouteNext` continues (#718).
+        pipeline = PipelineRoutes(custommiddleware, handler isa PipelineHandler ? handler : nothing)
 
         # NOTE: `custommiddleware` is captured as an *object*; `snapshot` is called per request
         # below. Hoisting it to here would freeze the route table at compose time: routes
@@ -546,25 +570,31 @@ function compose(router::HTTP.Router, globalmiddleware::Tuple,
                 # route middleware on that leaf that rerouted the request reached a guarded leaf
                 # unchecked (found in review of #291). Wrapping it costs one closure on a path
                 # nothing in Nitro produces.
-                leafhandler = innerhandler isa Function ? innerhandler :
-                              (r::HTTP.Request) -> innerhandler(r)
-                req.context[ROUTE_RESOLUTION_KEY] =
-                    RouteResolution(router, req.method, req.target, leafhandler, path,
-                                    params, mw_method, custom_snap, custommiddleware)
+                leafhandler = innerhandler isa Function ? innerhandler : FOREIGN_LEAF
 
                 # One acquire-load, then a lookup on a table no writer will ever mutate. `nothing`
-                # both for "never built" and for "built from a table registration has since
+                # both for "never cached" and for "cached from a table registration has since
                 # replaced" — `cached_chain` never serves a chain across generations.
                 func = cached_chain(chains, custom_snap, key)
-                isnothing(func) || return func(req)
+                if !isnothing(func)
+                    req.context[ROUTE_RESOLUTION_KEY] =
+                        RouteResolution(router, req.method, req.target, leafhandler, path,
+                                        params, mw_method, custom_snap, pipeline)
+                    return _call_chain(func, handler, req)
+                end
 
-                # Combine the route's middleware, from THIS request's snapshot — the one the
-                # chain is about to be stamped with.
-                strategy = buildmiddleware(
-                    get(custom_snap, genkey(mw_method, path), NO_ROUTE_MIDDLEWARE), handler)
+                # The chain registration folded from THIS request's entry (#718). A registration
+                # caught between its two publishes moves `custom_snap` forward to the table it
+                # finished with, so the stash below and the chain agree on one generation.
+                strategy, custom_snap = _route_chain(route_chains, custommiddleware, custom_snap,
+                                                     genkey(mw_method, path))
+                req.context[ROUTE_RESOLUTION_KEY] =
+                    RouteResolution(router, req.method, req.target, leafhandler, path,
+                                    params, mw_method, custom_snap, pipeline)
+                strategy === nothing && return _unbuilt_chain(mw_method, path)
 
                 # Warmup only: once per route per registration generation. The publish decides
-                # how much later requests rebuild, never whether they are served a stale chain —
+                # how much later requests look up again, never whether they are served a stale chain —
                 # that is `cached_chain`'s identity check alone, so a registration racing this
                 # request needs no ordering argument here (it did, #81). A request whose
                 # snapshot is already superseded simply declines to publish.
@@ -581,7 +611,7 @@ function compose(router::HTTP.Router, globalmiddleware::Tuple,
                 (declared || mw_method in HTTP_METHODS) &&
                     cache_chain!(chains, custommiddleware, custom_snap, key, strategy)
 
-                return strategy(req)
+                return _call_chain(strategy, handler, req)
             end
 
             # Unmatched (404) or method-mismatched (405): no route middleware applies, and the
@@ -606,6 +636,64 @@ function compose(router::HTTP.Router, globalmiddleware::Tuple,
         # made it fail before, rather than on every request.
         return _foldtuple(select, globalmiddleware)::Function
     end
+end
+
+# What a cache holds since #718: a route's `RouteEndpoint`, or `NO_ROUTE_CHAIN` for a route with
+# no router or route middleware of its own, which continues straight into `handler`. Both calls
+# are static.
+_call_chain(func::Function, handler, req::HTTP.Request) =
+    func isa RouteEndpoint ? call_chain(func, req) : handler(req)
+
+# The chain of a route with no middleware of its own: none. Cached like an endpoint, so a warm
+# route of either kind looks nothing up; `_call_chain` calls the pipeline's handler for it.
+struct NoRouteChain <: Function end
+const NO_ROUTE_CHAIN = NoRouteChain()
+
+# Stands in for a leaf that is not a `Function` in the stash, whose `handler` is `Function`-typed.
+# The terminal refuses it like any leaf not registered through Nitro (`_call_leaf`).
+struct ForeignLeaf <: Function end
+const FOREIGN_LEAF = ForeignLeaf()
+
+"""
+    _route_chain((chains, chains_lock), custommiddleware, snap, mwkey) -> (chain, snap)
+
+The chain registration folded for `mwkey`'s entry in `snap` (#718): its `RouteEndpoint`,
+`NO_ROUTE_CHAIN` when the route has no middleware of its own, or `nothing` when no chain was ever
+built for that entry.
+
+`publish_route_middleware!` publishes the chain and then the entry, under
+`route_chains_lock`. So a record whose entry is not `snap`'s belongs to a registration between
+those two publishes. Taking the same lock waits for it to finish; both tables are then read again
+together and agree, and the returned `snap` is the one they agree on. The lock is taken only on
+that mismatch, which is a cache miss racing a registration.
+
+`nothing` is what is left after the lock: an entry published with `publish!` directly, without
+its chain. Nothing in `src/` does that. Before this function it would have spun forever; it is
+refused instead (`_unbuilt_chain`).
+"""
+@noinline function _route_chain(route_chains::Tuple{CopyOnWriteDict{RouteChainRecord},ReentrantLock},
+                                custommiddleware::CopyOnWriteDict{RouteMiddleware},
+                                snap::Dict{String,RouteMiddleware}, mwkey::String)
+    chains, chains_lock = route_chains
+    chain = _recorded_chain(chains, snap, mwkey)
+    chain === nothing || return chain, snap
+    return lock(chains_lock) do
+        fresh = snapshot(custommiddleware)
+        _recorded_chain(chains, fresh, mwkey), fresh
+    end
+end
+
+function _recorded_chain(chains::CopyOnWriteDict{RouteChainRecord},
+                         snap::Dict{String,RouteMiddleware}, mwkey::String)
+    entry = get(snap, mwkey, nothing)
+    entry === nothing && return NO_ROUTE_CHAIN
+    rec = get(snapshot(chains), mwkey, nothing)
+    return rec !== nothing && rec.entry === entry ? rec.endpoint : nothing
+end
+
+@noinline function _unbuilt_chain(mw_method::String, path::String)
+    @error "Route middleware was published without its chain; refusing the request. Register route middleware through path()/urlpatterns(), which build it." route = path method = mw_method
+    return HTTP.Response(500, "500: Internal Server Error")
 end
 
 # `first(layers)(…(last(layers)(handler)))`: the first element outermost, as `foldlayers` orders

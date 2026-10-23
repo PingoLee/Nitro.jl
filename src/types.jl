@@ -1568,8 +1568,8 @@ any pipeline with global middleware — `serve(middleware = [...])`,
 `buildmiddleware` on **every request, forever** (#68). So it was steady-state dynamic dispatch
 on the hot path for the normal production configuration, which is what put it under the "no
 `Any` in the request hot path" rule rather than under cosmetics. (Since #255 every pipeline
-caches its chains, so `buildmiddleware` is back to once per route per registration generation —
-the narrowing still stands, it is just off the steady-state path now.)
+caches its chains, and since #718 `buildmiddleware` runs once per route, at registration — the
+narrowing still stands, it is just off the request path now.)
 
 Exactly two shapes are ever stored, from the only two write sites, and both go through
 `publish_route_middleware!`:
@@ -1649,18 +1649,24 @@ end
 """
     ChainCache()
 
-One pipeline's composed middleware chains (#255). `compose` (src/routerhof.jl) creates one per
+One pipeline's looked-up route chains (#255). `compose` (src/routerhof.jl) creates one per
 pipeline, so it lives exactly as long as the pipeline does: the server's lifetime under `serve`,
 one call under `internalrequest`.
 
+Since #718 a chain is folded once, at registration, and shared by every pipeline (a
+`RouteEndpoint`, recorded in `service.route_chains`); a route with no middleware of its own caches
+`NO_ROUTE_CHAIN`. What this cache saves is the per-request lookup: the `genkey` string and two table
+reads. It was a cache of folds when each pipeline folded its own chains.
+
 # Why per pipeline, and why that makes the key complete
 
-A chain is `foldlayers(handler, router mw, route mw)`. `handler`, which bakes in
-`catch_errors`/`show_errors`/`serialize`, is fixed for one pipeline's lifetime; the other two
-come from one `custommiddleware` snapshot. So *(this pipeline, that snapshot, method, path)*
-determines the chain, and a cache owned by the pipeline and stamped with the snapshot is
-complete **by construction**. (Global middleware is no longer part of a cached chain: since #291
-it wraps route selection itself, folded once per pipeline.)
+Before #718 a chain was `foldlayers(handler, router mw, route mw)`, with `handler` baking in
+`catch_errors`/`show_errors`/`serialize` for one pipeline's lifetime and the other two coming from
+one `custommiddleware` snapshot. So *(this pipeline, that snapshot, method, path)* determined the
+chain, and a cache owned by the pipeline and stamped with the snapshot was complete **by
+construction**. It still is: the recorded chain is now a function of *(that snapshot, method,
+path)* alone. (Global middleware is no longer part of a cached chain: since #291 it wraps route
+selection itself, folded once per pipeline.)
 
 The `App`-wide `middleware_cache` this replaced had to rebuild that completeness argument in its
 key, and could not: `cachetag` carried the three serializer booleans (#79), but global
@@ -1955,7 +1961,67 @@ _origin_listed(policy::WebSocketOriginPolicy, origin::AbstractString)::Bool =
     (canonical = first(_parse_origin(origin)); canonical !== nothing && canonical in policy.origins)
 
 """
-    RouteResolution(router, method, target, handler, route, params, mw_method, table, source)
+    RouterEntry(router, misses)
+
+The pipeline's innermost layer, which hands a request to the router terminal,
+`_dispatch_resolved` (src/core/pipeline.jl). A named type rather than a closure so that the
+handler a route chain continues into can be named; see [`PipelineHandler`](@ref).
+"""
+struct RouterEntry <: Function
+    router :: NitroRouter
+    misses :: MissResponses
+end
+
+"""
+    Serializer{H}(catch_errors, show_errors, enabled, handle)
+
+The layer `DefaultSerializer` builds around `handle` (src/core/framework_middleware.jl). Its
+settings are runtime `Bool`s, so its type does not depend on them (#572).
+"""
+struct Serializer{H} <: Function
+    catch_errors :: Bool
+    show_errors  :: Bool
+    enabled      :: Bool
+    handle       :: H
+end
+
+"""
+    PipelineHandler
+
+The handler `compose` wraps in every pipeline `setupmiddleware` builds: the serializer around the
+router terminal. One concrete type for every pipeline of every app, whatever its flags, which is
+what lets a route chain built at registration continue into it through [`RouteNext`](@ref) (#718).
+"""
+const PipelineHandler = Serializer{RouterEntry}
+
+"""
+    PipelineRoutes(source, next)
+
+What one pipeline's `compose` hands every request it stashes a [`RouteResolution`](@ref) for,
+built once per pipeline: `source`, the app's live `custommiddleware` table, for a rerouted leaf's
+entry (#291), and `next`, the pipeline's handler, where a route chain's [`RouteNext`](@ref)
+continues (#718). Mutable so the stash holds it by reference: carried by value, the handler was a
+48-byte box on every request, and the stash one size class larger.
+"""
+mutable struct PipelineRoutes
+    const source   :: CopyOnWriteDict{RouteMiddleware}
+    const has_next :: Bool
+    const next     :: PipelineHandler     # inline and concrete: read on every chained request
+end
+
+PipelineRoutes(source::CopyOnWriteDict{RouteMiddleware}, next::PipelineHandler) =
+    PipelineRoutes(source, true, next)
+
+# Outside a pipeline (a stash a test builds, or `compose` over a handler that is not a
+# `PipelineHandler`) there is no handler to continue into. `next` must still hold a value, so it is
+# this one, and `has_next` says not to call it.
+PipelineRoutes(source::CopyOnWriteDict{RouteMiddleware}, ::Nothing) =
+    PipelineRoutes(source, false, NO_PIPELINE_HANDLER)
+const NO_PIPELINE_HANDLER = Serializer(false, false, false,
+    RouterEntry(nitro_router(), MissResponses(HTTP.Response(404), HTTP.Response(405))))
+
+"""
+    RouteResolution(router, method, target, handler, route, params, mw_method, table, pipeline)
 
 One request's route lookup, handed from `compose` (src/routerhof.jl) to the innermost layer of
 the pipeline (`_dispatch_resolved`, src/core/pipeline.jl) so the route is resolved **once**
@@ -2020,7 +2086,8 @@ requires, or the leaf has no router or route middleware. Otherwise it refuses wi
 `genkey` string on every matched request, which #250 removed from the cache-hit path, to serve
 a case that is rare by construction.
 
-What the new leaf requires is read from a **fresh** snapshot of `source`, not from `table`. The
+What the new leaf requires is read from a **fresh** snapshot of `pipeline.source`, the live
+table, not from `table`. The
 router is live, so a route registered while this request sat in route middleware (Revise, a
 runtime `include_routes`) can be the leaf the rewrite reaches, and `table` predates its entry —
 reading "no entry" there would serve it unguarded. Across generations the check stays
@@ -2036,8 +2103,8 @@ contents. The `router` check is a true identity compare, which is what it should
 
 # Staleness within one `App`
 
-`compose` overwrites this entry on every request it matches — cache hit or miss alike, since
-the write sits above the chain-cache lookup — so a later pass that re-resolves the same
+`compose` overwrites this entry on every request it matches — cache hit or miss alike, on both
+branches of the chain-cache lookup — so a later pass that re-resolves the same
 `(router, method, target)` always installs the fresh handler. Re-registration is therefore
 handled by construction, not by invalidation, which is why a pipeline's cached chain
 ([`ChainCache`](@ref)) can stay cached while the handler it reaches changes.
@@ -2074,8 +2141,14 @@ struct RouteResolution
     params     :: Dict{String,String}
     mw_method  :: String                           # the method the running chain is keyed on
     table      :: Dict{String,RouteMiddleware}     # the snapshot that chain was built from
-    source     :: CopyOnWriteDict{RouteMiddleware} # the live table, for the rerouted leaf's entry
+    pipeline   :: PipelineRoutes                   # the live table, and where `RouteNext` goes (#718)
 end
+
+# A stash written outside a pipeline (tests drive the terminal directly) has no chain to continue.
+RouteResolution(router, method, target, handler, route, params, mw_method, table,
+                source::CopyOnWriteDict{RouteMiddleware}) =
+    RouteResolution(router, method, target, handler, route, params, mw_method, table,
+                    PipelineRoutes(source, nothing))
 
 """
     DeclaredMethodHandler(method, handler)
@@ -2118,5 +2191,7 @@ struct DeclaredMethodHandler{F<:Function} <: Function
 end
 
 (h::DeclaredMethodHandler)(req::HTTP.Request) = h.handler(req)
+
+include("routeendpoint.jl")
 
 end # module Types
