@@ -131,6 +131,27 @@ using Test
 # 1.8x: ~3x above its warm readings and ~1.33x below cold. Its whole effect is ~175 ms, so there is
 # no room for more on either side.
 #
+# ── `multipart`'s own limit, and why the probe captures through `let` (#736) ────────────────
+#
+# From #720 on, the `multipart` and `files_ext` probes read ~0.10–0.12 s instead of ~0.02 s, but
+# the multipart parse was never cold. Both probe closures referred to non-const globals, so
+# compiling the closure inferred `internalrequest` over the ABSTRACT `HTTP.Request`. The typed
+# pipeline (#572) made that inference walk every layer, 1.7 ms before and 75–140 ms after. The two
+# shapes were measuring their caller. The probe now captures through `let`, which the other
+# shapes' literals already amounted to. That caller cost is no longer measured here; it is #737.
+# `multipart` read 1.6–3.9x through all of it, under the general 8x. Julia 1.13.2, CI's flags:
+#
+#               warm (`let` capture)   abstract caller (#736)            cold (before #242)
+#   multipart   0.23–0.26x local       1.62–1.83x local, 1.88–3.86x CI   18.7x (1.12, above)
+#
+# CI has no warm `multipart` reading yet. `formdata`, the same ~0.015 s request, reads 0.24–0.52x
+# there, so 1.2 is ~2.3x above that proxy and ~1.57x below the lowest CI #736 reading (1.35x below
+# the local one). The false-pass margin is thinner than the 1.53x above because of the
+# denominator: #735 moved `dict_int` from 0.034 s to 0.065 s on a local trace, so every ratio
+# reads low until it is faster again. `files_ext` shares the path and keeps its 3.5. What 1.2
+# catches is the multipart path losing ~60 ms or more of its precompile coverage, or the probe
+# going back to an untyped capture.
+#
 # Move these with the `warmth:` lines from CI, not with a red on a loaded developer box.
 #
 # This is a `:slow` item — it spawns one Julia process per measurement. `--skip-tags slow`
@@ -149,7 +170,7 @@ const MAX_RATIO = 8.0
 const MAX_BASELINE_SECONDS = 1.0
 
 const SHAPES = ["dict_any" => MAX_RATIO, "query_ext" => MAX_RATIO, "json_ext" => MAX_RATIO,
-                "formdata" => MAX_RATIO, "multipart" => MAX_RATIO,
+                "formdata" => MAX_RATIO, "multipart" => 1.2,
                 "cookie_ext" => 3.5, "files_ext" => 3.5, "payload" => 3.5, "url" => 1.8]
 
 probe = joinpath(@__DIR__, ".helpers", "precompile_warmth_probe.jl")
