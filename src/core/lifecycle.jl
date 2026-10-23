@@ -65,13 +65,103 @@ function _warn_if_no_gc_target(env::AbstractString, gc_target::Nullable{UInt64})
     return nothing
 end
 
+# ── Writing to `stdout` under `juliac --trim` ─────────────────────────────────────────────────────
+#
+# Base declares the global `stdout::IO`, so every call on it is a dynamic dispatch, which a trimmed
+# build rejects. `_with_stdout` hands `f` the stream as one of the concrete types Base installs
+# there: `init_stdio` (a `TTY`, a `PipeEndpoint` or an `IOStream`), `redirect_stdout` (those, or
+# `devnull`), and the `IOContext` that `--color=yes|no` puts around a stream that is not a
+# terminal. Any other stream (a socket as `stdout`, say) gets the output through a dynamic call
+# under the JIT. JuliaC's own examples print to `Core.stdout`
+# instead, which has no `:color`, so the JIT keeps Base's `stdout` and the banner keeps its colours.
+#
+# A trimmed build always writes to Julia's `Core.stdout` (spelled `Base.Core`: inside this module,
+# `Core` is Nitro's own). Its `stdout` is the stream object saved when the image was built, never
+# initialized in the running executable, and a write to it throws "stream not initialized".
+# `redirect_stdout` points both fd 1 and the handle `Core.stdout` writes through at its target, so
+# the text still lands where a redirect sends it, only without colour.
+function _with_stdout(f::F) where {F}
+    Types._trimmed() && return f(Base.Core.stdout)
+    out = stdout
+    out isa Base.TTY && return f(out)
+    out isa IOStream && return f(out)
+    out isa Base.PipeEndpoint && return f(out)
+    out isa IOContext{Base.TTY} && return f(out)
+    out isa IOContext{IOStream} && return f(out)
+    out isa IOContext{Base.PipeEndpoint} && return f(out)
+    out isa Base.DevNull && return f(out)
+    return f(out)
+end
+
+# What `printstyled(io, text; color, bold, reverse)` writes, byte for byte, for a single line of
+# text. `printstyled` itself cannot be used: it hands `print` to `with_output_color` as a
+# `@nospecialize`d function, and that call is one a trimmed build cannot resolve.
+function _print_styled(io::IO, text::String, color::Bool, code::String;
+                       bold::Bool = false, reverse::Bool = false)
+    color || return print(io, text)
+    print(io, code)
+    bold && print(io, "\e[1m")
+    reverse && print(io, "\e[7m")
+    print(io, text)
+    reverse && print(io, "\e[27m")
+    bold && print(io, "\e[22m")
+    print(io, "\e[39m")
+    return nothing
+end
+
+# The stream's `:color`, as `printstyled` reads it. On a `TTY` that loads the terminal's terminfo
+# entry, through a parser a trimmed build cannot type, so a trimmed build prints without colour.
+_stdout_color(out::IO)::Bool = Types._trimmed() ? false : get(out, :color, false)::Bool
+
+const _CYAN = "\e[36m"
+const _LIGHT_BLACK = "\e[90m"
+const _YELLOW = "\e[33m"
+
+# `print(io, ::VersionNumber)` joins the prerelease and build parts over an untyped tuple; this is
+# the same text, printed part by part.
+function _print_version(io::IO, v::VersionNumber)
+    print(io, v.major, '.', v.minor, '.', v.patch)
+    _print_version_parts(io, '-', v.prerelease)
+    _print_version_parts(io, '+', v.build)
+    return nothing
+end
+
+# `@nospecialize`: the field is `Tuple{Vararg{Union{UInt64, String}}}`, which is not concrete, so
+# the call resolves only to a method compiled for that declared type.
+function _print_version_parts(io::IO, sep::Char, @nospecialize(parts::Tuple{Vararg{Union{UInt64, String}}}))
+    isempty(parts) && return nothing
+    print(io, sep)
+    leading = true
+    for part in parts
+        leading || print(io, '.')
+        print(io, part)
+        leading = false
+    end
+    return nothing
+end
+
+# Parsed once, here. A format string passed to `Dates.format` at run time was parsed on every call,
+# into a `DateFormat` whose type a trimmed build cannot know.
+const _BANNER_TIME_FORMAT = dateformat"yyyy-mm-dd HH:MM:SS"
+
 function serverwelcome(external_url::String, prefix::Nullable{String};
                        gc_target::Nullable{UInt64} = _gc_target_bytes())
+    # Built whole, then written once, in colour exactly when the stream asks for it: the bytes are
+    # the ones the `printstyled` calls on `stdout` used to write.
+    banner = _with_stdout(out -> _render_banner(external_url, prefix, gc_target,
+                                                _stdout_color(out)))
+    _with_stdout(out -> print(out, banner))
+    return nothing
+end
+
+function _render_banner(external_url::String, prefix::Nullable{String},
+                        gc_target::Nullable{UInt64}, color::Bool)::String
+    io = IOBuffer()
     server_url = Util.join_url_path(external_url, prefix)
-    curr_time = Dates.format(now(), "yyyy-mm-dd HH:MM:SS")
+    curr_time = Dates.format(now(), _BANNER_TIME_FORMAT)
     # Renamed: `current_env` is now a function in this module (#55).
     env = current_env()
-    
+
     # Read at CALL time, never folded into a `const` (#240). `const v = pkgversion(...)` is
     # evaluated in the precompile worker, and Julia does NOT treat `Project.toml`'s `version`
     # field as a staleness input for the cache -- so the const survives a release bump and the
@@ -79,36 +169,43 @@ function serverwelcome(external_url::String, prefix::Nullable{String};
     # 0.4.0 -> 0.5.0 -> 0.6.0 left the const reading 0.4.0 while a call-time read tracked, both
     # as the active project and as a dependency. That is the exact defect class of the
     # `1.10.0` literal this replaces, just with a longer fuse.
-    version = something(Base.pkgversion(@__MODULE__), "unknown")
-    printstyled(" Nitro $version ", color=:cyan, reverse=true, bold=true)
+    version = Base.pkgversion(@__MODULE__)
+    title = sprint() do s
+        print(s, " Nitro ")
+        version === nothing ? print(s, "unknown") : _print_version(s, version)
+        print(s, ' ')
+    end
+    _print_styled(io, title, color, _CYAN; reverse = true, bold = true)
     # `(8 threads + 1 interactive, GC target 2.8 GiB)`. The GC field is printed only when there
     # is something true to say: none at all when the runtime would not say (`nothing`) rather
     # than a guess.
-    printstyled(" ($(_thread_summary())", color=:light_black)
+    _print_styled(io, " ($(_thread_summary())", color, _LIGHT_BLACK)
     if gc_target !== nothing
-        printstyled(", ", color=:light_black)
+        _print_styled(io, ", ", color, _LIGHT_BLACK)
         if _has_gc_target(gc_target)
-            printstyled("GC target $(_format_gc_bytes(gc_target))", color=:light_black)
+            _print_styled(io, "GC target $(_format_gc_bytes(gc_target))", color, _LIGHT_BLACK)
         else
             # Not "2.0 PiB": that number is Julia's placeholder for "unset", and printing it would
             # read as a real, enormous limit.
-            printstyled("GC target: none", color=:yellow)
+            _print_styled(io, "GC target: none", color, _YELLOW)
         end
     end
-    printstyled(")", color=:light_black)
-    println("\n$curr_time")
+    _print_styled(io, ")", color, _LIGHT_BLACK)
+    println(io, "\n$curr_time")
     # ALWAYS printed, including the defaulted case. A prod box that forgot `NITRO_ENV` must
     # SEE that it is running as `dev` -- hiding the line when nobody set one reproduces exactly
     # the silent-wrong-environment failure this became functional to prevent (#55).
-    println("Environment: $env")
-    
+    println(io, "Environment: $env")
+
     if !isnothing(prefix)
-        println("Global prefix: $prefix")
+        println(io, "Global prefix: $prefix")
     end
-    
-    print("Starting server at ")
-    printstyled("$server_url\n", color=:cyan, bold=true)
-    println("Quit the server with CONTROL-C.")
+
+    print(io, "Starting server at ")
+    _print_styled(io, server_url, color, _CYAN; bold = true)
+    println(io)
+    println(io, "Quit the server with CONTROL-C.")
+    return String(take!(io))
 end
 
 function ReviseHandler()
@@ -726,7 +823,7 @@ function startserver(ctx::App; host, port, show_banner=false, async=false, kwarg
         catch error
             !isa(error, InterruptException) && @error "ERROR: " exception=(loggable(error), catch_backtrace())
         finally
-            println()
+            _with_stdout(out -> println(out))
             # Ctrl-C out of the blocking wait is THE documented way to stop a blocking `serve` —
             # the banner says so. Without this the listener survives the interrupt and only a
             # process restart clears it, which also made an interrupt one instant earlier (in the

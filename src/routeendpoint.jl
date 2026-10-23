@@ -43,7 +43,9 @@ end
 
 `false`, unless a `--trim` build has registered a route: then it is redefined to `true`, so
 inference folds [`RouteEndpoint`](@ref)'s branch either way and each build compiles one of its
-two calls. The JIT never sees the `ccall`; the verifier never sees the dynamic call.
+two calls. The JIT never sees the `ccall`; the verifier never sees the dynamic call. The startup
+banner reads it too (`_with_stdout`, `_stdout_color` in src/core/lifecycle.jl), for the two calls a
+trimmed build cannot make there.
 """
 _trimmed() = false
 
