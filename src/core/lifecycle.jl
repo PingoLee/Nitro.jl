@@ -766,7 +766,9 @@ end
 
 function startserver(ctx::App; host, port, show_banner=false, async=false, kwargs, start)::Union{Server, Nothing}
     show_banner && serverwelcome(ctx.service.external_url[], ctx.service.prefix[])
-    ctx.service.server[] = start(preprocesskwargs(kwargs))
+    # Concrete here, so this is where a trimmed build takes the handle's pointers (src/context.jl).
+    server = start(preprocesskwargs(kwargs))
+    ctx.service.server[] = AppContext.ServerHandle(server)
     # Before the hooks: every exit from here on goes through `terminate`, whose `close` releases
     # it. A no-op outside the Julia versions JuliaLang/julia#63882 affects (src/context.jl).
     AppContext._hold_wake_guard!(ctx.service)
@@ -819,7 +821,8 @@ function startserver(ctx::App; host, port, show_banner=false, async=false, kwarg
 
     if !async
         try
-            wait(ctx.service)
+            # This run's own server, whose type is concrete here, rather than through the handle.
+            wait(server)
         catch error
             !isa(error, InterruptException) && @error "ERROR: " exception=(loggable(error), catch_backtrace())
         finally
@@ -846,7 +849,7 @@ function startserver(ctx::App; host, port, show_banner=false, async=false, kwarg
         return nothing
     end
 
-    return ctx.service.server[]
+    return server
 end
 
 # The keywords `serve` hands `HTTP.listen!`, as a `NamedTuple`. `serve`'s `kwargs...` already have

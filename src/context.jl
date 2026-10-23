@@ -70,6 +70,86 @@ function _try_cancel(cancel::Function, task::Task)::Union{Bool,Nothing}
     end
 end
 
+# A trimmed build's server shims hand this back instead of a result when the call threw. The
+# exception never unwinds through the `@cfunction` frame: it is caught on the far side and thrown
+# again, as itself, on this one, as `EndpointFailure` does for a route (src/routeendpoint.jl).
+struct ServerCallFailure
+    err :: Any
+end
+
+"""
+    ServerHandle(server::HTTP.Server)
+
+The running server, behind one concrete type, for `Service.server` (docs/design/juliac-trim.md
+§3.3). The server's own type depends on the pipeline's, so a field holding it is abstract, and
+`juliac --trim=safe` rejects each call made through it: `isopen`, `wait` and the shutdown.
+
+**Under the JIT the handle holds only the server**, and each call is the direct call the bare
+field made before. **In a trimmed build** (`Types._trimmed()`) the constructor, which
+`startserver` calls where the server's type is concrete, also takes a static `@cfunction` pointer
+to each shim below, specialized on that type, and the calls become a `ccall`. The pointers are
+made at run time and never stored in an image. Pinned by test/juliac_internals_contract_tests.jl.
+"""
+struct ServerHandle
+    server   :: Server
+    isopen_c :: Ptr{Cvoid}    # `C_NULL` under the JIT, as are the other two
+    wait_c   :: Ptr{Cvoid}
+    close_c  :: Ptr{Cvoid}
+end
+
+# The shims a trimmed build calls. None of them throws: see `ServerCallFailure`.
+function _handing_back(f::F, server::Server)::Any where {F}
+    try
+        return f(server)
+    catch err
+        return ServerCallFailure(err)
+    end
+end
+_isopen_shim(server::S) where {S<:Server} = _handing_back(isopen, server)
+_wait_shim(server::S) where {S<:Server} = _handing_back(wait, server)
+_close_shim(server::S, timeout::Float64) where {S<:Server} =
+    _handing_back(s -> _shutdown_server(s; timeout), server)
+
+# After the shims: `@cfunction` resolves their names when this method is defined.
+function ServerHandle(server::S) where {S<:Server}
+    Types._trimmed() || return ServerHandle(server, C_NULL, C_NULL, C_NULL)
+    return ServerHandle(server,
+                        @cfunction(_isopen_shim, Any, (Ref{S},)),
+                        @cfunction(_wait_shim, Any, (Ref{S},)),
+                        @cfunction(_close_shim, Any, (Ref{S}, Float64)))
+end
+
+function _handed_back(result)
+    result isa ServerCallFailure && throw(result.err)
+    return result
+end
+
+# A handle built while `_trimmed()` was still `false` has no pointers. No build makes one today
+# (the switch flips while routes register, before `serve`), but a `ccall` through `C_NULL` would
+# crash the process, so it is refused instead, as `_endpoint_fptr!` refuses a missing thunk.
+function _server_fptr(p::Ptr{Cvoid})::Ptr{Cvoid}
+    p == C_NULL && throw(ErrorException(
+        "Nitro: this server handle was built outside a trimmed build and has no code to call"))
+    return p
+end
+
+function Base.isopen(h::ServerHandle)::Bool
+    Types._trimmed() || return isopen(h.server)
+    return _handed_back(ccall(_server_fptr(h.isopen_c), Any, (Any,), h.server))::Bool
+end
+
+function Base.wait(h::ServerHandle)::Nothing
+    Types._trimmed() || return wait(h.server)
+    return _handed_back(ccall(_server_fptr(h.wait_c), Any, (Any,), h.server))::Nothing
+end
+
+# A trimmed build passes `timeout` as a `Float64`, which a `ccall` needs.
+function _shutdown_server(h::ServerHandle; timeout::Real)::Bool
+    Types._trimmed() || return _shutdown_server(h.server; timeout)
+    return _handed_back(ccall(_server_fptr(h.close_c), Any, (Any, Float64), h.server,
+                              Float64(timeout)))::Bool
+end
+
 # Every mutable slot is a concrete `Base.RefValue{T}`, never `Ref{T}` (#571). `Ref{T}` is ABSTRACT
 # -- it has several concrete subtypes -- so `getindex` on a `Ref{T}` field cannot be resolved
 # statically and every `service.x[]` came back `Any`: a dynamic call per read, including the
@@ -77,7 +157,9 @@ end
 # `juliac --trim` build hits. `Ref{T}(x)` constructs a `RefValue{T}`, so the defaults and every
 # `x[]`/`x[] = v` call site are unchanged.
 @kwdef struct Service
-    server              :: Base.RefValue{Nullable{Server}} = Ref{Nullable{Server}}(nothing)
+    # Set by `startserver`, cleared by `close`. A `ServerHandle`, not the `HTTP.Server`, so that
+    # every call through it resolves in a trimmed build.
+    server              :: Base.RefValue{Nullable{ServerHandle}} = Ref{Nullable{ServerHandle}}(nothing)
     # Concrete, so every pipeline closure that captures it is too (#625). It is not a
     # customization point: a router of another type does not convert. The custom 404/405 live on
     # `App`; see `NitroRouter` (src/types.jl).
@@ -240,8 +322,15 @@ function Base.show(io::IO, app::App)
 end
 Base.show(io::IO, ::MIME"text/plain", app::App) = show(io, app)
 
-Base.isopen(service::Service)   = !isnothing(service.server[]) && isopen(service.server[])
-Base.wait(service::Service)     = !isnothing(service.server[]) && wait(service.server[])
+function Base.isopen(service::Service)
+    handle = service.server[]
+    return !isnothing(handle) && isopen(handle)
+end
+
+function Base.wait(service::Service)
+    handle = service.server[]
+    return !isnothing(handle) && wait(handle)
+end
 
 """
     _shutdown_server(server::Server; timeout::Real) -> Bool
@@ -345,9 +434,9 @@ Shut the service's HTTP server down within `timeout` seconds (see `_shutdown_ser
 release the handle.
 """
 function Base.close(service::Service; timeout::Real = service.shutdown_timeout[])
-    server = service.server[]
-    if !isnothing(server)
-        _shutdown_server(server; timeout)
+    handle = service.server[]
+    if !isnothing(handle)
+        _shutdown_server(handle; timeout)
         # Drop the handle — a closed `HTTP.Server` can never be restarted, so keeping it only
         # lets `serve()`'s already-serving guard mistake a corpse for a live listener.
         #
@@ -356,7 +445,7 @@ function Base.close(service::Service; timeout::Real = service.shutdown_timeout[]
         # concurrent `serve()` is admitted — legitimately, the port is free by then. Clearing
         # blindly afterwards would strand *that* server: live, listening, and unreachable from
         # `terminate()`, which is precisely the leak this whole change exists to remove.
-        service.server[] === server && (service.server[] = nothing)
+        service.server[] === handle && (service.server[] = nothing)
     end
     _release_wake_guard!(service)
     !isnothing(service.eager_revise[]) && close(service.eager_revise[])

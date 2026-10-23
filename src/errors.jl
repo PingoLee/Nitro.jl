@@ -609,6 +609,12 @@ setter, #298) and `_gc_target_bytes` in
 `src/middleware/extract_ip.jl` uses the predicate despite belonging to group 1, for consistency
 within a file this change already touched.
 
+Two catch-alls sit outside every group because they swallow nothing: `_endpoint_thunk`
+(`src/routeendpoint.jl`, #718) and `_handing_back` (`src/context.jl`), the far side of a trimmed
+build's `ccall`s, where an exception must not unwind through the foreign frame. Each returns what
+it caught as a value, and the caller's side throws it again, as itself, so an interrupt or an
+overflow reaches the catch it would have reached from a direct call.
+
 ### The executors' per-attempt catch uses the predicate and deliberately does NOT rethrow
 
 The per-attempt `catch` in both worker executors — `_execute_task_async` (`src/Workers/api.jl`)

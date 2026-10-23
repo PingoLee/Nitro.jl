@@ -139,7 +139,7 @@ end
     srv  = _serve(ctx, port)
     try
         @test_throws ArgumentError _serve(ctx, get_free_port())
-        @test ctx.service.server[] === srv        # the live handle was NOT overwritten
+        @test ctx.service.server[].server === srv        # the live handle was NOT overwritten
         @test isopen(ctx.service)
         # Proves the guard sits *before* serve()'s context mutations. This is the assertion
         # that catches a later refactor moving it below them.
@@ -180,7 +180,7 @@ end
         @test timedwait(() -> !isopen(ctx.service), 10.0; pollint = 0.05) === :ok
 
         srvB = _serve(ctx, get_free_port())
-        @test ctx.service.server[] === srvB
+        @test ctx.service.server[].server === srvB
         # Self-verifying: assert we really are inside the window. Without this, a pathological
         # runner where the drain finished first would silently degrade to green-without-testing.
         @test !istaskdone(stopping)
@@ -190,7 +190,7 @@ end
 
         # The decisive assertion: B's handle survived A's shutdown, so B is still reachable
         # from terminate() rather than being a permanently-bound orphan.
-        @test ctx.service.server[] === srvB
+        @test ctx.service.server[].server === srvB
         @test isopen(ctx.service)
     finally
         notify(release)
@@ -392,7 +392,7 @@ end
         @test ctx.service.server[] === nothing
         # The port is free again: a refused call leaves no listener behind.
         srv = _serve(ctx, port)
-        @test ctx.service.server[] === srv
+        @test ctx.service.server[].server === srv
     finally
         Nitro.Core.terminate(ctx)
     end
