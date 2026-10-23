@@ -5,7 +5,8 @@
 #   bench/juliac/smoke.sh <path-to-exe | jit> [repeats]
 #
 # Env: PORT (default 18080), THREADS (default "8,1"; exported as JULIA_NUM_THREADS for the exe,
-#      passed as --threads for the JIT run), JULIA (default "julia +1.12").
+#      passed as --threads for the JIT run), JULIA (default "julia +1.13", the Julia build.sh
+#      builds with by default; only the `jit` baseline uses it).
 # The thread count answers #570's question of whether the exe honours JULIA_NUM_THREADS: with
 # "8,1" a Julia process shows well over 9 OS threads (pool + libuv + GC); with 1 it shows a handful.
 set -uo pipefail
@@ -14,7 +15,7 @@ TARGET=${1:?usage: smoke.sh <exe|jit> [repeats]}
 REPEATS=${2:-3}
 PORT=${PORT:-18080}
 THREADS=${THREADS:-8,1}
-JULIA=${JULIA:-"julia +1.12"}
+JULIA=${JULIA:-"julia +1.13"}
 URL="http://127.0.0.1:$PORT/plaintext"
 
 for i in $(seq 1 "$REPEATS"); do
