@@ -92,9 +92,11 @@
 # `:default` clients) and empty slots at exit; under E the check_empty probes, the pop counts of
 # each cell (periodic pops on every `:default` thread, none under E-inf) and empty deques at exit.
 # With the modes here also: the handler count per `:default` tid in every mode; under sticky every
-# handler ran on its assigned tid, was still there at its end, and the per-tid counts are within
-# 10% of each other; under priority every handler started with the priority it was given; under
-# inner every child ran, non-sticky, on `:default`.
+# handler ran on its assigned tid, was still there at its end, the per-tid counts are within 10%
+# of each other, and the depth of the queue each handler joined is reported (p50/p90/p99/max, and
+# the deepest per tid: equal shares of the arrivals do not make equal queues when the threads do
+# not serve at the same rate); under priority every handler started with the priority it was
+# given; under inner every child ran, non-sticky, on `:default`.
 # Each validated cell runs under `multiq_watchdog`.
 # Use a small cell: `VALIDATE=1 D=1 CS=50 HS=0.2 VARIANT=C julia ...`.
 
@@ -126,7 +128,8 @@ mutable struct Slot
     atid::Int16      # sticky: the tid the handler was pinned to
     rtid::Int16      # the tid the handler started on
     prio::UInt16     # priority: the priority the handler was given
-    Slot() = new(Base.Event(true), 0.0, 0, 0, 0.0, 0, 0, 0, 0, 0)   # autoreset: one notify, one wake
+    depth::Int32     # sticky: handlers pinned to that tid and not yet started, at the pin
+    Slot() = new(Base.Event(true), 0.0, 0, 0, 0.0, 0, 0, 0, 0, 0, 0)   # autoreset: one notify, one wake
 end
 
 const SPAWNED = Threads.Atomic{Int}(0)
@@ -143,6 +146,8 @@ const INNER_BAD = Threads.Atomic{Int}(0)     # inner: children that ran sticky, 
 const DEFAULT_TIDS = Threads.threadpooltids(:default)
 const RR = Threads.Atomic{Int}(0)
 const SEQ = Threads.Atomic{Int}(0)
+# VALIDATE only, sticky: per tid, the handlers pinned to it and not yet started (its queue depth).
+const DEPTH = [Threads.Atomic{Int}(0) for _ in 1:Threads.maxthreadid()]
 const PRIO_MOD = Int(typemax(UInt16))   # 0..65534; typemax itself means "empty heap" to multiq_deletemin
 const PRIO_GATE = parse(Float64, get(ENV, "PRIO_GATE", "10"))
 
@@ -157,8 +162,9 @@ struct Rec
     hw::Vector{Int64}
     lag::Vector{Int64}   # VALIDATE only: start ordinal minus spawn ordinal
     tid::Vector{Int16}   # VALIDATE only: the tid the handler started on
+    depth::Vector{Int32} # VALIDATE only, sticky: the assigned tid's queue depth at the pin
     Rec() = new(sizehint!(Int64[], 4096), sizehint!(Int64[], 4096), sizehint!(Int64[], 4096),
-                sizehint!(Int64[], 4096), Int64[], Int16[])
+                sizehint!(Int64[], 4096), Int64[], Int16[], Int32[])
 end
 
 @inline function stamp_spawn!(slot::Slot)
@@ -180,6 +186,7 @@ function handle!(slot::Slot, inner::Bool)
         slot.start_ord = Threads.atomic_add!(STARTED, 1)
         slot.rtid = Threads.threadid()
         slot.atid != 0 && slot.rtid != slot.atid && Threads.atomic_add!(TID_BAD, 1)
+        slot.atid != 0 && Threads.atomic_sub!(DEPTH[slot.atid], 1)
         slot.prio != current_task().priority && Threads.atomic_add!(PRIO_BAD, 1)
     end
     slot.t_start = time_ns()
@@ -210,6 +217,7 @@ function record!(rec::Rec, slot::Slot, t0::UInt64, t1::UInt64)
     if VALIDATE
         push!(rec.lag, slot.start_ord - slot.spawn_ord)
         push!(rec.tid, slot.rtid)
+        push!(rec.depth, slot.depth)
     end
     return nothing
 end
@@ -231,7 +239,10 @@ function spawn_sticky!(slot::Slot, inner::Bool)
     t.sticky = true
     tid = DEFAULT_TIDS[mod1(Threads.atomic_add!(RR, 1) + 1, length(DEFAULT_TIDS))]
     ccall(:jl_set_task_tid, Cint, (Any, Cint), t, tid - 1) == 1 || error("could not pin the handler to tid $tid")
-    VALIDATE && (slot.atid = tid)
+    if VALIDATE
+        slot.atid = tid
+        slot.depth = Threads.atomic_add!(DEPTH[tid], 1)
+    end
     schedule(t)
     return t
 end
@@ -444,6 +455,13 @@ function validate_cell(recs::Vector{Rec}, mode::String, cl::Symbol, c::Int, h::F
         TID_MOVED[] == 0 || error("validate: sticky: $(TID_MOVED[]) handlers ended on a tid other than the one they started on")
         lo, hi = extrema(per_tid)
         hi <= 1.1 * lo || error("validate: sticky: handlers per tid $per_tid are not within 10% of each other")
+        # The queue each handler joined: how deep, overall and at its deepest per tid. Equal shares of
+        # the arrivals do not make equal queues when the threads do not serve at the same rate.
+        depth = reduce(vcat, (r.depth for r in recs))
+        deepest = [maximum(depth[tids .== t]; init = 0) for t in DEFAULT_TIDS]
+        sd = sort(depth)
+        println(stderr, "validate: ", label, ": sticky queue depth at the pin: p50 ", q(sd, 0.5), ", p90 ",
+                q(sd, 0.9), ", p99 ", q(sd, 0.99), ", max ", sd[end], "; deepest per :default tid ", deepest)
     end
     if mode == "priority"
         PRIO_BAD[] == 0 || error("validate: priority: $(PRIO_BAD[]) handlers started with a priority other than the one set")
