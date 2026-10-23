@@ -1317,15 +1317,61 @@ function _interleaved(n::Int)
     return popped
 end
 
-# Fill N, then time the drain: ns per pop, on one heap with no scheduler and no contention.
-function _drain_ns(n::Int)
+# Fill N, then time the drain: ns per pop, on one heap with no scheduler and no contention. The
+# tasks' priorities are all 0 (`:equal`, the only case Base produces), or distinct: `:increasing`
+# gives task i the priority i - 1, an arrival sequence; `:random` a distinct random permutation of
+# the same values (a fixed LCG, so every run drains the same heap). N must stay below
+# typemax(UInt16) for the distinct cases.
+function _drain_ns(n::Int, prio::Symbol = :equal)
+    n < typemax(UInt16) || error("_drain_ns: n = $n does not fit a UInt16 priority")
     h, ids = _newheap(), IdDict{Task,Int}()
-    foreach(i -> _push!(h, _dummy(ids, i)), 1:n)
+    prios = prio === :equal ? zeros(UInt16, n) : UInt16.(0:n - 1)
+    if prio === :random
+        state = UInt64(0x9e3779b97f4a7c15)
+        for i in n:-1:2   # Fisher–Yates
+            state = state * 0x5851f42d4c957f2d + 1
+            j = Int((state >> 33) % i) + 1
+            prios[i], prios[j] = prios[j], prios[i]
+        end
+    end
+    for i in 1:n
+        t = _dummy(ids, i)
+        t.priority = prios[i]
+        _push!(h, t)
+    end
     t0 = time_ns()
     for _ in 1:n
         _pop!(h)
     end
     return (time_ns() - t0) / n
+end
+
+# The P microbench (#618, variant P: `Task.priority` as an arrival sequence): the single-heap drain
+# on the build's own `taskheap`, driven by its own `multiq_sift_up`/`multiq_sift_down`, 1,000 and
+# 10,000 tasks, with equal priorities, with distinct increasing ones and with distinct random ones;
+# ns per pop, best of 3 after one warm-up. Prints the six numbers and returns them as a named tuple
+# of (n = 1000, n = 10,000) pairs, or `nothing` when the build's heap is not what is running
+# (another variant's heaps, or the work-stealing backend). The pop order is also checked: with
+# distinct increasing priorities a drain of 20 must come out as 1:20 (a min-heap on priority).
+function priority_drain_bench()
+    MULTIQ_VARIANT in ("A", "A0") && MULTIQ_BACKEND === :partr || return nothing
+    h, ids = _newheap(), IdDict{Task,Int}()
+    for i in 1:20
+        t = _dummy(ids, i)
+        t.priority = UInt16(i - 1)
+        _push!(h, t)
+    end
+    order = [ids[_pop!(h)] for _ in 1:20]
+    order == collect(1:20) || error("priority_drain_bench: distinct increasing priorities drained as $order")
+    foreach(p -> _drain_ns(1000, p), (:equal, :increasing, :random))
+    best(n, p) = round(minimum(_drain_ns(n, p) for _ in 1:3); digits = 1)
+    r = (equal = (best(1000, :equal), best(10_000, :equal)),
+         increasing = (best(1000, :increasing), best(10_000, :increasing)),
+         random = (best(1000, :random), best(10_000, :random)))
+    println(stderr, "prio bench: stock taskheap drain, ns per pop (best of 3), n = 1,000 / 10,000: equal ",
+            r.equal[1], " / ", r.equal[2], "; distinct increasing ", r.increasing[1], " / ", r.increasing[2],
+            "; distinct random ", r.random[1], " / ", r.random[2])
+    return r
 end
 
 # ── E's single-heap asserts: one `eheap` driven by E's own bucket operations ─────────────────
