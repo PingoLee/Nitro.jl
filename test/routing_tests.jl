@@ -1481,3 +1481,32 @@ exact.context[:params] = Nitro.Core.RouterHOF.EMPTY_PARAMS
 @test isempty(getparams(exact))
 @test getparams(exact) !== Nitro.Core.RouterHOF.EMPTY_PARAMS
 end
+
+@testitem "The path-parameter decode makes no dynamic call" tags=[:core] setup=[NitroCommon] begin
+using Test
+using HTTP
+using Nitro
+
+# `HTTP.getparams` reads a `Dict{Symbol,Any}`, so before its result was narrowed to the router's
+# `Params`, every use of the map in `_pathparams_uncached` was a dynamic call: the
+# loop, the decode, the UTF-8 check, the store (docs/design/juliac-trim.md §3.5). The return
+# type was already concrete then (the accessor annotates it), so the pin is on the calls: in the
+# optimized code no `:call` is left whose callee is not a builtin. A resolved call is an `:invoke`
+# or inlined (`dynamic_calls`, test/setup_tests.jl).
+T = Nitro.Types
+for R in (HTTP.Request{HTTP.EmptyBody}, HTTP.Request{HTTP.BytesBody{Vector{UInt8}}})
+    @test isempty(dynamic_calls(T._pathparams_uncached, (R,)))
+    @test isempty(dynamic_calls(T.pathparams, (R,)))
+    @test only(Base.return_types(T._pathparams_uncached, (R,))) == Union{Nothing, Dict{String,String}}
+end
+@test only(Base.return_types(T.pathparams, (T.LazyRequest,))) == Union{Nothing, Dict{String,String}}
+
+# A map an application put at `:params` itself, of another type, is still decoded as before, through
+# the out-of-line fallback, with the same refusals.
+foreign = HTTP.Request("GET", "/x")
+foreign.context[:params] = Dict{String,Any}("v" => "a%20b")
+@test getparams(foreign) == Dict("v" => "a b")
+bad = HTTP.Request("GET", "/x")
+bad.context[:params] = Dict{String,Any}("v" => "%ZZ")
+@test_throws "Malformed percent-encoding in path parameter 'v'" getparams(bad)
+end

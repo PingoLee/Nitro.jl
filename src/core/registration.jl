@@ -300,7 +300,8 @@ function registerhandler(ctx::App, router::Types.NitroRouter, httpmethod::String
 
     # The route's one erasure point for its handler (#718), wrapped once here so every shape below
     # -- the plain leaf, a `DeclaredMethodHandler`, the auto-`HEAD` -- carries the same endpoint.
-    handle = Types.RouteEndpoint(handle)
+    # It carries the handler with `format_response` folded in as well, which the serializer calls.
+    handle = Types.leaf_endpoint(handle)
 
     resolved_methods = if httpmethod == STREAM
         [GET, POST]

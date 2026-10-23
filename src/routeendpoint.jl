@@ -31,6 +31,9 @@ there, never a silent dynamic call.
 mutable struct RouteEndpoint <: Function
     const obj :: Any
     const sym :: String                 # "" under the JIT: nothing was exported
+    # A handler's endpoint with `format_response` folded in (`leaf_endpoint`); `nothing` for a
+    # chain, which is never formatted.
+    const formatted :: Union{Nothing, RouteEndpoint}
     @atomic empty_fptr :: Ptr{Cvoid}    # looked up on first use, in a trimmed image only
     @atomic bytes_fptr :: Ptr{Cvoid}
 end
@@ -106,12 +109,59 @@ end
 
 function RouteEndpoint(obj::C) where {C}
     obj isa RouteEndpoint && return obj
-    return RouteEndpoint(obj, _endpoint_symbol(C), C_NULL, C_NULL)
+    return RouteEndpoint(obj, _endpoint_symbol(C), nothing, C_NULL, C_NULL)
+end
+
+"""
+    FormattedLeaf(handler)
+
+A route handler with the serializer's `format_response` applied to what it returns. Behind its own
+[`RouteEndpoint`](@ref), the handler's return type is concrete where `format_response` is called,
+so the call resolves per route instead of on an `Any` in the serializer.
+"""
+struct FormattedLeaf{C} <: Function
+    handler :: C
+end
+
+(f::FormattedLeaf)(req::HTTP.Request) = format_response(f.handler(req))
+
+"""
+    leaf_endpoint(handler) -> RouteEndpoint
+
+The endpoint `registerhandler` puts on the router for `handler`: the handler itself, called as is
+for `serialize = false`, and in `formatted` the same handler through [`FormattedLeaf`](@ref), which
+the serializer calls instead ([`call_formatted`](@ref)). A trimmed image exports a thunk for each.
+"""
+function leaf_endpoint(obj::C) where {C}
+    obj isa RouteEndpoint && return obj
+    return RouteEndpoint(obj, _endpoint_symbol(C), RouteEndpoint(FormattedLeaf(obj)), C_NULL, C_NULL)
 end
 
 function (e::RouteEndpoint)(req::HTTP.Request)
     _trimmed() || return e.obj(req)
     return _call_exported(e, req)
+end
+
+"""
+    call_formatted(e, req) -> HTTP.Response
+
+The leaf call when the pipeline serializes: the handler and `format_response` in one call, through
+`e.formatted`. Under the JIT that is one dynamic call per request where the serializer made two
+(the handler, then `format_response` on its `Any` result); in a trimmed image it is a `ccall`.
+"""
+function call_formatted(e::RouteEndpoint, req::HTTP.Request)
+    f = e.formatted
+    f === nothing || return f(req)::HTTP.Response
+    return _format_unregistered(e, req)
+end
+
+# A leaf endpoint built without its formatted half: `RouteEndpoint(f)` rather than
+# `leaf_endpoint(f)`, as a test driving the terminal builds one. The JIT formats its result here,
+# as the serializer did. A trimmed image refuses it: that call is the dynamic one
+# `FormattedLeaf` exists to remove, and `_trimmed()` folds this branch away there.
+@noinline function _format_unregistered(e::RouteEndpoint, req::HTTP.Request)
+    _trimmed() && throw(ArgumentError("Nitro: a route handler endpoint has no formatted call; register routes with path()"))
+    return format_response(e(req))::HTTP.Response
 end
 
 # The same call, for `compose`'s chain. A second method rather than the call above so the JIT's

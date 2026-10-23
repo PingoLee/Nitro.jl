@@ -26,16 +26,27 @@
 # field cap (#327). The `RequestScope` is built ONCE, here, outside the per-request closure: every
 # request binds the same heap object, which is one scope insert and no box (#444). See
 # `RequestScope` (src/constants.jl) for why its shape is what costs.
+#
+# The `@with` itself is still dynamic under `juliac --trim`, inside Base: the `ScopedValue` HAMT
+# insert hashes a key of the abstract type `AbstractScopedValue`. That is upstream's, and nothing
+# here works around it (docs/design/juliac-trim.md §3.5).
 function _app_context_seed(ctx::App)
     scope = Constants.RequestScope(ctx, ctx.service.max_fields, ctx.service.shutting_down[])
     return function(handler::Function)
         return function(req::HTTP.Request)
             haskey(req.context, REQUEST_CONTEXT_KEY) ||
-                (req.context[REQUEST_CONTEXT_KEY] = ctx.app_context[])
+                (req.context[REQUEST_CONTEXT_KEY] = _app_context_value(ctx))
             return @with Constants.REQUEST_SCOPE => scope handler(req)
         end
     end
 end
+
+# `App.app_context` is declared `Ref{Any}`, which is abstract, so a bare `ctx.app_context[]` is a
+# dynamic `getindex` on every request (2 `juliac --trim` errors at each read). What it holds is a
+# `Base.RefValue{Any}`: that is what the field's default, `Ref{Any}(missing)`, constructs, and
+# nothing passes another. This assertion is redundant once the field itself is declared
+# `Base.RefValue{Any}`, as the `Service` slots were in #571.
+@inline _app_context_value(ctx::App) = (ctx.app_context::Base.RefValue{Any})[]
 
 """
     serving_app() -> Union{App, Nothing}
@@ -85,7 +96,8 @@ The guard is `(router, method, target)` — every input `gethandler` reads — a
 to know which application it belongs to. `misses` is that application's `not_found` and
 `method_not_allowed` (#625), which a miss on either path below answers with.
 """
-function _dispatch_resolved(r::HTTP.Router, misses::Types.MissResponses, req::HTTP.Request)
+function _dispatch_resolved(r::HTTP.Router, misses::Types.MissResponses, req::HTTP.Request,
+                            fmt::Val = Val(false))
     res = get(req.context, Types.ROUTE_RESOLUTION_KEY, nothing)
     if res isa Types.RouteResolution && res.router === r
         if res.method === req.method && res.target === req.target
@@ -94,12 +106,12 @@ function _dispatch_resolved(r::HTTP.Router, misses::Types.MissResponses, req::HT
             handler = res.handler
             # The common leaf first, in line: crossing `_call_leaf`'s `@nospecialize` frame costs
             # more than the call it guards.
-            handler isa Types.RouteEndpoint && return handler(req)
-            return _call_leaf(handler, req, res.route)
+            handler isa Types.RouteEndpoint && return _leaf(handler, req, fmt)
+            return _call_leaf(handler, req, res.route, fmt)
         end
-        return _route_rerouted(r, misses, req, res)
+        return _route_rerouted(r, misses, req, res, fmt)
     end
-    return _route_unresolved(r, misses, req)
+    return _route_unresolved(r, misses, req, fmt)
 end
 
 """
@@ -135,14 +147,14 @@ why. The log names both routes by their **patterns** and their **declared** meth
 a client-chosen method token, which a `"*"` leaf accepts verbatim.
 """
 function _route_rerouted(r::HTTP.Router, misses::Types.MissResponses, req::HTTP.Request,
-                         res::Types.RouteResolution)
+                         res::Types.RouteResolution, fmt::Val = Val(false))
     handler, route, params = RouterHOF._gethandler(r, req)
     (handler === nothing || handler === missing) && return _route_miss(r, misses, req, handler)
 
     ran = get(res.table, RouterHOF.genkey(res.mw_method, res.route), Types.NO_ROUTE_MIDDLEWARE)
     mw_method = handler isa Types.DeclaredMethodHandler ? handler.method : req.method
     needs = get(Types.snapshot(res.pipeline.source), RouterHOF.genkey(mw_method, route), nothing)
-    (needs === nothing || needs === ran) && return _route_call(req, handler, route, params)
+    (needs === nothing || needs === ran) && return _route_call(req, handler, route, params, fmt)
 
     @error "A router- or route-level middleware rerouted the request to a route with different middleware; refusing it. Rewrite req.method/req.target in global middleware (serve(middleware = [...])) instead, so the route is chosen after the rewrite." from = "$(res.mw_method) $(res.route)" to = "$(mw_method) $(route)"
     return Res.json(("message" => "500: Internal Server Error"), status = 500)
@@ -169,10 +181,11 @@ for how it answers a method mismatch (#281):
 The matched branch keeps upstream's order (`:route`, `:params` only when non-empty, then the
 handler) for the reason `_dispatch_resolved`'s fast branch gives.
 """
-function _route_unresolved(r::HTTP.Router, misses::Types.MissResponses, req::HTTP.Request)
+function _route_unresolved(r::HTTP.Router, misses::Types.MissResponses, req::HTTP.Request,
+                           fmt::Val = Val(false))
     handler, route, params = RouterHOF._gethandler(r, req)
     (handler === nothing || handler === missing) && return _route_miss(r, misses, req, handler)
-    return _route_call(req, handler, route, params)
+    return _route_call(req, handler, route, params, fmt)
 end
 
 # A miss is answered with the app's value itself, shared by every request it answers: the transport
@@ -195,14 +208,22 @@ end
 
 (e::Types.RouterEntry)(req::HTTP.Request) = _dispatch_resolved(e.router, e.misses, req)
 
+# `fmt` says whether the pipeline serializes. `Val(true)` comes only from the serializer
+# (`_formatted_response`): the leaf is then called through its formatted half, so every value
+# the terminal returns is an `HTTP.Response`. `Val(false)` calls the handler as is, for
+# `serialize = false`. A type parameter, so each pipeline compiles one branch.
+_leaf(e::Types.RouteEndpoint, req::HTTP.Request, ::Val{true}) = Types.call_formatted(e, req)
+_leaf(e::Types.RouteEndpoint, req::HTTP.Request, ::Val{false}) = e(req)
+
 # `(r::Router)(req)`'s matched branch: `:route`, `:params` only when non-empty, then the handler.
 # `@nospecialize`: the router hands the leaf back as `Any`, and a call that specializes on an `Any`
 # argument is a dynamic call (#718).
-function _route_call(req::HTTP.Request, @nospecialize(handler), route::String, params)
+function _route_call(req::HTTP.Request, @nospecialize(handler), route::String, params,
+                     fmt::Val = Val(false))
     req.context[:route] = route
     isempty(params) || (req.context[:params] = params)
-    handler isa Types.RouteEndpoint && return handler(req)
-    return _call_leaf(handler, req, route)
+    handler isa Types.RouteEndpoint && return _leaf(handler, req, fmt)
+    return _call_leaf(handler, req, route, fmt)
 end
 
 """
@@ -216,10 +237,10 @@ called: routes are declared with `path()` (nitro-core §3), and a call to an arb
 dynamic call `juliac --trim=safe` rejects. `serve` refuses to start with one on the router; this
 covers `internalrequest` and a leaf added after `serve`.
 """
-function _call_leaf(@nospecialize(handler), req::HTTP.Request, route::String)
+function _call_leaf(@nospecialize(handler), req::HTTP.Request, route::String, fmt::Val = Val(false))
     # The branches `_nitro_leaf` (src/core/registration.jl) accepts, each with its static call.
-    handler isa Types.RouteEndpoint && return handler(req)
-    handler isa Types.DeclaredMethodHandler{Types.RouteEndpoint} && return handler.handler(req)
+    handler isa Types.RouteEndpoint && return _leaf(handler, req, fmt)
+    handler isa Types.DeclaredMethodHandler{Types.RouteEndpoint} && return _leaf(handler.handler, req, fmt)
     handler isa RetiredHeadHandler && return handler(req)
     return _refuse_foreign_leaf(req, route)
 end
@@ -475,7 +496,7 @@ function internalrequest(ctx::App, req::HTTP.Request; middleware::Union{Tuple,Ve
     # defect this commit exists to remove — a request observing a context that is not its own —
     # just reached by reuse rather than by a data race. Covered by the "a reused request object
     # does not inherit a previous call's context" item in test/appcontext_race_tests.jl.
-    req.context[REQUEST_CONTEXT_KEY] = ismissing(context) ? ctx.app_context[] : Context(context)
+    req.context[REQUEST_CONTEXT_KEY] = ismissing(context) ? _app_context_value(ctx) : Context(context)
 
     # A request a route chain is still running on (a middleware that calls `internalrequest` with
     # its own `req`) carries that chain's stash, and the call below writes its own over it. Put the

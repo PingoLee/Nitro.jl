@@ -215,6 +215,27 @@ end
     @test Nitro.getparams(HTTP.Request("GET", "/x")) === nothing
 end
 
+@testset "`getparams` hands back the router's `Params`" begin
+    # `Types._pathparams_uncached` takes its typed path when `HTTP.getparams(req) isa Params`:
+    # upstream reads it from the `Dict{Symbol,Any}` metadata table, so that test is what makes every
+    # later use of the map static (docs/design/juliac-trim.md §3.5). Every routed request takes it
+    # only while upstream reads `:params` and every router path stores a `Params` there.
+    H = HTTP.Handlers
+    @test H.Params === Dict{String, String}
+    req = HTTP.Request("GET", "/x")
+    req.context[:params] = H.Params("k" => "v")
+    @test HTTP.getparams(req) === req.context[:params]
+    # Upstream's router, which stores `:params` itself.
+    r = HTTP.Router()
+    seen = Ref{Any}(nothing)
+    HTTP.register!(r, "GET", "/f/{name}", req -> (seen[] = HTTP.getparams(req); HTTP.Response(200)))
+    r(HTTP.Request("GET", "/f/a"))
+    @test seen[] isa H.Params
+    # `gethandler`, which Nitro's terminal stores from (`_route_call`, `_dispatch_resolved`).
+    _, _, params = H.gethandler(r, HTTP.Request("GET", "/f/b"))
+    @test params isa H.Params && params["name"] == "b"
+end
+
 @testset "body type hierarchy still present" begin
     @test isdefined(HTTP, :EmptyBody)
     @test isdefined(HTTP, :BytesBody)

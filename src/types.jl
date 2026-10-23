@@ -1361,12 +1361,33 @@ end
 # object; the read-only rule above covers both. Never an empty one: an exact route's params are the
 # shared `RouterHOF.EMPTY_PARAMS`, which the router does not store but which must not reach an app
 # as a mutable handle if it ever were.
+#
+# The `isa HTTP.Handlers.Params` test is the boundary where the router's map becomes typed.
+# Upstream reads it out of the `Dict{Symbol,Any}` metadata table, so before it every use of the map
+# below was a dynamic call: iterating it, the decode, the UTF-8 check, the store and both error
+# messages, 36 `juliac --trim` errors on every route with a path parameter
+# (docs/design/juliac-trim.md §3.5). Every writer of `:params` Nitro knows stores a `Params`:
+# upstream's router, and Nitro's terminal (`_dispatch_resolved`, `_route_call`), from `gethandler`.
+# `test/http_internals_contract_tests.jl` pins that type. Anything else was put there by
+# application code, and `_pathparams_foreign` decodes it as before.
 function _pathparams_uncached(req::HTTP.Request)
     raw = HTTP.getparams(req)
     raw === nothing && return nothing
-    if raw isa Dict{String,String} && !isempty(raw) && _pathparams_verbatim(raw)
-        return raw
-    end
+    raw isa HTTP.Handlers.Params || return _pathparams_foreign(raw)
+    !isempty(raw) && _pathparams_verbatim(raw) && return raw
+    return _decode_pathparams(raw)
+end
+
+# A `:params` that is not the router's `Params`: a middleware that wrote its own map. It is decoded
+# the way it always was, through the same loop, but with a dynamic call that only this request
+# pays. A trimmed image refuses it instead (`_trimmed()` folds this branch away there): that call
+# is the one the boundary above exists to remove.
+@noinline function _pathparams_foreign(@nospecialize(raw))
+    _trimmed() && throw(ArgumentError("Nitro: req.context[:params] holds a value that is not HTTP.Handlers.Params"))
+    return _decode_pathparams(raw)
+end
+
+function _decode_pathparams(raw)
     decoded = Dict{String,String}()
     for (k, v) in raw
         value = try
