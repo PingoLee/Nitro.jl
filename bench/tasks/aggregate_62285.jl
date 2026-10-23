@@ -44,7 +44,7 @@ function readtsv(paths, cols)
         isempty(l) && continue
         f = split(l, '\t')
         f[1] == cols[1] && continue
-        length(f) == length(cols) || error("$p: $(length(f)) fields, $(length(cols)) expected: $l")
+        length(f) >= length(cols) || error("$p: $(length(f)) fields, at least $(length(cols)) expected: $l")
         push!(rows, Dict(zip(cols, f)))
     end
     return rows
