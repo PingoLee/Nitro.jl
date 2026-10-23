@@ -334,9 +334,18 @@ end
 function (s::Types.Serializer)(req::HTTP.Request)
     s.enabled || return s.handle(req)
     return handlerequest(s.catch_errors; show_errors = s.show_errors) do
-        format_response(s.handle(req))
+        _formatted_response(s.handle, req)
     end
 end
+
+# Over the router terminal, the leaf formats its own result (`Types.FormattedLeaf`), where the
+# handler's return type is known; `format_response` on the `Any` the terminal hands back was a
+# runtime dispatch per request, and a call `juliac --trim` rejects (docs/design/juliac-trim.md
+# §3.2). What the terminal returns is then a response whatever the route. A serializer over any
+# other handler formats here, as before.
+_formatted_response(e::Types.RouterEntry, req::HTTP.Request)::HTTP.Response =
+    _dispatch_resolved(e.router, e.misses, req, Val(true))
+_formatted_response(handle, req::HTTP.Request) = format_response(handle(req))
 
 # The pipeline's error boundary (#256): `handlerequest` around the WHOLE middleware chain, so an
 # exception escaping middleware gets the same treatment one escaping a handler does -- an `@error`

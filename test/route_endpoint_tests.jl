@@ -68,7 +68,7 @@ end
 end
 
 @testset "the trimmed path fails loudly where it cannot work" begin
-    e = RouteEndpoint((req::HTTP.Request) -> "x", "nitro_route_endpoint_missing", C_NULL, C_NULL)
+    e = RouteEndpoint((req::HTTP.Request) -> "x", "nitro_route_endpoint_missing", nothing, C_NULL, C_NULL)
     # No exported code for it in this process: an error naming the fix, never a call through NULL.
     @test_throws ErrorException T._call_exported(e, HTTP.Request("GET", "/"))
     # A request body the transport never builds: refused, never a dynamic call.
@@ -180,5 +180,92 @@ end
               logger.logs)
     # The app's own routes are unaffected.
     @test text(Nitro.Core.internalrequest(app, HTTP.Request("GET", "/ok"))) == "ok"
+end
+end
+
+@testitem "The serializer formats at the leaf, and its result is a response" tags=[:core, :middleware] setup=[NitroCommon] begin
+using Test
+using HTTP
+using Nitro
+using Nitro.Core.Types: RouteEndpoint, FormattedLeaf, RouterEntry, snapshot
+import Nitro: App, path, urlpatterns
+
+# A handler's endpoint carries the handler with `format_response` folded in (`FormattedLeaf`), and
+# the serializer calls that one. `format_response` on the terminal's `Any` result was a runtime
+# dispatch per request and a call `juliac --trim` rejects (docs/design/juliac-trim.md §3.2).
+const T = Nitro.Core.Types
+const Bytes = HTTP.Request{HTTP.BytesBody{Vector{UInt8}}}
+function leaf(app::App, method::String, route::String)
+    handler, _, _ = Nitro.Core.RouterHOF._gethandler(app.service.router, HTTP.Request(method, route))
+    return handler
+end
+
+@testset "a handler's endpoint has a formatted half; a chain's has none" begin
+    app = App()
+    mw = handler -> (req -> handler(req))
+    urlpatterns(app, "",
+        path("/s", req -> "text"; method = "GET"),
+        path("/mw", req -> Dict("a" => 1); method = "GET", middleware = [mw]))
+    e = leaf(app, "GET", "/s")
+    @test e isa RouteEndpoint && e.formatted isa RouteEndpoint
+    @test e.formatted.obj isa FormattedLeaf
+    @test e(HTTP.Request("GET", "/s")) == "text"                      # the raw call
+    res = T.call_formatted(e, HTTP.Request("GET", "/s"))              # the formatted one
+    @test res isa HTTP.Response && res.status == 200 && String(res.body) == "text"
+    chain = snapshot(app.service.route_chains)["GET|/mw"].endpoint
+    @test chain.formatted === nothing
+end
+
+@testset "inside the formatted half, `format_response` resolves" begin
+    # A handler returning a `String` has a concrete return type, so the formatting is static there.
+    h = (req::HTTP.Request) -> "x"
+    @test isempty(dynamic_calls(FormattedLeaf(h), (Bytes,)))
+    # The serializer's call into the terminal returns a response, whatever the route.
+    rt = only(Base.return_types(Nitro.Core._formatted_response, (RouterEntry, Bytes)))
+    @test rt <: HTTP.Response
+end
+
+@testset "what reaches middleware and the client is unchanged" begin
+    app = App()
+    seen = Ref{Any}(nothing)
+    spy = handler -> (req -> (r = handler(req); seen[] = r; r))
+    urlpatterns(app, "",
+        path("/s", req -> "text"; method = "GET", middleware = [spy]),
+        path("/d", req -> Dict("a" => 1); method = "GET"),
+        path("/n", req -> 7; method = "GET"),
+        path("/p/<int:id>", (req, id::Int) -> id + 1; method = "GET"))
+    res = Nitro.internalrequest(app, HTTP.Request("GET", "/s"))
+    @test seen[] isa HTTP.Response && String(seen[].body) == "text"   # route middleware: formatted, as before
+    @test HTTP.header(res, "Content-Type") == "text/plain; charset=utf-8"
+    res = Nitro.internalrequest(app, HTTP.Request("GET", "/d"))
+    @test HTTP.header(res, "Content-Type") == "application/json; charset=utf-8" && String(res.body) == "{\"a\":1}"
+    @test String(Nitro.internalrequest(app, HTTP.Request("GET", "/n")).body) == "7"
+    @test String(Nitro.internalrequest(app, HTTP.Request("GET", "/p/4")).body) == "5"
+    # `serialize = false`: the handler's own value, through the raw call.
+    @test Nitro.Core.setupmiddleware(app; serialize = false)(HTTP.Request("GET", "/d")) == Dict("a" => 1)
+    @test Nitro.internalrequest(app, HTTP.Request("GET", "/missing")).status == 404
+end
+
+@testset "a leaf built without the formatted half still formats under the JIT" begin
+    e = RouteEndpoint((req::HTTP.Request) -> "bare")
+    @test e.formatted === nothing
+    @test String(T.call_formatted(e, HTTP.Request("GET", "/")).body) == "bare"
+end
+
+@testset "the caught exception's response is chosen by a closed set of types" begin
+    U = Nitro.Core.Util
+    E = Nitro.Core.Errors
+    cases = (E.ValidationError("x") => 400, E.UnsupportedMediaTypeError("x") => 415,
+             E.AuthorizationError("x") => 403, E.WorkerUnavailableError("x") => 503,
+             E.WorkerCapacityError(:owner, "x") => 429, E.WorkerCapacityError(:queue, "x") => 503,
+             ErrorException("x") => 500)
+    for (e, status) in cases
+        @test U._error_response(e).status == status
+        @test String(U._error_response(e).body) == String(U.handle_error(e).body)
+    end
+    @test isempty(dynamic_calls(U._error_response, (Any,)))
+    # One branch per `handle_error` method: a new method without a branch in `_error_response`
+    # would answer 500 for its type. Count them so adding one fails here first.
+    @test length(methods(U.handle_error)) == 6
 end
 end

@@ -49,6 +49,20 @@ function handle_error(::Any)
     return Res.json(("message" => "500: Internal Server Error"), status = 500)    
 end
 
+# The response for what `handlerequest` caught, by a closed set of `isa` tests over the types
+# that have a `handle_error` of their own. The caught value is `Any`, so `handle_error(error)`
+# was a runtime dispatch on every caught exception, and a call `juliac --trim` cannot resolve
+# (docs/design/juliac-trim.md §3.2). In each branch the value has the branch's type, so the call
+# is static; everything else is the generic 500. Add a branch here with any new method above.
+function _error_response(@nospecialize(error))
+    error isa ValidationError && return handle_error(error)
+    error isa UnsupportedMediaTypeError && return handle_error(error)
+    error isa AuthorizationError && return handle_error(error)
+    error isa WorkerUnavailableError && return handle_error(error)
+    error isa WorkerCapacityError && return handle_error(error)
+    return handle_error(nothing)
+end
+
 function handlerequest(getresponse::Function, catch_errors::Bool; show_errors::Bool = true)
     if !catch_errors
         return getresponse()
@@ -125,7 +139,7 @@ function handlerequest(getresponse::Function, catch_errors::Bool; show_errors::B
                 # `current_exceptions()`, a cause chain, or the original exception.
                 @error "ERROR: " exception=(loggable(error), catch_backtrace())
             end
-            return handle_error(error)
+            return _error_response(error)
         end
     end
 end

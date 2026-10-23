@@ -81,7 +81,7 @@ end
     @test unsafe_load(cglobal(:jl_exe_handle, Ptr{Cvoid})) != C_NULL
     @test T._image_symbol("nitro_contract_concrete") == C_NULL
     # ...so a trimmed-image call that finds no code says so, rather than calling NULL.
-    ep = T.RouteEndpoint((req) -> "never", "nitro_contract_missing", C_NULL, C_NULL)
+    ep = T.RouteEndpoint((req) -> "never", "nitro_contract_missing", nothing, C_NULL, C_NULL)
     err = try
         T._endpoint_fptr!(ep, true); nothing
     catch e
