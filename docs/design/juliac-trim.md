@@ -1,6 +1,8 @@
 # juliac `--trim`: the walls, and the order to clear them in
 
-Design record for compiling a Nitro app with Julia 1.12's `juliac --trim`. It covers what the
+Design record for compiling a Nitro app with `juliac --trim`: on Julia 1.13 through the
+[JuliaC.jl](https://github.com/JuliaLang/JuliaC.jl) app, and up to #718 on Julia 1.12.7's bundled
+driver (§1 says which count comes from which). It covers what the
 verifier reports, which walls are cleared, which remain, why each remaining one is a design
 question rather than a patch, and the decision (§4) that makes clearing them the goal. The measuring
 harness is `bench/juliac/` ([#570](https://github.com/PingoLee/Nitro.jl/issues/570)). The first
@@ -23,11 +25,19 @@ wall was cleared in [#571](https://github.com/PingoLee/Nitro.jl/issues/571), and
 > Measured on the request-path probe (§1), it clears every error on the route path, 22 of them. The
 > next walls are `HTTP.listen!`'s keyword call in front of the request path, and, on it, what
 > follows a handler's `Any` result (`format_response`, the security-header layer).
+>
+> **Recounted on Julia 1.13 (§3.5)**, from the same commit as a 1.12.7 control: the minimal app
+> goes from 40 errors to 96 and the probe from 36 to 70. No Nitro code changed between the two.
+> 1.13's trim compiler also verifies every closure that verified code builds, as a root of its own.
+> That reaches the per-request task behind `HTTP.listen!`, so `app.jl` now shows the request
+> path while the listener's wall still stands. And the probe's path-parameter read gets through
+> to `_pathparams_uncached`, where `HTTP.getparams` is `Any`.
 
 ## 1. How to measure
 
 ```bash
-bench/juliac/build.sh unsafe-warn        # julia +1.12; log under bench/results/ (gitignored)
+julia +1.13 -e 'using Pkg; Pkg.Apps.add("JuliaC")'   # once: the `juliac` app, in ~/.julia/bin
+bench/juliac/build.sh unsafe-warn        # julia +1.13 with JuliaC; log under bench/results/ (gitignored)
 ```
 
 ```bash
@@ -35,15 +45,39 @@ ENTRY=probe bench/juliac/build.sh unsafe-warn   # the request path, without the 
 julia bench/juliac/frames.jl bench/results/juliac-<stamp>-<entry>-<mode>.log
 ```
 
+**The frontend.** Julia 1.12 ships a `juliac.jl` driver under `share/julia/juliac/`; Julia 1.13
+ships none, and its frontend is the JuliaC.jl app. `build.sh` runs JuliaC under `julia +1.13` by
+default. `JULIAC=bundled` (which defaults `JULIA` to `julia +1.12`) runs 1.12's driver instead,
+so a 1.12 count can be reproduced until the floor moves to 1.13
+([#526](https://github.com/PingoLee/Nitro.jl/issues/526)). Every count up to #718 below is
+1.12.7's; §3.5 recounts on 1.13. Toolchain of that recount: Julia 1.13.2, JuliaC 0.3.12 (git
+tree `49a147f5`, release commit `98e82861`), gcc 13.3.0, Linux x86-64. The 1.12.7 control used
+the driver Julia 1.12.7 ships.
+
+Three things about the JuliaC path that a count depends on:
+- JuliaC passes `--trim=<mode>` to the process that loads the entry file, so
+  `Base.JLOptions().trim` is set while routes register. `RouteEndpoint` (#718) exports its thunks
+  then: the 1.13 probe exe carries all 14 `nitro_route_endpoint_*` symbols, without
+  `--compile-ccallable`.
+- The verifier's output must reach the log through a pipe. With stderr redirected straight to a
+  file, a 1.13 build lost the last errors and the summary line (66 of 70 logged). `build.sh` pipes
+  through `tee`, and `frames.jl` warns when the `Trim verify finished` line is missing or
+  disagrees with its own total.
+- JuliaC builds for every target in Julia's system image unless `JULIA_CPU_TARGET` is set. The
+  1.12 driver built for `native`. `build.sh` defaults to `native`, so exe size and build time
+  stay comparable; the count does not depend on it.
+
 The verifier reports **the first dynamic call on each path** and does not look past it. A low
 count therefore means "the first wall is close", not "nearly done". Each fix can expose code that
 was never verified before. Count the errors by the first frame inside `src/` (`frames.jl` does),
 not by the raw total: one line of Nitro can account for hundreds of Base frames (§2).
 
-`app.jl` reaches the request path only through `serve` and `HTTP.listen!`, so while any wall stands
-in front of the listener the route path is never verified at all. `probe.jl` builds the pipeline
-with `setupmiddleware` and calls it on requests (an exact route, a converter route, three
-middleware stacks), so the request path is measured whatever the listener does.
+`app.jl` reaches the request path only through `serve` and `HTTP.listen!`. On 1.12, while any
+wall stands in front of the listener, the route path is never verified at all. `probe.jl` builds
+the pipeline with `setupmiddleware` and calls it on requests (an exact route, a converter route,
+three middleware stacks), so the request path is measured whatever the listener does. On 1.13 the
+verifier also reaches the per-request task behind the listener (§3.5), but `app.jl` has one exact
+route and no middleware, so the probe stays the measure of the route path.
 
 ## 2. Cleared: the lifecycle wall (#571)
 
@@ -56,23 +90,27 @@ middleware stacks), so the request path is measured whatever the listener does.
 The lesson that generalizes: **`repr`/`string` of an un-inferred value is the most expensive single
 trim mistake**, and that includes a `Symbol`. Type the value, then `print` it.
 
-## 3. Remaining (40 errors on the minimal app)
+## 3. Remaining (40 errors on the minimal app on Julia 1.12.7, 96 on 1.13)
 
 Measured 2026-10-22 on Julia 1.12.7, before and after #572. Each error is printed twice, so 20
 sites. `main` before #572 had **22**: the 20 below plus `CookieKey`'s, which arrived with a later
-merge.
+merge. The last column is the 1.13 recount (§3.5), 2026-10-23 at `dea736f0`, with JuliaC; a
+1.12.7 control at the same commit gives the After #572 column again, total 40.
 
-| First frame in `src/` | Before #572 | After #572 | What |
-|---|---:|---:|---|
-| `src/core/pipeline.jl` `setupmiddleware` | 4 | 0 | the fold (§3.2), **cleared** |
-| `src/core/lifecycle.jl` `serve` → `_serve_listener`, `startserver` | 4 | 0 | the pipeline's type through `serve`, **cleared** |
-| `src/core/lifecycle.jl` `_serve_pipeline`, the `start` closure | | 4 | `HTTP.listen!(…; kwargs...)` over the `Dict{Symbol,Any}` `startserver` passes: **the next wall in front of the request path** |
-| `src/core/lifecycle.jl` `serverwelcome`, `startserver` | | 16 | the banner and the blocking wait's `println`: `Dates.format(now(), "yyyy-mm-dd HH:MM:SS")` builds a `DateFormat` from a runtime string (4 of the 16 surface inside Dates' own `io.jl`), `IO`-typed `stdout`, `join` over `VersionNumber` fields |
-| `src/context.jl` `close`, `isopen`, `wait` | 6 | 8 | **the server field (§3.3)** |
-| `src/context.jl` `_try_cancel` | 2 | 2 | the `revise = :eager` watcher's `invokelatest`: dev-only and dynamic on purpose, so it stays |
-| `src/types.jl` `startup`/`shutdown` | 2 | 4 | the lifecycle hooks (§3.4) |
-| `src/crypto.jl` `CookieKey` | 2 | 2 | `NTuple{32,UInt8}` from a `Vector` |
-| outside `src/` (OpenSSL.jl, a Base `string`, the libuv read callback) | 2 | 2 | upstream |
+| First frame in `src/` | Before #572 | After #572 | 1.13 | What |
+|---|---:|---:|---:|---|
+| `src/core/pipeline.jl` `setupmiddleware` | 4 | 0 | 0 | the fold (§3.2), **cleared** |
+| `src/core/lifecycle.jl` `serve` → `_serve_listener`, `startserver` | 4 | 0 | 0 | the pipeline's type through `serve`, **cleared** |
+| `src/core/lifecycle.jl` `_serve_pipeline`, the `start` closure | | 4 | 4 | `HTTP.listen!(…; kwargs...)` over the `Dict{Symbol,Any}` `startserver` passes: **the next wall in front of the request path** |
+| `src/core/lifecycle.jl` `serverwelcome`, `startserver` | | 16 | 14 | the banner and the blocking wait's `println`: `Dates.format(now(), "yyyy-mm-dd HH:MM:SS")` builds a `DateFormat` from a runtime string (4 of the 16 surface inside Dates' own `io.jl`), `IO`-typed `stdout`, `join` over `VersionNumber` fields. The control counts this row 18 (2 of them at `startserver`'s wait), which is where its 40 comes from |
+| `src/context.jl` `close`, `isopen`, `wait` | 6 | 8 | 8 | **the server field (§3.3)** |
+| `src/context.jl` `_try_cancel`; on 1.13 also `lifecycle.jl:118` | 2 | 2 | 3 | the `revise = :eager` watcher's `invokelatest`: dev-only and dynamic on purpose, so it stays |
+| `src/types.jl` `startup`/`shutdown` | 2 | 4 | 4 | the lifecycle hooks (§3.4) |
+| `src/crypto.jl` `CookieKey` | 2 | 2 | 2 | `NTuple{32,UInt8}` from a `Vector` |
+| `src/core/transport.jl`: the stream handler's body read (`_http_stream_request`, `_swallow_request_body!`), the response write and release | | | 18 | **new on 1.13**: the per-request task, reached past the `HTTP.listen!` wall (§3.5) |
+| `src/middleware/security_headers.jl` | | | 20 | **new on 1.13**: a response typed `Any`, the same rows as on the probe (§3.2) |
+| `src/core/pipeline.jl` `_app_context_seed`; serializer `format_response`, `handle_error` | | | 11 | **new on 1.13**: the probe's rows of the same name (§3.2) |
+| outside `src/` (OpenSSL.jl, a Base `string`, the libuv read callback; on 1.13 also Base's `errormonitor` task, `printstyled`'s closure, `showerror`, the TLS read) | 2 | 2 | 12 | upstream |
 
 The verifier reports **the first dynamic call on each path**, so a cleared wall raises the count
 when it exposes code that was never verified. Every row #572 added is code that ran before #572
@@ -223,26 +261,30 @@ The candidates, measured on the probe and in a scratch spike (Julia 1.12.7):
 | a closed set of Nitro's own layer types (union-splitting) | does not help | route middleware is user code, union-splitting stops at four types, and the leaf is always a user closure |
 | **`RouteEndpoint`: an exported thunk per type, called with `ccall`** | **passes** | a scratch program with three differently typed chains builds under `--trim=safe` with 0 errors and serves all three; on the Nitro probe the route path clears (below) |
 
-Verifier on `bench/juliac/probe.jl`, `unsafe-warn`, Julia 1.12.7, counted by first frame in `src/`:
+Verifier on `bench/juliac/probe.jl`, `unsafe-warn`, Julia 1.12.7, counted by first frame in `src/`.
+The last column is #718 again, recounted on Julia 1.13 with JuliaC (§3.5):
 
-| First frame in `src/` | `main` | #718 |
-|---|---:|---:|
-| `routerhof.jl` `foldlayers` (the fold on the request path) | 10 | 0 |
-| `types.jl` `cache_chain!` | 2 | 0 |
-| `routerhof.jl` `compose`: the cached and the fresh chain call | 4 | 0 |
-| `pipeline.jl` the leaf call (`_dispatch_resolved`, `_route_unresolved`, `_route_rerouted`) | 6 | 0 |
-| `framework_middleware.jl` / `misc.jl` serializer: `format_response(::Any)`, `handle_error` | 6 | 10 |
-| `middleware/security_headers.jl` (a response typed `Any`) | 12 | 12 |
-| `pipeline.jl` `_app_context_seed` (`ScopedValue` HAMT) | 6 | 6 |
-| `types.jl` `pathparams` on `LazyRequest` (newly reached, inside a handler) | – | 2 |
-| outside `src/`: `probe.jl`'s own `main`, Base's `string`, the libuv read callback | 6 | 6 |
-| **total** | **52** | **36** |
+| First frame in `src/` | `main` | #718 | #718, 1.13 |
+|---|---:|---:|---:|
+| `routerhof.jl` `foldlayers` (the fold on the request path) | 10 | 0 | 0 |
+| `types.jl` `cache_chain!` | 2 | 0 | 0 |
+| `routerhof.jl` `compose`: the cached and the fresh chain call | 4 | 0 | 0 |
+| `pipeline.jl` the leaf call (`_dispatch_resolved`, `_route_unresolved`, `_route_rerouted`) | 6 | 0 | 0 |
+| `framework_middleware.jl` / `misc.jl` serializer: `format_response(::Any)`, `handle_error` | 6 | 10 | 12 |
+| `middleware/security_headers.jl` (a response typed `Any`) | 12 | 12 | 10 |
+| `pipeline.jl` `_app_context_seed` (`ScopedValue` HAMT) | 6 | 6 | 6 |
+| `types.jl` `pathparams` on `LazyRequest` (newly reached, inside a handler) | – | 2 | 0 |
+| `types.jl` `_pathparams_uncached`: `HTTP.getparams` returns `Any` | – | – | 36 |
+| outside `src/`: `probe.jl`'s own `main`, Base's `string`, the libuv read callback | 6 | 6 | 6 |
+| **total** | **52** | **36** | **70** |
 
 The route path is clear: what remains starts after a handler returns, whose result is `Any` by
 design, or in layers outside the route boundary. The trimmed probe binary shows the same: on
 `main` it dies inside `foldlayers`; with #718 the request reaches the route's handler through the
 endpoint, which builds its response, and the binary stops at `format_response`, the next wall.
-`app.jl` stays at 40: its request path is still behind `HTTP.listen!`'s keyword call.
+`app.jl` stays at 40: its request path is still behind `HTTP.listen!`'s keyword call. The 1.13
+binary, built with JuliaC, does the same: `GET /plaintext` goes through the `ccall` into its
+handler, which builds `"Hello, World!"`, and the exe stops at `format_response` (§3.5).
 
 What it asks of an application: nothing in code, but a route middleware factory now runs once per
 route at registration, so what it creates is shared by `serve` and every `internalrequest`; a
@@ -277,6 +319,74 @@ only at startup and shutdown. The typed option this section used to name,
 wherever the wrapper is built (#625, §3.1). The hooks need a shape of their own. That is open,
 and it comes fifth in §4's order.
 
+### 3.5 The recount on Julia 1.13
+
+Built 2026-10-23 at `dea736f0` (#718 merged) with JuliaC on Julia 1.13.2, against a control with
+the driver Julia 1.12.7 ships, at the same commit (§1). The control reproduces §3's and §3.2's
+1.12.7 totals, 40 and 36, so every difference below comes from the toolchain, not from Nitro.
+
+| Build | 1.12.7 | 1.13 |
+|---|---:|---:|
+| `ENTRY=app`, `unsafe-warn` | 40 | 96 |
+| `ENTRY=probe`, `unsafe-warn` | 36 | 70 |
+| `ENTRY=probe`, `safe` | – | fails on the same 70 |
+
+**Most of it is one change: 1.13 verifies the closures that verified code builds.** Its trim
+compiler (`collectinvokes!` in `Compiler/src/typeinfer.jl`) gained a rule that 1.12.7's lacks.
+When code it compiles builds a closure (a `:new` of a `Function` subtype), it also compiles that
+closure and verifies it as a root of its own, whether or not the call that would run it resolves.
+Those stacks end at the closure, with no caller. On `app.jl` that root is the per-request task
+`parallel_stream_handler` spawns, so the request path behind the `HTTP.listen!` wall is now
+verified. New rows on the app:
+- `transport.jl`, 18: the body reads (`_http_stream_request`, `_swallow_request_body!`) and the
+  response write and release, on the handler's `Any` result;
+- `security_headers.jl`, 20, and `_app_context_seed` and the serializer, 11: the rows the probe
+  already showed (§3.2);
+- outside `src/`, +10: Base's `errormonitor` task, the closure `printstyled` hands to
+  `with_output_color`, `showerror`, and the TLS read. The banner's `printstyled` line drops from 8
+  errors to 4 in the same build, so the `serverwelcome` row reads 14 rather than 18;
+- `lifecycle.jl:118`, 1: the `revise = :eager` watcher's `invokelatest`, dynamic on purpose.
+
+Unchanged on the app: `HTTP.listen!`'s keyword call (4), the server field (8), the lifecycle hooks
+(4) and `CookieKey` (2). So the walls §4 orders are the same; 1.13 shows more of what is behind
+them.
+
+**On the probe: path parameters reach `_pathparams_uncached`.** On 1.12.7 the converter route's
+`pathparams(lr.req)` is unresolved: the field is the `HTTP.Request` UnionAll, so the verifier
+stops there (2). On 1.13 the stack shows the call resolved to
+`pathparams(::Request{HTTP.BytesBody{Vector{UInt8}}})`, and the verifier walks on into
+`_pathparams_uncached`. There `HTTP.getparams(req)` is `get(req.context::Dict{Symbol,Any},
+:params, nothing)::Any`, so every use of the raw map is dynamic: iterating it, `unescapeuri`,
+`isvalid`, `setindex!` and the error-message `string`, 36 in all. **This is a new wall on the request
+path of every route with a path parameter.** It is recorded here, not fixed: it is `src/` work
+for the request-path step of §4.
+
+Two smaller moves on the probe: the serializer and security-header rows trade 2 errors (16 in
+both versions), and the OpenSSL site outside `src/` reports its first frame as Base's
+`getproperty` rather than `string`.
+
+**The endpoint path runs on 1.13.** The trimmed probe (`unsafe-warn`) exports all 14
+`nitro_route_endpoint_*` symbols, so `JLOptions().trim` was set while routes registered. Run, it
+sends `GET /plaintext` through the `ccall` into the route's handler, which builds
+`"Hello, World!"`, and stops at `format_response`'s `MethodError`. That is the same place as on
+1.12.7, and the same binary behaviour #718 reported.
+
+**The untrimmed app serves, and its first request no longer compiles.** `ENTRY=app`, `--trim=no`,
+`JULIA_CPU_TARGET=native`, then `smoke.sh`, three runs each, `THREADS=8,1`. The machine was busy
+(load ≈ 4 on 12 cores), so these are indicative, not measurements:
+
+| `app.jl`, untrimmed | exe size | time to listen | first request | warm | RSS |
+|---|---:|---:|---:|---:|---:|
+| 1.12.7 exe, bundled driver | 391 MB | 0.30 s | 1.44 s | 0.3 ms | 460 MB |
+| 1.13 exe, JuliaC | 350 MB | 0.24 s | 0.024 s | 0.3 ms | 276 MB |
+| 1.13 JIT (`smoke.sh jit`) | – | 2.3 s | 1.43 s | 0.3 ms | 437 MB |
+
+On 1.12.7 the image kept the JIT, and the first request paid for compiling it (§4). On 1.13 it
+does not: about 60 times faster and 40% less memory. The likely cause is the closure rule above.
+The per-request task body is now compiled into the image, where 1.12.7 compiled it at the first
+request. That has not been checked further. The build took 183 s (indicative); with
+`FILLER_ROUTES=1000` it took 235 s and made a 402 MB exe, a reference point for #726.
+
 ## 4. The decision: `--trim=safe` is a target
 
 **The question was:** is `--trim=safe` a product target for Nitro, or a ratchet that only keeps
@@ -296,10 +406,15 @@ buy is a startup and deployment win:
 - time to listen, already measured untrimmed: 0.53 s against 2.48 s under the JIT;
 - binary size: 3.8 MB trimmed;
 - resident memory and time to first request: **neither measured trimmed yet.** Untrimmed, the
-  first request is no faster (1.33 s against 1.28 s), because the image keeps the JIT.
+  first request is no faster (1.33 s against 1.28 s), because the image keeps the JIT. That was
+  1.12. On 1.13 the untrimmed exe's first request is ≈ 0.02 s against the JIT's 1.4 s
+  (indicative, §3.5).
 
 The order:
 
+0. **The harness is on Julia 1.13. Done:** `bench/juliac/build.sh` builds with JuliaC.jl by
+   default, keeps 1.12's driver behind `JULIAC=bundled` until the floor moves (#526), and §3.5
+   gives the backlog its 1.13 counts.
 1. **§3.1, the router's type. Done (#625):** one Nitro-owned router type, and the custom
    404/405 as fixed responses on `App`. It typed every pipeline closure, but cleared no verifier
    error on its own: the fold behind it is the next wall on that path (§3).
@@ -312,8 +427,10 @@ The order:
    construction, so it needs its own shape. One candidate, not designed yet: a typed handle that
    `serve` returns and `terminate` takes. **§3.2's route boundary is done (#718)**: one
    `RouteEndpoint` per route chain and per handler.
-4. **The request path:** #537, #538, #546, #566. Those four also help the JIT build, so they need
-   not wait for 1–3.
+4. **The request path.** The audit's four (#537, #538, #546, #566) are closed. What the verifier
+   shows there now: `format_response` on a handler's `Any` result, the security-header layer,
+   `_app_context_seed`, and on 1.13 `_pathparams_uncached`'s untyped `HTTP.getparams` and the
+   transport's response write (§3.5). Like the four, these need not wait for 1–3.
 5. **§3.4, the lifecycle hooks ([#719](https://github.com/PingoLee/Nitro.jl/issues/719)).**
 6. **Outside Nitro:** OpenSSL.jl and the libuv read callback, reported upstream.
 
