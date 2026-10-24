@@ -208,6 +208,26 @@ Assigns the session dictionary to the request context.
 """
 setsession!(req::HTTP.Request, val) = (req.context[:session] = val)
 
+# `f(getsession(req), args...)`, with the session at its concrete type when it is the
+# `Dict{String,Any}` `SessionMiddleware` stores, so Nitro's own readers make a static call on it
+# (docs/design/juliac-trim.md §3): `req.context` is a `Dict{Symbol,Any}`, and an untyped read made
+# every use of the session dynamic. An app may store a session of its own shape (the guards read a
+# `Symbol`-keyed one too); that keeps the JIT's dynamic call, and a trimmed image refuses it, as
+# `with_response` refuses a body it does not list.
+function with_session(f::F, req::HTTP.Request, args::Vararg{Any,N}) where {F,N}
+    session = getsession(req)
+    session === nothing && return f(nothing, args...)
+    session isa Dict{String,Any} && return f(session, args...)
+    return _with_foreign_session(f, session, args...)
+end
+
+@noinline function _with_foreign_session(f::F, @nospecialize(session), args::Vararg{Any,N}) where {F,N}
+    Types._trimmed() && throw(ArgumentError(
+        "Nitro: a trimmed image reads only the Dict{String,Any} session SessionMiddleware stores; " *
+        "got a $(nameof(typeof(session)))"))
+    return f(session, args...)
+end
+
 """
     getuser(req::HTTP.Request) -> Any
 

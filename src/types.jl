@@ -407,6 +407,20 @@ function _store_call(f::F, args::Vararg{Any,N}; kwargs...) where {F,N}
     return result
 end
 
+# The session and its id as `SessionMiddleware` stores them, at their concrete types for the calls
+# that follow (docs/design/juliac-trim.md §3), and checked rather than asserted for the reason
+# `_store_bool` below gives: a `TypeError` would hold the session or the id (#612). Another value
+# is a `SessionStoreFault` naming its type only; it failed before as well, in the store call.
+function _stored_session(x)::Dict{String,Any}
+    x isa Dict{String,Any} && return x
+    throw(SessionStoreFault("the request's session is a `$(nameof(typeof(x)))` other than the " *
+                            "`Dict{String,Any}` a session store holds"))
+end
+function _stored_session_id(x)::String
+    x isa String && return x
+    throw(SessionStoreFault("the request's session id is a `$(nameof(typeof(x)))`, not a String"))
+end
+
 # The contract's `Bool`, checked rather than asserted: the `TypeError` of a `::Bool` assert holds
 # the returned value, which can be the session (#612). Typed `::Bool`, so inference does not carry
 # `Any` out of a call whose arguments come from `req.context`.

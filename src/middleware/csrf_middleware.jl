@@ -2,14 +2,14 @@ module CSRFMiddleware_
 
 using HTTP
 
-using ...Types: CookieConfig, Nullable, with_response
+using ...Types: CookieConfig, Nullable, with_response, _trimmed
 using ...Cookies: get_cookie, set_cookie!
 import ...Cookies
 using ...Crypto: secure_random_bytes, _empty_hmac_key, _hmac_sha256, SecretString, reveal, base64url_encode,
     base64url_decode
 using ...Errors: is_unrecoverable
 using ...Res: json
-using ...Core: own_response_headers, getjson, getform, header_name_isequal
+using ...Core: own_response_headers, getjson, getform, with_session, header_name_isequal
 using ...Util: _mark_private!, _auth_credential, _ascii_casefold_eq
 
 export CSRFMiddleware, csrf_token!, issue_csrf_token!, validate_csrf_token
@@ -192,7 +192,19 @@ id is not (`Principal.id` is nullable, and a session-only app never populates `g
 """
 function _binding(req::HTTP.Request)::Nullable{String}
     value = Base.get(req.context, :session_id, nothing)
-    return value isa AbstractString ? String(value) : nothing
+    # The concrete string types first, so the conversion is static: `SessionMiddleware` and
+    # `regenerate_session!` store a `String`, and a cookie value can arrive as a `SubString`.
+    value isa String && return value
+    value isa SubString{String} && return String(value)
+    return value isa AbstractString ? _foreign_binding(value) : nothing
+end
+
+# Any other string type an app stored: converted under the JIT, as before; a trimmed image, which
+# has no code for the conversion, refuses it rather than leave the token unbound.
+@noinline function _foreign_binding(@nospecialize(value::AbstractString))::String
+    _trimmed() && throw(ArgumentError(
+        "Nitro: a trimmed image binds CSRF tokens only to a String session id; got a $(nameof(typeof(value)))"))
+    return String(value)
 end
 
 function _warn_unbound()
@@ -396,9 +408,13 @@ function _session_persists(req::HTTP.Request, binding_before::Nullable{String},
     Base.get(req.context, :session_new, false) === true || return true
     Base.get(req.context, :session_modified, false) === true && return true
     binding_before == binding_after || return true          # rotated: saved under the new id
-    session = Base.get(req.context, :session, nothing)
-    return session isa AbstractDict && !isempty(session)
+    # Asserted: the foreign-session fallback is an `Any` under the JIT, and the `::Bool` return
+    # type would otherwise convert it with a dynamic call.
+    return with_session(_holds_data, req)::Bool
 end
+
+_holds_data(session::AbstractDict) = !isempty(session)
+_holds_data(_) = false
 
 function _presented_token(req::HTTP.Request, header_name::String, form_field::String)
     header_token = HTTP.header(req, header_name, "")

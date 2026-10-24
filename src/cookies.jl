@@ -4,7 +4,7 @@ using HTTP
 using Dates
 using UUIDs
 using ..Types
-using ..Types: _normalize_domain, _store_call, _store_bool
+using ..Types: _normalize_domain, _store_call, _store_bool, _stored_session, _stored_session_id
 using ..Errors
 using ..Util: _is_tchar, _ascii_casefold_eq
 
@@ -846,8 +846,10 @@ which is what the logout recipe `empty!(getsession(req))` + `regenerate_session!
 fresh clock from `SessionMiddleware` when it is written back.
 """
 function regenerate_session!(req::HTTP.Request, store::AbstractSessionStore{String, Dict{String,Any}}; ttl::Int=3600)
-    old_id = get(req.context, :session_id, nothing)
-    session_data = get(req.context, :session, Dict{String,Any}())
+    # Checked to what `SessionMiddleware` stores, so the store calls below are static.
+    raw_id = get(req.context, :session_id, nothing)
+    old_id = raw_id === nothing ? nothing : _stored_session_id(raw_id)
+    session_data = _stored_session(get(req.context, :session, Dict{String,Any}()))
 
     new_id = string(secure_uuid4())
 

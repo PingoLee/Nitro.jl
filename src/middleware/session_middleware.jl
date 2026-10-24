@@ -7,7 +7,7 @@ using UUIDs
 using ...Types: AbstractSessionStore, MemoryStore, SessionPayload, Nullable, is_expired,
     update_session!, delete_session!, session_store_full, SESSION_AUTH_HASH_KEY,
     _session_auth_hash_current, _session_auth_hash_of, _store_call, _store_bool
-using ...Types: CookieConfig, LifecycleMiddleware, with_response
+using ...Types: CookieConfig, LifecycleMiddleware, with_response, _stored_session, _stored_session_id
 using ..JanitorMiddleware: _janitor
 using ...Cookies: get_cookie, set_cookie!, storesession!, prunesessions!, regenerate_session!,
     _validate_cookie_prefix
@@ -458,8 +458,12 @@ function SessionMiddleware(;
             # Let downstream middleware and the handler read or mutate the session.
             response = handle(req)
 
-            current_session = req.context[:session]
-            final_session_id = get(req.context, :session_id, session_id)
+            # Checked: the handler can replace either (`setsession!`, `regenerate_session!`), and
+            # both write these types. Read untyped, every use below was a dynamic call. The
+            # session itself is checked after the absolute-deadline exit below, which ends the
+            # session without reading it.
+            raw_session = req.context[:session]
+            final_session_id = _stored_session_id(get(req.context, :session_id, session_id))
 
             # Every write below -- insert, update, rotation -- and the cookie use this, so the
             # stored expiry never passes the absolute deadline (#362). A new session's clock
@@ -479,6 +483,7 @@ function SessionMiddleware(;
                 _end_session!(store, final_session_id, "past its absolute lifetime")
                 return response
             end
+            current_session = _stored_session(raw_session)
 
             # Stamp the sign-in with the user's current `session_auth_hash` (#391). Before the
             # rotation below, so the data it moves already carries the stamp.
@@ -496,7 +501,7 @@ function SessionMiddleware(;
                 current_auth_marker = _auth_marker(current_session, final_session_id, auth_key, validator)
                 if _auth_marker_changed(original_auth_marker, current_auth_marker)
                     regenerate_session!(req, store; ttl=ttl)
-                    final_session_id = req.context[:session_id]
+                    final_session_id = _stored_session_id(req.context[:session_id])
                 end
             end
 

@@ -50,6 +50,9 @@ function setip! end
 function getpeerip end
 function getcontext end
 function route_missed end
+# Not exported: CSRF and the guards read the session through it (docs/design/juliac-trim.md §3),
+# and `core/request.jl` holds the body.
+function with_session end
 # One generic pair for both cooperative-cancellation tokens (#466): `core/request.jl` adds the
 # `HTTP.Request` methods, and Workers imports these and adds the `TaskInfo` ones, so
 # `using Nitro, Nitro.Workers` binds one function rather than two that must be qualified.
