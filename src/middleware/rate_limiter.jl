@@ -359,7 +359,10 @@ end
 
 # Fixed window: the request path's own strict `>` (see `_sweep_expired!`).
 @inline _is_expired(b::Tuple{Int, DateTime}, window::Period, t::DateTime) = t - b[2] > window
-@inline _expires_at(b::Tuple{Int, DateTime}, window::Period) = b[2] + window + Millisecond(1)
+# Two additions, never `b[2] + window + Millisecond(1)`: Dates evaluates that as `DateTime + (window
+# + Millisecond(1))`, a `CompoundPeriod`, whose addition walks a `Vector{Period}` (a dynamic call
+# per period). A `DateTime` takes each fixed period on its own, so the instant is the same.
+@inline _expires_at(b::Tuple{Int, DateTime}, window::Period) = (b[2] + window) + Millisecond(1)
 
 # Sliding window: expired once its newest timestamp is at or before the prune cutoff, i.e. the
 # request path would prune every timestamp. A bucket is sorted -- `_record!` inserts a
