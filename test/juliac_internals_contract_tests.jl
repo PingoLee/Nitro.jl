@@ -185,7 +185,7 @@ end
 end
 end
 
-@testitem "juliac: the lifecycle hooks' foreign calls" tags=[:core, :network] setup=[NitroCommon] begin
+@testitem "juliac: the lifecycle hooks' foreign calls, and Revise refused" tags=[:core, :network] setup=[NitroCommon] begin
 using Test
 import Nitro
 
@@ -253,6 +253,15 @@ end
                 show_banner = false, access_log = false)
     Nitro.Core.terminate(app3)
     println("SERVE=", up[], " ", down[])
+    # Revise is refused, before anything starts: a trimmed image cannot make its `invokelatest`.
+    rev = try
+        Nitro.serve(App(); revise = :lazy, host = "127.0.0.1", port = $(get_free_port()), async = true,
+                    show_banner = false, access_log = false)
+        "served"
+    catch e
+        e isa ArgumentError && occursin("trimmed build", e.msg) ? "refused" : string(typeof(e))
+    end
+    println("REVISE=", rev)
     """
     cmd = `$(Base.julia_cmd()) --code-coverage=none --project=$(Base.active_project()) --startup-file=no -e $script`
     out, err = IOBuffer(), IOBuffer()
@@ -260,7 +269,7 @@ end
     out, err = String(take!(out)), String(take!(err))
     @test (p.exitcode, p.termsignal) == (0, 0) || (out, last(err, 2000))
     for line in ("PTRS=true", "UP=true 1", "BOOM=true", "INTERRUPT=true", "DOWN=true 1",
-                 "VECTOR=refused", "ROUTE=refused true", "SERVE=1 1")
+                 "VECTOR=refused", "ROUTE=refused true", "SERVE=1 1", "REVISE=refused")
         @test occursin(line, out) || (line, out)
     end
 end

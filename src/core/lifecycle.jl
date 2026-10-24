@@ -350,6 +350,12 @@ function serve(ctx::App;
     if revise ∉ (:none, :lazy, :eager)
         throw(ArgumentError("Invalid `revise` value :$revise. Expected one of :none, :lazy, or :eager."))
     end
+    # Revise is a development tool and reaches the revised world through `invokelatest`, which a
+    # trimmed image cannot make. Refused there, so every `revise` branch below folds away in one.
+    if revise != :none && Types._trimmed()
+        throw(ArgumentError(
+            "`revise = :$revise` is not available in a trimmed build; serve with `revise = :none`."))
+    end
 
     # Validate HERE rather than only at shutdown. `_shutdown_server` also rejects a bad value,
     # but by then it is far too late: the stored timeout is read on every `terminate()`, so a
@@ -516,7 +522,9 @@ function serve(ctx::App;
     # this, the `revise = :none` branch is concrete all the way to `HTTP.listen!`.
     pipeline_kwargs = (; serialize, catch_errors, show_errors, access_log, access_log_query,
                        access_log_skip, security_headers)
-    if revise == :none
+    # `Types._trimmed()` first: Revise was refused above in a trimmed image, so the branch below is
+    # dead there.
+    if Types._trimmed() || revise == :none
         return _serve_pipeline(ctx, setupmiddleware(ctx; middleware, pipeline_kwargs...),
                                handler, body_limit, request_limit, upgraded_limit, security_headers,
                                revise, host, port, show_banner, async, kwargs)
@@ -545,7 +553,7 @@ function _serve_pipeline(ctx::App, configured_middelware::P, handler::H, body_li
     listener = first(_serve_listener(configured_middelware, handler, body_limit, request_limit,
                                      upgraded_limit, security_headers))
 
-    if revise == :eager
+    if !Types._trimmed() && revise == :eager
         # Never overwrite a live watcher: its handle is the only way to stop it (#427). `close`
         # is idempotent, so closing one `terminate` already closed costs nothing.
         previous = ctx.service.eager_revise[]
@@ -564,12 +572,10 @@ function _serve_pipeline(ctx::App, configured_middelware::P, handler::H, body_li
     catch
         # A `serve(async = true)` that never got its listener up (an address in use, say) returns
         # no handle to `terminate`, so its watcher must stop here or nothing ever stops it (#427).
-        ctx.service.eager_revise[] === nothing || close(ctx.service.eager_revise[])
+        AppContext._close_eager_revise(ctx.service)
         rethrow()
     finally
-        if ctx.service.eager_revise[] !== nothing && async == false
-            close(ctx.service.eager_revise[])
-        end
+        async == false && AppContext._close_eager_revise(ctx.service)
     end
 end
 

@@ -455,7 +455,17 @@ function Base.close(service::Service; timeout::Real = service.shutdown_timeout[]
         service.server[] === handle && (service.server[] = nothing)
     end
     _release_wake_guard!(service)
-    !isnothing(service.eager_revise[]) && close(service.eager_revise[])
+    _close_eager_revise(service)
+    return nothing
+end
+
+# Stop the `revise = :eager` watcher, if one runs. A trimmed build never starts one (`serve` refuses
+# Revise there), so the branch folds away, and with it the watcher's `invokelatest`
+# (docs/design/juliac-trim.md §3).
+function _close_eager_revise(service::Service)
+    Types._trimmed() && return nothing
+    watcher = service.eager_revise[]
+    watcher === nothing || close(watcher)
     return nothing
 end
 
