@@ -197,6 +197,13 @@ end
         Res.file(req, file; stream = true), Res.file(ranged, file; stream = true), Res.sse(),
         Nitro.Core.format_response("x"), Nitro.Core.format_response(Dict("a" => 1)),
         HTTP.Response(404), HTTP.Response(200, "x"),
+        # A `loadfile` that returns some other byte array or string (#741's review).
+        Res.file(file; loadfile = p -> codeunits(read(p, String))),
+        Res.file(file; loadfile = p -> view(read(p), 1:5)),
+        Res.file(file; loadfile = p -> SubString(read(p, String), 1, 5)),
+        Res.file(req, file; loadfile = p -> codeunits(read(p, String))),
+        Res.file(req, file; loadfile = p -> view(read(p), 1:5)),
+        Res.file(ranged, file; loadfile = p -> view(read(p), 1:5)),
     ]
     try
         for r in built
@@ -207,6 +214,25 @@ end
             r.body isa Union{T.StreamedFileBody, HTTP.SSEStream} && HTTP.body_close!(r.body)
         end
     end
+end
+
+@testset "loadfile: the same bytes, copied only when they are not a Vector{UInt8}" begin
+    dir = mktempdir()
+    file = joinpath(dir, "a.txt")
+    write(file, "hello world")
+    req = HTTP.Request("GET", "/a.txt")
+    bytes = Vector{UInt8}("hello world")
+    @test Res.file(file; loadfile = _ -> bytes).body === bytes
+    @test Res.file(req, file; loadfile = _ -> bytes).body.data === bytes
+    for (load, want) in ((_ -> view(bytes, 1:5), b"hello"), (_ -> codeunits("hey"), b"hey"))
+        r = Res.file(file; loadfile = load)
+        @test r.body isa Vector{UInt8} && r.body == want
+        @test parse(Int, HTTP.header(r, "Content-Length")) == length(want)
+        rr = Res.file(req, file; loadfile = load)
+        @test rr.body.data isa Vector{UInt8} && rr.body.data == want
+    end
+    r = Res.file(file; loadfile = _ -> SubString("hello", 1, 3))
+    @test r.body isa String && r.body == "hel"
 end
 
 @testset "the transport's body methods are the ones the list was checked against" begin
