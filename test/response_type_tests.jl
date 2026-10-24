@@ -234,3 +234,22 @@ end
     @test SecurityHeaders()(req -> "raw")(HTTP.Request("GET", "/")) == "raw"
 end
 end
+
+@testitem "The transport writes each listed body without a dynamic call" tags=[:core] setup=[NitroCommon] begin
+using Test
+using HTTP
+using Nitro
+
+# `stream_handler` hands the pipeline's response to `_send_response!` through
+# `Types.with_response`, so each body type gets its own compiled write path: the HEAD length, the
+# hand-off copy, the early slot release, the write and the release, all static (#453, #298, #654).
+const T = Nitro.Core.Types
+const S = HTTP.Stream{false, HTTP.Request{HTTP.EmptyBody}}
+const A = T.Nullable{Nitro.Core._Admission}
+for B in (String, Vector{UInt8}, HTTP.EmptyBody, HTTP.BytesBody{Vector{UInt8}},
+          HTTP.BytesBody{T.RangeBytes}, T.StreamedFileBody, HTTP.SSEStream)
+    @test isempty(dynamic_calls(Nitro.Core._send_response!, (HTTP.Response{B}, S, HTTP.Request{HTTP.EmptyBody}, A)))
+end
+# A pipeline value that is not a response (the transport answers it with an empty `200`).
+@test isempty(dynamic_calls(Nitro.Core._send_response!, (Nothing, S, HTTP.Request{HTTP.EmptyBody}, A)))
+end

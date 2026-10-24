@@ -67,7 +67,8 @@ try
     @test precompile(listener, (stream,))
     @test precompile(request_handler, (stream,))
     @test precompile(Nitro.Core._handle_reporting, (typeof(request_handler), stream))
-    @test precompile(Nitro.Core._write_response_body!, (stream, String))
+    @test precompile(Nitro.Core._send_response!, (Nitro.Core.HTTP.Response{String}, stream,
+        Nitro.Core.Types.EmptyRequest, Nothing))
 finally
     terminate(app)
 end

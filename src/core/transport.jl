@@ -1222,100 +1222,115 @@ function stream_handler(middleware::Function; max_body_bytes::Int64 = DEFAULT_MA
             end
 
             result = middleware(req)
-            produced = result isa HTTP.Response ? result : nothing
-
-            try
-                if !_response_started(stream)
-                    resp = produced === nothing ? HTTP.Response(200) : produced
-                    stream.message.method == "HEAD" && (resp = _with_head_content_length(resp))
-                    # Only the pipeline's own value needs it: the two above are built here.
-                    resp === produced && (resp = _handoff_copy(resp))
-                    resp.request = req
-                    stream.response = resp
-                    # A bodyless response — a `HEAD`, or a 1xx, 204 or 304 status — gets the head and
-                    # no body, so there is nothing to drain. Draining it anyway is not merely wasted
-                    # work: it can pin the process (#160, #671). HTTP's `startwrite` sets
-                    # `ignore_writes` for exactly these and `_server_write` then returns without
-                    # touching the socket, so for an open-ended body — an `HTTP.SSEStream` whose
-                    # producer is still running — this loop consumes events forever. Because it never
-                    # touches the socket, `terminate`'s force-close cannot unblock it either: the
-                    # request task, the connection task (`parallel_stream_handler` waits on it) and the
-                    # producer task are all pinned for the life of the process. One `curl -I` against a
-                    # route registered for HEAD is enough, and so is one GET of a
-                    # `Res.sse(f; status = 204)` — `Res.sse` hands its status straight to
-                    # `HTTP.sse_stream`, so nothing stops a handler choosing a bodyless one. HTTP.jl
-                    # 2.11 closes such a body unread in its own writer (JuliaWeb/HTTP.jl#1409), but
-                    # Nitro does not write through that one (nitro-core §4), so it needs this check.
-                    #
-                    # Skipping the drain is equivalent for every buffered body — those writes were
-                    # already being discarded — and the `finally` below still releases a streaming one,
-                    # which is what lets an SSE producer notice and unwind. The response head is
-                    # unaffected: the `closewrite` below calls `startwrite` regardless. The head a
-                    # `HEAD` gets is `_with_head_content_length`'s business, above (#146).
-                    #
-                    # `_allows_body` restates HTTP's rule rather than reading `ignore_writes`, which
-                    # only `startwrite` sets. Calling `startwrite` here to find out would change the
-                    # write it is asked about: an explicitly started FIXED body past 4 KiB goes out in
-                    # pieces as it is written (#529), where a buffered one now reaches the socket whole,
-                    # head included, at the `closewrite` below (#453).
-                    # test/http_internals_contract_tests.jl holds the restatement to HTTP's own set.
-                    #
-                    # `stream.message.method`, NOT `req.method`. They are equal at entry and are two
-                    # different mutable objects: `_http_stream_request` builds a fresh `Request` from
-                    # `head.method`, while HTTP's own suppression keys on `stream.message`. A
-                    # middleware that rewrites the method — an app mapping `HEAD` onto its `GET`
-                    # handlers, or an `X-HTTP-Method-Override` layer — would otherwise desynchronize
-                    # the two: rewriting `HEAD → GET` reinstates the drain HTTP is still ignoring, and
-                    # the pin this guard exists to remove comes back. Reading the value HTTP itself
-                    # branches on makes that unrepresentable. `_reject_oversized_body!` above already
-                    # reads it the same way.
-                    if _allows_body(stream)
-                        # A streaming body with no declared length hands its permit back here,
-                        # before a write that can last as long as the client stays connected
-                        # (#298; see `_releases_slot_early` and above `stream_handler`).
-                        adm !== nothing && _releases_slot_early(resp) && _release_request_slot!(adm)
-                        _write_response_body!(stream, resp.body)
-                    end
-                end
-                # Put the response on the wire HERE, on the request's own task, on every path that
-                # reached the middleware chain (#453). (The 413/503 refusals above return before it
-                # and are still written by HTTP's loop: rare, and cheap.)
-                # On HTTP/1.1 an in-memory fixed-length response is buffered whole and reaches the
-                # socket only at `closewrite`: that call serializes the head and makes the write
-                # syscall. Left to HTTP's loop, it runs on the CONNECTION task after this returns,
-                # and HTTP.jl 2.x runs every connection task on the `:interactive` pool, which
-                # `julia -t N` sizes at one thread. So every response the server sent was written by
-                # that one thread, whatever the request's own work had been spread across: in one
-                # interleaved run on a loaded box, ~30k rps `/plaintext` against ~58k for bare
-                # HTTP.jl (~72k on the quiet box #448 measured), whose `streamhandler` adapter calls
-                # `closewrite` inside the handler and so on the spawned task (bench/socket/,
-                # `-t 8`, pinned cores). Calling it here closed most of that gap.
-                #
-                # It also keeps the slot invariant (#298): under `max_concurrent_requests` the
-                # buffered response — and the request body `resp.request` pins — reaches the socket
-                # while the slot is still held, not after the `finally` below has released it. (A
-                # streamed body is already on the wire unless it is 4 KiB or less, which this sends;
-                # either way it checks the length, #377/#529.)
-                #
-                # Nothing about the response changes, only which task writes it. `closewrite` is
-                # idempotent (HTTP returns at once when writes are already closed), so the loop's
-                # own call is then a no-op; and its errors are classified exactly as before, since an
-                # exception from here reaches the same `catch` in HTTP's loop the handler's does —
-                # through `parallel_stream_handler`'s unwrap when the request was spawned. `closeread`
-                # stays with HTTP's loop: it moved no measurable throughput, and an upgraded
-                # connection's read side is not this layer's to close.
-                HTTP.closewrite(stream)
-            finally
-                # Idempotent, and a no-op for the buffered bodies that are the overwhelming majority.
-                # `_write_response_body!` has usually already done this — releasing as soon as the body
-                # is drained keeps descriptor pressure down — so this is the net, not the owner.
-                produced === nothing || _release_response_body!(produced.body)
+            # At its concrete body type (`Types.with_response`), so every call `_send_response!`
+            # makes on the pipeline's value is static. Anything else gets the empty `200` it
+            # always has.
+            if result isa HTTP.Response
+                Types.with_response(_send_response!, result, stream, req, adm)
+            else
+                _send_response!(nothing, stream, req, adm)
             end
             return nothing
         finally
             adm === nothing || _release_request_slot!(adm)
         end
     end
+end
+
+# The write half of `stream_handler`, once the pipeline has returned: `produced` is its value at a
+# concrete body type (`Types.with_response`), or `nothing` when it was not a response. A function
+# of its own so each body type gets its own compiled copy, with nothing dispatched at run time. It
+# runs on the request's task, inside the slot `stream_handler` holds, exactly as it did inline.
+function _send_response!(produced::Union{Nothing,HTTP.Response}, stream::HTTP.Stream,
+                         req::HTTP.Request, adm::Nullable{_Admission})
+    try
+        if !_response_started(stream)
+            resp = produced === nothing ? HTTP.Response(200) : produced
+            stream.message.method == "HEAD" && (resp = _with_head_content_length(resp))
+            # Only the pipeline's own value needs it: the two above are built here.
+            resp === produced && (resp = _handoff_copy(resp))
+            resp.request = req
+            stream.response = resp
+            # A bodyless response — a `HEAD`, or a 1xx, 204 or 304 status — gets the head and
+            # no body, so there is nothing to drain. Draining it anyway is not merely wasted
+            # work: it can pin the process (#160, #671). HTTP's `startwrite` sets
+            # `ignore_writes` for exactly these and `_server_write` then returns without
+            # touching the socket, so for an open-ended body — an `HTTP.SSEStream` whose
+            # producer is still running — this loop consumes events forever. Because it never
+            # touches the socket, `terminate`'s force-close cannot unblock it either: the
+            # request task, the connection task (`parallel_stream_handler` waits on it) and the
+            # producer task are all pinned for the life of the process. One `curl -I` against a
+            # route registered for HEAD is enough, and so is one GET of a
+            # `Res.sse(f; status = 204)` — `Res.sse` hands its status straight to
+            # `HTTP.sse_stream`, so nothing stops a handler choosing a bodyless one. HTTP.jl
+            # 2.11 closes such a body unread in its own writer (JuliaWeb/HTTP.jl#1409), but
+            # Nitro does not write through that one (nitro-core §4), so it needs this check.
+            #
+            # Skipping the drain is equivalent for every buffered body — those writes were
+            # already being discarded — and the `finally` below still releases a streaming one,
+            # which is what lets an SSE producer notice and unwind. The response head is
+            # unaffected: the `closewrite` below calls `startwrite` regardless. The head a
+            # `HEAD` gets is `_with_head_content_length`'s business, above (#146).
+            #
+            # `_allows_body` restates HTTP's rule rather than reading `ignore_writes`, which
+            # only `startwrite` sets. Calling `startwrite` here to find out would change the
+            # write it is asked about: an explicitly started FIXED body past 4 KiB goes out in
+            # pieces as it is written (#529), where a buffered one now reaches the socket whole,
+            # head included, at the `closewrite` below (#453).
+            # test/http_internals_contract_tests.jl holds the restatement to HTTP's own set.
+            #
+            # `stream.message.method`, NOT `req.method`. They are equal at entry and are two
+            # different mutable objects: `_http_stream_request` builds a fresh `Request` from
+            # `head.method`, while HTTP's own suppression keys on `stream.message`. A
+            # middleware that rewrites the method — an app mapping `HEAD` onto its `GET`
+            # handlers, or an `X-HTTP-Method-Override` layer — would otherwise desynchronize
+            # the two: rewriting `HEAD → GET` reinstates the drain HTTP is still ignoring, and
+            # the pin this guard exists to remove comes back. Reading the value HTTP itself
+            # branches on makes that unrepresentable. `_reject_oversized_body!` above already
+            # reads it the same way.
+            if _allows_body(stream)
+                # A streaming body with no declared length hands its permit back here,
+                # before a write that can last as long as the client stays connected
+                # (#298; see `_releases_slot_early` and above `stream_handler`).
+                adm !== nothing && _releases_slot_early(resp) && _release_request_slot!(adm)
+                _write_response_body!(stream, resp.body)
+            end
+        end
+        # Put the response on the wire HERE, on the request's own task, on every path that
+        # reached the middleware chain (#453). (The 413/503 refusals above return before it
+        # and are still written by HTTP's loop: rare, and cheap.)
+        # On HTTP/1.1 an in-memory fixed-length response is buffered whole and reaches the
+        # socket only at `closewrite`: that call serializes the head and makes the write
+        # syscall. Left to HTTP's loop, it runs on the CONNECTION task after this returns,
+        # and HTTP.jl 2.x runs every connection task on the `:interactive` pool, which
+        # `julia -t N` sizes at one thread. So every response the server sent was written by
+        # that one thread, whatever the request's own work had been spread across: in one
+        # interleaved run on a loaded box, ~30k rps `/plaintext` against ~58k for bare
+        # HTTP.jl (~72k on the quiet box #448 measured), whose `streamhandler` adapter calls
+        # `closewrite` inside the handler and so on the spawned task (bench/socket/,
+        # `-t 8`, pinned cores). Calling it here closed most of that gap.
+        #
+        # It also keeps the slot invariant (#298): under `max_concurrent_requests` the
+        # buffered response — and the request body `resp.request` pins — reaches the socket
+        # while the slot is still held, not after the `finally` below has released it. (A
+        # streamed body is already on the wire unless it is 4 KiB or less, which this sends;
+        # either way it checks the length, #377/#529.)
+        #
+        # Nothing about the response changes, only which task writes it. `closewrite` is
+        # idempotent (HTTP returns at once when writes are already closed), so the loop's
+        # own call is then a no-op; and its errors are classified exactly as before, since an
+        # exception from here reaches the same `catch` in HTTP's loop the handler's does —
+        # through `parallel_stream_handler`'s unwrap when the request was spawned. `closeread`
+        # stays with HTTP's loop: it moved no measurable throughput, and an upgraded
+        # connection's read side is not this layer's to close.
+        HTTP.closewrite(stream)
+    finally
+        # Idempotent, and a no-op for the buffered bodies that are the overwhelming majority.
+        # `_write_response_body!` has usually already done this — releasing as soon as the body
+        # is drained keeps descriptor pressure down — so this is the net, not the owner.
+        produced === nothing || _release_response_body!(produced.body)
+    end
+    return nothing
 end
 
 # One `Threads.@spawn` per request, and nothing else (#39). This used to spawn the
