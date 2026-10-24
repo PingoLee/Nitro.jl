@@ -90,3 +90,75 @@ end
     @test err isa ErrorException && occursin("register routes at top level", err.msg)
 end
 end
+
+@testitem "juliac: the server handle's foreign calls" tags=[:core, :network] setup=[NitroCommon] begin
+using Test
+import Nitro
+
+# ── `ServerHandle` (src/context.jl), which keeps `Service.server` concrete ─────────────────────
+#
+# In a trimmed build each call through the handle is a `ccall` to a static `@cfunction` that
+# `ServerHandle(server)` takes where the server's type `S` is concrete: an argument declared
+# `Ref{S}` on the shim's side and passed as `Any` on the caller's, an `Any` result, and a shim that
+# hands an exception back instead of letting it unwind through the foreign frame. A failure means
+# the trimmed path needs re-checking with `bench/juliac/build.sh`; docs/design/juliac-trim.md §3.3.
+
+const AC = Nitro.Core.AppContext
+
+@testset "under the JIT the handle holds only the server" begin
+    app = Nitro.Core.App()
+    try
+        server = Nitro.serve(app; host = "127.0.0.1", port = get_free_port(), async = true,
+                             show_banner = false, access_log = false)
+        h = app.service.server[]
+        @test h isa AC.ServerHandle && h.server === server
+        @test h.isopen_c == C_NULL && h.wait_c == C_NULL && h.close_c == C_NULL
+        @test isopen(app.service)
+    finally
+        Nitro.Core.terminate(app)
+    end
+    @test isnothing(app.service.server[])
+end
+
+# The trimmed branches themselves, in a child: `_trimmed()` is redefined to `true` there, as a
+# `--trim` build's route registration redefines it, which would flip every `RouteEndpoint` in this
+# process to its `ccall` path. The child registers no route and sends no request, so only the
+# server handle takes it: `serve` builds it through the real constructor, and `isopen`, `wait`
+# and `close(::Service)` make the real `ccall`s.
+@testset "the trimmed branches make their foreign calls" begin
+    script = """
+    import Nitro
+    const AC = Nitro.Core.AppContext
+    Core.eval(Nitro.Core.Types, :(_trimmed() = true))
+    app = Nitro.Core.App()
+    server = Nitro.serve(app; host = "127.0.0.1", port = $(get_free_port()), async = true,
+                         show_banner = false, access_log = false)
+    h = app.service.server[]
+    println("PTRS=", h.server === server && h.isopen_c != C_NULL && h.wait_c != C_NULL && h.close_c != C_NULL)
+    println("OPEN=", isopen(app.service))
+    # A throw inside the shim comes back as a value and is thrown again here, as itself.
+    neg = try close(app.service; timeout = -1); "none" catch e; e isa ArgumentError ? "ArgumentError" : string(typeof(e)) end
+    println("NEGATIVE=", neg, " ", app.service.server[] === h, " ", isopen(app.service))
+    # A wait parked inside the foreign frame, then a graceful shutdown, which spawns its drain and
+    # parks in `timedwait` inside another one.
+    w = @async wait(app.service)
+    sleep(0.5)
+    println("PARKED=", istaskstarted(w) && !istaskdone(w))
+    close(app.service; timeout = 5)
+    println("CLOSED=", isnothing(app.service.server[]), " ", !isopen(server))
+    println("WAITED=", fetch(w) === nothing)
+    # A handle without pointers is refused, never called through `C_NULL`.
+    bare = AC.ServerHandle(server, C_NULL, C_NULL, C_NULL)
+    println("BARE=", try isopen(bare); "called" catch e; e isa ErrorException ? "refused" : "other" end)
+    """
+    cmd = `$(Base.julia_cmd()) --code-coverage=none --project=$(Base.active_project()) --startup-file=no -e $script`
+    out, err = IOBuffer(), IOBuffer()
+    p = run(pipeline(ignorestatus(cmd); stdout = out, stderr = err))
+    out, err = String(take!(out)), String(take!(err))
+    @test (p.exitcode, p.termsignal) == (0, 0) || (out, last(err, 2000))
+    for line in ("PTRS=true", "OPEN=true", "NEGATIVE=ArgumentError true true", "PARKED=true",
+                 "CLOSED=true true", "WAITED=true", "BARE=refused")
+        @test occursin(line, out) || (line, out)
+    end
+end
+end

@@ -139,7 +139,7 @@ end
     srv  = _serve(ctx, port)
     try
         @test_throws ArgumentError _serve(ctx, get_free_port())
-        @test ctx.service.server[] === srv        # the live handle was NOT overwritten
+        @test ctx.service.server[].server === srv        # the live handle was NOT overwritten
         @test isopen(ctx.service)
         # Proves the guard sits *before* serve()'s context mutations. This is the assertion
         # that catches a later refactor moving it below them.
@@ -180,7 +180,7 @@ end
         @test timedwait(() -> !isopen(ctx.service), 10.0; pollint = 0.05) === :ok
 
         srvB = _serve(ctx, get_free_port())
-        @test ctx.service.server[] === srvB
+        @test ctx.service.server[].server === srvB
         # Self-verifying: assert we really are inside the window. Without this, a pathological
         # runner where the drain finished first would silently degrade to green-without-testing.
         @test !istaskdone(stopping)
@@ -190,7 +190,7 @@ end
 
         # The decisive assertion: B's handle survived A's shutdown, so B is still reachable
         # from terminate() rather than being a permanently-bound orphan.
-        @test ctx.service.server[] === srvB
+        @test ctx.service.server[].server === srvB
         @test isopen(ctx.service)
     finally
         notify(release)
@@ -273,6 +273,22 @@ end
     @test Nitro.Core.preprocesskwargs(pairs((; reuseaddr = false)))[:reuseaddr] === false
     # Existing behavior must survive the edit.
     @test !haskey(Nitro.Core.preprocesskwargs(pairs((; queuesize = 100))), :queuesize)
+end
+
+@testset "the keywords serve hands listen! keep a concrete type (docs/design/juliac-trim.md §3)" begin
+    # A `Dict{Symbol,Any}` here made the keyword call into `HTTP.listen!` one `juliac --trim`
+    # cannot resolve. Each shape covers one branch: nothing passed, a default's `_ns` spelling
+    # (the default is skipped), an explicit value (the default is overridden), and a keyword
+    # `listen!` does not take, which must still reach it for its own `MethodError` (#525).
+    for kw in (pairs((;)), pairs((; idle_timeout_ns = 5, queuesize = 1)),
+               pairs((; reuseaddr = false, read_header_timeout = 0, read_timeout = 2.5)),
+               pairs((; parallel = true)))
+        @test isconcretetype(only(Base.return_types(Nitro.Core.preprocesskwargs, (typeof(kw),))))
+    end
+    got = Nitro.Core.preprocesskwargs(pairs((; idle_timeout_ns = 5, read_timeout = 2.5, parallel = true)))
+    @test got.idle_timeout_ns === 5 && !haskey(got, :idle_timeout)   # no default beside `_ns`
+    @test got.read_header_timeout == Nitro.Core.Constants.DEFAULT_READ_HEADER_TIMEOUT_SECONDS
+    @test got.read_timeout === 2.5 && got.parallel === true && got.allow_h2c === false
 end
 
 @testset "reuseaddr reaches the Server" begin
@@ -376,7 +392,7 @@ end
         @test ctx.service.server[] === nothing
         # The port is free again: a refused call leaves no listener behind.
         srv = _serve(ctx, port)
-        @test ctx.service.server[] === srv
+        @test ctx.service.server[].server === srv
     finally
         Nitro.Core.terminate(ctx)
     end

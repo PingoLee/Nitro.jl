@@ -38,6 +38,11 @@ wall was cleared in [#571](https://github.com/PingoLee/Nitro.jl/issues/571), and
 > app from 96 to 87, and the trimmed probe now serves `GET /plaintext` through the whole
 > pipeline. What is left on the probe's request path is the security-header layer, Base's
 > `ScopedValue` HAMT, and the probe's own `main`.
+>
+> **The start-up walls are cleared (§3, §3.3):** the banner, `CookieKey`, `HTTP.listen!`'s keyword
+> call and the server field, 28 errors. On 1.13 the minimal app goes from 87 to 59, and what is
+> left on it is the request path, the lifecycle hooks, the `revise = :eager` watcher and upstream
+> code.
 
 ## 1. How to measure
 
@@ -96,28 +101,29 @@ route and no middleware, so the probe stays the measure of the route path.
 The lesson that generalizes: **`repr`/`string` of an un-inferred value is the most expensive single
 trim mistake**, and that includes a `Symbol`. Type the value, then `print` it.
 
-## 3. Remaining (40 errors on the minimal app on Julia 1.12.7, 96 on 1.13, 87 after §3.6)
+## 3. Remaining (40 errors on the minimal app on Julia 1.12.7; on 1.13, 96, then 87 after §3.6 and 59 after the start-up walls)
 
 Measured 2026-10-22 on Julia 1.12.7, before and after #572. Each error is printed twice, so 20
 sites. `main` before #572 had **22**: the 20 below plus `CookieKey`'s, which arrived with a later
 merge. The `1.13` column is the recount (§3.5), 2026-10-23 at `dea736f0`, with JuliaC; a
-1.12.7 control at the same commit gives the After #572 column again, total 40. The last count
-column is the same build after the request-path change (§3.6).
+1.12.7 control at the same commit gives the After #572 column again, total 40. The `1.13, §3.6`
+column is the same build after the request-path change (§3.6), and the last count column after
+the start-up walls (below).
 
-| First frame in `src/` | Before #572 | After #572 | 1.13 | 1.13, §3.6 | What |
-|---|---:|---:|---:|---:|---|
-| `src/core/pipeline.jl` `setupmiddleware` | 4 | 0 | 0 | 0 | the fold (§3.2), **cleared** |
-| `src/core/lifecycle.jl` `serve` → `_serve_listener`, `startserver` | 4 | 0 | 0 | 0 | the pipeline's type through `serve`, **cleared** |
-| `src/core/lifecycle.jl` `_serve_pipeline`, the `start` closure | | 4 | 4 | 4 | `HTTP.listen!(…; kwargs...)` over the `Dict{Symbol,Any}` `startserver` passes: **the next wall in front of the request path** |
-| `src/core/lifecycle.jl` `serverwelcome`, `startserver` | | 16 | 14 | 14 | the banner and the blocking wait's `println`: `Dates.format(now(), "yyyy-mm-dd HH:MM:SS")` builds a `DateFormat` from a runtime string (4 of the 16 surface inside Dates' own `io.jl`), `IO`-typed `stdout`, `join` over `VersionNumber` fields. The control counts this row 18 (2 of them at `startserver`'s wait), which is where its 40 comes from |
-| `src/context.jl` `close`, `isopen`, `wait` | 6 | 8 | 8 | 8 | **the server field (§3.3)** |
-| `src/context.jl` `_try_cancel`; on 1.13 also `lifecycle.jl:118` | 2 | 2 | 3 | 3 | the `revise = :eager` watcher's `invokelatest`: dev-only and dynamic on purpose, so it stays |
-| `src/types.jl` `startup`/`shutdown` | 2 | 4 | 4 | 4 | the lifecycle hooks (§3.4) |
-| `src/crypto.jl` `CookieKey` | 2 | 2 | 2 | 2 | `NTuple{32,UInt8}` from a `Vector` |
-| `src/core/transport.jl`: the stream handler's body read (`_http_stream_request`, `_swallow_request_body!`), the response write and release | | | 18 | 18 | **new on 1.13**: the per-request task, reached past the `HTTP.listen!` wall (§3.5) |
-| `src/middleware/security_headers.jl` | | | 20 | 20 | **new on 1.13**: a response typed `Any`, the same rows as on the probe (§3.2) |
-| `src/core/pipeline.jl` `_app_context_seed`; serializer `format_response`, `handle_error` | | | 11 | 2 | **new on 1.13**: the probe's rows of the same name (§3.2). §3.6 clears all but the seed's `@with`, which is inside Base |
-| outside `src/` (OpenSSL.jl, a Base `string`, the libuv read callback; on 1.13 also Base's `errormonitor` task, `printstyled`'s closure, `showerror`, the TLS read) | 2 | 2 | 12 | 12 | upstream |
+| First frame in `src/` | Before #572 | After #572 | 1.13 | 1.13, §3.6 | start-up walls | What |
+|---|---:|---:|---:|---:|---:|---|
+| `src/core/pipeline.jl` `setupmiddleware` | 4 | 0 | 0 | 0 | 0 | the fold (§3.2), **cleared** |
+| `src/core/lifecycle.jl` `serve` → `_serve_listener`, `startserver` | 4 | 0 | 0 | 0 | 0 | the pipeline's type through `serve`, **cleared** |
+| `src/core/lifecycle.jl` `_serve_pipeline`, the `start` closure | | 4 | 4 | 4 | 0 | `HTTP.listen!(…; kwargs...)` over the `Dict{Symbol,Any}` `startserver` passes, **cleared** (below) |
+| `src/core/lifecycle.jl` `serverwelcome`, `startserver` | | 16 | 14 | 14 | 0 | the banner and the blocking wait's `println`: `Dates.format(now(), "yyyy-mm-dd HH:MM:SS")` builds a `DateFormat` from a runtime string (4 of the 16 surface inside Dates' own `io.jl`), `IO`-typed `stdout`, `join` over `VersionNumber` fields. The control counts this row 18 (2 of them at `startserver`'s wait), which is where its 40 comes from |
+| `src/context.jl` `close`, `isopen`, `wait` | 6 | 8 | 8 | 8 | 0 | **the server field (§3.3)**, cleared |
+| `src/context.jl` `_try_cancel`; on 1.13 also `lifecycle.jl:118` | 2 | 2 | 3 | 3 | 3 | the `revise = :eager` watcher's `invokelatest`: dev-only and dynamic on purpose, so it stays |
+| `src/types.jl` `startup`/`shutdown` | 2 | 4 | 4 | 4 | 4 | the lifecycle hooks (§3.4) |
+| `src/crypto.jl` `CookieKey` | 2 | 2 | 2 | 2 | 0 | `NTuple{32,UInt8}` from a `Vector` |
+| `src/core/transport.jl`: the stream handler's body read (`_http_stream_request`, `_swallow_request_body!`), the response write and release | | | 18 | 18 | 18 | **new on 1.13**: the per-request task, reached past the `HTTP.listen!` wall (§3.5) |
+| `src/middleware/security_headers.jl` | | | 20 | 20 | 20 | **new on 1.13**: a response typed `Any`, the same rows as on the probe (§3.2) |
+| `src/core/pipeline.jl` `_app_context_seed`; serializer `format_response`, `handle_error` | | | 11 | 2 | 2 | **new on 1.13**: the probe's rows of the same name (§3.2). §3.6 clears all but the seed's `@with`, which is inside Base |
+| outside `src/` (OpenSSL.jl, a Base `string`, the libuv read callback; on 1.13 also Base's `errormonitor` task, `printstyled`'s closure, `showerror`, the TLS read) | 2 | 2 | 12 | 12 | 12 | upstream |
 
 The verifier reports **the first dynamic call on each path**, so a cleared wall raises the count
 when it exposes code that was never verified. Every row #572 added is code that ran before #572
@@ -139,13 +145,50 @@ What #572 changed:
 
 | Where | What | Kind |
 |---|---|---|
-| `_serve_pipeline`'s `start` closure → `HTTP.listen!` | keyword call splatting a `Dict{Symbol,Any}` | next; small |
+| `_serve_pipeline`'s `start` closure → `HTTP.listen!` | keyword call splatting a `Dict{Symbol,Any}` | **cleared**: a `NamedTuple` (below) |
 | `compose` → the route's cached chain | a route table of differently typed chains | the route boundary (§3.2), **cleared** in [#718](https://github.com/PingoLee/Nitro.jl/issues/718) |
-| `isopen(::Service)`, `close(::Service)`, `wait` | `Service.server` holds `HTTP.Server{F}`, a UnionAll | **the server field (§3.3)** |
+| `isopen(::Service)`, `close(::Service)`, `wait` | `Service.server` holds `HTTP.Server{F}`, a UnionAll | **cleared**: `ServerHandle` (§3.3) |
 | `startup`/`shutdown` | `LifecycleMiddleware.on_startup`/`on_shutdown` are `Union{Function,Nothing}`-typed | lifecycle only (§3.4), [#719](https://github.com/PingoLee/Nitro.jl/issues/719) |
-| the banner | `IO`-typed `stdout`, a runtime `DateFormat` | startup only; not designed yet |
+| the banner | `IO`-typed `stdout`, a runtime `DateFormat` | **cleared** (below) |
 | the `revise = :eager` watcher's cancel | `Base.invokelatest` | dev-only and dynamic on purpose, so it stays |
 | `OpenSSL.jl`, libuv read callback | outside Nitro | upstream |
+
+**The start-up walls, cleared.** Four rows stood in front of the request path or on the way out of
+`serve`: the banner, `CookieKey`, `HTTP.listen!`'s keyword call and the server field. Measured
+2026-10-23 on `bench/juliac/app.jl`, `unsafe-warn`, Julia 1.13.2 with JuliaC 0.3.12, against
+`main` at `b218d362` (§3.6 merged); counted by first frame in `src/`:
+
+| First frame in `src/` | `main` | after | What changed |
+|---|---:|---:|---|
+| `src/core/lifecycle.jl` `serverwelcome`, `startserver` (the banner, the blocking wait's `println`) | 14 | 0 | the banner is built in one buffer and written once, through `_with_stdout`, which hands it `stdout` as one of the concrete types Base installs there; colours are `printstyled`'s bytes; the version is printed part by part; the date format is a `dateformat"…"` constant |
+| `src/crypto.jl` `CookieKey` | 2 | 0 | `ntuple` over `Val(32)`, after checking the length |
+| `src/core/lifecycle.jl` `_serve_pipeline`, the `start` closure → `HTTP.listen!` | 4 | 0 | `preprocesskwargs` returns a `NamedTuple`, not a `Dict{Symbol,Any}`, so the keyword call resolves |
+| `src/context.jl` `close`, `isopen`, `wait` | 8 | 0 | `Service.server` holds a `ServerHandle` (§3.3) |
+| `src/core/transport.jl`: the body reads, the response write and release | 18 | 18 | the request path (§4, step 4) |
+| `src/middleware/security_headers.jl` | 20 | 20 | a route chain's `Any` result (§3.6) |
+| `src/core/pipeline.jl` `_app_context_seed`'s `@with` | 2 | 2 | inside Base's `ScopedValue` HAMT (§3.5) |
+| `src/types.jl` `startup`/`shutdown` | 4 | 4 | the lifecycle hooks (§3.4) |
+| `src/context.jl` `_try_cancel`, `src/core/lifecycle.jl` the `ReviseHandler`'s `invokelatest` | 3 | 3 | dev-only and dynamic on purpose |
+| outside `src/` | 12 | 12 | upstream |
+| **total** | **87** | **59** | |
+
+By step: 87, then 71 with the banner and `CookieKey`, 67 with the keywords, 59 with the server
+field. No step added a row. The probe is unchanged at 20, row for row: none of the four is on its
+path.
+
+What a trimmed build does differently, all at start-up or shutdown: the banner has no colour, since
+reading `:color` from a terminal loads terminfo through untyped code; and the banner and the
+blocking wait's newline go to Julia's `Core.stdout`, because a trimmed executable's `stdout` is
+the stream saved when the image was built, never initialized. A write to it throws "stream not
+initialized" (found by running the trimmed app: a Ctrl-C to its blocking `serve` died there). With
+that fixed, the same Ctrl-C unwinds through `terminate`, the handle's `ccall`s and a clean exit.
+Under the JIT the banner's bytes are unchanged on a terminal, a file and a pipe, and with
+`--color=yes|no`.
+
+The keyword call keeps every key the caller passed, so a keyword `HTTP.listen!` does not take is
+still refused by its own `MethodError` (#525), and every value still meets HTTP.jl's own checks.
+A list of named, typed keywords would have made Nitro refuse unknown keys itself, with a different
+error.
 
 ### 3.1 The router field: cleared in #625
 
@@ -312,12 +355,45 @@ Julia 1.13.2 against `main`:
   longer compiles a specialization per handler type, which is the likely source; #726 measures
   registration on its own.
 
-### 3.3 The server field
+### 3.3 The server field: cleared
 
-`Service.server` holds `HTTP.Server{F}`, where `F` is the listener and so the pipeline type. It is
+`Service.server` held `HTTP.Server{F}`, where `F` is the listener and so the pipeline type. It is
 read only at the start of `serve` (`isopen`) and at `terminate` (`close` → `_shutdown_server`),
-never per request. A concrete field needs the same type-parameter decision as §3.1. Re-deriving
-`isopen` from HTTP.jl's internal fields would work, and it is the wrong trade (nitro-core §4).
+never per request, but each of those calls was one `--trim=safe` rejects: 8 errors on 1.13. The
+server's type first exists inside `serve`, which in an executable runs in `main`, so it cannot be
+a type parameter of `App` (§3.1 kept `App` concrete) and cannot be exported at build time the way
+§3.2's route thunks are.
+
+**Done: `ServerHandle` (`src/context.jl`).** `Service.server` is a
+`Base.RefValue{Nullable{ServerHandle}}`, a concrete Nitro struct that holds the `HTTP.Server` and,
+in a trimmed build only, three static `@cfunction` pointers to typed shims for `isopen`, `wait`
+and the bounded shutdown. `startserver`, where the server's type `S` is concrete, builds it:
+- **Under the JIT** the pointers are `C_NULL` and every call is the direct call the bare field made
+  before, behind the same `_trimmed()` switch as `RouteEndpoint`. Nothing runs per request.
+- **In a trimmed build** each call is a `ccall` through its pointer, which the verifier accepts.
+  The `@cfunction`'s signature (`Ref{S}`, and a `Float64` timeout) is static in a method specialized
+  on `S`, so its code is compiled ahead of time. The pointer is made at run time and never stored in
+  an image, which is what broke `FunctionWrapper` (§3.1). The shims catch what the call throws and
+  hand it back, so no exception unwinds through the foreign frame, as `RouteEndpoint`'s thunk does.
+  The new catch is in `src/errors.jl`'s list. A handle without pointers is refused, not called.
+- **The blocking `serve` waits on its own server**, whose type is concrete there, not through the
+  handle, so no foreign frame sits under Ctrl-C for the server's whole life.
+- `serve(async = true)` still returns the `HTTP.Server`; `terminate`, `isopen`/`wait(::Service)`,
+  the double-`serve` guard and the compare-and-clear in `close` (now on handles) are unchanged.
+
+A scratch program first checked the mechanism under `juliac --trim=safe` on 1.13.2: 0 errors, and
+the executable ran a `sleep` inside the foreign frame and handed an exception back.
+`test/juliac_internals_contract_tests.jl` runs the trimmed branches in a child process, with
+`_trimmed()` redefined to `true`, against a live server.
+
+| Candidate | Verifier | Why it was not chosen |
+|---|---|---|
+| **`ServerHandle`: static `@cfunction`s made in `startserver`** | clears the 8 | chosen: no API change, nothing per request |
+| a typed handle `serve` returns and `terminate` takes | at best the same | `terminate(app)`, `terminate()` and the double-`serve` guard still need an erased handle on `Service`, so it is this design plus an API change and an `upgrading/` entry |
+| a thunk exported at build time, as `RouteEndpoint` | cannot clear | the thunks are made with `Core.eval` at registration, which runs while the image is built; the server's type first exists in `serve`, in `main`, where an executable has no `Core.eval`. It would need a new build-time API that declares the server type |
+| one concrete listener type, erased per request | clears | adds a dynamic call to every request under the JIT, against §4's rule |
+| a supervisor task that owns the typed server, driven over typed channels | clears | moves the blocking wait and `close` onto another task, which changes where Ctrl-C lands (#426, #677) |
+| `isopen` re-derived from HTTP.jl's internal fields | clears | the wrong trade (nitro-core §4) |
 
 ### 3.4 Lifecycle hooks
 
@@ -499,11 +575,12 @@ The order:
    blocked on the server field. The dependency runs the other way: `Service.server` is
    `HTTP.Server{F}` with `F` the pipeline's type, so the field cannot be concrete until the
    pipeline is. The fold also cleared its own errors without §3.3.
-3. **§3.3, the server field**, and `HTTP.listen!`'s keyword call in front of the request path.
-   The field's type parameter is the pipeline's, fixed at `serve` time, not at `App`
-   construction, so it needs its own shape. One candidate, not designed yet: a typed handle that
-   `serve` returns and `terminate` takes. **§3.2's route boundary is done (#718)**: one
-   `RouteEndpoint` per route chain and per handler.
+3. **§3.3, the server field, and `HTTP.listen!`'s keyword call in front of the request path.
+   Done**, with the banner and `CookieKey`: `ServerHandle` holds the server behind one concrete
+   type, a direct call under the JIT and a `ccall` through a static `@cfunction` in a trimmed
+   build, and `serve` hands `listen!` its keywords as a `NamedTuple` (§3). The minimal app went
+   from 87 to 59 on 1.13. **§3.2's route boundary is done (#718)**: one `RouteEndpoint` per route
+   chain and per handler.
 4. **The request path.** The audit's four (#537, #538, #546, #566) are closed. The path
    parameters, the serializer, the error response and the app-context read are typed (§3.6). What
    the verifier shows there now: the security-header layer and the transport's response write,

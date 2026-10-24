@@ -481,7 +481,13 @@ would compare by identity. `show` and `JSON.lower` mask them, the same as `Secre
 """
 struct CookieKey
     bytes::NTuple{32, UInt8}
-    CookieKey(secret::SecretString) = new(NTuple{32, UInt8}(_cookie_key(secret)))
+    function CookieKey(secret::SecretString)
+        key = _cookie_key(secret)
+        length(key) == 32 || throw(ArgumentError("a cookie key is 32 bytes, got $(length(key))"))
+        # `ntuple` over `Val(32)`, not `NTuple{32, UInt8}(key)`: converting a `Vector` to a tuple
+        # is a call `juliac --trim` cannot resolve, since the length is not in the vector's type.
+        return new(ntuple(i -> key[i], Val(32)))
+    end
 end
 
 Base.show(io::IO, ::CookieKey) = print(io, "CookieKey(****)")

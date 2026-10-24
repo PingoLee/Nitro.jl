@@ -338,6 +338,25 @@ end
     @test !occursin("1.10.0", output)
 end
 
+# The banner prints the version and its colours without `print(::VersionNumber)` and
+# `printstyled`, neither of which a `juliac --trim` build can call (docs/design/juliac-trim.md §3).
+# Each replacement must write the bytes Base's own function writes.
+@testset "the banner's version and colours are Base's bytes" begin
+    for v in (v"0.6.0", v"1.2.3-rc1", v"1.2.3-alpha.2.x", v"1.2.3+build.7", v"0.0.1-dev.1+exp.sha")
+        @test sprint(Nitro.Core._print_version, v) == string(v)
+    end
+    for color in (true, false), (code, name) in ((Nitro.Core._CYAN, :cyan),
+                                                 (Nitro.Core._LIGHT_BLACK, :light_black),
+                                                 (Nitro.Core._YELLOW, :yellow)),
+        bold in (true, false), rev in (true, false)
+        ours = sprint(io -> Nitro.Core._print_styled(io, " Nitro 0.6.0 ", color, code;
+                                                     bold, reverse = rev))
+        base = sprint(io -> printstyled(io, " Nitro 0.6.0 "; color = name, bold, reverse = rev);
+                      context = :color => color)
+        @test ours == base
+    end
+end
+
 # #299: the banner reports the GC target and the thread pools, and never guesses. The target is
 # injected so each shape is deterministic; the live read has its own smoke test below.
 @testset "serverwelcome banner reports the GC target and thread pools" begin
