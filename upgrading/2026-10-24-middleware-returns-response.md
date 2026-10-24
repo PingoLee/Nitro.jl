@@ -1,7 +1,7 @@
 ## A middleware that returns anything but an `HTTP.Response` gets a `500`
 
 - **Version**: Unreleased
-- **Nitro ref**: `src/routerhof.jl` (`ResponseBoundary`), `src/core/transport.jl`, `src/middleware/security_headers.jl`
+- **Nitro ref**: `src/routerhof.jl` (`ResponseBoundary`), `src/core/transport.jl`, `src/middleware/security_headers.jl`, `src/middleware/cors_middleware.jl`, `src/middleware/rate_limiter.jl`, `src/middleware/session_middleware.jl`, `src/middleware/csrf_middleware.jl`
 - **Recorded**: 2026-10-24
 - **Severity**: behavior (a middleware, or a handler under `serialize = false`, whose value reaches the outside of the global middleware chain without being an `HTTP.Response`)
 
@@ -34,13 +34,29 @@ Three things are unchanged:
 - **Route, router and global middleware still see the handler's raw value under
   `serialize = false`.** The check is at the outside of the global chain, not on each layer. A
   global middleware that formats raw values into responses (the Oxygen-era pattern) keeps
-  working.
+  working. What Nitro's own layers do with such a value, inside that formatter, is below.
 - **What a `STREAM` or `WEBSOCKET` handler returns under `serialize = false`, once it has written
   its response on the stream, is not an error**: `nothing`, or what its last `write` returned.
   Nothing more is sent. This also fixes that shape under the access log (on by default): the
   client used to lose the connection mid-response, and the server logged an error.
 - **The internal `setupmiddleware(app; serialize = false)(req)`** now returns that `500` rather
   than the handler's raw value. It is not public API. Only tests that called it directly see this.
+
+**Nitro's own layers and a raw value.** Under `serialize = false`, a `SecurityHeaders`, `Cors`,
+`RateLimiter`, `SessionMiddleware` or `CSRFMiddleware` placed inside a formatting middleware (route
+middleware, say) can receive the handler's raw value. Each used to raise a `MethodError` on it,
+which was a `500`. Now:
+
+- `SecurityHeaders`, `Cors` and `RateLimiter` pass it through untouched. The formatter outside
+  them turns it into a response, without their headers: no security headers, no
+  `Access-Control-Allow-Origin`, no rate-limit headers on that response.
+- `SessionMiddleware` and `CSRFMiddleware` pass it through only while none of their cookies is
+  due. When one is (a session was written, a CSRF token was handed out or refreshed), they raise
+  an `ArgumentError` that names the layer and the value's type, still a `500`. Passing the value
+  on without the cookie would answer as if all were well while the client holds no cookie for the
+  session just stored, or for the token in the body, whose next `POST` is then refused. The
+  session is stored before the cookie step, as it was before this change, so a raw value can still
+  leave a session row behind; return a response from such a route.
 
 ### How to find the calls to migrate
 
@@ -54,6 +70,9 @@ grep -rn -E 'serialize *= *false' --include=*.jl .
 # response is what now gets a 500:
 grep -rn -E 'handler *-> *\(?req' --include=*.jl .
 grep -rn -E 'middleware *= *\[' --include=*.jl .
+# Nitro's own header and cookie layers, which inside a formatter now pass a raw value through
+# (or, for the session and CSRF layers, raise when their cookie is due):
+grep -rn -E '(SecurityHeaders|Cors|RateLimiter|SessionMiddleware|CSRFMiddleware)\(' --include=*.jl .
 ```
 
 ### Before → after
@@ -80,4 +99,15 @@ path("/items", req -> Res.json(Dict("a" => 1)))
 # or keep the raw value and format it in global middleware
 formatting = handler -> (req -> (v = handler(req); v isa HTTP.Response ? v : Res.json(v)))
 serve(app; serialize = false, middleware = [formatting])
+```
+
+A route behind one of Nitro's header or cookie layers, under `serialize = false`, returns a
+response itself, so the layer can add its headers or its cookie:
+
+```julia
+# before: a raw value; Cors raised a MethodError (500), and now adds no CORS headers
+path("/items", req -> Dict("a" => 1); middleware = [Cors(allowed_origins = ["https://app.example"])])
+
+# after
+path("/items", req -> Res.json(Dict("a" => 1)); middleware = [Cors(allowed_origins = ["https://app.example"])])
 ```

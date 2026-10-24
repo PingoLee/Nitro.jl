@@ -564,6 +564,15 @@ rate limiter).
 """
 own_response_headers(resp::HTTP.Response) = _rebuild_with_headers(resp, copy(resp.headers))
 
+# What `SessionMiddleware` and `CSRFMiddleware` raise when their cookie is due on a value that is not
+# a response: a handler's raw value under `serialize = false`. Passing it through, as the
+# header-only layers do, would leave a stored session with no cookie, or a token in the body with
+# none, so the next request fails somewhere else. Names the value's type, never the value (#613).
+_cookie_on_raw_value(layer::String, @nospecialize(value)) = ArgumentError(
+    "$layer: its cookie is due, but the layer inside it returned a $(nameof(typeof(value))), not an " *
+    "HTTP.Response. Under `serialize = false`, return a response from the handler, or turn the " *
+    "value into one in a middleware inside this layer.")
+
 """
     add_response_headers(resp::HTTP.Response, extra) -> HTTP.Response
 

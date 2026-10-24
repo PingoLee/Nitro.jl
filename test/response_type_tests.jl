@@ -321,12 +321,27 @@ end
     req() = (r = HTTP.Request("GET", "/"); setip!(r, Nitro.Core.Sockets.IPv4("127.0.0.1")); r)
     @test Cors(allowed_origins = ["https://a.example"])(raw)(req()) == "a raw value"
     @test RateLimiter(strategy = :fixed_window, rate_limit = 10).middleware(raw)(req()) == "a raw value"
+    # Session and CSRF pass a raw value through only while no cookie of theirs is due: before,
+    # each raised a `MethodError` on any raw value.
     session = SessionMiddleware(store = MemoryStore()).middleware
-    # Writes the session, so the cookie step runs; before, it raised a `MethodError` here.
-    writes = req -> (getsession(req)["k"] = 1; "a raw value")
-    @test session(writes)(req()) == "a raw value"
     csrf = CSRFMiddleware("typed-paths-csrf-secret-not-for-production-0123456789")
-    @test session(csrf(writes))(req()) == "a raw value"
+    @test session(raw)(req()) == "a raw value"
+    @test session(csrf(raw))(req()) == "a raw value"
+end
+
+@testset "a cookie due on a raw value fails loudly, naming the type only" begin
+    req() = HTTP.Request("GET", "/")
+    caught(f) = try f(); nothing catch e; e end
+    session = SessionMiddleware(store = MemoryStore()).middleware
+    writes = req -> (getsession(req)["k"] = "secret-session-value"; "secret raw value")
+    err = caught(() -> session(writes)(req()))
+    @test err isa ArgumentError && occursin("SessionMiddleware", err.msg) && occursin("String", err.msg)
+    @test !occursin("secret", err.msg)
+    csrf = CSRFMiddleware("typed-paths-csrf-secret-not-for-production-0123456789")
+    asks = req -> (csrf_token!(req); "secret raw value")
+    err = caught(() -> session(csrf(asks))(req()))
+    @test err isa ArgumentError && occursin("CSRFMiddleware", err.msg)
+    @test !occursin("secret", err.msg)
 end
 
 @testset "a session of another type fails without its values in the error (#612)" begin

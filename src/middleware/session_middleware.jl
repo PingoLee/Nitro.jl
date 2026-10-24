@@ -13,7 +13,7 @@ using ...Cookies: get_cookie, set_cookie!, storesession!, prunesessions!, regene
     _validate_cookie_prefix
 using ...Crypto: secure_uuid4
 using ...Errors: ValidatorFault, is_unrecoverable
-using ...Util: _rebuild_with_headers
+using ...Util: _rebuild_with_headers, _cookie_on_raw_value
 using ...Util: _mark_private!
 
 export SessionMiddleware, SessionPruner, rehash_session!
@@ -583,9 +583,11 @@ function SessionMiddleware(;
                 session_written = false
             end
 
-            # Only a response carries a cookie: anything else (a raw handler value under
-            # `serialize = false`) passes through untouched, as `SecurityHeaders` passes it.
-            (session_written && response isa HTTP.Response) || return response
+            session_written || return response
+            # Only a response carries a cookie. A raw handler value under `serialize = false`
+            # cannot, and the session is already stored, so this fails loudly rather than pass
+            # the value through without the cookie that names that session.
+            response isa HTTP.Response || throw(_cookie_on_raw_value("SessionMiddleware", response))
             # Own the headers before adding Set-Cookie: `response` may be a shared/`const`
             # object (e.g. an auth-rejection response). Mutating it in place would attach
             # this visitor's session cookie to every later request that returns the same

@@ -11,7 +11,8 @@ using ...Crypto: secure_random_bytes, _empty_hmac_key, _hmac_sha256, SecretStrin
 using ...Errors: is_unrecoverable
 using ...Res: json
 using ...Core: own_response_headers, getjson, getform, with_session, header_name_isequal
-using ...Util: _mark_private!, _auth_credential, _ascii_casefold_eq, _rebuild_with_headers
+using ...Util: _mark_private!, _auth_credential, _ascii_casefold_eq, _rebuild_with_headers,
+    _cookie_on_raw_value
 
 export CSRFMiddleware, csrf_token!, issue_csrf_token!, validate_csrf_token
 
@@ -713,17 +714,15 @@ function CSRFMiddleware(key::Union{AbstractString, SecretString}; cookie_name::S
                 _warn_unbound()
                 return response
             end
-            # Only a response carries a cookie: anything else (a raw handler value under
-            # `serialize = false`) passes through untouched, as `SecurityHeaders` passes it.
-            response isa HTTP.Response || return response
-
             # Under an unchanged binding the answer is the one computed before the handler; a
             # rotation (or a binding that first appeared) re-verifies under the new one.
             still_valid = binding == binding_before ? verified :
                           _verified_token(secret, cookie_value, binding)
             needs_token = still_valid === nothing
-            # On the headers, one concrete type whatever the body, so the call is static.
-            handler_minted = _response_sets_cookie(response.headers, cookie_name)
+            # On the headers, one concrete type whatever the body, so the call is static. A raw
+            # handler value under `serialize = false` set no cookie.
+            handler_minted = response isa HTTP.Response &&
+                             _response_sets_cookie(response.headers, cookie_name)
             if handler_minted
                 _keep_session!(req)
                 return response
@@ -749,6 +748,10 @@ function CSRFMiddleware(key::Union{AbstractString, SecretString}; cookie_name::S
             else
                 return response
             end
+            # A cookie is due. A raw handler value under `serialize = false` cannot carry one,
+            # and the handler may have put the token in it, so this fails loudly rather than
+            # pass the value through without the cookie that token needs.
+            response isa HTTP.Response || throw(_cookie_on_raw_value("CSRFMiddleware", response))
             # Own the headers before issuing the cookie: `response` may be a shared/`const`
             # object, and setting a cookie mutates the headers in place. The cookie and the
             # `private` marking go on the copy, whose type is the same whatever the body, and the
