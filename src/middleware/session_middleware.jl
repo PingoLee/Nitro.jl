@@ -7,7 +7,7 @@ using UUIDs
 using ...Types: AbstractSessionStore, MemoryStore, SessionPayload, Nullable, is_expired,
     update_session!, delete_session!, session_store_full, SESSION_AUTH_HASH_KEY,
     _session_auth_hash_current, _session_auth_hash_of, _store_call, _store_bool
-using ...Types: CookieConfig, LifecycleMiddleware
+using ...Types: CookieConfig, LifecycleMiddleware, with_response
 using ..JanitorMiddleware: _janitor
 using ...Cookies: get_cookie, set_cookie!, storesession!, prunesessions!, regenerate_session!,
     _validate_cookie_prefix
@@ -578,17 +578,19 @@ function SessionMiddleware(;
                 session_written = false
             end
 
-            if session_written
-                # Own the headers before adding Set-Cookie: `response` may be a shared/`const`
-                # object (e.g. an auth-rejection response). Mutating it in place would attach
-                # this visitor's session cookie to every later request that returns the same
-                # object — a cross-request session leak — and races other threads.
-                response = own_response_headers(response)
-                # Append the session cookie without clobbering any sibling Set-Cookie headers.
-                set_cookie!(response, session_cookie, final_session_id; config=config, encrypted=false, maxage=ttl)
-                _mark_private!(response)
-            end
-
+            # Only a response carries a cookie: anything else (a raw handler value under
+            # `serialize = false`) passes through untouched, as `SecurityHeaders` passes it.
+            (session_written && response isa HTTP.Response) || return response
+            # Own the headers before adding Set-Cookie: `response` may be a shared/`const`
+            # object (e.g. an auth-rejection response). Mutating it in place would attach
+            # this visitor's session cookie to every later request that returns the same
+            # object — a cross-request session leak — and races other threads. The rebuild is the
+            # one step that needs the body's type, so it alone goes through `with_response`;
+            # the two calls after it touch only the headers.
+            response = with_response(own_response_headers, response)::HTTP.Response
+            # Append the session cookie without clobbering any sibling Set-Cookie headers.
+            set_cookie!(response, session_cookie, final_session_id; config=config, encrypted=false, maxage=ttl)
+            _mark_private!(response)
             return response
         end
     end
