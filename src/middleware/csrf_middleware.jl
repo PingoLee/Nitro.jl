@@ -1,6 +1,7 @@
 module CSRFMiddleware_
 
 using HTTP
+import JSON
 
 using ...Types: CookieConfig, Nullable, with_response, _trimmed
 using ...Cookies: get_cookie, set_cookie!
@@ -430,13 +431,8 @@ function _presented_token(req::HTTP.Request, header_name::String, form_field::St
         is_unrecoverable(e) && rethrow()
         nothing
     end
-    if form isa AbstractDict
-        if haskey(form, form_field)
-            return string(form[form_field])
-        elseif haskey(form, Symbol(form_field))
-            return string(form[Symbol(form_field)])
-        end
-    end
+    token = _field_token(form, form_field)
+    token === nothing || return token
 
     json = try
         getjson(req)
@@ -444,14 +440,30 @@ function _presented_token(req::HTTP.Request, header_name::String, form_field::St
         is_unrecoverable(e) && rethrow()
         nothing
     end
-    if json isa AbstractDict
-        if haskey(json, form_field)
-            return string(json[form_field])
-        elseif haskey(json, Symbol(form_field))
-            return string(json[Symbol(form_field)])
-        end
-    end
+    return _field_token(json, form_field)
+end
 
+# The token a parsed body carries under `field`, at the types the body parsers return: a form is a
+# `Dict{String,String}`, a JSON object a `JSON.Object{String,Any}`. A closed set of `isa`s, so each
+# read is a static call (docs/design/juliac-trim.md §3). A JSON value that is not a string is no
+# token: every token Nitro issues is one, so it could never have matched, and the answer is the
+# same 403.
+function _field_token(@nospecialize(body), field::String)::Nullable{String}
+    body === nothing && return nothing
+    body isa Dict{String,String} && return Base.get(body, field, nothing)
+    if body isa JSON.Object{String,Any}
+        value = Base.get(body, field, nothing)
+        return value isa String ? value : nothing
+    end
+    return _foreign_field_token(body, field)
+end
+
+# Any other parsed body: read as before under the JIT, a `String` or `Symbol` key and the value as a
+# string; a trimmed image, which has no code for it, finds no token there.
+@noinline function _foreign_field_token(@nospecialize(body), field::String)::Nullable{String}
+    (_trimmed() || !(body isa AbstractDict)) && return nothing
+    haskey(body, field) && return string(body[field])
+    haskey(body, Symbol(field)) && return string(body[Symbol(field)])
     return nothing
 end
 
