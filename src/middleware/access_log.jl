@@ -26,8 +26,9 @@ module StructuredAccessLogMiddleware
 
 using HTTP
 using Dates
-using Sockets: IPv4
+using Sockets: IPv4, IPv6
 using ...Core: getip, route_missed, LifecycleMiddleware
+using ...Types: _trimmed
 using ...Util: _log_target_path, _check_access_log_skip
 using ...Errors: loggable, is_unrecoverable
 using ..JanitorMiddleware: _janitor
@@ -239,13 +240,27 @@ function _ip_string(ip::IPv4)::String
 end
 _ip_string(ip)::String = string(ip)
 
+# The client address as text, at the two types `serve` and `setip!` store, so the call is static
+# (`getip` reads a `Dict{Symbol,Any}`; docs/design/juliac-trim.md §3). Another value a middleware
+# stored is printed as before under the JIT; a trimmed image, which has no code for it, records no
+# address rather than fail the record.
+function _client_ip_string(@nospecialize(ip))::Union{Nothing,String}
+    ip === nothing && return nothing
+    ip isa IPv4 && return _ip_string(ip)
+    ip isa IPv6 && return _ip_string(ip)
+    return _trimmed() ? nothing : _foreign_ip_string(ip)
+end
+@noinline _foreign_ip_string(@nospecialize(ip))::String = string(ip)
+
 # Redaction is decided HERE, at capture, not left to the sink (#320). The record used to carry
 # the raw query and a prefix-sliced path, so an app persisting it wrote password-reset tokens,
 # OAuth codes and absolute-form credentials (`http://user:pw@h/x`) into its access-log store --
 # while the console logger beside it had redacted both by default since #39. A sink is
 # app code and cannot un-see a secret it was handed; the only safe default is to never hand it.
-function _capture!(r::_Run, req::HTTP.Request, resp, t0::UInt64, annotate, log_query::Bool,
-                   max_field_bytes::Int)
+# `resp` unspecialized: it is whatever the inner layer returned, an `Any`, and only its status is
+# read, after an `isa`. One method for every call, so the call into it is static.
+function _capture!(r::_Run, req::HTTP.Request, @nospecialize(resp), t0::UInt64, annotate,
+                   log_query::Bool, max_field_bytes::Int)
     try
         # t0 is a `time_ns()` reading; the monotonic delta can never go negative.
         duration_ms = round(Int, (time_ns() - t0) / 1_000_000)
@@ -253,8 +268,7 @@ function _capture!(r::_Run, req::HTTP.Request, resp, t0::UInt64, annotate, log_q
         path = _truncate_field(_log_target_path(target), max_field_bytes)
         query = log_query ? _truncate_field(_raw_query(target), max_field_bytes) : nothing
         status = resp isa HTTP.Response ? Int(resp.status) : (resp === nothing ? 500 : 200)
-        ipaddr = getip(req)
-        ip = ipaddr === nothing ? nothing : _ip_string(ipaddr)
+        ip = _client_ip_string(getip(req))
         ua = HTTP.header(req, "User-Agent", "")
         user_agent = isempty(ua) ? nothing : _truncate_field(ua, max_field_bytes)
         method = _truncate_field(req.method, max_field_bytes)

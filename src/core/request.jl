@@ -346,8 +346,13 @@ The miss belongs to the method and target that missed. A middleware that gets a 
 `req.target` (a trailing-slash or locale fallback) and is then served by a route reads as
 **not** missed.
 """
-route_missed(req::HTTP.Request)::Bool =
-    Base.get(req.context, Types.ROUTE_MISS_KEY, nothing) == (req.method, req.target)
+function route_missed(req::HTTP.Request)::Bool
+    # `isa` first: the key holds the `(method, target)` tuple Nitro writes, and the comparison is
+    # then static (`req.context` is a `Dict{Symbol,Any}`; docs/design/juliac-trim.md §3). Nothing
+    # else could equal that tuple, so the answer is the same.
+    miss = Base.get(req.context, Types.ROUTE_MISS_KEY, nothing)
+    return miss isa Tuple{String,String} && miss == (req.method, req.target)
+end
 
 # Set at each place Nitro answers "no route" (see `Types.ROUTE_MISS_KEY`). It records WHICH request
 # shape missed rather than a bare `true`, so a re-dispatch to a target a route then serves is not
