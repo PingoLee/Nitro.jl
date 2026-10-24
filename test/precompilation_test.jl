@@ -67,7 +67,8 @@ try
     @test precompile(listener, (stream,))
     @test precompile(request_handler, (stream,))
     @test precompile(Nitro.Core._handle_reporting, (typeof(request_handler), stream))
-    @test precompile(Nitro.Core._write_response_body!, (stream, String))
+    @test precompile(Nitro.Core._send_response!, (Nitro.Core.HTTP.Response{String}, stream,
+        Nitro.Core.Types.EmptyRequest, Nothing))
 finally
     terminate(app)
 end
@@ -141,8 +142,10 @@ end
     @test HTTP.hasheader(setupmiddleware(app; security_headers = SecurityHeaders())(
         HTTP.Request("GET", "/x")), "X-Frame-Options")
 
-    # `serialize = false`: the handler's own return value comes back, unformatted.
-    @test setupmiddleware(app; serialize = false)(HTTP.Request("GET", "/x")) == "x"
+    # `serialize = false`: nothing formats the handler's `"x"`, so it reaches the pipeline's
+    # response boundary as it is, and the boundary answers a 500 (test/response_type_tests.jl).
+    @test (@test_logs (:error, r"not an HTTP.Response") setupmiddleware(app; serialize = false)(
+        HTTP.Request("GET", "/x"))).status == 500
 
     # `catch_errors = false`: a throw propagates rather than becoming a 500.
     boom = handler -> (req -> error("boom"))

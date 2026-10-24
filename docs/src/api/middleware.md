@@ -7,6 +7,16 @@ the server is up. `serve()`, `path()` and `urlpatterns()` take either form; only
 a chain by hand needs the `.middleware` field. The type is not exported, so construct one as
 `Nitro.LifecycleMiddleware(...)`.
 
+**A middleware returns an `HTTP.Response`.** Nitro checks that once, where the global middleware
+chain hands its result to the framework's own outer layers (the error handling, `SecurityHeaders`,
+the access log, the transport). A value that is anything else is answered with a `500`
+(`{"message": "500: Internal Server Error"}`). One `@error` record names the value's type and the
+matched route's pattern, never the value. Inside the chain nothing is checked, so under
+`serve(serialize = false)` route and global middleware still receive a handler's raw value and
+may turn it into a response. The one exception is a `STREAM` or `WEBSOCKET` handler under
+`serialize = false` that has already written its response on the stream: whatever it returns
+(usually `nothing`) is not an error.
+
 **A middleware that throws** is handled the same way as a handler that throws, as long as
 `catch_errors=true` (the default for both `serve()` and `internalrequest()`). The exception is
 logged with its backtrace and the client receives `{"message": "500: Internal Server Error"}`.

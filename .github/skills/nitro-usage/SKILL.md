@@ -80,6 +80,12 @@ first) → route (`path(...; middleware)`) → handler**, each list top-down. Gr
 instances (one `SessionMiddleware` = one store, one janitor). They never run on a 404/405, so
 rate limiting, `ExtractIP` and access logging stay global.
 
+**A middleware is `handler -> (req -> response)` and returns an `HTTP.Response`**: the handler's
+own response, a new one (never a mutated copy of the inner one), or its own from `Res.*`. Whatever
+leaves the global chain as anything else (a `String`, a `Dict`, `nothing`) is a logged `500`.
+Under `serve(serialize = false)` a handler's raw value is fine *inside* the chain, as long as some
+middleware turns it into a response.
+
 There is **no single-argument `urlpatterns(routes)`** — the prefix comes first, `""` for root.
 Registration is a separate step from starting the server: declare routes, call `urlpatterns(...)`,
 *then* call `serve()`.

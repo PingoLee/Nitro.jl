@@ -407,23 +407,16 @@ end
         precompile(request_handler, (stream,))
         # What the spawn runs: a `@spawn` closure's body is not compiled with the listener.
         precompile(Core._handle_reporting, (typeof(request_handler), stream))
-        precompile(Core._write_response_body!, (stream, String))
-        precompile(Core._write_response_body!, (stream, Vector{UInt8}))
-        # The two streaming bodies (#551), ~120 ms each on a first request: a streamed file
-        # (`Res.file(req, path)` over 8 MiB or with `stream = true`, and a mount's files over its
-        # threshold), whose body type is whatever `servecontent` builds over an `IO`, so it is
-        # read off a real call rather than named; and `Res.sse`'s `SSEStream`, with the builder itself.
-        mktempdir() do dir
-            file = joinpath(dir, "streamed.bin")
-            write(file, "precompile")
-            open(file) do io
-                body = Core.HTTP.servecontent(Request("GET", "/"), io).body
-                precompile(Core._write_response_body!, (stream, typeof(body)))
-            end
-        end
-        let events = Res.sse()
-            precompile(Core._write_response_body!, (stream, typeof(events.body)))
-            close(events.body)
+        # The write half, once per body type Nitro builds (`Types.with_response`), for the two
+        # requests the transport builds. The two streaming bodies (#551) cost ~120 ms each on a
+        # first request when cold: a streamed file (`Res.file(req, path)` over 8 MiB or with
+        # `stream = true`, and a mount's files over its threshold) and `Res.sse`'s `SSEStream`.
+        # The admission is `nothing` unless `max_concurrent_requests` holds a slot.
+        for B in (String, Vector{UInt8}, Core.HTTP.EmptyBody, Core.HTTP.BytesBody{Vector{UInt8}},
+                  Core.HTTP.BytesBody{Core.Types.RangeBytes}, Core.Types.StreamedFileBody,
+                  Core.HTTP.SSEStream),
+            R in (Core.Types.EmptyRequest, Core.Types.BytesRequest), A in (Nothing, Core._Admission)
+            precompile(Core._send_response!, (Core.HTTP.Response{B}, stream, R, A))
         end
     end
 

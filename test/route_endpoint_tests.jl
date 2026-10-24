@@ -241,8 +241,10 @@ end
     @test HTTP.header(res, "Content-Type") == "application/json; charset=utf-8" && String(res.body) == "{\"a\":1}"
     @test String(Nitro.internalrequest(app, HTTP.Request("GET", "/n")).body) == "7"
     @test String(Nitro.internalrequest(app, HTTP.Request("GET", "/p/4")).body) == "5"
-    # `serialize = false`: the handler's own value, through the raw call.
-    @test Nitro.Core.setupmiddleware(app; serialize = false)(HTTP.Request("GET", "/d")) == Dict("a" => 1)
+    # `serialize = false`: the handler's own value, through the raw call, to the response
+    # boundary, which refuses it (test/response_type_tests.jl).
+    @test (@test_logs (:error, r"not an HTTP.Response") Nitro.Core.setupmiddleware(app; serialize = false)(
+        HTTP.Request("GET", "/d"))).status == 500
     @test Nitro.internalrequest(app, HTTP.Request("GET", "/missing")).status == 404
 end
 

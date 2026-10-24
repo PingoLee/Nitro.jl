@@ -294,7 +294,9 @@ removed.
 @kwdef struct App <: AbstractApp
     service :: Service          = Service()
     mod     :: Nullable{Module} = nothing
-    app_context :: Ref{Any}     = Ref{Any}(missing) # This stores a reference to an Context{T} object
+    # `Base.RefValue{Any}`, not `Ref{Any}`: `Ref` is abstract, so `getindex` on it was a dynamic call
+    # on every request, as it was for the `Service` slots before #571.
+    app_context :: Base.RefValue{Any} = Ref{Any}(missing) # This stores a reference to an Context{T} object
     # Only the three resendable body types (`Types.MissResponse`); the constructor below converts
     # or refuses anything else. Shared by every miss; the transport hands HTTP.jl a copy
     # (`_handoff_copy` in src/core/transport.jl, #628).
