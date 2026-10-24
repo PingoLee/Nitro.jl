@@ -733,10 +733,12 @@ function FixedRateLimiter(;
         end
     end
 
-    # If auto_extract_ip is true, then we'll use this composed version of the middleware
-    function extract_ip_and_rate_limit(handle::Function) :: Function
-        reduce(|>, [handle, rate_limit_only, extract_client_ip])
-    end
+    # If auto_extract_ip is true, then we'll use this composed version of the middleware.
+    # Composed by direct calls, `extract_client_ip(rate_limit_only(handle))`, which is what
+    # `reduce(|>, [handle, rate_limit_only, extract_client_ip])` did: that fold over a
+    # `Vector{Function}` and a `::Function` result erased the chain's type, so every global
+    # middleware around this one was a dynamic call (docs/design/juliac-trim.md §3).
+    extract_ip_and_rate_limit(handle::Function) = extract_client_ip(rate_limit_only(handle))
 
     return LifecycleMiddleware(;
         middleware = auto_extract_ip ? extract_ip_and_rate_limit : rate_limit_only, 
@@ -948,10 +950,9 @@ function SlidingRateLimiter(;
         end
     end
 
-    # Compose with IP extraction if auto_extract_ip is enabled
-    function extract_ip_and_rate_limit(handle::Function) :: Function
-        return reduce(|>, [handle, rate_limit_only, extract_client_ip])
-    end
+    # Compose with IP extraction if auto_extract_ip is enabled: direct calls, as in the fixed
+    # limiter above, so the chain keeps its type.
+    extract_ip_and_rate_limit(handle::Function) = extract_client_ip(rate_limit_only(handle))
 
     # A `LifecycleMiddleware` with both hooks left `nothing` (#172). This strategy owns no
     # background task — a full stripe reaps its expired buckets inline (#403), so there is
