@@ -194,31 +194,38 @@ function (sh::SecurityHeaders)(handle::Function)
         # on that (#572).
         isempty(frozen) && return handle(req)
         resp = handle(req)
-
-        # A NEW response, never a mutation of the one the inner layer returned. That response
-        # may be a shared module-level `const` (an auth rejection, a cached error), and Nitro
-        # serves every request on its own thread -- so `setheader` here would both leak these
-        # headers across requests and race. See nitro-core §4.
-        #
-        # Fast path: the inner layer set none of these, which is almost every response. The
-        # `any` scan itself allocates nothing and the shared `frozen` vector is appended as-is,
-        # so this path costs exactly what the middleware cost before the conflict check existed
-        # -- it is not allocation-free, because `add_response_headers` builds a new `Response`
-        # by design, and nothing here should be "optimized" on the belief that it was.
-        any(p -> HTTP.hasheader(resp, p.first), frozen) || return add_response_headers(resp, frozen)
-
-        # A handler or an inner middleware already chose a value for at least one of these, so
-        # DO NOT add a second copy. Two conflicting `X-Frame-Options` on the wire is not "more
-        # secure": RFC 7034 §2.1 says the browser must treat the directive as invalid, so the
-        # likely outcome is the protection being dropped entirely -- worse than either value
-        # alone. The explicit choice wins, which is also what Django's `SecurityMiddleware`
-        # (`setdefault`) and Phoenix's `put_secure_browser_headers` both do.
-        missing_pairs = [p for p in frozen if !HTTP.hasheader(resp, p.first)]
-        # Every header already present -- e.g. a router's own `SecurityHeaders()` inside a
-        # `serve(security_headers = …)` layer (#402). Nothing to add, so nothing to rebuild.
-        isempty(missing_pairs) && return resp
-        return add_response_headers(resp, missing_pairs)
+        # Only a response has headers to add. Anything else (a raw handler value under
+        # `serialize = false`, reaching a router's own `SecurityHeaders()`) passes through untouched.
+        resp isa HTTP.Response || return resp
+        # At its concrete body type, so every call below is static (`Types.with_response`).
+        return Types.with_response(_with_security_headers, resp, frozen)
     end
+end
+
+function _with_security_headers(resp::HTTP.Response, frozen::Vector{Pair{String,String}})
+    # A NEW response, never a mutation of the one the inner layer returned. That response may be a
+    # shared module-level `const` (an auth rejection, a cached error), and Nitro serves every
+    # request on its own thread -- so `setheader` here would both leak these headers across
+    # requests and race. See nitro-core §4.
+    #
+    # Fast path: the inner layer set none of these, which is almost every response. The `any` scan
+    # itself allocates nothing and the shared `frozen` vector is appended as-is, so this path costs
+    # exactly what the middleware cost before the conflict check existed -- it is not
+    # allocation-free, because `add_response_headers` builds a new `Response` by design, and
+    # nothing here should be "optimized" on the belief that it was.
+    any(p -> HTTP.hasheader(resp, p.first), frozen) || return add_response_headers(resp, frozen)
+
+    # A handler or an inner middleware already chose a value for at least one of these, so DO NOT
+    # add a second copy. Two conflicting `X-Frame-Options` on the wire is not "more secure": RFC 7034
+    # §2.1 says the browser must treat the directive as invalid, so the likely outcome is the
+    # protection being dropped entirely -- worse than either value alone. The explicit choice wins,
+    # which is also what Django's `SecurityMiddleware` (`setdefault`) and Phoenix's
+    # `put_secure_browser_headers` both do.
+    missing_pairs = [p for p in frozen if !HTTP.hasheader(resp, p.first)]
+    # Every header already present -- e.g. a router's own `SecurityHeaders()` inside a
+    # `serve(security_headers = …)` layer (#402). Nothing to add, so nothing to rebuild.
+    isempty(missing_pairs) && return resp
+    return add_response_headers(resp, missing_pairs)
 end
 
 end

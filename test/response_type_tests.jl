@@ -146,3 +146,91 @@ end
     end
 end
 end
+
+@testitem "Types.with_response — every body Nitro builds takes a static branch" tags=[:core, :middleware] setup=[NitroCommon] begin
+using Test
+using HTTP
+using Nitro
+
+# `with_response` (src/routeendpoint.jl) is the closed dispatch on a response's body type that
+# lets `SecurityHeaders` and the transport call `HTTP.Response{B}` code statically. A body outside
+# its list still works under the JIT, through one dynamic call in `_with_unlisted_body`, but a
+# trimmed image refuses it. So every body a Nitro builder produces must be listed: this fails
+# when a builder gains one the dispatch lacks.
+
+const T = Nitro.Core.Types
+const LISTED = (String, Vector{UInt8}, HTTP.EmptyBody, HTTP.BytesBody{Vector{UInt8}},
+                HTTP.BytesBody{T.RangeBytes}, T.StreamedFileBody, HTTP.SSEStream)
+
+# Whether `with_response(f, ::HTTP.Response{B})` compiles to the fallback's call.
+function reaches_fallback(f, B)
+    for (ci, _) in code_typed(T.with_response, (typeof(f), HTTP.Response{B}); optimize = true), st in ci.code
+        st isa Expr && st.head === :invoke || continue
+        x = st.args[1]
+        mi = x isa Core.CodeInstance ? x.def : x
+        mi isa Core.MethodInstance || (mi = getproperty(mi, :def))
+        mi.def.name === :_with_unlisted_body && return true
+    end
+    return false
+end
+status_of(r::HTTP.Response) = r.status
+
+@testset "each listed body is a branch, and only those" begin
+    for B in LISTED
+        @test !reaches_fallback(status_of, B)
+    end
+    # The control: an unlisted body (a strided view) takes the fallback, and still works under the JIT.
+    unlisted = HTTP.Response(200, HTTP.BytesBody(view(UInt8[1, 2, 3, 4], 1:2:3)))
+    @test reaches_fallback(status_of, typeof(unlisted).parameters[1])
+    @test T.with_response(status_of, unlisted) == 200
+end
+
+@testset "every Nitro builder's body is listed" begin
+    dir = mktempdir()
+    file = joinpath(dir, "a.txt")
+    write(file, "hello world")
+    req = HTTP.Request("GET", "/a.txt")
+    ranged = HTTP.Request("GET", "/a.txt", ["Range" => "bytes=0-3"])
+    built = Any[
+        Res.send("x"), Res.json(Dict("a" => 1)), Res.json(UInt8[0x7b, 0x7d]), Res.html("<p>"),
+        Res.status(204), Res.redirect("/"), Res.file(file), Res.file(req, file), Res.file(ranged, file),
+        Res.file(req, file; stream = true), Res.file(ranged, file; stream = true), Res.sse(),
+        Nitro.Core.format_response("x"), Nitro.Core.format_response(Dict("a" => 1)),
+        HTTP.Response(404), HTTP.Response(200, "x"),
+    ]
+    try
+        for r in built
+            @test typeof(r).parameters[1] in LISTED
+        end
+    finally
+        for r in built
+            r.body isa Union{T.StreamedFileBody, HTTP.SSEStream} && HTTP.body_close!(r.body)
+        end
+    end
+end
+
+@testset "the transport's body methods are the ones the list was checked against" begin
+    # A new `_write_response_body!` or `_release_response_body!` method is a new body type the
+    # transport writes: add it to `with_response` (and to LISTED above) in the same change.
+    @test length(methods(Nitro.Core._write_response_body!)) == 5
+    @test length(methods(Nitro.Core._release_response_body!)) == 4
+end
+
+@testset "SecurityHeaders: static per body, a new response of the same type" begin
+    SH = Nitro.Core.SecurityHeadersMiddleware
+    for B in LISTED
+        @test isempty(dynamic_calls(SH._with_security_headers, (HTTP.Response{B}, Vector{Pair{String, String}})))
+    end
+    @test isempty(dynamic_calls(SecurityHeaders()(req -> Res.send("x")), (HTTP.Request{HTTP.EmptyBody},)))
+    for inner in (Res.send("x"), Res.json(UInt8[0x7b, 0x7d]), HTTP.Response(204))
+        before = copy(inner.headers)
+        out = SecurityHeaders()(req -> inner)(HTTP.Request("GET", "/"))
+        @test typeof(out) === typeof(inner)
+        @test out !== inner && inner.headers == before
+        @test HTTP.hasheader(out, "X-Frame-Options")
+    end
+    # Anything that is not a response passes through: a router's own `SecurityHeaders()` can see a
+    # handler's raw value under `serialize = false`, before the boundary does.
+    @test SecurityHeaders()(req -> "raw")(HTTP.Request("GET", "/")) == "raw"
+end
+end

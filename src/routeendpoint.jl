@@ -242,3 +242,52 @@ struct RouteChainRecord
     entry    :: RouteMiddleware
     endpoint :: RouteEndpoint
 end
+
+# ── The response's body type (docs/design/juliac-trim.md §3.7) ──────────────────────────────────
+#
+# `HTTP.Response{B}` is a UnionAll over its body, and `B` varies by route: a builder's `String` or
+# `Vector{UInt8}`, `servecontent`'s `BytesBody` (a range is a view), a streamed file, an SSE stream.
+# So a response that leaves a route chain is `HTTP.Response` at best, and every call on it that
+# reads the body or rebuilds the response (`add_response_headers` keeps `B`) dispatches on `B` at
+# run time: a dynamic call under the JIT, a call `juliac --trim` rejects. `with_response` is the
+# closed dispatch over the bodies Nitro's own builders produce, in the style of `_error_response`.
+
+# `servecontent`'s 206 over a byte source: `BytesBody(@view(source[a:b]))`.
+const RangeBytes = SubArray{UInt8, 1, Vector{UInt8}, Tuple{UnitRange{Int64}}, true}
+# `servecontent(req, ::IO)` over `open(path)`: `Res.file(req, path; stream = true)` and a mount's
+# files over its threshold. HTTP.jl does not declare the type `public`; the name is canaried in
+# test/http_internals_contract_tests.jl.
+const StreamedFileBody = HTTP._SeekableResponseBody{IOStream}
+
+"""
+    with_response(f, resp::HTTP.Response, args...)
+
+`f(resp, args...)`, with `resp` at its concrete type `HTTP.Response{B}` whenever `B` is a body
+type Nitro builds: `String`, `Vector{UInt8}`, `HTTP.EmptyBody`, `HTTP.BytesBody` over a vector or
+a range of one, a streamed file, an `HTTP.SSEStream`. The test on `B` is a closed set of `isa`s, so
+each branch is a static call.
+
+Any other body is a response an application built itself. Under the JIT it takes one dynamic call,
+as every response did before; a trimmed image refuses it, since that call is exactly what it
+cannot make. Add a branch here when a Nitro builder gains a body type; the guard in
+test/response_type_tests.jl fails until it is.
+"""
+# `Vararg{Any,N}`, not a bare `args...`: Julia does not specialize a vararg tail it only passes on,
+# and the splat into `f` is then a dynamic `_apply_iterate`.
+function with_response(f::F, @nospecialize(resp::HTTP.Response), args::Vararg{Any,N}) where {F,N}
+    resp isa HTTP.Response{String} && return f(resp, args...)
+    resp isa HTTP.Response{Vector{UInt8}} && return f(resp, args...)
+    resp isa HTTP.Response{HTTP.EmptyBody} && return f(resp, args...)
+    resp isa HTTP.Response{HTTP.BytesBody{Vector{UInt8}}} && return f(resp, args...)
+    resp isa HTTP.Response{HTTP.BytesBody{RangeBytes}} && return f(resp, args...)
+    resp isa HTTP.Response{StreamedFileBody} && return f(resp, args...)
+    resp isa HTTP.Response{HTTP.SSEStream} && return f(resp, args...)
+    return _with_unlisted_body(f, resp, args...)
+end
+
+@noinline function _with_unlisted_body(f::F, @nospecialize(resp::HTTP.Response),
+                                     args::Vararg{Any,N}) where {F,N}
+    _trimmed() && throw(ArgumentError(
+        "Nitro: a trimmed image serves only the response bodies Nitro builds; got a $(typeof(resp))"))
+    return f(resp, args...)
+end

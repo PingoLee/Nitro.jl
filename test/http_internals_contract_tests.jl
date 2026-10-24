@@ -43,6 +43,8 @@ import Sockets
 #       the keyword form stores for a `String`/`Vector{UInt8}` body. `_rebuild_with_headers`
 #       in src/utilities/misc.jl (#447) uses the same constructor for every header-adding
 #       middleware layer, carrying each field over by position.
+#   • src/routeendpoint.jl — `Types.with_response`'s closed body dispatch names
+#       `_SeekableResponseBody{IOStream}`, the private body `servecontent` builds over a file.
 #   • src/context.jl — `_shutdown_server`'s bounded drain: it depends on `close(::Server)`
 #       releasing the listener BEFORE its unbounded quiesce loop, and escalates to
 #       `HTTP.forceclose`.
@@ -367,6 +369,24 @@ end
         @test streamed.body.owns_io === false              # servecontent does NOT claim it
         Nitro.Res.adopt_stream_io!(streamed, io)
         @test streamed.body.owns_io === true               # ... and we do
+    end
+
+    # `Types.with_response` (src/routeendpoint.jl) names the two bodies `servecontent` builds that
+    # the builders do not name themselves, so their types are a branch of its closed dispatch: a
+    # streamed file is the private `_SeekableResponseBody` over the `IOStream` `open` returns, and a
+    # range over bytes is a `BytesBody` over a view. Renamed or reparameterized upstream, those
+    # responses would take the dispatch's fallback: one dynamic call under the JIT, a refusal in a
+    # trimmed image. Fail here instead.
+    let path = joinpath(mktempdir(), "x.bin")
+        write(path, "some streamable bytes")
+        @test isdefined(HTTP, :_SeekableResponseBody)
+        open(path) do io
+            @test typeof(HTTP.servecontent(HTTP.Request("GET", "/x"), io).body) ===
+                  Nitro.Core.Types.StreamedFileBody
+        end
+        ranged = HTTP.servecontent(HTTP.Request("GET", "/x", ["Range" => "bytes=0-3"]), read(path))
+        @test ranged.status == 206
+        @test typeof(ranged.body) === HTTP.BytesBody{Nitro.Core.Types.RangeBytes}
     end
 
     # The OTHER branch, which is the one that leaks if it is wrong. A 304/412/416 carries no body
