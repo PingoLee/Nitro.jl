@@ -11,7 +11,7 @@ using ..Types: Nullable, LifecycleMiddleware, CopyOnWriteDict, snapshot,
                 RouteMiddleware, NO_ROUTE_MIDDLEWARE, DeclaredMethodHandler,
                 ChainCache, cached_chain, cache_chain!,
                 RouteEndpoint, RouteNext, RouteChainRecord, PipelineHandler, PipelineRoutes,
-                call_chain
+                call_chain, LifecycleEntry, route_lifecycle_entry, serve_lifecycle_entry, _trimmed
 
 export router, compose, genkey, process_middleware, HOFRouter, OuterRouter, InnerRouter
 
@@ -153,8 +153,8 @@ function normalize_middleware(middleware::Vector) :: Vector{Function}
 end
 
 # The `serve(middleware = (…))` form (#572): a `Tuple` keeps each element's type, so the global
-# fold in `compose` is typed. A `LifecycleMiddleware` member still unwraps to its `Function`-typed
-# `.middleware`, which is abstract either way.
+# fold in `compose` is typed. A `LifecycleMiddleware` member unwraps to its `.middleware`, whose
+# type is one of the struct's parameters (#719), so it stays typed too.
 normalize_middleware(middleware::Tuple) =
     map(mw -> mw isa LifecycleMiddleware ? mw.middleware : mw, middleware)
 
@@ -204,10 +204,17 @@ one shared `RateLimiter()` passed to N routes is one registration, so its cleanu
 once, not N times. `∉` on a single-digit vector costs nothing.
 """
 function register_route_lifecycle!(ctx::App, middleware::Vector)
+    # A trimmed image exports nothing at run time, so a route lifecycle registered there would have
+    # no code for its hooks and fail at `startserver`, with the listener already open. Refused
+    # here instead, before anything changes, as `serve` refuses a `Vector` of them (#719).
+    if _trimmed() && Base.JLOptions().trim == 0 && any(mw -> mw isa LifecycleMiddleware, middleware)
+        throw(ArgumentError("Nitro: in a trimmed image, register route middleware with lifecycle " *
+                            "hooks at top level, while the image is built (#719)"))
+    end
     lock(ctx.service.lifecycle_lock) do
         for mw in middleware
             mw isa LifecycleMiddleware || continue
-            mw ∈ ctx.service.route_lifecycle && continue
+            _holds(ctx.service.route_lifecycle, mw) && continue
             # PROMOTE, don't just append. "Route ownership wins" has to hold in both
             # directions or the object ends up in both halves and `terminate` calls its
             # `on_shutdown` TWICE in one cycle — once per half. Reachable whenever route
@@ -220,13 +227,17 @@ function register_route_lifecycle!(ctx::App, middleware::Vector)
             #
             # `RateLimiter`'s hooks happen to tolerate it, but `LifecycleMiddleware` is public
             # and an app hook that closes a connection or decrements a refcount does not.
-            i = findfirst(==(mw), ctx.service.serve_lifecycle)
+            i = findfirst(e -> e.mw === mw, ctx.service.serve_lifecycle)
             isnothing(i) || deleteat!(ctx.service.serve_lifecycle, i)
-            push!(ctx.service.route_lifecycle, mw)
+            push!(ctx.service.route_lifecycle, route_lifecycle_entry(mw))
         end
     end
     return ctx
 end
+
+# Is `mw` one of `entries`' objects? `===`, which is what `∈` on the bare middleware meant: a
+# `LifecycleMiddleware` defines no `==`, so it fell back to egality.
+_holds(entries::Vector{LifecycleEntry}, mw::LifecycleMiddleware) = any(e -> e.mw === mw, entries)
 
 """
     register_serve_lifecycle!(ctx::App, middleware::Union{Tuple,Vector}) -> App
@@ -248,15 +259,39 @@ Route is the winning side because the entry then survives `terminate()`, which i
 #82 exists to restore — a shared object passed both to a route and to `serve(middleware = ...)`
 is still, in the app's own terms, that route's middleware.
 """
-function register_serve_lifecycle!(ctx::App, middleware::Union{Tuple,Vector})
+function register_serve_lifecycle!(ctx::App, middleware::Tuple)
+    # Member by member, never a loop: a loop variable over a mixed tuple is abstract, and its
+    # type is exactly what a trimmed build needs at `serve_lifecycle_entry` (#719).
+    lock(() -> _register_serve_each!(ctx.service, middleware), ctx.service.lifecycle_lock)
+    return ctx
+end
+
+# The `serve(middleware = [ … ])` form. Each member's type is known only at run time, so a trimmed
+# image refuses one that owns hooks: it has no code for them (`serve_lifecycle_entry`).
+function register_serve_lifecycle!(ctx::App, middleware::Vector)
     lock(ctx.service.lifecycle_lock) do
         for mw in middleware
             mw isa LifecycleMiddleware || continue
-            mw ∈ ctx.service.route_lifecycle && continue      # route ownership wins
-            mw ∉ ctx.service.serve_lifecycle && push!(ctx.service.serve_lifecycle, mw)
+            _trimmed() && throw(ArgumentError(
+                "Nitro: in a trimmed build, pass `serve(middleware = (…))` as a Tuple when it holds " *
+                "a LifecycleMiddleware; a Vector's members have no compiled hooks (#719)"))
+            _register_serve_one!(ctx.service, mw)
         end
     end
     return ctx
+end
+
+_register_serve_each!(::Service, ::Tuple{}) = nothing
+function _register_serve_each!(service::Service, middleware::Tuple)
+    _register_serve_one!(service, first(middleware))
+    return _register_serve_each!(service, Base.tail(middleware))
+end
+
+_register_serve_one!(::Service, _) = nothing
+function _register_serve_one!(service::Service, mw::LifecycleMiddleware)
+    _holds(service.route_lifecycle, mw) && return nothing      # route ownership wins
+    _holds(service.serve_lifecycle, mw) || push!(service.serve_lifecycle, serve_lifecycle_entry(mw))
+    return nothing
 end
 
 """

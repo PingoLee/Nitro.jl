@@ -41,7 +41,8 @@ end
 """
     _trimmed() -> Bool
 
-`false`, unless a `--trim` build has registered a route: then it is redefined to `true`, so
+`false`, unless a `--trim` build has registered a route or a route's lifecycle middleware: then it
+is redefined to `true`, so
 inference folds [`RouteEndpoint`](@ref)'s branch either way and each build compiles one of its
 two calls. The JIT never sees the `ccall`; the verifier never sees the dynamic call. The startup
 banner reads it too (`_with_stdout`, `_stdout_color` in src/core/lifecycle.jl), for the two calls a
@@ -82,7 +83,13 @@ end
 
 # Chain or handler type => the stem of its exported symbols. `--trim` builds only.
 const ENDPOINT_EXPORTS = IdDict{Any,String}()
-const ENDPOINT_EXPORTS_LOCK = ReentrantLock()
+# The same for a route-owned `LifecycleMiddleware` type (#719, `route_lifecycle_entry` below).
+const LIFECYCLE_EXPORTS = IdDict{Any,String}()
+const ENDPOINT_EXPORTS_LOCK = ReentrantLock()     # guards both tables
+
+# The first export of either kind redefines `_trimmed()`. Called under `ENDPOINT_EXPORTS_LOCK`.
+_flip_trimmed!() = isempty(ENDPOINT_EXPORTS) && isempty(LIFECYCLE_EXPORTS) &&
+    Core.eval(@__MODULE__, :(_trimmed() = true))
 
 function _export_thunk(::Type{C}, ::Type{R}, sym::String) where {C,R}
     # `jl_extern_c` finds the method by its EXACT signature, not by dispatch, so the concrete
@@ -100,7 +107,7 @@ function _endpoint_symbol(::Type{C})::String where {C}
     Base.JLOptions().trim == 0 && return ""
     return lock(ENDPOINT_EXPORTS_LOCK) do
         get!(ENDPOINT_EXPORTS, C) do
-            isempty(ENDPOINT_EXPORTS) && Core.eval(@__MODULE__, :(_trimmed() = true))
+            _flip_trimmed!()
             sym = string("nitro_route_endpoint_", length(ENDPOINT_EXPORTS) + 1)
             _export_thunk(C, EmptyRequest, sym * "_e")
             _export_thunk(C, BytesRequest, sym * "_b")
@@ -291,3 +298,124 @@ end
         "Nitro: a trimmed image serves only the response bodies Nitro builds; got a $(typeof(resp))"))
     return f(resp, args...)
 end
+
+# ── Lifecycle hooks (#719; docs/design/juliac-trim.md §3.4) ─────────────────────────────────────
+#
+# The registry holds lifecycle middleware of as many types as an app installs, so the call from
+# `startserver`/`terminate` into each one's `startup`/`shutdown` cannot be resolved statically.
+# `LifecycleEntry` is that call's erasure point, as `RouteEndpoint` is a route's. The two halves of
+# the registry are registered at different times, so each gets the pointer it can get then:
+# route-owned entries at top level, which under `juliac` is build time, through an exported thunk;
+# serve-owned ones in `serve`, inside `main`, through a static `@cfunction` taken where the
+# middleware's type is concrete, as `ServerHandle` takes the server's (src/context.jl).
+
+"""
+    LifecycleEntry
+
+One registered [`LifecycleMiddleware`](@ref), behind one concrete type, for
+`Service.route_lifecycle` and `Service.serve_lifecycle` (#719). `mw` is the object itself, which
+dedup and promotion compare by `===`; [`startup`](@ref) and [`shutdown`](@ref) on the entry run
+that object's hooks.
+
+**Under the JIT it is a direct call**, `startup(e.mw)`: one dynamic call per hook per server, as
+before. **In a trimmed image it is a `ccall`**: through the thunk a `--trim` build exported for a
+route-owned entry ([`route_lifecycle_entry`](@ref)), or through the `@cfunction` `serve` took for
+a serve-owned one ([`serve_lifecycle_entry`](@ref)). An entry with neither has no code to call,
+and running it is an error.
+"""
+mutable struct LifecycleEntry
+    const mw   :: LifecycleMiddleware
+    const sym  :: String        # an exported thunk's symbol: route-owned, `--trim` build; else ""
+    const shim :: Ptr{Cvoid}    # a static `@cfunction`: serve-owned, trimmed image; else `C_NULL`
+    @atomic thunk :: Ptr{Cvoid} # `sym`, looked up on first use
+end
+
+# What both kinds of pointer call: the hook, at `L`. `startup`/`shutdown` already catch what a hook
+# throws; this catch is for anything else, which must not unwind through the foreign frame
+# (`EndpointFailure`, above).
+function _lifecycle_call(lf::L, up::Cint)::Any where {L<:LifecycleMiddleware}
+    try
+        return up != 0 ? startup(lf) : shutdown(lf)
+    catch err
+        return EndpointFailure(err)
+    end
+end
+
+# The exported entry for a route-owned type `L`, in `RouteEndpoint`'s calling convention.
+struct LifecycleThunk{L} end
+
+function _lifecycle_thunk(::Type{L}, lf::Ptr{Cvoid}, up::Cint, out::Ptr{Cvoid}) where {L}
+    cell = unsafe_pointer_to_objref(out)::Base.RefValue{Any}
+    cell[] = _lifecycle_call(unsafe_pointer_to_objref(lf)::L, up)
+    return nothing
+end
+
+function _export_lifecycle_thunk(::Type{L}, sym::String) where {L}
+    # The exact signature, for `jl_extern_c` (see `_export_thunk`).
+    Core.eval(@__MODULE__, :((::LifecycleThunk{$L})(lf::Ptr{Cvoid}, up::Cint, out::Ptr{Cvoid}) =
+                                 _lifecycle_thunk($L, lf, up, out)))
+    Base.Experimental.entrypoint(LifecycleThunk{L}(), (Ptr{Cvoid}, Cint, Ptr{Cvoid}))
+    Base._ccallable(sym, Cvoid, Tuple{LifecycleThunk{L}, Ptr{Cvoid}, Cint, Ptr{Cvoid}})
+    return nothing
+end
+
+"""
+    route_lifecycle_entry(mw::LifecycleMiddleware) -> LifecycleEntry
+
+The entry `register_route_lifecycle!` (src/routerhof.jl) records. In a `--trim` build, where routes
+register while the image is built, it exports a thunk for `mw`'s type on first sight, as
+`RouteEndpoint` does for a chain; otherwise it has no pointer.
+"""
+function route_lifecycle_entry(mw::LifecycleMiddleware)
+    L = typeof(mw)
+    Base.JLOptions().trim == 0 && return LifecycleEntry(mw, "", C_NULL, C_NULL)
+    sym = lock(ENDPOINT_EXPORTS_LOCK) do
+        get!(LIFECYCLE_EXPORTS, L) do
+            _flip_trimmed!()
+            # Not `sym`: assigning the outer name inside these closures would box it (#364).
+            stem = string("nitro_lifecycle_", length(LIFECYCLE_EXPORTS) + 1)
+            _export_lifecycle_thunk(L, stem)
+            stem
+        end
+    end
+    return LifecycleEntry(mw, sym, C_NULL, C_NULL)
+end
+
+"""
+    serve_lifecycle_entry(mw::LifecycleMiddleware) -> LifecycleEntry
+
+The entry `register_serve_lifecycle!` records for a `serve(middleware = (…))` member, where `mw`'s
+type is concrete. In a trimmed image it takes a static `@cfunction` pointer to the hooks at that
+type, made at run time and never stored in an image (`ServerHandle`, src/context.jl).
+"""
+function serve_lifecycle_entry(mw::L) where {L<:LifecycleMiddleware}
+    _trimmed() || return LifecycleEntry(mw, "", C_NULL, C_NULL)
+    return LifecycleEntry(mw, "", @cfunction(_lifecycle_call, Any, (Ref{L}, Cint)), C_NULL)
+end
+
+function _lifecycle_fptr!(e::LifecycleEntry)::Ptr{Cvoid}
+    p = @atomic :acquire e.thunk
+    p == C_NULL || return p
+    p = isempty(e.sym) ? C_NULL : _image_symbol(e.sym)
+    p == C_NULL && throw(ErrorException(
+        "Nitro: no code for this lifecycle middleware's hooks in this process. In a trimmed image, " *
+        "register route middleware at top level and pass `serve(middleware = (…))` as a Tuple"))
+    @atomic :release e.thunk = p      # racing first calls look up the same symbol
+    return p
+end
+
+function _run_lifecycle(e::LifecycleEntry, up::Bool)::Union{Nothing,InterruptException}
+    _trimmed() || return up ? startup(e.mw) : shutdown(e.mw)
+    result = if e.shim != C_NULL
+        ccall(e.shim, Any, (Any, Cint), e.mw, Cint(up))
+    else
+        out = Ref{Any}()
+        ccall(_lifecycle_fptr!(e), Cvoid, (Any, Cint, Any), e.mw, Cint(up), out)
+        out[]
+    end
+    result isa EndpointFailure && throw(result.err)
+    return result::Union{Nothing,InterruptException}
+end
+
+startup(e::LifecycleEntry) = _run_lifecycle(e, true)
+shutdown(e::LifecycleEntry) = _run_lifecycle(e, false)

@@ -1094,6 +1094,10 @@ Both hooks are optional; `nothing` means "nothing to do", which is why a middlew
 resource to own can still be one of these rather than a bare function (`RateLimiter`'s
 `:sliding_window` strategy is exactly that case).
 
+The struct is parameterized on the three fields' types, `LifecycleMiddleware{M,S,D}`, so each
+value has a concrete type. `LifecycleMiddleware` without parameters is still the type to test
+against and to collect in (`x isa LifecycleMiddleware`, `LifecycleMiddleware[]`).
+
 # A middleware list accepts either form
 
 ```julia
@@ -1146,14 +1150,22 @@ A hook that throws is logged and swallowed, and the rest of the sequence still r
 sequence still runs to completion, and `serve()`/`terminate()` then re-raise the interrupt
 once (#185).
 """
-@kwdef struct LifecycleMiddleware 
+struct LifecycleMiddleware{M<:Function, S<:Union{Function,Nothing}, D<:Union{Function,Nothing}}
     # The middleware function itself (handles incoming requests)
-    middleware :: Function
+    middleware :: M
     # A hook that's called when the server starts up (optional)
-    on_startup :: Union{Function,Nothing} = nothing
+    on_startup :: S
     # A hook that's called when the server is shutdown (optional)
-    on_shutdown :: Union{Function,Nothing} = nothing
+    on_shutdown :: D
 end
+
+# Parameterized on the three functions' types (#719), so a `serve(middleware = (…))` tuple holding
+# one is concrete: the global fold reaches `.middleware` without a dynamic call, and `serve` can take
+# the hooks' pointers in a trimmed build (`serve_lifecycle_entry`, src/routeendpoint.jl). The bare
+# name is still the type every `isa` and `Vector{LifecycleMiddleware}` means.
+LifecycleMiddleware(; middleware::Function, on_startup::Union{Function,Nothing} = nothing,
+                    on_shutdown::Union{Function,Nothing} = nothing) =
+    LifecycleMiddleware(middleware, on_startup, on_shutdown)
 
 # SECURITY (#307): the default `show` prints each closure WITH its captures -- `repr` of a closure
 # is `var"#3#4"{String}("the-key")` -- and every `LifecycleMiddleware` Nitro builds closes over a

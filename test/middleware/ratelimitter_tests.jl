@@ -670,7 +670,9 @@ end
     @test sliding isa Nitro.LifecycleMiddleware
     @test sliding.on_startup === nothing
     @test sliding.on_shutdown === nothing
-    @test typeof(sliding) === typeof(RateLimiter(strategy=:fixed_window, window=Minute(1)))
+    # Not one concrete type any more: `LifecycleMiddleware` is parameterized on its functions
+    # (#719), so each strategy's value has a type of its own. Both are still the one public type.
+    @test RateLimiter(strategy=:fixed_window, window=Minute(1)) isa Nitro.LifecycleMiddleware
     # ...and the wrapper changed nothing about the request path: `.middleware` is still the
     # composed limiter chain, which admits a request under the limit and reaches the handler.
     bare_sliding = RateLimiter(strategy=:sliding_window, rate_limit=5, window=Minute(1),

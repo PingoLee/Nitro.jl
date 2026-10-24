@@ -7,7 +7,7 @@ using ..Types
 # Unexported from `Types` on purpose: `CopyOnWriteDict` is internal plumbing for `compose`,
 # so it is named explicitly here rather than widened onto `Core`'s reexport surface.
 using ..Types: CopyOnWriteDict, RouteMiddleware, RouteChainRecord, NamedRoute, NitroRouter, nitro_router,
-    MissResponse, miss_response
+    MissResponse, miss_response, LifecycleEntry
 using ..Constants: SHUTDOWN_TIMEOUT_SECONDS, DEFAULT_MAX_FIELDS, AbstractApp
 # The serve task, a shutdown and a Revise hook log what they caught as `loggable(e)`, never `e`:
 # each logs whatever reached it, and the rule holds everywhere in `src/` (#658).
@@ -205,15 +205,20 @@ end
     # supervisors, ASGI lifespan, and `defer`/`atexit`. Nobody ships FIFO teardown, and nobody
     # should ship an unspecified one.
     #
-    # Dedup moves from `Set` to an `∉` guard in `register_*_lifecycle!` and stays load-bearing:
-    # one shared `RateLimiter()` passed to N routes must start its cleanup task once, not N
-    # times. Swapping the container without that guard would regress it silently.
+    # Dedup moves from `Set` to a membership guard (`_holds`) in `register_*_lifecycle!` and
+    # stays load-bearing: one shared `RateLimiter()` passed to N routes must start its cleanup
+    # task once, not N times. Swapping the container without that guard would regress it silently.
     #
     # One lock for both halves — they are always read together, and the asymmetry #74 points at
     # (`named_routes` has `named_routes_lock`, `extensions` has `extensions_lock`) is the
     # convention here.
-    route_lifecycle       :: Vector{LifecycleMiddleware} = LifecycleMiddleware[]
-    serve_lifecycle       :: Vector{LifecycleMiddleware} = LifecycleMiddleware[]
+    #
+    # Each element is a `LifecycleEntry` (src/routeendpoint.jl), not the bare middleware (#719):
+    # one concrete type, so the broadcast over a half is a static call per hook, and in a trimmed
+    # image the entry carries the pointer its hooks are called through. Its `mw` is the object
+    # dedup and promotion compare.
+    route_lifecycle       :: Vector{LifecycleEntry} = LifecycleEntry[]
+    serve_lifecycle       :: Vector{LifecycleEntry} = LifecycleEntry[]
     lifecycle_lock        :: ReentrantLock          = ReentrantLock()
     cookies               :: Base.RefValue{CookieConfig} = Ref{CookieConfig}(CookieConfig())
     extensions            :: Dict{Symbol, Any}      = Dict{Symbol, Any}()
