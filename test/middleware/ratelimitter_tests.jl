@@ -920,14 +920,16 @@ end
               (:noip, strategy, fail_open, expected...)
         fail_open || @test out.status == 503
 
-        # Post-handler bookkeeping: a non-`Response` makes `own_response_headers` throw AFTER
-        # the handler ran. That used to be caught and, under `fail_open`, run the chain again.
+        # Post-handler bookkeeping. A non-`Response` used to make `own_response_headers` throw
+        # AFTER the handler ran, which was caught and, under `fail_open`, ran the chain again.
+        # It now passes through untouched, as `SecurityHeaders` passes it (docs/design/
+        # juliac-trim.md §3.7), and the chain still runs exactly once.
         calls = Threads.Atomic{Int}(0)
         w = RateLimiter(; strategy, auto_extract_ip=false, fail_open).middleware(
             f421_counting(calls, _ -> "not a response"))
         out, _ = f421_run(() -> w(f421_req()))
-        @test (:post, strategy, fail_open, out isa MethodError, calls[]) ==
-              (:post, strategy, fail_open, true, 1)
+        @test (:post, strategy, fail_open, out, calls[]) ==
+              (:post, strategy, fail_open, "not a response", 1)
     end
 end
 

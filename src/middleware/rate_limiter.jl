@@ -502,8 +502,17 @@ function _respond(handle::Function, req::HTTP.Request, outcome::Int, remaining::
         push!(resp.headers, "Retry-After" => string(reset_time))
         return resp
     end
+    response = handle(req)
+    # Only a response has headers: anything else (a raw handler value under `serialize = false`)
+    # passes through untouched, as `SecurityHeaders` passes it. At its concrete body type
+    # (`Types.with_response`), so the calls below are static.
+    response isa HTTP.Response || return response
+    return Types.with_response(_with_rate_headers, response, rate_limit, remaining, reset_time)
+end
+
+function _with_rate_headers(resp::HTTP.Response, rate_limit::Int, remaining::Int, reset_time::Int)
     # Own the handler's (possibly shared/`const`) response before adding headers.
-    response = own_response_headers(handle(req))
+    response = own_response_headers(resp)
     set_rate_headers!(response, rate_limit, remaining, reset_time)
     return response
 end
