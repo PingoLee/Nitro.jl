@@ -1,6 +1,7 @@
 ﻿module RouterHOF
 
 using HTTP
+import ..Res
 
 using ..Util: join_url_path, _canonical_route
 using ..AppContext: App, Service
@@ -634,7 +635,10 @@ function compose(service::Service, globalmiddleware::Tuple)
         # (#572). The assert keeps a broken middleware (one that returns something other than
         # a function) failing here, when the pipeline is built, as `foldlayers`' return type
         # made it fail before, rather than on every request.
-        return _foldtuple(select, globalmiddleware)::Function
+        #
+        # `ResponseBoundary` holds what comes out to the middleware contract, so every layer
+        # outside it sees an `HTTP.Response` rather than `Any`.
+        return ResponseBoundary(_foldtuple(select, globalmiddleware)::Function)
     end
 end
 
@@ -701,6 +705,54 @@ end
 # type alone, so inference follows it to the end, which the fold `setupmiddleware` builds on (#572).
 _foldtuple(handler, ::Tuple{}) = handler
 _foldtuple(handler, layers::Tuple) = first(layers)(_foldtuple(handler, Base.tail(layers)))
+
+"""
+    ResponseBoundary(chain)
+
+The pipeline's global middleware chain, as `compose` returns it: `chain(req)`, which is
+user code, with what it returns held to the middleware contract — an `HTTP.Response`.
+
+Everything outside this point is framework code (the error boundary, `SecurityHeaders`, the
+access log, the transport), and each of them reads the response. With the contract checked
+once here, they see `HTTP.Response` rather than `Any`, which is what lets `juliac --trim` and the
+JIT resolve their calls (docs/design/juliac-trim.md §3.7).
+
+What breaks the contract is answered here, not passed on:
+- Whatever a handler returns once it has written its response on the stream (a `STREAM` or
+  WebSocket route under `serialize = false`: usually `nothing`, or what its last `write`
+  returned) becomes a placeholder `200`, the response the serializer would have made of it. The
+  transport writes nothing for a started response, so the client never sees it.
+- Anything else is a `500`, logged with the value's type and the route, never the value (#613).
+  Before, the same value made the access log or `SecurityHeaders` throw (a bodyless `500`), or
+  with neither installed went out as an empty `200`.
+"""
+struct ResponseBoundary{F} <: Function
+    chain :: F
+end
+
+function (b::ResponseBoundary)(req::HTTP.Request)
+    resp = b.chain(req)
+    resp isa HTTP.Response && return resp
+    return _not_a_response(resp, req)
+end
+
+# The record names the value's type and the route's declared pattern (`nothing` when no route
+# matched): never the value, which is the handler's own data, and never the request's method or
+# target, which the client chose (#613).
+@noinline function _not_a_response(@nospecialize(value), req::HTTP.Request)::HTTP.Response
+    _response_started(req) && return HTTP.Response(200)
+    @error("A middleware returned a value that is not an HTTP.Response; answering 500. Every " *
+           "middleware returns a response, and under `serialize = false` so does every handler.",
+           type = typeof(value), route = get(req.context, :route, nothing))
+    return Res.json(("message" => "500: Internal Server Error"), status = 500)
+end
+
+# Whether the request's handler already started writing on the stream (`_response_started` in
+# src/core/transport.jl, which this module is included before). An in-process request has none.
+function _response_started(req::HTTP.Request)::Bool
+    stream = get(req.context, :stream, nothing)
+    return stream isa HTTP.Stream && (@atomic :acquire stream.response_started)
+end
 
 
 """

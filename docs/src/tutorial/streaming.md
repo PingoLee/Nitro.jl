@@ -178,7 +178,8 @@ path("/raw", raw, method = "STREAM",
 
 What such a middleware gets back from the handler is **not** what the client received. The handler
 usually returns `nothing`, and the default serializer turns that into a placeholder `200` response
-with a `null` JSON body (under `serve(serialize = false)` the middleware gets the `nothing` itself).
+with a `null` JSON body (under `serve(serialize = false)` the middleware gets the `nothing` itself,
+and may pass it on: what a handler that started its response returns is not an error).
 A middleware that logs the status, audits the body or computes an ETag from it is reading that
 placeholder, not the bytes the handler wrote to the socket.
 
