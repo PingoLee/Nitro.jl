@@ -172,12 +172,14 @@ function _janitor(work::Function, interval::Period, label::String, what::String,
 
     # One lock over all three activation transitions -- see the docstring. Not on the request path.
     activation = ReentrantLock()
-    active = Ref{Union{Ref{Bool},Nothing}}(nothing)
+    # `Base.RefValue{Bool}`, not `Ref{Bool}`: `Ref{T}` is abstract, so the stop write in
+    # `on_shutdown` was a dynamic `setindex!`, which a trimmed image cannot make (#571, #719).
+    active = Ref{Union{Base.RefValue{Bool},Nothing}}(nothing)
     janitor_task = Ref{Union{Task,Nothing}}(nothing)
 
     # Retire the activation this task owns, so a later `on_startup()` can respawn. A no-op unless
     # the slot is still ours: `on_shutdown` may have emptied it, or a newer activation may own it.
-    retire! = function (token::Ref{Bool})
+    retire! = function (token::Base.RefValue{Bool})
         lock(activation) do
             active[] === token || return nothing
             active[] = nothing
