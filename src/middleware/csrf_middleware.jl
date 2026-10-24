@@ -2,7 +2,7 @@ module CSRFMiddleware_
 
 using HTTP
 
-using ...Types: CookieConfig, Nullable
+using ...Types: CookieConfig, Nullable, with_response
 using ...Cookies: get_cookie, set_cookie!
 import ...Cookies
 using ...Crypto: secure_random_bytes, _empty_hmac_key, _hmac_sha256, SecretString, reveal, base64url_encode,
@@ -682,6 +682,9 @@ function CSRFMiddleware(key::Union{AbstractString, SecretString}; cookie_name::S
                 _warn_unbound()
                 return response
             end
+            # Only a response carries a cookie: anything else (a raw handler value under
+            # `serialize = false`) passes through untouched, as `SecurityHeaders` passes it.
+            response isa HTTP.Response || return response
 
             # Under an unchanged binding the answer is the one computed before the handler; a
             # rotation (or a binding that first appeared) re-verifies under the new one.
@@ -715,8 +718,9 @@ function CSRFMiddleware(key::Union{AbstractString, SecretString}; cookie_name::S
                 return response
             end
             # Own the headers before issuing the cookie: `response` may be a shared/`const`
-            # object, and setting a cookie mutates the headers in place.
-            response = own_response_headers(response)
+            # object, and setting a cookie mutates the headers in place. The rebuild is the one
+            # step that needs the body's type, so it alone goes through `with_response`.
+            response = with_response(own_response_headers, response)::HTTP.Response
             _set_token_cookie!(response, secret, raw_token, binding, cookie_name, ttl, config)
             # One visitor's credential in a Set-Cookie (and, when the handler asked, often in the
             # body): never storable by a shared cache. A refresh sends it with no session write,
