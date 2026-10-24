@@ -11,7 +11,7 @@ using ...Crypto: secure_random_bytes, _empty_hmac_key, _hmac_sha256, SecretStrin
 using ...Errors: is_unrecoverable
 using ...Res: json
 using ...Core: own_response_headers, getjson, getform, with_session, header_name_isequal
-using ...Util: _mark_private!, _auth_credential, _ascii_casefold_eq
+using ...Util: _mark_private!, _auth_credential, _ascii_casefold_eq, _rebuild_with_headers
 
 export CSRFMiddleware, csrf_token!, issue_csrf_token!, validate_csrf_token
 
@@ -292,7 +292,7 @@ end
 # Signs `raw_token` under `binding` and sets it on `res`. Split out of `issue_csrf_token!` so the
 # middleware can sign a token it did NOT just generate: the one `csrf_token!` already handed the
 # handler, which may have gone into the response body (#431).
-function _set_token_cookie!(res::HTTP.Response, secret::String, raw_token::String,
+function _set_token_cookie!(res::Union{HTTP.Response, HTTP.Headers}, secret::String, raw_token::String,
                             binding::AbstractString, cookie_name::String, ttl::Int,
                             config::CookieConfig)
     set_cookie!(res, cookie_name, _signed_token(secret, raw_token, binding); config=config, encrypted=false, maxage=ttl)
@@ -510,9 +510,12 @@ return it, masked, in its body); the middleware must not then append a second, d
 that shadows it — `set_cookie!` appends, and the browser takes the last one, so the client would
 end up holding a token that does not match what the handler told it to send.
 """
-function _response_sets_cookie(res::HTTP.Response, cookie_name::String)
+_response_sets_cookie(res::HTTP.Response, cookie_name::String) =
+    _response_sets_cookie(res.headers, cookie_name)
+
+function _response_sets_cookie(headers::HTTP.Headers, cookie_name::String)
     n = ncodeunits(cookie_name)
-    for (name, value) in res.headers
+    for (name, value) in headers
         header_name_isequal(name, "Set-Cookie") || continue
         # `startswith(value, cookie_name * "=")`, without building the prefix per call (#542)
         startswith(value, cookie_name) && ncodeunits(value) > n && codeunit(value, n + 1) == UInt8('=') &&
@@ -719,7 +722,8 @@ function CSRFMiddleware(key::Union{AbstractString, SecretString}; cookie_name::S
             still_valid = binding == binding_before ? verified :
                           _verified_token(secret, cookie_value, binding)
             needs_token = still_valid === nothing
-            handler_minted = _response_sets_cookie(response, cookie_name)
+            # On the headers, one concrete type whatever the body, so the call is static.
+            handler_minted = _response_sets_cookie(response.headers, cookie_name)
             if handler_minted
                 _keep_session!(req)
                 return response
@@ -746,14 +750,16 @@ function CSRFMiddleware(key::Union{AbstractString, SecretString}; cookie_name::S
                 return response
             end
             # Own the headers before issuing the cookie: `response` may be a shared/`const`
-            # object, and setting a cookie mutates the headers in place. The rebuild is the one
-            # step that needs the body's type, so it alone goes through `with_response`.
-            response = with_response(own_response_headers, response)::HTTP.Response
-            _set_token_cookie!(response, secret, raw_token, binding, cookie_name, ttl, config)
+            # object, and setting a cookie mutates the headers in place. The cookie and the
+            # `private` marking go on the copy, whose type is the same whatever the body, and the
+            # new response is built from it once, at its body type (`with_response`).
+            headers = copy(response.headers)
+            _set_token_cookie!(headers, secret, raw_token, binding, cookie_name, ttl, config)
             # One visitor's credential in a Set-Cookie (and, when the handler asked, often in the
             # body): never storable by a shared cache. A refresh sends it with no session write,
             # so `SessionMiddleware` would not mark it (#431 review).
-            _mark_private!(response)
+            _mark_private!(headers)
+            response = with_response(_rebuild_with_headers, response, headers)
             # `given` is already the context's token; `:csrf_token` keeps the mask handed out.
             raw_token === given || _set_context_token!(req, raw_token)
             # A refresh of a still-valid token needs nothing kept: its session already exists.

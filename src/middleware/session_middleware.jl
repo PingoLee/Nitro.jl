@@ -13,7 +13,7 @@ using ...Cookies: get_cookie, set_cookie!, storesession!, prunesessions!, regene
     _validate_cookie_prefix
 using ...Crypto: secure_uuid4
 using ...Errors: ValidatorFault, is_unrecoverable
-using ...Core: own_response_headers
+using ...Util: _rebuild_with_headers
 using ...Util: _mark_private!
 
 export SessionMiddleware, SessionPruner, rehash_session!
@@ -589,14 +589,14 @@ function SessionMiddleware(;
             # Own the headers before adding Set-Cookie: `response` may be a shared/`const`
             # object (e.g. an auth-rejection response). Mutating it in place would attach
             # this visitor's session cookie to every later request that returns the same
-            # object — a cross-request session leak — and races other threads. The rebuild is the
-            # one step that needs the body's type, so it alone goes through `with_response`;
-            # the two calls after it touch only the headers.
-            response = with_response(own_response_headers, response)::HTTP.Response
+            # object — a cross-request session leak — and races other threads. The cookie and
+            # the `private` marking go on the copy, whose type is the same whatever the body, and
+            # the new response is built from it once, at its body type (`with_response`).
+            headers = copy(response.headers)
             # Append the session cookie without clobbering any sibling Set-Cookie headers.
-            set_cookie!(response, session_cookie, final_session_id; config=config, encrypted=false, maxage=ttl)
-            _mark_private!(response)
-            return response
+            set_cookie!(headers, session_cookie, final_session_id; config=config, encrypted=false, maxage=ttl)
+            _mark_private!(headers)
+            return with_response(_rebuild_with_headers, response, headers)
         end
     end
 

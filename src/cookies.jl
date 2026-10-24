@@ -581,11 +581,11 @@ function get_cookie(
 end
 
 """
-Set a cookie on an HTTP response.
+Set a cookie on an HTTP response, or on an `HTTP.Headers` a response will be built from.
 If secret_key is provided in the config, the value will be encrypted.
 """
 function set_cookie!(
-    res::HTTP.Response, 
+    res::Union{HTTP.Response, HTTP.Headers}, 
     name::Union{String, Symbol}, 
     value::Any; 
     config::CookieConfig = CookieConfig(),
@@ -647,7 +647,7 @@ end
 # `domain` normalized), and `nothing` means "none", not "the config's". Untyped, so it
 # specializes on the keywords' own types when `attrs` was empty and takes the Dict's `Any` values
 # when it was not.
-function _set_cookie!(res::HTTP.Response, name, value, config::CookieConfig, final_path,
+function _set_cookie!(res::Union{HTTP.Response, HTTP.Headers}, name, value, config::CookieConfig, final_path,
                       final_domain, expires, maxage, httponly, secure, samesite, encrypted,
                       secret_key)
     # 2. Normalize the rest
@@ -719,9 +719,12 @@ function _set_cookie!(res::HTTP.Response, name, value, config::CookieConfig, fin
     
     # CORRECT WAY: Appending to the headers vector directly
     # HTTP.setheader would replace all existing Set-Cookie headers, which is wrong for multiple cookies.
-    push!(res.headers, "Set-Cookie" => cookie_str)
+    push!(_cookie_headers(res), "Set-Cookie" => cookie_str)
     return res
 end
+
+_cookie_headers(res::HTTP.Response) = res.headers
+_cookie_headers(headers::HTTP.Headers) = headers
 
 """
 Load cookie settings from a dictionary into a CookieConfig object.
