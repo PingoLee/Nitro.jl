@@ -279,3 +279,99 @@ end
 # A pipeline value that is not a response (the transport answers it with an empty `200`).
 @test isempty(dynamic_calls(Nitro.Core._send_response!, (Nothing, S, HTTP.Request{HTTP.EmptyBody}, A)))
 end
+
+@testitem "Nitro's own middleware reaches the response and the session at concrete types" tags=[:core, :middleware] setup=[NitroCommon] begin
+using Test
+using HTTP
+using Nitro
+import JSON
+
+# The request-time middleware an app installs (`Cors`, `SessionMiddleware`, `CSRFMiddleware`,
+# `RateLimiter`, the guards): what each reads back from the inner layer or from `req.context` is
+# `Any`, and every use of it was a dynamic call under the JIT and one `juliac --trim` rejects
+# (docs/design/juliac-trim.md §3). These pin the typed paths, and the pass-through for a value
+# that is not a response.
+
+const M = Nitro.Core.Middleware
+const T = Nitro.Core.Types
+const R = HTTP.Request{HTTP.EmptyBody}
+const LISTED = (String, Vector{UInt8}, HTTP.EmptyBody, HTTP.BytesBody{Vector{UInt8}},
+                HTTP.BytesBody{T.RangeBytes}, T.StreamedFileBody, HTTP.SSEStream)
+
+@testset "no dynamic call on the typed paths" begin
+    cors = Cors(allowed_origins = ["https://a.example"])(req -> Res.send("x"))
+    @test isempty(dynamic_calls(cors, (R,)))
+    @test isempty(dynamic_calls(M.CORSMiddleware._with_cors_headers, (Any, Vector{Pair{String,String}})))
+    for B in LISTED
+        @test isempty(dynamic_calls(M.RateLimiterMiddleware._with_rate_headers,
+                                    (HTTP.Response{B}, Int, Int, Int)))
+    end
+    @test isempty(dynamic_calls(M.RateLimiterMiddleware._expires_at,
+                                (Tuple{Int, Nitro.Core.Dates.DateTime}, Nitro.Core.Dates.Second)))
+    for body in (Dict{String,String}, JSON.Object{String,Any}, Any)
+        @test isempty(dynamic_calls(M.CSRFMiddleware_._field_token, (body, String)))
+    end
+    @test isempty(dynamic_calls(M.CSRFMiddleware_._binding, (R,)))
+    @test isempty(dynamic_calls(M.CSRFMiddleware_._session_persists, (R, Union{Nothing,String}, String)))
+    @test isempty(dynamic_calls(M.GuardsMiddleware._request_claims, (R, String)))
+end
+
+@testset "a value that is not a response passes through untouched" begin
+    raw = req -> "a raw value"
+    req() = (r = HTTP.Request("GET", "/"); setip!(r, Nitro.Core.Sockets.IPv4("127.0.0.1")); r)
+    @test Cors(allowed_origins = ["https://a.example"])(raw)(req()) == "a raw value"
+    @test RateLimiter(strategy = :fixed_window, rate_limit = 10).middleware(raw)(req()) == "a raw value"
+    session = SessionMiddleware(store = MemoryStore()).middleware
+    # Writes the session, so the cookie step runs; before, it raised a `MethodError` here.
+    writes = req -> (getsession(req)["k"] = 1; "a raw value")
+    @test session(writes)(req()) == "a raw value"
+    csrf = CSRFMiddleware("typed-paths-csrf-secret-not-for-production-0123456789")
+    @test session(csrf(writes))(req()) == "a raw value"
+end
+
+@testset "a session of another type fails without its values in the error (#612)" begin
+    session = SessionMiddleware(store = MemoryStore()).middleware
+    swapped = req -> (req.context[:session] = Dict("user_id" => 424242); Res.send("x"))
+    err = try
+        session(swapped)(HTTP.Request("GET", "/")); nothing
+    catch e
+        e
+    end
+    @test err isa Nitro.Core.Errors.SessionStoreFault
+    @test !occursin("424242", sprint(showerror, err))
+    req = HTTP.Request("GET", "/")
+    req.context[:session] = Dict("user_id" => 424242)
+    req.context[:session_id] = "the-id"
+    err = try
+        regenerate_session!(req, MemoryStore()); nothing
+    catch e
+        e
+    end
+    @test err isa Nitro.Core.Errors.SessionStoreFault
+    @test !occursin("424242", sprint(showerror, err))
+end
+
+@testset "a JSON CSRF token that is not a string is no token" begin
+    json(body) = (r = HTTP.Request("POST", "/", ["Content-Type" => "application/json"], body); r)
+    @test M.CSRFMiddleware_._presented_token(json("{\"_csrf\": \"abc\"}"), "X-CSRF-Token", "_csrf") == "abc"
+    @test M.CSRFMiddleware_._presented_token(json("{\"_csrf\": 123}"), "X-CSRF-Token", "_csrf") === nothing
+end
+
+@testset "the session reads: Nitro's shape is static, another shape still works under the JIT" begin
+    req = HTTP.Request("GET", "/")
+    @test Nitro.Core.with_session(s -> s, req) === nothing
+    d = Dict{String,Any}("user_id" => 1)
+    req.context[:session] = d
+    @test Nitro.Core.with_session(s -> s, req) === d
+    req.context[:session] = Dict{Symbol,Any}(:user_id => 1)
+    @test Nitro.Core.with_session(s -> s[:user_id], req) == 1
+    # Past `_session_persists`'s early answers (a new session, unrotated), so the answer is
+    # whether the session holds data, read through `with_session` for either shape.
+    req.context[:session_new] = true
+    for (session, holds) in ((Dict{Symbol,Any}(), false), (Dict{Symbol,Any}(:a => 1), true),
+                             (Dict{String,Any}(), false), (Dict{String,Any}("a" => 1), true))
+        req.context[:session] = session
+        @test M.CSRFMiddleware_._session_persists(req, "id", "id") === holds
+    end
+end
+end
