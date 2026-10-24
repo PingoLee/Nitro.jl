@@ -98,7 +98,8 @@ is explicit introspection, not accidental disclosure.)
   and with no `?`, `#`, whitespace, empty or dot segments. Its escapes are canonicalized like
   the request's (`"/caf%c3%a9"` is `"/caf%C3%A9"`). Anything else, including `""` and `"/"`,
   is an `ArgumentError`.
-- `revise=:none`: `:lazy`/`:eager` enable Revise-based hot reload (dev only).
+- `revise=:none`: `:lazy`/`:eager` enable Revise-based hot reload (dev only). An application
+  compiled with `juliac --trim` refuses both.
 - `secret_key`, `httponly`, `secure`, `samesite`: override cookie defaults for this run.
 - `shutdown_timeout=10.0`: seconds `terminate` waits for in-flight requests to drain
   before force-closing what remains. `0` skips the graceful phase entirely. A handler that

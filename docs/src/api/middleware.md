@@ -13,7 +13,9 @@ the access log, the transport). A value that is anything else is answered with a
 (`{"message": "500: Internal Server Error"}`). One `@error` record names the value's type and the
 matched route's pattern, never the value. Inside the chain nothing is checked, so under
 `serve(serialize = false)` route and global middleware still receive a handler's raw value and
-may turn it into a response. The one exception is a `STREAM` or `WEBSOCKET` handler under
+may turn it into a response. Nitro's own layers that add headers to the response (`Cors`,
+`SessionMiddleware`, `CSRFMiddleware`, `RateLimiter`, `SecurityHeaders`) pass such a value through
+untouched. The one exception is a `STREAM` or `WEBSOCKET` handler under
 `serialize = false` that has already written its response on the stream: whatever it returns
 (usually `nothing`) is not an error.
 
