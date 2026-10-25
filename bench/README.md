@@ -116,6 +116,7 @@ bench/socket/run.sh "nitro@8,1 nitro@8,2 nitro@8,4"  # one mode per --threads, i
 RATE=20000 bench/socket/run.sh "nitro@8,1 nitro@8,0" # fixed rate: latency without saturation (#491)
 JULIA="julia +1.12" bench/socket/run.sh              # another Julia, by juliaup channel
 BASE_ROOTS="a=/wt/a b=/wt/b" bench/socket/run.sh "a b"  # a series of commits, one worktree each
+ROOTS="a=/wt/a b=/wt/b" bench/socket/route_mem.sh "0 100 1000" 2  # RSS, heap, JIT bytes against the route count (#728)
 bench/socket/contention.sh "8,1 6,2 8,0" 5 8s       # /health while the default pool is busy (#491)
 bench/socket/stall.sh "nitro nitro@8,0 go" 3 6s      # /plaintext while K handlers compute (#467)
 VARIANTS="login login_bcrypt" bench/socket/stall.sh "nitro go" 3 6s   # ... while K check a password (#587)

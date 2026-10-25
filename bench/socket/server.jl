@@ -90,6 +90,10 @@
 # pool woke since the previous `/lag` (p50/p99/max in ms, then resets) -- what a `Timer`-driven
 # deadline, such as a Workers timeout, sees while the pool is busy (#491). `/gc` answers every
 # field of `Base.gc_num()` as JSON, so a script can take the GC's counters before and after a run.
+# The Nitro modes also answer `/mem` (#728): after a full collection, `Base.gc_live_bytes()`,
+# `Base.jit_total_bytes()`, the `Base.summarysize` of the app's router, route middleware and chain
+# records (0 where a build has no such field) and of the whole `App`, and the size of the Nitro
+# package image the process loaded. It collects, so read `VmRSS` before calling it.
 
 using HTTP
 using JSON
@@ -160,6 +164,24 @@ end
 
 gc_body() = let g = Base.gc_num()
     JSON.json(Dict(string(f) => getfield(g, f) for f in fieldnames(typeof(g))))
+end
+
+function mem_body(app)
+    GC.gc(true)
+    svc = app.service
+    field_bytes(f) = hasproperty(svc, f) ? Base.summarysize(getproperty(svc, f)) : 0
+    origin = get(Base.pkgorigins, Base.PkgId(Nitro), nothing)
+    ji = origin === nothing ? nothing : origin.cachepath
+    so = ji === nothing ? "" : string(splitext(ji)[1], ".", Base.Libc.Libdl.dlext)
+    return JSON.json(Dict(
+        "gc_live_bytes"    => Base.gc_live_bytes(),
+        "jit_total_bytes"  => Base.jit_total_bytes(),
+        "router_bytes"     => field_bytes(:router),
+        "middleware_bytes" => field_bytes(:custommiddleware),
+        "chains_bytes"     => field_bytes(:route_chains),
+        "app_bytes"        => Base.summarysize(app),
+        "pkgimage_bytes"   => isfile(so) ? filesize(so) : 0,
+    ))
 end
 
 # PROBE=1 (#618): where a slow request's time went. `go/fairness -stamp` tags every request with
@@ -399,6 +421,7 @@ function start_nitro()
         path("/lag",       req -> Res.send(lag_body(); content_type = "application/json"); method = "GET"),
         path("/gc",        req -> Res.send(gc_body(); content_type = "application/json"); method = "GET"),
         path("/probe",     req -> Res.send(probe_body(); content_type = "text/tab-separated-values"); method = "GET"),
+        path("/mem",       req -> Res.send(mem_body(app); content_type = "application/json"); method = "GET"),
         path("/query",     (req, q::Query{QueryArgs}) -> Res.send(q.payload.name); method = "GET"),
         # `/links` reverses 20 links with `url`, as a page template would; `/links_prebuilt`
         # prints the same body by hand, so the gap is `url` alone (#557).
