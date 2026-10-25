@@ -70,10 +70,10 @@ end
 
 @testset "an interrupt ends the loop normally, with a warning -- not a failure (#369)" begin
     # With `exit_on_sigint(false)` -- every REPL -- Julia throws SIGINT into whichever task parked
-    # last on thread 1. A janitor is `Threads.@spawn`, so under Julia 1.12's default layout (thread
-    # 1 is the interactive thread) it never gets one. Under `-t 1` it can, and then rethrowing
-    # killed it with an `Unhandled Task ERROR` while the server kept running, and looping on would
-    # re-park it to take every later press too. It stops and says so; the reasoning is next to the
+    # last on thread 1. A janitor is `Threads.@spawn`, so under Julia's default layout (since
+    # 1.12, thread 1 is the interactive thread) it never gets one. Under `-t 1` it can, and then
+    # rethrowing killed it with an `Unhandled Task ERROR` while the server kept running, and
+    # looping on would re-park it to take every later press too. It stops and says so; the reasoning is next to the
     # Workers `_cleanup_scheduler_loop`. Against the unpatched loop this call THROWS.
     interrupting = FlakyWork(1, InterruptException())
     token = Ref(true)

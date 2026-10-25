@@ -960,7 +960,7 @@ from heavy jobs; give the heavy jobs a queue instead, as below.
 
 ### CPU-Bound Jobs
 
-Julia's tasks are cooperative, and Julia 1.12 has no preemption: a callback that computes without
+Julia's tasks are cooperative, and Julia does not preempt them: a callback that computes without
 yielding holds its thread until it returns. Worker callbacks and request handlers share the
 `:default` thread pool, and Julia has no task priorities, so a burst of CPU-bound jobs delays every
 request. With 64 such jobs in flight, a `/health` probe was measured at a p99 of about 4 seconds,

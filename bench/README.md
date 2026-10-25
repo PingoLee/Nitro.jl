@@ -20,6 +20,7 @@ bench/
 │   ├── session.jl      # MemoryStore read/write (payload-size scaling)
 │   ├── ratelimiter.jl  # limiter hot path: keying, lock contention, exempt-path scan
 │   ├── claims.jl       # a Claims{T} bind against two untyped getprincipal reads (#527)
+│   ├── jwt.jl          # decode_jwt, jwt_validator (secret, 4-key keyset), a request with and without BearerAuth (#723)
 │   ├── taskpattern.jl  # SYNTHETIC replica of parallel_stream_handler's task overhead
 │   ├── httpparse.jl    # HTTP.jl's request-head parse on the connection task
 │   ├── holds.jl        # how long one large JSON / multipart / file call holds its thread (#588)
@@ -114,6 +115,7 @@ PROFILE=10 bench/socket/run.sh nitro 1 20s           # sample every thread for 1
 bench/socket/run.sh "nitro@8,1 nitro@8,2 nitro@8,4"  # one mode per --threads, interleaved (#462)
 RATE=20000 bench/socket/run.sh "nitro@8,1 nitro@8,0" # fixed rate: latency without saturation (#491)
 JULIA="julia +1.12" bench/socket/run.sh              # another Julia, by juliaup channel
+BASE_ROOTS="a=/wt/a b=/wt/b" bench/socket/run.sh "a b"  # a series of commits, one worktree each
 ROOTS="a=/wt/a b=/wt/b" bench/socket/route_mem.sh "0 100 1000" 2  # RSS, heap, JIT bytes against the route count (#728)
 bench/socket/contention.sh "8,1 6,2 8,0" 5 8s       # /health while the default pool is busy (#491)
 bench/socket/stall.sh "nitro nitro@8,0 go" 3 6s      # /plaintext while K handlers compute (#467)
@@ -376,7 +378,6 @@ bench/juliac/build.sh safe                              # the goal
 ENTRY=probe bench/juliac/build.sh unsafe-warn           # the request path, past whatever walls the listener
 ENTRY=fatal bench/juliac/build.sh unsafe-warn           # a start-up failure with secrets in reach
 bench/juliac/fatal_check.sh bench/juliac/out/nitro-fatal-unsafe-warn   # ...and whether its stderr leaks them
-JULIAC=bundled bench/juliac/build.sh unsafe-warn        # the same build with Julia 1.12's own driver
 julia bench/juliac/frames.jl bench/results/juliac-<stamp>-<entry>-<mode>.log   # errors by first frame in src/
 bench/juliac/smoke.sh bench/juliac/out/nitro-min-no     # first vs warm /plaintext, RSS, OS threads
 bench/juliac/smoke.sh jit                               # the same app under the JIT, as the baseline
@@ -391,32 +392,31 @@ bench/juliac/smoke.sh jit                               # the same app under the
   distinct middleware stacks (two through an `include_routes` group). The verifier reports only
   the first dynamic call on each path, so `app.jl` sees the request path only once every wall in
   front of `HTTP.listen!` is gone; the probe sees it now. `ENTRY=probe` selects it.
-- `fatal.jl` (#749) fails at start-up on purpose, while its exception reaches a CSRF secret, a JWT
-  secret and a closure-captured key. A trimmed executable prints an uncaught exception by walking
-  its raw fields, so no masking `show` applies. `FAIL=serve` fails inside `serve`, which in a
-  trimmed image rethrows a value-free exception. `FAIL=boot` fails before `serve`, inside the
-  `@main` recipe from the deployment docs, and `FAIL=wrapped` is the `serve` failure inside it.
-  `FAIL=bare` is the same failure as `boot` with no recipe, and it leaks. `fatal_check.sh
-  <exe|jit>` runs every mode and greps `stderr` for the sentinels. For an executable it exits 1
-  if a judged mode leaks. An untrimmed executable's `serve` mode is expected to fail until #752.
+- `fatal.jl` (#749, #752) fails at start-up on purpose, while its exception reaches a CSRF secret,
+  a JWT secret and a closure-captured key. A juliac executable, trimmed or not, prints an uncaught
+  exception by walking its raw fields, so no masking `show` applies. `FAIL=serve` fails inside
+  `serve`, which in any juliac executable rethrows a value-free exception. `FAIL=boot` fails
+  before `serve`, inside the `@main` recipe from the deployment docs, and `FAIL=wrapped` is the
+  `serve` failure inside it. `FAIL=bare` is the same failure as `boot` with no recipe, and it
+  leaks. `FATAL_ROUTES=0`, read at build time, registers no route. `fatal_check.sh <exe|jit>`
+  runs every mode and greps `stderr` for the sentinels. For an executable it exits 1 if a judged
+  mode leaks, and that now holds for `--trim=no` and for a no-route trimmed build too.
 - `build.sh` pins `--project` to `bench/juliac`, instantiates it under the building Julia (into
-  its own `Manifest-v<major>.<minor>.toml`, so 1.12 and 1.13 builds do not re-resolve each other),
-  and logs to `results/juliac-<stamp>-<entry>-<mode>.log` with the Julia, the frontend and the
-  Nitro commit in the header; the exe lands in `juliac/out/` (gitignored), unbundled, linked
-  against that Julia's own `lib/`. The log goes through `tee` on purpose: a 1.13 build whose
+  its own `Manifest-v<major>.<minor>.toml`, so builds under two Julia minors do not re-resolve
+  each other), and logs to `results/juliac-<stamp>-<entry>-<mode>.log` with the Julia, the
+  frontend and the Nitro commit in the header; the exe lands in `juliac/out/` (gitignored),
+  unbundled, linked against that Julia's own `lib/`. The log goes through `tee` on purpose: a 1.13 build whose
   stderr went straight to a file lost the end of the verifier's output.
-- **The frontend.** `JULIAC=juliac` (the default) runs the JuliaC.jl app (`JULIAC_BIN`, default
-  `~/.julia/bin/juliac`) under `JULIA` (default `julia +1.13`): Julia 1.13 ships no driver of its
-  own. `JULIAC=bundled` runs the `juliac.jl` driver Julia 1.12 ships in `share/julia/juliac/`, with
-  `JULIA` defaulting to `julia +1.12`. The switch stays until the floor moves to 1.13 (#526), so a
-  1.12 count can still be reproduced.
-- `JULIA_CPU_TARGET` defaults to `native`, which is what the 1.12 driver built for. Left unset,
-  JuliaC builds for every target of Julia's system image, which made the untrimmed 1.13 app 512 MB
-  and a 7-minute build. The verifier's count is the same either way.
+- **The frontend** is the JuliaC.jl app (`JULIAC_BIN`, default `~/.julia/bin/juliac`), run under
+  `JULIA` (default `julia +1.13`): Julia 1.13 ships no driver of its own. Julia 1.12's bundled
+  `juliac.jl` driver was selectable as `JULIAC=bundled` until the floor moved to 1.13 (#526).
+- `JULIA_CPU_TARGET` defaults to `native`, which is also what the 1.12 driver built for, so the
+  earlier counts stay comparable. Left unset, JuliaC builds for every target of Julia's system
+  image, which made the untrimmed 1.13 app 512 MB and a 7-minute build. The verifier's count is
+  the same either way.
 - `frames.jl` counts a log's verifier errors by their first frame inside `src/`, the count
-  `docs/design/juliac-trim.md` §1 asks for. It reads both verifier formats (1.12's
-  `Verifier error #N:` and 1.13's `Error #N:`) and checks its total against the verifier's own
-  `Trim verify finished` line.
+  `docs/design/juliac-trim.md` §1 asks for. It reads 1.13's `Error #N:` format and checks its
+  total against the verifier's own `Trim verify finished` line.
 - `smoke.sh` exports `THREADS` as `JULIA_NUM_THREADS` for the exe — a compiled `main` does not
   parse Julia flags — and reports the OS thread count, which is how you see whether the layout took.
   Its `jit` baseline runs under `JULIA` (default `julia +1.13`).

@@ -16,7 +16,7 @@
 # The seam is `Task.scope`. `Base.setproperty!(::Task, :scope)` explicitly permits the write on
 # an **unstarted** task and refuses it on a started one, so building the `Task`, clearing its
 # scope, and only then scheduling is the sanctioned order. `Base.ScopedValues` is in Base from
-# 1.11 and Nitro pins `julia = "^1.12"`, so nothing is added to `Project.toml`.
+# 1.11 and Nitro pins `julia = "^1.13"`, so nothing is added to `Project.toml`.
 #
 # A worker run therefore sees the DEFAULT of every `ScopedValue`, not the submitter's binding --
 # with one deliberate exception, the logger, immediately below. That is the intended semantics

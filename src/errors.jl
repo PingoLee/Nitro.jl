@@ -272,8 +272,13 @@ hooks, and `mountable_files` skipping an unreadable directory. The source scan i
 `test/middleware/log_exposure_tests.jl` enforces the rule, so a new site that logs the live object
 fails there. The PormG stores use it for PormG's own database errors.
 
-Deliberately **not exported**: a log filter that dispatched on the original exception type
-matches on `.type` instead.
+It is also what `serve` throws in a juliac executable in place of the exception that left it
+(#749, #752; see [`startup_failure_text`](@ref Nitro.Core.Errors.startup_failure_text)).
+
+**Public, not exported**, together with its two fields: a log filter that dispatched on the
+original exception type matches on `.type` instead, and so does an executable's `@main` that
+catches what leaves `serve` (`e.type === :AddressInUseError`). The constructor is not part of
+that contract.
 """
 struct LoggedException <: Exception
     type::Symbol
@@ -297,12 +302,12 @@ end
 """
     _value_free(e) -> LoggedException
 
-What `serve` throws in place of `e` in a trimmed image (#749). There, an exception that escapes
-`main` is printed by the runtime's `jl_static_show`, which walks the object's raw fields and calls
-no `show` method, so no masking `show` applies: a `MethodError` over the middleware chain printed
-the CSRF secret and the JWT keyset in clear. A `LoggedException` has two plain fields, and this
-one is built without the original's values. Both of its fields are safe for the static printer
-to walk.
+What `serve` throws in place of `e` in a juliac executable, trimmed (#749) or not (#752). There,
+an exception that escapes `main` is printed by the runtime's `jl_static_show`, which walks the
+object's raw fields and calls no `show` method, so no masking `show` applies: a `MethodError` over
+the middleware chain printed the CSRF secret and the JWT keyset in clear. A `LoggedException` has
+two plain fields, and this one is built without the original's values. Both of its fields are safe
+for the static printer to walk.
 
 - `type` is `nameof(typeof(e))`, as for `loggable`.
 - `text` is the message of an `ArgumentError` or an `ErrorException` whose `msg` is a `String`,
@@ -312,7 +317,7 @@ to walk.
 
 Unlike `loggable`, it never calls `showerror`, which a trimmed image cannot dispatch for an
 arbitrary exception. It has the same limit as `loggable`: a message that quotes a value still
-prints that value. Internal; `serve` is its only caller.
+prints that value. Internal; `serve` and `startup_failure_text` are its callers.
 """
 function _value_free(@nospecialize(e))::LoggedException
     e isa LoggedException && return e
@@ -320,9 +325,35 @@ function _value_free(@nospecialize(e))::LoggedException
     msg = e isa ArgumentError ? e.msg : e isa ErrorException ? e.msg :
           e isa HTTP.AddressInUseError ? string("address already in use: ", e.address) : nothing
     text = msg isa String ? string(type, ": ", msg) :
-        string(type, " (its contents are withheld: a trimmed image prints an uncaught exception's raw fields)")
+        string(type, " (its contents are withheld: a compiled executable prints an uncaught exception's raw fields)")
     return LoggedException(type, text)
 end
+
+"""
+    Nitro.startup_failure_text(e) -> String
+
+One line that says what `e` was, built without its values, for an executable's `@main` to print
+when start-up fails. In a `juliac` executable an exception that escapes `main` is printed field by
+field, `SecretString` contents included, so the entry point catches it and prints this instead
+(docs/src/tutorial/deployment.md has the recipe).
+
+The line is the exception type's name, then:
+- the message of an `ArgumentError` or an `ErrorException` whose `msg` is a `String`, which
+  covers Nitro's own start-up refusals;
+- the address of an `HTTP.AddressInUseError`, a port already in use;
+- the `text` of a [`LoggedException`](@ref Nitro.Core.Errors.LoggedException), which is what `serve`
+  throws in a juliac executable (#752);
+- for anything else, a fixed note that the contents are withheld.
+
+It never calls `showerror` or `show`, which a trimmed image cannot dispatch for an arbitrary
+exception, so it is safe in a trimmed and an untrimmed executable alike. A message that quotes a
+value still prints that value: Nitro's own messages do not.
+
+Public, not exported: call it as `Nitro.startup_failure_text(e)`.
+"""
+startup_failure_text(@nospecialize(e))::String = _value_free(e).text
+
+public LoggedException, startup_failure_text
 
 """
     UnsupportedMediaTypeError(msg::String)

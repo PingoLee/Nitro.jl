@@ -41,7 +41,7 @@ covered in [Memory and GC](@ref) below — check it on the target machine, not o
  Nitro <version>  (8 threads + 1 interactive, GC target 2.8 GiB)
 ```
 
-The thread count is the default pool, where handlers run. Julia 1.12 also starts one
+The thread count is the default pool, where handlers run. Since 1.12, Julia also starts one
 *interactive* thread, in a pool of its own: `--threads=8` means 8 default threads **and** 1
 interactive one. HTTP.jl runs its accept loop and every connection's task there, reading each
 request's head before handing it on. Nitro then starts every request on its own task in the
@@ -134,7 +134,7 @@ stop a production server with `terminate` or its process supervisor rather than 
 ### Handlers that compute
 
 A task gives up its thread only when it waits: on I/O, a lock, a `sleep` or a `yield()`. Julia
-1.12 does not preempt one, so a handler that computes for 200 ms holds its default thread for
+does not preempt one, so a handler that computes for 200 ms holds its default thread for
 200 ms. Waiting on a database, another service or a file is not computing; those handlers give
 their thread back while they wait and are not what this section is about.
 
@@ -582,7 +582,8 @@ says little about a fresh container.
 
 ## Compiling with juliac (experimental)
 
-Julia 1.12 and later can compile an application into a standalone executable with `juliac`, and
+Julia can compile an application into a standalone executable with `juliac` (on 1.13, the
+[JuliaC.jl](https://github.com/JuliaLang/JuliaC.jl) app), and
 `--trim` drops every method the program cannot reach. Nitro is working towards `--trim=safe`, but
 it does not build a Nitro app cleanly today. What is left, and how it is measured, is recorded in
 `docs/design/juliac-trim.md` in the repository. This section covers the one rule that holds
@@ -595,18 +596,22 @@ executable built by `juliac`, trimmed or not (`--trim=no`), has no such display.
 the exception by walking its fields, so any key, password or token the exception reaches is
 written to `stderr` in clear, which in production usually means a log collector.
 
-In a trimmed image, `serve` handles its own part of this. An error that leaves `serve` (a
-middleware that fails while the pipeline is built, or a port already in use) is rethrown as a
-value-free `Nitro.Errors.LoggedException`. It keeps the original's type name, the message of an
-`ArgumentError` or an `ErrorException` (so Nitro's own refusals still read in full), the address
-of a port already in use, and the backtrace, and nothing else. That switch takes effect once the image
-has registered a route at top level, which a trimmed app does anyway (see below). Under the JIT,
-`serve` rethrows the original exception unchanged, and so does an untrimmed executable, which
-`serve` cannot yet tell apart from the JIT.
+In a juliac executable, trimmed or not, `serve` handles its own part of this. An error that
+leaves `serve` (a middleware that fails while the pipeline is built, or a port already in use) is
+rethrown as a value-free [`Nitro.Errors.LoggedException`](@ref Nitro.Core.Errors.LoggedException).
+It keeps the original's type name in `type` and, in `text`, the message of an `ArgumentError` or an
+`ErrorException` (so Nitro's own refusals still read in full) or the address of a port already in
+use. The backtrace is kept too, and nothing else. A port already in use is therefore caught as
+`e isa Nitro.Errors.LoggedException && e.type === :AddressInUseError`, not as
+`HTTP.AddressInUseError`. Under the JIT, `serve` rethrows the original exception unchanged.
 
-So the entry point catches what escapes. That covers your own start-up code before `serve`, and
-`serve` itself in an untrimmed executable. Print the value-free text of a `LoggedException`, or
-the type name of anything else, on `Core.stderr`, and exit non-zero:
+Your own start-up code runs before `serve` and outside its frames, so the entry point still
+catches what escapes. Print [`Nitro.startup_failure_text`](@ref Nitro.Core.Errors.startup_failure_text)
+of it on `Core.stderr`, and exit non-zero. The line is built the same way whether `serve` already
+replaced the exception or your own code threw it. It keeps the type's name, and the message of an
+`ArgumentError` or an `ErrorException` verbatim. So never interpolate a secret into your own
+`error(...)` or `ArgumentError(...)` message (`error("cannot reach $(db_url)")` prints the URL,
+password included):
 
 ```julia
 using Nitro
@@ -620,22 +625,23 @@ function (@main)(args::Vector{String})::Cint
         serve(app; host = "0.0.0.0", port = 8080)
     catch e
         e isa InterruptException && rethrow()
-        if e isa Nitro.Errors.LoggedException
-            println(Core.stderr, "start-up failed: ", e.text)
-        else
-            println(Core.stderr, "start-up failed: ", nameof(typeof(e)))
-        end
+        println(Core.stderr, "start-up failed: ", Nitro.startup_failure_text(e))
         return Cint(1)
     end
     return Cint(0)
 end
 ```
 
-Use `Core.stderr`, and the type name or a `LoggedException`'s text, not
-`@error "…" exception = e`: a trimmed image cannot dispatch the logging machinery or `showerror`
-on an arbitrary exception. The type name is the
-name only (`nameof`), never `typeof(e)` itself, because a type can carry a value as a parameter.
+Use `Core.stderr` and `Nitro.startup_failure_text`, not `@error "…" exception = e`: a trimmed
+image cannot dispatch the logging machinery or `showerror` on an arbitrary exception, and an
+untrimmed one would print what `showerror` prints, values included. `startup_failure_text` calls
+neither. It gives the type's name only (`nameof`), never `typeof(e)` itself, because a type can
+carry a value as a parameter.
 The routes are registered at top level, so under `juliac` they run while the image is built and
 `main` only serves. Keep the whole life of the server inside the `try`: with `serve(app; async =
 true)`, a later `wait` on the server rethrows what the server task raised, and outside the `try`
 that is printed raw.
+
+How `serve` knows it runs in an executable: both juliac build scripts define `Main._main`, the C
+entry point that calls your `main`. Do not define a global `_main` in `Main` yourself, or `serve`
+treats a JIT session as an executable too, and replaces the exceptions that leave it there.

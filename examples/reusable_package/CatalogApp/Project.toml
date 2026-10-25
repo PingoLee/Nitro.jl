@@ -11,7 +11,7 @@ Nitro = "e5efdb2c-68ee-4494-894d-55bb80f0a340"
 Nitro = {path = "../../.."}
 
 [compat]
-julia = "1.12"
+julia = "1.13"
 
 [extras]
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"

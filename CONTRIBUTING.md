@@ -123,7 +123,8 @@ under *Area rule files* and are canonical **there**.
   CompatHelper rewrites `Project.toml` through a TOML round-trip that silently drops **every**
   comment line; no flag disables it. Rationale parked there survives only until the next dependency
   bump. Keep the file comment-free *on purpose*, and never "fix" a stripped comment by restoring it.
-  The standing case: **`julia = "^1.12"` is intentional — do not lower it to the 1.10 LTS**, and
+  The standing case: **`julia = "^1.13"` is intentional — do not lower it to 1.12**
+  ([#526](https://github.com/PingoLee/Nitro.jl/issues/526): CI tests only the 1.13 series), and
   `HTTP` is pinned with `~` (one minor series), never `^`, because core depends on
   `HTTP.BytesBody` and other internals no SemVer covers (see nitro-core §4); moving it is a
   deliberate bump that re-runs `test/http_internals_contract_tests.jl` and writes an `upgrading/`
@@ -215,8 +216,8 @@ they **shadow** the same-named functions `using .Core` brings in. An `(app, …)
 | `src/routerhof.jl` | Higher-order router internals (`HOFRouter`) — plumbing, not public API. Also `ResponseBoundary`, which `compose` wraps the global middleware chain in: the one place a middleware's result is checked against the contract (an `HTTP.Response`, else a logged `500`), so every framework layer outside it reads a response, not `Any` |
 | `src/routeendpoint.jl` | `RouteEndpoint` (#718), included into `Types`: the one erasure point per route, for its middleware chain (folded at registration, ending in `RouteNext`) and for its handler, which also carries the handler with `format_response` folded in (`FormattedLeaf`, what the serializer calls). A direct call under the JIT; a `ccall` to a thunk exported with `Base._ccallable` in a `juliac --trim` build (pinned by `test/juliac_internals_contract_tests.jl`). Also `RouteChainRecord`, the chain beside the entry it was folded from; `with_response`, the closed dispatch on a response's body type that `SecurityHeaders`, the transport and the header and cookie middleware call through; and `LifecycleEntry` (#719), the lifecycle registry's erasure point, through an exported thunk (route-owned) or a static `@cfunction` (serve-owned) in a trimmed build |
 | `src/context.jl` | `AppContext` module — the public **`App`** handle and its secret-safe `show`, plus `Service`, app-context storage, extension slots, lifecycle services |
-| `src/methods.jl` | The `(app::App, …)` public surface **and** the argument-less conveniences bound to the global `CONTEXT[]`. Both live here because definitions in `Nitro` shadow `Core`'s |
-| `src/types.jl`, `src/constants.jl`, `src/errors.jl` | Shared vocabulary: `Nullable`, `Principal`, HTTP method constants, `ValidationError`/`CookieError`/`AuthorizationError`, the internal `AuthDenial` an extractor throws to serve a denial factory's response (#527), the internal `ValidatorFault` that replaces a throwing validator's exception (#595), the internal `SessionStoreFault` that replaces a session-store call's (#612), and the internal `LoggedException` (`loggable`) that error log records carry in place of the live exception (#613) |
+| `src/methods.jl` | The `(app::App, …)` public surface **and** the argument-less conveniences bound to the global `CONTEXT[]`. Both live here because definitions in `Nitro` shadow `Core`'s. Also `_rethrow_value_free`, which both `serve` forms call, and its gate `_juliac_executable` (#749, #752) |
+| `src/types.jl`, `src/constants.jl`, `src/errors.jl` | Shared vocabulary: `Nullable`, `Principal`, HTTP method constants, `ValidationError`/`CookieError`/`AuthorizationError`, the internal `AuthDenial` an extractor throws to serve a denial factory's response (#527), the internal `ValidatorFault` that replaces a throwing validator's exception (#595), the internal `SessionStoreFault` that replaces a session-store call's (#612), the `LoggedException` (`loggable`) that error log records carry in place of the live exception (#613) and `serve` throws in a juliac executable (#749, #752), public with its two fields, and `startup_failure_text`, the value-free line an executable's `@main` prints |
 | `src/environment.jl` | `Environment` module — `current_env()`, the `NITRO_ENV`/`GENIE_ENV` precedence and its closed value set. Reports the environment; deliberately gates nothing (#55) |
 | `src/response.jl` | The `Res` module — the response builders handlers use: `json`, `html`, `send`, `status`, `file`, `redirect` |
 | `src/utilities/typememo.jl` | `TypeMemo` — the lock-free per-type `Bool` memo keyed on the world counter, behind the per-request type checks in `BodyParsers`, `Reflection` and `Extractors`. In `Util`, below all three, so each can import it (#498) |
@@ -289,7 +290,7 @@ julia --project=docs -e 'using Pkg; Pkg.develop(PackageSpec(path=pwd())); Pkg.in
 julia --project=docs docs/make.jl
 ```
 
-- **CI runs the suite on Julia 1.13 on Linux and Windows at `JULIA_NUM_THREADS` 1 **and** 2.** (1.12 left the matrix by decision on #526, ahead of the floor moving to `^1.13`. The macOS legs are parked for the pre-release phase: over 40 runs they never failed alone and were the only legs cancelled for runner capacity. The matrix comment in `ci.yml` says what they stop covering and when to restore them.)
+- **CI runs the suite on Julia 1.13 on Linux and Windows at `JULIA_NUM_THREADS` 1 **and** 2.** (1.12 left the matrix and the floor moved to `^1.13`, both by decision on #526. The macOS legs are parked for the pre-release phase: over 40 runs they never failed alone and were the only legs cancelled for runner capacity. The matrix comment in `ci.yml` says what they stop covering and when to restore them.)
   It runs them at **`-O0`** (#667), so reproduce a CI red with `julia -O0`: an allocation probe can
   read differently at the default `-O2`.
   A change that only passes single-threaded is not green.

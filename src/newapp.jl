@@ -31,7 +31,7 @@ const _NEWAPP_MEMORY =
 
 # Kept equal to Nitro's own `julia` compat by `test/newapp_tests.jl`. HTTP's is derived from the
 # loaded version instead, because Nitro pins it to one minor series (`~`) on purpose.
-const _NEWAPP_JULIA_COMPAT = "^1.12"
+const _NEWAPP_JULIA_COMPAT = "^1.13"
 const _NEWAPP_NITRO_URL = "https://github.com/PingoLee/Nitro.jl.git"
 const _TEST_UUID = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 

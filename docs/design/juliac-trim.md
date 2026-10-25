@@ -72,11 +72,11 @@ ENTRY=probe bench/juliac/build.sh unsafe-warn   # the request path, without the 
 julia bench/juliac/frames.jl bench/results/juliac-<stamp>-<entry>-<mode>.log
 ```
 
-**The frontend.** Julia 1.12 ships a `juliac.jl` driver under `share/julia/juliac/`; Julia 1.13
-ships none, and its frontend is the JuliaC.jl app. `build.sh` runs JuliaC under `julia +1.13` by
-default. `JULIAC=bundled` (which defaults `JULIA` to `julia +1.12`) runs 1.12's driver instead,
-so a 1.12 count can be reproduced until the floor moves to 1.13
-([#526](https://github.com/PingoLee/Nitro.jl/issues/526)). Every count up to #718 below is
+**The frontend.** Julia 1.13 ships no `juliac` driver; its frontend is the JuliaC.jl app, and
+`build.sh` runs it under `julia +1.13`. Julia 1.12 shipped a `juliac.jl` driver under
+`share/julia/juliac/`, which `build.sh` ran as `JULIAC=bundled` until the floor moved to 1.13
+([#526](https://github.com/PingoLee/Nitro.jl/issues/526)); that switch is gone, so the 1.12.7
+counts below are records, no longer reproducible with `build.sh`. Every count up to #718 below is
 1.12.7's; §3.5 recounts on 1.13. Toolchain of that recount: Julia 1.13.2, JuliaC 0.3.12 (git
 tree `49a147f5`, release commit `98e82861`), gcc 13.3.0, Linux x86-64. The 1.12.7 control used
 the driver Julia 1.12.7 ships.
@@ -92,7 +92,7 @@ Three things about the JuliaC path that a count depends on:
   disagrees with its own total.
 - JuliaC builds for every target in Julia's system image unless `JULIA_CPU_TARGET` is set. The
   1.12 driver built for `native`. `build.sh` defaults to `native`, so exe size and build time
-  stay comparable; the count does not depend on it.
+  stay comparable with those records; the count does not depend on it.
 
 The verifier reports **the first dynamic call on each path** and does not look past it. A low
 count therefore means "the first wall is close", not "nearly done". Each fix can expose code that
@@ -845,9 +845,10 @@ secret and its JWT keyset in clear to `stderr`. In a served app the request path
 handler throws. A failure at start-up, in `serve` or in the app's own boot, printed whatever its
 arguments reached. Two parts now cover it:
 
-- **`serve` rethrows a value-free exception in a trimmed image.** Both public `serve` forms catch
-  at their outermost frame (`_rethrow_value_free`, `src/methods.jl`) and, when `_trimmed()`,
-  `rethrow` a `LoggedException` built by `Errors._value_free`. It keeps the type's name, the
+- **`serve` rethrows a value-free exception in a juliac executable.** Both public `serve` forms
+  catch at their outermost frame (`_rethrow_value_free`, `src/methods.jl`) and, when `_trimmed()`
+  or `_juliac_executable()` (#752, below), `rethrow` a `LoggedException` built by
+  `Errors._value_free`. It keeps the type's name, the
   message of an `ArgumentError` or an `ErrorException`, the address of an
   `HTTP.AddressInUseError` (a failed bind), and nothing else. It never calls
   `showerror`, which the image cannot dispatch for an arbitrary exception. `rethrow(x)` keeps the
@@ -855,8 +856,9 @@ arguments reached. Two parts now cover it:
   helpers take `@nospecialize` arguments: without that, the call on the caught `e::Any` is itself
   a dynamic dispatch, and in the trimmed image it failed with a `MethodError` that printed the
   original exception as its argument.
-- **The app's `@main` catches what runs before `serve`**, printing `nameof(typeof(e))` on
-  `Core.stderr`. That is the recipe in `docs/src/tutorial/deployment.md`.
+- **The app's `@main` catches what runs before `serve`**, printing
+  `Nitro.startup_failure_text(e)` on `Core.stderr` (#752; it printed `nameof(typeof(e))` before).
+  That is the recipe in `docs/src/tutorial/deployment.md`.
 
 `bench/juliac/fatal.jl` fails on purpose with a CSRF secret, a JWT secret and a closure-captured
 key in reach, and `bench/juliac/fatal_check.sh` greps its `stderr` for them (Julia 1.13.2, JuliaC
@@ -869,12 +871,60 @@ key in reach, and `bench/juliac/fatal_check.sh` greps its `stderr` for them (Jul
 | `bare` (before `serve`, no recipe) | all three leak | all three leak | all three leak |
 
 The `--trim=no` column answers #744's printing question: an untrimmed executable uses the same
-static printer, but `_trimmed()` stays `false` there, so `serve` cannot tell it from the JIT
-(#752). The same holds for a trimmed image that registers no route at top level, since
-`_trimmed()` flips only when the build exports one (`_flip_trimmed!`). Until then, the recipe is
-what covers both, and the deployment docs require it for every juliac executable. `bare` is the limit no change in Nitro can reach: the failure never enters
-Nitro's frames. The verifier counts do not move: the minimal app is 10 errors on `main` and after
-(this toolchain counts 10 where the count above read 11), and `ENTRY=fatal` is 63 on both.
+static printer, but `_trimmed()` stays `false` there, so `serve` could not tell it from the JIT
+(#752). The same held for a trimmed image that registers no route at top level, since
+`_trimmed()` flips only when the build exports one (`_flip_trimmed!`). `bare` is the limit no
+change in Nitro can reach: the failure never enters Nitro's frames. The verifier counts do not
+move: the minimal app is 10 errors on `main` and after (this toolchain counts 10 where the count
+above read 11), and `ENTRY=fatal` is 63 on both.
+
+**The signal for "a juliac executable" (#752).** `serve` needs one fact at the moment it fails, at
+run time: is this process a juliac executable, trimmed or not? It must be false under the JIT, in
+`Pkg.precompile`, and in a PackageCompiler sysimage. The candidates, measured with a probe package
+that prints each fact (Julia 1.13.2, JuliaC 0.3.12, PackageCompiler 2.4.5, Linux x86-64):
+
+| candidate | JIT | `Pkg.precompile` | JuliaC build | JuliaC exe, run | PackageCompiler build | `julia -J` run |
+|---|---|---|---|---|---|---|
+| `generating_output(false)` | false | false | **true** | false | `precompile_execution_file`: false; `script`: **true** | false |
+| `JLOptions().trim` | 0 | 0 | 0 / 3 | **0** in both | 0 | 0 |
+| `JLOptions().image_file_specified` | 0 | 1 | 1 | 0 | 1 | 1 |
+| `JLOptions().julia_bin` basename | `julia` | `julia` | `julia` | the exe's name | `julia` | `julia` |
+| a flag set in `__init__` | — | `Core.eval` there is an `ErrorException` | **never runs** | — | — | — |
+| a flag set by a call at the app's top level | false | false | set | **true** | `script`: set | **true** |
+| `isdefined(Main, :_main)` | false | false | true | **true** in both | false | false |
+
+- **`__init__` cannot set a build-time flag.** A non-incremental build (`--output-incremental=no`,
+  which JuliaC passes) defers a loaded package's `__init__` to the image's start-up. Nothing runs
+  it while the image is built.
+- **A flag set by a Nitro call at the app's top level** (`App()`, `urlpatterns`) is frozen into
+  the image, trimmed or not, but it is not exact. PackageCompiler's `script` keyword runs a file in
+  the `--output-o` process, where `generating_output(false)` is true as well. A sysimage built
+  that way kept the flag, and `julia -J` read it. It also misses an app that builds its `App`
+  inside `main`.
+- **`trim`, `image_file_specified` and `julia_bin`** do not tell an executable from a JIT session.
+  `trim` is 0 at run time even in a trimmed executable. `image_file_specified` is 0 under a plain
+  `julia` too. `julia_bin` is whatever the file is named.
+- **`isdefined(Main, :_main)` is exact for the drivers that exist.** JuliaC's build script and the
+  one Julia 1.12 bundles both define `Main._main(argc, argv)`, the C entry point that calls the
+  app's `main` (with no exception handler, which is why the runtime's fatal printer gets the
+  exception). Nothing else defines it unless an application names a global `_main` itself, which
+  the deployment docs warn against. It is read at run time, in `Nitro._juliac_executable()`, and
+  costs one binding lookup on a path that is already failing. It is trim-safe. Its weak point: if
+  JuliaC renames `_main`, it reads `false` and the untrimmed executable leaks again. CI has no
+  JuliaC, so `fatal_check.sh` on a `--trim=no` build is what catches that. `_trimmed()` stays in
+  the gate, so a trimmed image that registered a route is covered either way.
+
+After the change (`bench/juliac/fatal_check.sh`):
+
+| `FAIL=` | `--trim=no` | `--trim=unsafe-warn` | `--trim=unsafe-warn`, no route (`FATAL_ROUTES=0`) |
+|---|---|---|---|
+| `serve` | `LoggedException(type=:StartupFailed, …)`, nothing leaks | `LoggedException(type=:MethodError, …)`, nothing leaks | the same, nothing leaks |
+| `boot` (recipe) | `start-up failed: StartupFailed …` | the same | the same |
+| `wrapped` (recipe) | `start-up failed: StartupFailed …` | `start-up failed: MethodError …` | the same |
+| `bare` (no recipe) | all three leak | all three leak | all three leak |
+
+Before it, `serve` leaked all three in the `--trim=no` and the no-route builds. The verifier counts
+do not move: the minimal app 10, `ENTRY=fatal` 63, the no-route build 113.
 
 Under the JIT the same probe found that `jwt_validator` captures a string secret as a plain
 `String`, so Base's default display of an exception holding the chain prints the JWT secret, while
@@ -914,9 +964,8 @@ buy is a startup and deployment win:
 
 The order:
 
-0. **The harness is on Julia 1.13. Done:** `bench/juliac/build.sh` builds with JuliaC.jl by
-   default, keeps 1.12's driver behind `JULIAC=bundled` until the floor moves (#526), and §3.5
-   gives the backlog its 1.13 counts.
+0. **The harness is on Julia 1.13. Done:** `bench/juliac/build.sh` builds with JuliaC.jl, the
+   1.12 driver left with the 1.12 floor (#526), and §3.5 gives the backlog its 1.13 counts.
 1. **§3.1, the router's type. Done (#625):** one Nitro-owned router type, and the custom
    404/405 as fixed responses on `App`. It typed every pipeline closure, but cleared no verifier
    error on its own: the fold behind it is the next wall on that path (§3).

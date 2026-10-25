@@ -23,7 +23,7 @@ import Nitro
 #       OUTSIDE a build is not in the executable's table, which is why the JIT never takes that path.
 #
 # Every assertion here is about what Nitro calls, in the shape it calls it. Must pass on Julia
-# 1.12 (the release whose juliac the trimmed build is measured with) and 1.13 (CI). A failure means
+# 1.13, which CI runs and which the trimmed build is measured with (JuliaC). A failure means
 # the trimmed path needs re-checking with `bench/juliac/build.sh` on the new release before
 # anything else; docs/design/juliac-trim.md §3.2.
 
@@ -278,17 +278,18 @@ end
 end
 end
 
-@testitem "juliac: an error leaving serve in a trimmed image carries no values (#749)" tags=[:core, :security] setup=[NitroCommon] begin
+@testitem "juliac: an error leaving serve in an executable carries no values (#749, #752)" tags=[:core, :security] setup=[NitroCommon] begin
 using Test
 import Nitro
+import Sockets
 
 # ── `_rethrow_value_free` (src/methods.jl) and `_value_free` (src/errors.jl) ────────────────────
 #
-# In a trimmed executable an exception that escapes `main` is printed by the runtime's
-# `jl_static_show`, which walks raw fields and calls no `show` method: a `SecretString`'s mask
-# does not apply. So in a trimmed image `serve` rethrows a `LoggedException` built without the
-# original's values. `sprint(dump, x)` is the raw walk here: it prints every field, as the static
-# printer does. The executable itself is checked by `bench/juliac/fatal_check.sh`.
+# In a juliac executable, trimmed or not, an exception that escapes `main` is printed by the
+# runtime's `jl_static_show`, which walks raw fields and calls no `show` method: a `SecretString`'s
+# mask does not apply. So there `serve` rethrows a `LoggedException` built without the original's
+# values. `sprint(dump, x)` is the raw walk here: it prints every field, as the static printer
+# does. The executables themselves are checked by `bench/juliac/fatal_check.sh`.
 
 const E = Nitro.Core.Errors
 
@@ -327,6 +328,9 @@ end
 fail_on_fold(handler) = throw(StartupFailed(handler))
 
 @testset "under the JIT, serve rethrows the original" begin
+    # Neither gate is set here: this process is not a juliac executable (#752).
+    @test Nitro.Core.Types._trimmed() === false
+    @test Nitro._juliac_executable() === false
     app = Nitro.Core.App()
     err = try
         Nitro.serve(app; middleware = (fail_on_fold,), host = "127.0.0.1", port = get_free_port(),
@@ -337,20 +341,70 @@ fail_on_fold(handler) = throw(StartupFailed(handler))
     end
     @test err isa StartupFailed
     @test !isopen(app.service)
+    # A port already in use stays an `HTTP.AddressInUseError`, which an app can catch by type.
+    held = Sockets.listen(Sockets.IPv4("127.0.0.1"), 0)
+    busy_app = Nitro.Core.App()
+    try
+        port = Int(Sockets.getsockname(held)[2])
+        busy = try
+            Nitro.serve(busy_app; host = "127.0.0.1", port, async = true, show_banner = false,
+                        access_log = false)
+            nothing
+        catch e
+            e
+        end
+        @test busy isa Nitro.Core.HTTP.AddressInUseError
+    finally
+        # Should the bind ever succeed, the server must not outlive this item.
+        isopen(busy_app.service) && Nitro.Core.terminate(busy_app)
+        close(held)
+    end
 end
 
-# The trimmed branch, in a child with `_trimmed()` redefined to `true` (see the server handle's
-# item above for why a child). `serve` fails while the global chain is folded, before anything
-# binds, with a CSRF secret and a closure-captured key inside the chain it is handed.
-@testset "in a trimmed image, serve rethrows a value-free LoggedException" begin
+# `startup_failure_text` (src/errors.jl) is what the deployment recipe prints: the same value-free
+# text, for every shape `_value_free` handles, and never a value the exception holds.
+@testset "startup_failure_text carries no value (#752)" begin
+    key = "S3NT1NEL-key"
+    sec = Nitro.SecretString("S3NT1NEL-secret")
+    held = () -> (key, sec)
+    shapes = (MethodError(identity, (held, 1)), StartupFailed(held), StartupFailed((sec,)),
+              ArgumentError(SubString("S3NT1NEL-sub", 1, 12)), KeyError(key),
+              ErrorException("failed"), Nitro.Core.HTTP.AddressInUseError("127.0.0.1:8080"),
+              E.LoggedException(:KeyError, "KeyError: withheld"))
+    for e in shapes
+        text = Nitro.startup_failure_text(e)
+        @test text isa String
+        @test !occursin("S3NT1NEL", text)
+        @test text == E._value_free(e).text
+        @test startswith(text, string(e isa E.LoggedException ? e.type : nameof(typeof(e))))
+    end
+    @test Nitro.startup_failure_text(ArgumentError("bad value")) == "ArgumentError: bad value"
+    @test Nitro.startup_failure_text(Nitro.Core.HTTP.AddressInUseError("127.0.0.1:8080")) ==
+          "AddressInUseError: address already in use: 127.0.0.1:8080"
+    # Public, not exported, and the type the recipe matches on is public with it.
+    @test Base.ispublic(Nitro, :startup_failure_text) && !Base.isexported(Nitro, :startup_failure_text)
+    @test Base.ispublic(Nitro.Errors, :LoggedException) && !Base.isexported(Nitro.Errors, :LoggedException)
+end
+
+# The gated branch, in a child (see the server handle's item above for why a child), once per
+# gate. `trimmed` redefines `_trimmed()` to `true`, as a `--trim` build's route registration does.
+# `executable` defines `Main._main`, as both juliac build scripts do, with `_trimmed()` still
+# `false`: the untrimmed executable, and a trimmed one with no route, of #752. `serve` fails while
+# the global chain is folded, before anything binds, with a CSRF secret and a closure-captured key
+# inside the chain it is handed.
+@testset "in a juliac executable ($gate), serve rethrows a value-free LoggedException" for (gate, setup) in (
+        ("trimmed", "Core.eval(Nitro.Core.Types, :(_trimmed() = true))"),
+        ("executable", "_main(argc::Cint, argv::Ptr{Ptr{Cchar}})::Cint = Cint(0)"))
     script = """
     import Nitro
-    Core.eval(Nitro.Core.Types, :(_trimmed() = true))
+    $setup
+    println("GATES=", Nitro.Core.Types._trimmed(), " ", Nitro._juliac_executable())
     struct StartupFailed{T} <: Exception
         value::T
     end
     fail_on_fold(handler) = throw(StartupFailed(handler))
     interrupt_on_fold(handler) = throw(InterruptException())
+    refuse_on_fold(handler) = throw(ArgumentError("Nitro: refused at start-up"))
     keyed(key::String) = handler -> (req -> (isempty(key) ? nothing : handler(req)))
     chain = (Nitro.CSRFMiddleware("S3NT1NEL-csrf-secret-0123456789abcdef"), keyed("S3NT1NEL-key"))
     caught(f) = try f(); nothing catch e; (e, stacktrace(catch_backtrace())) end
@@ -368,6 +422,10 @@ end
         # An interrupt is not a failure and carries nothing: it passes through as itself.
         i, _ = caught(() -> serve((interrupt_on_fold, chain...)))
         println(name, "_INTERRUPT=", i isa InterruptException)
+        # A refusal keeps its message, which is what the recipe prints.
+        r, _ = caught(() -> serve((refuse_on_fold, chain...)))
+        println(name, "_REFUSAL=", r isa Nitro.Errors.LoggedException &&
+                Nitro.startup_failure_text(r) == "ArgumentError: Nitro: refused at start-up")
     end
     """
     cmd = `$(Base.julia_cmd()) --code-coverage=none --project=$(Base.active_project()) --startup-file=no -e $script`
@@ -375,8 +433,9 @@ end
     p = run(pipeline(ignorestatus(cmd); stdout = out, stderr = err))
     out, err = String(take!(out)), String(take!(err))
     @test (p.exitcode, p.termsignal) == (0, 0) || (out, last(err, 2000))
+    @test occursin(gate == "trimmed" ? "GATES=true false" : "GATES=false true", out) || out
     for name in ("APP", "GLOBAL"), line in ("_TYPE=logged:StartupFailed", "_LEAK=false", "_FRAMES=true",
-                                            "_INTERRUPT=true")
+                                            "_INTERRUPT=true", "_REFUSAL=true")
         @test occursin(name * line, out) || (name * line, out)
     end
     @test !occursin("S3NT1NEL", err)

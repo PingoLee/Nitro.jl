@@ -65,13 +65,12 @@ jobs:
       fail-fast: false
       matrix:
         # Julia 1.13 only, on the OS x thread-count grid: the maintainer's decision on
-        # #526. It is the version every application on Nitro runs, and the floor `[compat]`
-        # will declare once the floor PR lands (`julia = "^1.13"`). Until it does, the declared
-        # floor `^1.12` is deliberately NOT tested: a leg for a version nothing ships would be
-        # the configuration-nobody-runs CI the PormG pin rules warn about. 1.12 used to hold
-        # this grid while 1.13 ran on one ubuntu leg, on the reasoning that version-specific
+        # #526. It is the floor `[compat]` declares (`julia = "^1.13"`), so the declared
+        # floor and the tested version are the same series. A leg for a version nothing ships
+        # would be the configuration-nobody-runs CI the PormG pin rules warn about. 1.12 used to
+        # hold this grid while 1.13 ran on one ubuntu leg, on the reasoning that version-specific
         # breakage is not OS-specific; #301's Windows-only crash says it can be, so the one
-        # version in use gets every leg that earns its place.
+        # supported version gets every leg that earns its place.
         #
         # macOS is PARKED (commented out in `os` below), like `nightly`, for the pre-release
         # phase. Over the 40 CI runs before it was parked, the two macOS legs failed only when
@@ -347,10 +346,10 @@ jobs:
           persist-credentials: false
       - uses: julia-actions/setup-julia@da908477b5db94c10ffce8cfea9f2b3b9d5db687 # v3.0.3
         with:
-          version: '1.12'
+          version: '1.13'
       - uses: julia-actions/cache@9353db09a0f2bbbdec6f41791918c75d37391b36 # v3.5.0
         with:
-          cache-name: julia-cache;workflow=${{ github.workflow }};job=${{ github.job }};version=1.12
+          cache-name: julia-cache;workflow=${{ github.workflow }};job=${{ github.job }};version=1.13
       - run: |
           julia --project=docs -e '
             using Pkg
@@ -377,7 +376,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: julia-actions/setup-julia@da908477b5db94c10ffce8cfea9f2b3b9d5db687 # v3.0.3
         with:
-          version: '1.12'
+          version: '1.13'
       # No package build needed — the script uses only stdlib and reads files.
       - name: Lint agent-context docs for path/link/symbol drift
         run: julia .github/scripts/docs_lint.jl
