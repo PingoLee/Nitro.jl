@@ -45,7 +45,7 @@ Things the package gets right that are easy to get wrong:
 
 ## Run it
 
-From this directory, with Julia 1.12 or newer:
+From this directory, with Julia 1.13 or newer:
 
 ```bash
 julia --project=ReportKit  -e 'using Pkg; Pkg.instantiate(); Pkg.test()'
