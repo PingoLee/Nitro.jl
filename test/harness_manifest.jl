@@ -26,6 +26,9 @@ const TEST_FILES = [
     # it. `aqua_tests.jl` stays last because it summarises the PACKAGE -- opposite
     # kind of guard, opposite end. Needs no @testsetup and binds no socket.
     "harness_tests.jl",
+    # The runner's own checks: collection refusals, selection, `--shuffle`, and the watchdog
+    # and setup/TEST_END guards provoked in child processes (#754).
+    "runner_tests.jl",
 
     # ── Shared setup ──────────────────────────────────────────────────────────
     "setup_tests.jl",
