@@ -6,14 +6,21 @@
 #   bench/juliac/fatal_check.sh bench/juliac/out/nitro-fatal-unsafe-warn
 #   bench/juliac/fatal_check.sh jit
 #
+# Build at least these three, the cases #752 named (FATAL_ROUTES is read while the image is
+# built; a second OUT keeps the no-route exe from replacing the other):
+#   ENTRY=fatal bench/juliac/build.sh no
+#   ENTRY=fatal bench/juliac/build.sh unsafe-warn
+#   OUT=/tmp/noroute FATAL_ROUTES=0 ENTRY=fatal bench/juliac/build.sh unsafe-warn
+#
 # Per mode it prints the exit code, what stderr says the failure was, and any sentinel found.
 # For an executable, `serve`, `boot` and `wrapped` must exit non-zero, leak nothing and say what
-# failed: `serve` through the value-free `LoggedException` Nitro's `serve` throws in a trimmed
-# image, the other two through the recipe's `start-up failed: …` line. `bare` is reported, not
-# judged: it fails before Nitro's frames, so it leaks unless the app catches it. Under `jit`
-# nothing is judged either, since Base's display calls the `show` methods and Nitro does not
-# sanitize there. An untrimmed (`--trim=no`) executable fails `serve` until #752: `serve` cannot
-# tell it from the JIT yet, so that red is expected there and is not a regression.
+# failed: `serve` through the value-free `LoggedException` Nitro's `serve` throws in any juliac
+# executable (#749, #752), the other two through the recipe's `start-up failed: …` line. `bare` is
+# reported, not judged: it fails before Nitro's frames, so it leaks unless the app catches it.
+# Under `jit` nothing is judged either, since Base's display calls the `show` methods and Nitro
+# does not sanitize there. A red `serve` on a `--trim=no` build means `serve` no longer recognizes
+# the executable: `Nitro._juliac_executable` reads `Main._main`, which JuliaC's build script
+# defines, so check whether JuliaC renamed it.
 # Exits 1 if an executable fails a judged mode. Stderr goes to OUT (default
 # bench/juliac/out, gitignored) as fatal-<mode>.stderr; it may hold the sentinels, never real keys.
 set -uo pipefail

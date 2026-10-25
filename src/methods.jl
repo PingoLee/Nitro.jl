@@ -13,16 +13,30 @@ function resetstate()
     end
 end
 
+# Whether this process is a juliac executable, trimmed or not (#752). Both build scripts, JuliaC's
+# and the one Julia 1.12 bundles, define `Main._main`: the C entry point that calls the app's
+# `main` with no exception handler around it. So it is defined in every juliac executable, and
+# under the JIT or a PackageCompiler sysimage only if the application defines it itself.
+#
+# It is read at run time on purpose. A flag frozen while the image is built cannot come from
+# `__init__`, which a non-incremental build defers to the image's start-up. Nor can it come from
+# `generating_output(false)` alone, which is also true while PackageCompiler runs a sysimage's
+# `script`. docs/design/juliac-trim.md has the measurements, in "The signal for 'a juliac
+# executable'" (inside §3.8). If JuliaC renamed `_main`, this
+# would read `false` again; `bench/juliac/fatal_check.sh` on a `--trim=no` build is what notices.
+_juliac_executable() = isdefined(Main, :_main)
+
 # Called from the outermost `catch` of both `serve` forms below, so `rethrow` still sees the
-# exception being handled. In a trimmed image the runtime prints an exception that escapes `main`
-# by walking its raw fields, secrets included (#749), so there the exception is swapped for a
-# value-free one. An untrimmed juliac executable prints the same way, but nothing tells it from
-# the JIT yet (#752). `rethrow(x)` keeps the original backtrace, whose frames carry no values.
-# Unrecoverable errors (an interrupt, a stack overflow) carry nothing either and pass unchanged,
-# as does everything under the JIT, where an app can still catch, say, the
-# `HTTP.AddressInUseError` of a port already in use.
+# exception being handled. In a juliac executable, trimmed or not, the runtime prints an exception
+# that escapes `main` by walking its raw fields, secrets included (#749, #752). There the exception
+# is swapped for a value-free one. `_trimmed()` stays in the gate so a trimmed image that registered
+# a route keeps the swap whatever `_juliac_executable` reads. `rethrow(x)` keeps the original
+# backtrace, whose frames carry no values. Unrecoverable errors (an interrupt, a stack overflow)
+# carry nothing either and pass unchanged, as does everything under the JIT, where an app can
+# still catch, say, the `HTTP.AddressInUseError` of a port already in use.
 function _rethrow_value_free(@nospecialize(e))
-    if Nitro.Core.Types._trimmed() && !Nitro.Core.Errors.is_unrecoverable(e)
+    if (Nitro.Core.Types._trimmed() || _juliac_executable()) &&
+       !Nitro.Core.Errors.is_unrecoverable(e)
         rethrow(Nitro.Core.Errors._value_free(e))
     end
     rethrow()
@@ -933,7 +947,7 @@ function serve(app::App; async::Bool = false, secret_key = nothing, kwargs...)
             end
         end
     catch e
-        # Same as the singleton form above: value-free in a trimmed image (#749).
+        # Same as the singleton form above: value-free in a juliac executable (#749, #752).
         _rethrow_value_free(e)
     end
 end

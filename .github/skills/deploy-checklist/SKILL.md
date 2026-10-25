@@ -25,6 +25,12 @@ Read `nitro-config.instructions.md` for config ownership rules before recommendi
       Keep it `true` in production so failures are recorded in your logs — setting
       `show_errors=false` does not harden the response (it is already generic); it only
       silences your own error logs.
+- [ ] **A `juliac` executable's `@main` catches what escapes and prints only
+      `Nitro.startup_failure_text(e)` on `Core.stderr`**, trimmed or not. An uncaught exception
+      in an executable is printed field by field, secrets included. `serve` sanitizes its own
+      errors there, but not the app's start-up code before it. The line keeps an
+      `ErrorException`/`ArgumentError` message verbatim, so no secret is interpolated into one.
+      The recipe is in the deployment guide, under *Compiling with juliac*.
 - [ ] **`NITRO_ENV` is set on the target box**, to one of `dev` / `prod` / `test`. Unset
       resolves to `dev`, and `serve()` now *rejects* anything outside that set — so a
       `staging` value that used to boot no longer does. Confirm it from the unit file /
