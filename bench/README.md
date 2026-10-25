@@ -390,14 +390,15 @@ bench/juliac/smoke.sh jit                               # the same app under the
   distinct middleware stacks (two through an `include_routes` group). The verifier reports only
   the first dynamic call on each path, so `app.jl` sees the request path only once every wall in
   front of `HTTP.listen!` is gone; the probe sees it now. `ENTRY=probe` selects it.
-- `fatal.jl` (#749) fails at start-up on purpose, while its exception reaches a CSRF secret, a JWT
-  secret and a closure-captured key. A trimmed executable prints an uncaught exception by walking
-  its raw fields, so no masking `show` applies. `FAIL=serve` fails inside `serve`, which in a
-  trimmed image rethrows a value-free exception. `FAIL=boot` fails before `serve`, inside the
-  `@main` recipe from the deployment docs, and `FAIL=wrapped` is the `serve` failure inside it.
-  `FAIL=bare` is the same failure as `boot` with no recipe, and it leaks. `fatal_check.sh
-  <exe|jit>` runs every mode and greps `stderr` for the sentinels. For an executable it exits 1
-  if a judged mode leaks. An untrimmed executable's `serve` mode is expected to fail until #752.
+- `fatal.jl` (#749, #752) fails at start-up on purpose, while its exception reaches a CSRF secret,
+  a JWT secret and a closure-captured key. A juliac executable, trimmed or not, prints an uncaught
+  exception by walking its raw fields, so no masking `show` applies. `FAIL=serve` fails inside
+  `serve`, which in any juliac executable rethrows a value-free exception. `FAIL=boot` fails
+  before `serve`, inside the `@main` recipe from the deployment docs, and `FAIL=wrapped` is the
+  `serve` failure inside it. `FAIL=bare` is the same failure as `boot` with no recipe, and it
+  leaks. `FATAL_ROUTES=0`, read at build time, registers no route. `fatal_check.sh <exe|jit>`
+  runs every mode and greps `stderr` for the sentinels. For an executable it exits 1 if a judged
+  mode leaks, and that now holds for `--trim=no` and for a no-route trimmed build too.
 - `build.sh` pins `--project` to `bench/juliac`, instantiates it under the building Julia (into
   its own `Manifest-v<major>.<minor>.toml`, so 1.12 and 1.13 builds do not re-resolve each other),
   and logs to `results/juliac-<stamp>-<entry>-<mode>.log` with the Julia, the frontend and the
