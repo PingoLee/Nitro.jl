@@ -39,9 +39,9 @@ function _format_gc_bytes(bytes::UInt64)::String
     return gib >= 1 ? "$(round(gib; digits = 1)) GiB" : "$(round(bytes / 2.0^20; digits = 1)) MiB"
 end
 
-# `Threads.nthreads()` is the default pool only. Julia 1.12 also starts one interactive thread by
-# default, and HTTP.jl runs its accept loop and every connection task there, so it is worth
-# showing — but as a separate count, because handlers never run on it.
+# `Threads.nthreads()` is the default pool only. Since 1.12, Julia also starts one interactive
+# thread by default, and HTTP.jl runs its accept loop and every connection task there, so it is
+# worth showing — but as a separate count, because handlers never run on it.
 function _thread_summary()::String
     ndefault = Threads.nthreads(:default)
     ninteractive = Threads.nthreads(:interactive)
@@ -587,7 +587,7 @@ end
 #     `serve` is pinned there. This one re-parks after every revision, so the first Ctrl-C after a
 #     file save killed the watcher instead of stopping `serve`; the second landed in the dead task
 #     and aborted the process ("fatal: error thrown and no exception handler available"). Under
-#     Julia 1.12's default layout thread 1 is the interactive thread, which the `:default` pool
+#     the default layout (since 1.12) thread 1 is the interactive thread, which the `:default` pool
 #     never runs on, so the watcher cannot take a press at all. Running `revise()` off thread 1 is
 #     not new: `revise=:lazy` already calls it from `Threads.@spawn`ed request tasks, and Revise
 #     serializes it behind its own `ReentrantLock`. The only thing ever thrown into this task is

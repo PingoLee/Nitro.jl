@@ -75,7 +75,7 @@ end
 function base64url_encode(data::AbstractVector{UInt8})
     count = length(data)
     # `StringVector`, not `Vector{UInt8}`: `String` takes it over without copying, which it
-    # does not do for a plain vector on Julia 1.12.
+    # does not do for a plain vector on Julia 1.12 and 1.13.
     out = Base.StringVector(cld(4 * count, 3))
     alphabet = _BASE64URL_ALPHABET
     input = firstindex(data)

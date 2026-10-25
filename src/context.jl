@@ -484,7 +484,7 @@ end
 # `_consumer_wake_guard` in Workers, #514) and both `wake_guard` fields.
 _needs_wake_guard(v::VersionNumber = VERSION) = v"1.13.0-rc3" <= v < v"1.14.0-"
 
-# Tests only: CI runs 1.12, where the gate is shut, and this lets it drive the serve path anyway.
+# Tests only: it drives the serve path wherever the gate is shut (a fixed 1.13.x, a later Julia).
 const _WAKE_GUARD_FORCED = Ref(false)
 
 # Called by `startserver` once the listener is set. Reuses a guard that is still open (a

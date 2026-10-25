@@ -23,7 +23,7 @@ import Nitro
 #       OUTSIDE a build is not in the executable's table, which is why the JIT never takes that path.
 #
 # Every assertion here is about what Nitro calls, in the shape it calls it. Must pass on Julia
-# 1.12 (the release whose juliac the trimmed build is measured with) and 1.13 (CI). A failure means
+# 1.13, which CI runs and which the trimmed build is measured with (JuliaC). A failure means
 # the trimmed path needs re-checking with `bench/juliac/build.sh` on the new release before
 # anything else; docs/design/juliac-trim.md §3.2.
 

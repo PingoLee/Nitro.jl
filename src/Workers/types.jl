@@ -584,7 +584,7 @@ submit_queued_task(app, "compute", "fit-42", task_info -> begin
 end, Owner(uid))
 ```
 
-**Why it exists.** Julia's tasks are cooperative and Julia 1.12 has no preemption: a callback that
+**Why it exists.** Julia's tasks are cooperative and Julia does not preempt them: a callback that
 computes without reaching `yield`, `sleep`, `wait` or I/O holds its thread until it returns. Worker
 callbacks share the `:default` thread pool with every request handler, so a request scheduled onto
 that thread waits for the whole computation. `checkpoint!` is the explicit point at which it
@@ -715,7 +715,7 @@ end
 # A declared queue: one buffer drained by up to `concurrency` processor tasks (#513).
 #
 # **`concurrency` is a bulkhead, not a throughput knob.** Every processor runs on `:default`, the
-# pool that also runs every request handler, and Julia 1.12 has no preemption (#467), so a queue of
+# pool that also runs every request handler, and Julia does not preempt tasks (#467), so a queue of
 # CPU-bound jobs with `k` processors can hold at most `k` of those threads -- the rest stay free for
 # handlers by construction. That is Sidekiq's per-queue concurrency and River's `MaxWorkers`.
 #

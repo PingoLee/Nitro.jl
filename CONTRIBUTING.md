@@ -123,7 +123,8 @@ under *Area rule files* and are canonical **there**.
   CompatHelper rewrites `Project.toml` through a TOML round-trip that silently drops **every**
   comment line; no flag disables it. Rationale parked there survives only until the next dependency
   bump. Keep the file comment-free *on purpose*, and never "fix" a stripped comment by restoring it.
-  The standing case: **`julia = "^1.12"` is intentional — do not lower it to the 1.10 LTS**, and
+  The standing case: **`julia = "^1.13"` is intentional — do not lower it to 1.12**
+  ([#526](https://github.com/PingoLee/Nitro.jl/issues/526): CI tests only the 1.13 series), and
   `HTTP` is pinned with `~` (one minor series), never `^`, because core depends on
   `HTTP.BytesBody` and other internals no SemVer covers (see nitro-core §4); moving it is a
   deliberate bump that re-runs `test/http_internals_contract_tests.jl` and writes an `upgrading/`
@@ -289,7 +290,7 @@ julia --project=docs -e 'using Pkg; Pkg.develop(PackageSpec(path=pwd())); Pkg.in
 julia --project=docs docs/make.jl
 ```
 
-- **CI runs the suite on Julia 1.13 on Linux and Windows at `JULIA_NUM_THREADS` 1 **and** 2.** (1.12 left the matrix by decision on #526, ahead of the floor moving to `^1.13`. The macOS legs are parked for the pre-release phase: over 40 runs they never failed alone and were the only legs cancelled for runner capacity. The matrix comment in `ci.yml` says what they stop covering and when to restore them.)
+- **CI runs the suite on Julia 1.13 on Linux and Windows at `JULIA_NUM_THREADS` 1 **and** 2.** (1.12 left the matrix and the floor moved to `^1.13`, both by decision on #526. The macOS legs are parked for the pre-release phase: over 40 runs they never failed alone and were the only legs cancelled for runner capacity. The matrix comment in `ci.yml` says what they stop covering and when to restore them.)
   It runs them at **`-O0`** (#667), so reproduce a CI red with `julia -O0`: an allocation probe can
   read differently at the default `-O2`.
   A change that only passes single-threaded is not green.
