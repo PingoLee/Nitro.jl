@@ -359,7 +359,10 @@ end
 
 # Fixed window: the request path's own strict `>` (see `_sweep_expired!`).
 @inline _is_expired(b::Tuple{Int, DateTime}, window::Period, t::DateTime) = t - b[2] > window
-@inline _expires_at(b::Tuple{Int, DateTime}, window::Period) = b[2] + window + Millisecond(1)
+# Two additions, never `b[2] + window + Millisecond(1)`: Dates evaluates that as `DateTime + (window
+# + Millisecond(1))`, a `CompoundPeriod`, whose addition walks a `Vector{Period}` (a dynamic call
+# per period). A `DateTime` takes each fixed period on its own, so the instant is the same.
+@inline _expires_at(b::Tuple{Int, DateTime}, window::Period) = (b[2] + window) + Millisecond(1)
 
 # Sliding window: expired once its newest timestamp is at or before the prune cutoff, i.e. the
 # request path would prune every timestamp. A bucket is sorted -- `_record!` inserts a
@@ -502,8 +505,17 @@ function _respond(handle::Function, req::HTTP.Request, outcome::Int, remaining::
         push!(resp.headers, "Retry-After" => string(reset_time))
         return resp
     end
+    response = handle(req)
+    # Only a response has headers: anything else (a raw handler value under `serialize = false`)
+    # passes through untouched, as `SecurityHeaders` passes it. At its concrete body type
+    # (`Types.with_response`), so the calls below are static.
+    response isa HTTP.Response || return response
+    return Types.with_response(_with_rate_headers, response, rate_limit, remaining, reset_time)
+end
+
+function _with_rate_headers(resp::HTTP.Response, rate_limit::Int, remaining::Int, reset_time::Int)
     # Own the handler's (possibly shared/`const`) response before adding headers.
-    response = own_response_headers(handle(req))
+    response = own_response_headers(resp)
     set_rate_headers!(response, rate_limit, remaining, reset_time)
     return response
 end
@@ -721,10 +733,12 @@ function FixedRateLimiter(;
         end
     end
 
-    # If auto_extract_ip is true, then we'll use this composed version of the middleware
-    function extract_ip_and_rate_limit(handle::Function) :: Function
-        reduce(|>, [handle, rate_limit_only, extract_client_ip])
-    end
+    # If auto_extract_ip is true, then we'll use this composed version of the middleware.
+    # Composed by direct calls, `extract_client_ip(rate_limit_only(handle))`, which is what
+    # `reduce(|>, [handle, rate_limit_only, extract_client_ip])` did: that fold over a
+    # `Vector{Function}` and a `::Function` result erased the chain's type, so every global
+    # middleware around this one was a dynamic call (docs/design/juliac-trim.md §3).
+    extract_ip_and_rate_limit(handle::Function) = extract_client_ip(rate_limit_only(handle))
 
     return LifecycleMiddleware(;
         middleware = auto_extract_ip ? extract_ip_and_rate_limit : rate_limit_only, 
@@ -936,10 +950,9 @@ function SlidingRateLimiter(;
         end
     end
 
-    # Compose with IP extraction if auto_extract_ip is enabled
-    function extract_ip_and_rate_limit(handle::Function) :: Function
-        return reduce(|>, [handle, rate_limit_only, extract_client_ip])
-    end
+    # Compose with IP extraction if auto_extract_ip is enabled: direct calls, as in the fixed
+    # limiter above, so the chain keeps its type.
+    extract_ip_and_rate_limit(handle::Function) = extract_client_ip(rate_limit_only(handle))
 
     # A `LifecycleMiddleware` with both hooks left `nothing` (#172). This strategy owns no
     # background task — a full stripe reaps its expired buckets inline (#403), so there is

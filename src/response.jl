@@ -305,7 +305,7 @@ Custom headers are applied last and may override defaults.
 """
 function file(path::String; status::Int=200, headers::Vector=NO_HEADERS, filename=nothing,
               disposition::Union{Nothing,String}=nothing, loadfile=nothing)
-    body = isnothing(loadfile) ? read(path) : loadfile(path)
+    body = isnothing(loadfile) ? read(path) : _loaded_body(loadfile(path))
     content_type = mime_from_path(path, MIME"application/octet-stream"()) |> contenttype_from_mime
 
     h = HTTP.Headers(3 + length(headers))
@@ -323,6 +323,15 @@ function file(path::String; status::Int=200, headers::Vector=NO_HEADERS, filenam
     apply_headers!(h, headers)
     return _file_response(status, h, body)
 end
+
+# What a `loadfile` returns, as one of the two bodies `Types.with_response` lists for this builder:
+# a `Vector{UInt8}` or a `String` as is, any other byte array or string copied once into one. A
+# `codeunits` or a view of a buffer would otherwise make a body type a trimmed image refuses
+# (docs/design/juliac-trim.md §3.7). Anything else is passed on, to HTTP's keyword form below.
+_loaded_body(body::Union{String,Vector{UInt8}}) = body
+_loaded_body(body::AbstractVector{UInt8}) = Vector{UInt8}(body)
+_loaded_body(body::AbstractString) = String(body)
+_loaded_body(body) = body
 
 # `read` gives bytes and a `loadfile` usually gives bytes or a String: those take the field
 # constructor (#541). Any other body keeps HTTP's keyword form, which knows how to wrap it.
@@ -428,7 +437,10 @@ function file(req::HTTP.Request, path::String; headers::Vector=NO_HEADERS, filen
     end
 
     body = isnothing(loadfile) ? read(path) : loadfile(path)
-    source = body isa AbstractVector{UInt8} ? body : Vector{UInt8}(codeunits(body))
+    # A `Vector{UInt8}` as is; any other byte array, or a string, copied once into one, so the
+    # response's body is the `BytesBody{Vector{UInt8}}` `Types.with_response` lists.
+    source = body isa Vector{UInt8} ? body :
+             Vector{UInt8}(body isa AbstractVector{UInt8} ? body : codeunits(body))
     # When `loadfile` decided the body, the file's own size is not the body's size, so the
     # validators must describe what is being sent (#92's rule, one layer up).
     tag, modtime = file_validators(path; etag = etag, bytes = source)

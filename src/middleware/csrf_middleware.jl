@@ -1,16 +1,18 @@
 module CSRFMiddleware_
 
 using HTTP
+import JSON
 
-using ...Types: CookieConfig, Nullable
+using ...Types: CookieConfig, Nullable, with_response, _trimmed
 using ...Cookies: get_cookie, set_cookie!
 import ...Cookies
 using ...Crypto: secure_random_bytes, _empty_hmac_key, _hmac_sha256, SecretString, reveal, base64url_encode,
     base64url_decode
 using ...Errors: is_unrecoverable
 using ...Res: json
-using ...Core: own_response_headers, getjson, getform, header_name_isequal
-using ...Util: _mark_private!, _auth_credential, _ascii_casefold_eq
+using ...Core: own_response_headers, getjson, getform, with_session, header_name_isequal
+using ...Util: _mark_private!, _auth_credential, _ascii_casefold_eq, _rebuild_with_headers,
+    _cookie_on_raw_value
 
 export CSRFMiddleware, csrf_token!, issue_csrf_token!, validate_csrf_token
 
@@ -192,7 +194,19 @@ id is not (`Principal.id` is nullable, and a session-only app never populates `g
 """
 function _binding(req::HTTP.Request)::Nullable{String}
     value = Base.get(req.context, :session_id, nothing)
-    return value isa AbstractString ? String(value) : nothing
+    # The concrete string types first, so the conversion is static: `SessionMiddleware` and
+    # `regenerate_session!` store a `String`, and a cookie value can arrive as a `SubString`.
+    value isa String && return value
+    value isa SubString{String} && return String(value)
+    return value isa AbstractString ? _foreign_binding(value) : nothing
+end
+
+# Any other string type an app stored: converted under the JIT, as before; a trimmed image, which
+# has no code for the conversion, refuses it rather than leave the token unbound.
+@noinline function _foreign_binding(@nospecialize(value::AbstractString))::String
+    _trimmed() && throw(ArgumentError(
+        "Nitro: a trimmed image binds CSRF tokens only to a String session id; got a $(nameof(typeof(value)))"))
+    return String(value)
 end
 
 function _warn_unbound()
@@ -279,7 +293,7 @@ end
 # Signs `raw_token` under `binding` and sets it on `res`. Split out of `issue_csrf_token!` so the
 # middleware can sign a token it did NOT just generate: the one `csrf_token!` already handed the
 # handler, which may have gone into the response body (#431).
-function _set_token_cookie!(res::HTTP.Response, secret::String, raw_token::String,
+function _set_token_cookie!(res::Union{HTTP.Response, HTTP.Headers}, secret::String, raw_token::String,
                             binding::AbstractString, cookie_name::String, ttl::Int,
                             config::CookieConfig)
     set_cookie!(res, cookie_name, _signed_token(secret, raw_token, binding); config=config, encrypted=false, maxage=ttl)
@@ -396,9 +410,13 @@ function _session_persists(req::HTTP.Request, binding_before::Nullable{String},
     Base.get(req.context, :session_new, false) === true || return true
     Base.get(req.context, :session_modified, false) === true && return true
     binding_before == binding_after || return true          # rotated: saved under the new id
-    session = Base.get(req.context, :session, nothing)
-    return session isa AbstractDict && !isempty(session)
+    # Asserted: the foreign-session fallback is an `Any` under the JIT, and the `::Bool` return
+    # type would otherwise convert it with a dynamic call.
+    return with_session(_holds_data, req)::Bool
 end
+
+_holds_data(session::AbstractDict) = !isempty(session)
+_holds_data(_) = false
 
 function _presented_token(req::HTTP.Request, header_name::String, form_field::String)
     header_token = HTTP.header(req, header_name, "")
@@ -414,13 +432,8 @@ function _presented_token(req::HTTP.Request, header_name::String, form_field::St
         is_unrecoverable(e) && rethrow()
         nothing
     end
-    if form isa AbstractDict
-        if haskey(form, form_field)
-            return string(form[form_field])
-        elseif haskey(form, Symbol(form_field))
-            return string(form[Symbol(form_field)])
-        end
-    end
+    token = _field_token(form, form_field)
+    token === nothing || return token
 
     json = try
         getjson(req)
@@ -428,14 +441,30 @@ function _presented_token(req::HTTP.Request, header_name::String, form_field::St
         is_unrecoverable(e) && rethrow()
         nothing
     end
-    if json isa AbstractDict
-        if haskey(json, form_field)
-            return string(json[form_field])
-        elseif haskey(json, Symbol(form_field))
-            return string(json[Symbol(form_field)])
-        end
-    end
+    return _field_token(json, form_field)
+end
 
+# The token a parsed body carries under `field`, at the types the body parsers return: a form is a
+# `Dict{String,String}`, a JSON object a `JSON.Object{String,Any}`. A closed set of `isa`s, so each
+# read is a static call (docs/design/juliac-trim.md §3). A JSON value that is not a string is no
+# token: every token Nitro issues is one, so it could never have matched, and the answer is the
+# same 403.
+function _field_token(@nospecialize(body), field::String)::Nullable{String}
+    body === nothing && return nothing
+    body isa Dict{String,String} && return Base.get(body, field, nothing)
+    if body isa JSON.Object{String,Any}
+        value = Base.get(body, field, nothing)
+        return value isa String ? value : nothing
+    end
+    return _foreign_field_token(body, field)
+end
+
+# Any other parsed body: read as before under the JIT, a `String` or `Symbol` key and the value as a
+# string; a trimmed image, which has no code for it, finds no token there.
+@noinline function _foreign_field_token(@nospecialize(body), field::String)::Nullable{String}
+    (_trimmed() || !(body isa AbstractDict)) && return nothing
+    haskey(body, field) && return string(body[field])
+    haskey(body, Symbol(field)) && return string(body[Symbol(field)])
     return nothing
 end
 
@@ -482,9 +511,12 @@ return it, masked, in its body); the middleware must not then append a second, d
 that shadows it — `set_cookie!` appends, and the browser takes the last one, so the client would
 end up holding a token that does not match what the handler told it to send.
 """
-function _response_sets_cookie(res::HTTP.Response, cookie_name::String)
+_response_sets_cookie(res::HTTP.Response, cookie_name::String) =
+    _response_sets_cookie(res.headers, cookie_name)
+
+function _response_sets_cookie(headers::HTTP.Headers, cookie_name::String)
     n = ncodeunits(cookie_name)
-    for (name, value) in res.headers
+    for (name, value) in headers
         header_name_isequal(name, "Set-Cookie") || continue
         # `startswith(value, cookie_name * "=")`, without building the prefix per call (#542)
         startswith(value, cookie_name) && ncodeunits(value) > n && codeunit(value, n + 1) == UInt8('=') &&
@@ -682,13 +714,15 @@ function CSRFMiddleware(key::Union{AbstractString, SecretString}; cookie_name::S
                 _warn_unbound()
                 return response
             end
-
             # Under an unchanged binding the answer is the one computed before the handler; a
             # rotation (or a binding that first appeared) re-verifies under the new one.
             still_valid = binding == binding_before ? verified :
                           _verified_token(secret, cookie_value, binding)
             needs_token = still_valid === nothing
-            handler_minted = _response_sets_cookie(response, cookie_name)
+            # On the headers, one concrete type whatever the body, so the call is static. A raw
+            # handler value under `serialize = false` set no cookie.
+            handler_minted = response isa HTTP.Response &&
+                             _response_sets_cookie(response.headers, cookie_name)
             if handler_minted
                 _keep_session!(req)
                 return response
@@ -714,14 +748,21 @@ function CSRFMiddleware(key::Union{AbstractString, SecretString}; cookie_name::S
             else
                 return response
             end
+            # A cookie is due. A raw handler value under `serialize = false` cannot carry one,
+            # and the handler may have put the token in it, so this fails loudly rather than
+            # pass the value through without the cookie that token needs.
+            response isa HTTP.Response || throw(_cookie_on_raw_value("CSRFMiddleware", response))
             # Own the headers before issuing the cookie: `response` may be a shared/`const`
-            # object, and setting a cookie mutates the headers in place.
-            response = own_response_headers(response)
-            _set_token_cookie!(response, secret, raw_token, binding, cookie_name, ttl, config)
+            # object, and setting a cookie mutates the headers in place. The cookie and the
+            # `private` marking go on the copy, whose type is the same whatever the body, and the
+            # new response is built from it once, at its body type (`with_response`).
+            headers = copy(response.headers)
+            _set_token_cookie!(headers, secret, raw_token, binding, cookie_name, ttl, config)
             # One visitor's credential in a Set-Cookie (and, when the handler asked, often in the
             # body): never storable by a shared cache. A refresh sends it with no session write,
             # so `SessionMiddleware` would not mark it (#431 review).
-            _mark_private!(response)
+            _mark_private!(headers)
+            response = with_response(_rebuild_with_headers, response, headers)
             # `given` is already the context's token; `:csrf_token` keeps the mask handed out.
             raw_token === given || _set_context_token!(req, raw_token)
             # A refresh of a still-valid token needs nothing kept: its session already exists.

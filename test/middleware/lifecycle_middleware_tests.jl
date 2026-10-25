@@ -75,6 +75,8 @@ using HTTP
 using Nitro
 using Nitro.Core: LifecycleMiddleware, process_middleware
 import Nitro: App, path, text
+# The registry holds a `LifecycleEntry` per object (#719); these compare the objects themselves.
+objects(entries) = [e.mw for e in entries]
 
 # Regression test for #68 item 2. `process_middleware` used to `push!` into the shared
 # lifecycle Set, and `setupmiddleware` called it — from `serve`
@@ -122,7 +124,7 @@ end
     @test length(processed) == 1
     @test processed[1] === lf.middleware
     # Route-owned: every caller of `process_middleware` is a route-registration path (#82).
-    @test lf in ctx.service.route_lifecycle
+    @test lf in objects(ctx.service.route_lifecycle)
     @test isempty(ctx.service.serve_lifecycle)
 end
 
@@ -132,12 +134,12 @@ end
     Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
         path("/y", (req::HTTP.Request) -> Res.send("ok"), middleware = [lf])
     ])
-    @test lf in ctx.service.route_lifecycle
+    @test lf in objects(ctx.service.route_lifecycle)
 
     lf2, _, _, _ = counting_lifecycle()
     ctx2 = App()
     Nitro.Core.router(ctx2, "/hof"; middleware = [lf2])
-    @test lf2 in ctx2.service.route_lifecycle
+    @test lf2 in objects(ctx2.service.route_lifecycle)
 end
 
 @testset "dedup holds — one shared instance across N routes registers once" begin
@@ -165,8 +167,8 @@ end
                                  middleware = [lf])
     Nitro.Core.Routing.urlpatterns(ctx, "", outer)
     @test length(ctx.service.route_lifecycle) == 2
-    @test lf in ctx.service.route_lifecycle
-    @test inner_lf in ctx.service.route_lifecycle
+    @test lf in objects(ctx.service.route_lifecycle)
+    @test inner_lf in objects(ctx.service.route_lifecycle)
     @test isempty(ctx.service.serve_lifecycle)
 end
 
@@ -179,7 +181,7 @@ end
         path("/shared", (req::HTTP.Request) -> Res.send("ok"), middleware = [lf]),
     ])
     Nitro.Core.RouterHOF.register_serve_lifecycle!(ctx, Any[lf])
-    @test lf in ctx.service.route_lifecycle
+    @test lf in objects(ctx.service.route_lifecycle)
     @test isempty(ctx.service.serve_lifecycle)
 end
 
@@ -191,17 +193,17 @@ end
     lf, _, _, _ = counting_lifecycle()
     ctx = App()
     Nitro.Core.RouterHOF.register_serve_lifecycle!(ctx, Any[lf])
-    @test lf in ctx.service.serve_lifecycle
+    @test lf in objects(ctx.service.serve_lifecycle)
 
     Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
         path("/late", (req::HTTP.Request) -> Res.send("ok"), middleware = [lf]),
     ])
 
-    @test lf in ctx.service.route_lifecycle
-    @test lf ∉ ctx.service.serve_lifecycle          # promoted out, not duplicated
+    @test lf in objects(ctx.service.route_lifecycle)
+    @test lf ∉ objects(ctx.service.serve_lifecycle)          # promoted out, not duplicated
     # The assertion that matters: exactly one registration across both halves, so exactly one
     # on_startup and one on_shutdown per cycle.
-    @test count(==(lf), [ctx.service.route_lifecycle; ctx.service.serve_lifecycle]) == 1
+    @test count(==(lf), objects([ctx.service.route_lifecycle; ctx.service.serve_lifecycle])) == 1
 end
 end
 
@@ -212,6 +214,8 @@ using HTTP
 using Nitro
 using Nitro.Core: LifecycleMiddleware
 import Nitro: App, path, text
+# The registry holds a `LifecycleEntry` per object (#719); these compare the objects themselves.
+objects(entries) = [e.mw for e in entries]
 
 # The other half of #68 item 2: moving registration out of `setupmiddleware` must not break
 # the path that legitimately needs it. `serve` registers explicitly now, so `on_startup`
@@ -233,7 +237,7 @@ Nitro.Core.serve(ctx; middleware = [lf], host = HOST, port = port, async = true,
                  show_banner = false, show_errors = false, access_log = nothing)
 @test timedwait(() -> Base.isopen(ctx.service), 10.0) === :ok
 
-@test lf in ctx.service.serve_lifecycle
+@test lf in objects(ctx.service.serve_lifecycle)
 @test started[] == 1
 @test stopped[] == 0
 
@@ -249,6 +253,8 @@ using HTTP
 using Nitro
 using Nitro.Core: LifecycleMiddleware
 import Nitro: App, path, text
+# The registry holds a `LifecycleEntry` per object (#719); these compare the objects themselves.
+objects(entries) = [e.mw for e in entries]
 
 # Regression test for #82. `terminate()` used to `empty!` a single `lifecycle_middleware` Set
 # that held two kinds of member with different lifetimes. Emptying is right for the
@@ -280,7 +286,7 @@ _serve(ctx, port) = Nitro.Core.serve(ctx; host = HOST, port = port, async = true
     Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
         path("/limited", (req::HTTP.Request) -> Res.send("ok"), middleware = [lf])
     ])
-    @test lf in ctx.service.route_lifecycle
+    @test lf in objects(ctx.service.route_lifecycle)
 
     _serve(ctx, get_free_port())
     @test timedwait(() -> Base.isopen(ctx.service), 10.0) === :ok
@@ -289,7 +295,7 @@ _serve(ctx, port) = Nitro.Core.serve(ctx; host = HOST, port = port, async = true
     @test stopped[] == 1
 
     # The whole point: route registration is NOT repeated, so the entry has to have survived.
-    @test lf in ctx.service.route_lifecycle
+    @test lf in objects(ctx.service.route_lifecycle)
 
     _serve(ctx, get_free_port())
     @test timedwait(() -> Base.isopen(ctx.service), 10.0) === :ok
@@ -506,6 +512,8 @@ using Nitro.Core: LifecycleMiddleware, startup, shutdown
 using Nitro.Core.RouterHOF: register_route_lifecycle!, register_serve_lifecycle!,
                             lifecycle_snapshot
 import Nitro: App, path, text
+# The registry holds a `LifecycleEntry` per object (#719); these compare the objects themselves.
+objects(entries) = [e.mw for e in entries]
 
 # Regression test for #74 item 1. `startup.`/`shutdown.` broadcast over a `Set`, which collects
 # in HASH order — and `LifecycleMiddleware` is an immutable struct whose fields are closures,
@@ -547,7 +555,7 @@ end
     register_route_lifecycle!(ctx, Any[a, b, c])
 
     route_lf, _ = lifecycle_snapshot(ctx)
-    @test route_lf == [a, b, c]                  # a Vector now, and in the order given
+    @test objects(route_lf) == [a, b, c]                  # a Vector now, and in the order given
 
     startup.(route_lf)
     shutdown.(Iterators.reverse(route_lf))
@@ -576,7 +584,7 @@ end
     # promoted object is torn down after every serve-owned entry — including ones that started
     # BEFORE it, which LIFO required to be torn down after it.
     #
-    # Until now the only assertion about promotion was `lf ∉ ctx.service.serve_lifecycle`, i.e.
+    # Until now the only assertion about promotion was `lf ∉ objects(ctx.service.serve_lifecycle)`, i.e.
     # membership. Nothing pinned the ORDER, which is how `routerhof.jl`'s "Promotion is not
     # order-preserving" note described the exception BACKWARDS from #82 until 5086684 — and how
     # that wrong sentence got copied into the public `LifecycleMiddleware` docstring in PR #184
@@ -610,8 +618,8 @@ end
 
     register_route_lifecycle!(ctx, Any[rl])       # PROMOTION
     route_lf, serve_lf = lifecycle_snapshot(ctx)
-    @test serve_lf == [a, b]                      # `rl` removed from here, in place
-    @test route_lf == [c, rl]                     # ...and APPENDED here, behind `c` — not prepended
+    @test objects(serve_lf) == [a, b]                      # `rl` removed from here, in place
+    @test objects(route_lf) == [c, rl]                     # ...and APPENDED here, behind `c` — not prepended
 
     empty!(order)
     shutdown.(Iterators.reverse(serve_lf))        # `terminate`'s order, exactly
@@ -680,8 +688,8 @@ end
 
     route_lf, _ = lifecycle_snapshot(ctx)
     @test length(route_lf) == 64                 # no lost update
-    @test Set(route_lf) == Set(entries)
-    @test allunique(route_lf)                    # ...and no duplicate
+    @test Set(objects(route_lf)) == Set(entries)
+    @test allunique(objects(route_lf))                    # ...and no duplicate
 
     # Registering the same objects again, concurrently, must still be a no-op.
     @sync for e in entries

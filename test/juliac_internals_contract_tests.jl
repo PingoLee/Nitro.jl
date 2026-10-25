@@ -89,6 +89,28 @@ end
     end
     @test err isa ErrorException && occursin("register routes at top level", err.msg)
 end
+
+# `LifecycleThunk{L}` (#719) is exported the same way, with a `Cint` in the middle: concrete, so
+# `_ccallable` takes it.
+struct ContractLifecycleThunk{L} end
+(::ContractLifecycleThunk{Int})(a::Ptr{Cvoid}, up::Cint, c::Ptr{Cvoid}) = nothing
+
+@testset "_ccallable exports the lifecycle thunk's shape" begin
+    @test Base._ccallable("nitro_contract_lifecycle", Cvoid,
+                          Tuple{ContractLifecycleThunk{Int}, Ptr{Cvoid}, Cint, Ptr{Cvoid}}) === nothing
+    @test (Base.Experimental.entrypoint(ContractLifecycleThunk{Int}(), (Ptr{Cvoid}, Cint, Ptr{Cvoid})); true)
+    # A lifecycle entry with no code in this process is refused, never called through `C_NULL`.
+    lm = Nitro.Core.LifecycleMiddleware(middleware = h -> h, on_startup = () -> nothing)
+    for sym in ("", "nitro_contract_lifecycle_missing")
+        e = T.LifecycleEntry(lm, sym, C_NULL, C_NULL)
+        err = try
+            T._lifecycle_fptr!(e); nothing
+        catch caught
+            caught
+        end
+        @test err isa ErrorException && occursin("no code for this lifecycle middleware", err.msg)
+    end
+end
 end
 
 @testitem "juliac: the server handle's foreign calls" tags=[:core, :network] setup=[NitroCommon] begin
@@ -158,6 +180,96 @@ end
     @test (p.exitcode, p.termsignal) == (0, 0) || (out, last(err, 2000))
     for line in ("PTRS=true", "OPEN=true", "NEGATIVE=ArgumentError true true", "PARKED=true",
                  "CLOSED=true true", "WAITED=true", "BARE=refused")
+        @test occursin(line, out) || (line, out)
+    end
+end
+end
+
+@testitem "juliac: the lifecycle hooks' foreign calls, and Revise refused" tags=[:core, :network] setup=[NitroCommon] begin
+using Test
+import Nitro
+
+# ── `LifecycleEntry` (src/routeendpoint.jl), which keeps the lifecycle registry concrete (#719) ──
+#
+# In a trimmed build a serve-owned entry's hooks are a `ccall` to a static `@cfunction` that
+# `serve_lifecycle_entry` takes where the middleware's type is concrete: `Ref{L}` and a `Cint` on
+# the shim's side, `Any` and a `Cint` on the caller's, an `Any` result. A route-owned entry's are a
+# thunk exported while the image is built, which this process, not being a build, cannot export.
+# docs/design/juliac-trim.md §3.4.
+
+const T = Nitro.Core.Types
+const RH = Nitro.Core.RouterHOF
+
+@testset "under the JIT an entry holds no pointer and calls the hook directly" begin
+    up = Ref(0)
+    lm = Nitro.Core.LifecycleMiddleware(middleware = h -> h, on_startup = () -> (up[] += 1))
+    app = Nitro.Core.App()
+    RH.register_serve_lifecycle!(app, (lm,))
+    RH.register_route_lifecycle!(app, Any[Nitro.Core.LifecycleMiddleware(middleware = h -> h)])
+    route_lf, serve_lf = RH.lifecycle_snapshot(app)
+    for e in (only(route_lf), only(serve_lf))
+        @test e isa T.LifecycleEntry && e.sym == "" && e.shim == C_NULL && e.thunk == C_NULL
+    end
+    @test only(serve_lf).mw === lm
+    @test T.startup(only(serve_lf)) === nothing && up[] == 1
+end
+
+# The trimmed branches, in a child with `_trimmed()` redefined to `true` (see the server handle's
+# item above for why a child). It registers no route.
+@testset "the trimmed branches make their foreign calls" begin
+    script = """
+    import Nitro
+    const T = Nitro.Core.Types
+    const RH = Nitro.Core.RouterHOF
+    using Nitro.Core: LifecycleMiddleware, App, startup, shutdown
+    Core.eval(T, :(_trimmed() = true))
+    up, down = Ref(0), Ref(0)
+    lm = LifecycleMiddleware(middleware = h -> h, on_startup = () -> (up[] += 1),
+                             on_shutdown = () -> (down[] += 1))
+    boom = LifecycleMiddleware(middleware = h -> h, on_startup = () -> error("hook failed"))
+    intr = LifecycleMiddleware(middleware = h -> h, on_startup = () -> throw(InterruptException()))
+    app = App()
+    RH.register_serve_lifecycle!(app, (lm, boom, intr, h -> h))
+    _, s = RH.lifecycle_snapshot(app)
+    println("PTRS=", length(s) == 3 && all(e -> e.shim != C_NULL && e.sym == "", s))
+    println("UP=", startup(s[1]) === nothing, " ", up[])
+    # A hook's own throw is logged and swallowed by `startup`, on the far side of the foreign frame.
+    println("BOOM=", startup(s[2]) === nothing)
+    # An interrupt comes back as a value, as it does from a direct call (#185).
+    println("INTERRUPT=", startup(s[3]) isa InterruptException)
+    println("DOWN=", shutdown(s[1]) === nothing, " ", down[])
+    # A `Vector` member has no compiled hooks in an image, so it is refused.
+    vec = try RH.register_serve_lifecycle!(App(), Any[lm]); "accepted" catch e; e isa ArgumentError ? "refused" : "other" end
+    println("VECTOR=", vec)
+    # A route-owned entry gets its thunk only from a `--trim` build; this process is not one, so
+    # registration refuses it, before the registry changes, rather than `startserver` later.
+    app2 = App()
+    route = try RH.register_route_lifecycle!(app2, Any[lm]); "registered" catch e; e isa ArgumentError ? "refused" : "other" end
+    println("ROUTE=", route, " ", isempty(RH.lifecycle_snapshot(app2)[1]))
+    # End to end: `serve` registers the tuple and starts it, `terminate` stops it, both by `ccall`.
+    up[] = 0; down[] = 0
+    app3 = App()
+    Nitro.serve(app3; middleware = (lm,), host = "127.0.0.1", port = $(get_free_port()), async = true,
+                show_banner = false, access_log = false)
+    Nitro.Core.terminate(app3)
+    println("SERVE=", up[], " ", down[])
+    # Revise is refused, before anything starts: a trimmed image cannot make its `invokelatest`.
+    rev = try
+        Nitro.serve(App(); revise = :lazy, host = "127.0.0.1", port = $(get_free_port()), async = true,
+                    show_banner = false, access_log = false)
+        "served"
+    catch e
+        e isa ArgumentError && occursin("trimmed build", e.msg) ? "refused" : string(typeof(e))
+    end
+    println("REVISE=", rev)
+    """
+    cmd = `$(Base.julia_cmd()) --code-coverage=none --project=$(Base.active_project()) --startup-file=no -e $script`
+    out, err = IOBuffer(), IOBuffer()
+    p = run(pipeline(ignorestatus(cmd); stdout = out, stderr = err))
+    out, err = String(take!(out)), String(take!(err))
+    @test (p.exitcode, p.termsignal) == (0, 0) || (out, last(err, 2000))
+    for line in ("PTRS=true", "UP=true 1", "BOOM=true", "INTERRUPT=true", "DOWN=true 1",
+                 "VECTOR=refused", "ROUTE=refused true", "SERVE=1 1", "REVISE=refused")
         @test occursin(line, out) || (line, out)
     end
 end

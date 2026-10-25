@@ -5,7 +5,7 @@ using Sockets
 # `getpeerip` is not called here — this middleware writes `:peer_ip` and `getpeerip` reads it —
 # but importing it lets the `@ref` cross-references in the docstrings below resolve.
 using ...Core: getip, setip!, getpeerip, header_name_isequal
-using ...Types: Nullable, REQUEST_FORWARDED_PROTO_KEY
+using ...Types: Nullable, REQUEST_FORWARDED_PROTO_KEY, _trimmed
 using ...Errors: is_unrecoverable
 # Byte-safe header-value helpers: malformed UTF-8 must not turn into a 500 (see their comment).
 using ...Util: _ows_strip, _ascii_casefold_eq, _is_tchar
@@ -179,20 +179,39 @@ function ExtractIP(;
             # extractor, the client an earlier one resolved for a later one. Trust is judged
             # against it, so extractors chain -- see "More than one extractor" above.
             peer = getip(req)
-            # Recorded once, by the first extractor, while `:ip` still is the socket peer. A
-            # later one used to re-record whatever `:ip` held by then (#330), which made a
-            # forwarded address the "socket peer" an audit trail relies on to spot a forged
-            # header. A global `ExtractIP` plus a `RateLimiter` at its default
-            # `auto_extract_ip = true` is exactly that chain.
-            peer === nothing || haskey(req.context, :peer_ip) || (req.context[:peer_ip] = peer)
-            # Judged against the same hop as the address header, and BEFORE `_resolve` moves
-            # `getip` on: the proxy that wrote the scheme is the one this extractor trusts.
-            policy.proto === nothing || _record_forwarded_proto!(req, policy, peer)
-            resolved = _resolve(req, policy, peer)
-            resolved === nothing || setip!(req, resolved)
-            return handle(req)
+            # At the address types `serve` and `setip!` store, so the two calls below are
+            # static (docs/design/juliac-trim.md §3): `getip` reads a `Dict{Symbol,Any}`.
+            # Anything else a middleware stored keeps the JIT's dynamic calls.
+            peer isa IPv4 && return _extract!(handle, req, policy, peer)
+            peer isa IPv6 && return _extract!(handle, req, policy, peer)
+            peer === nothing && return _extract!(handle, req, policy, nothing)
+            return _extract_foreign!(handle, req, policy, peer)
         end
     end
+end
+
+function _extract!(handle::H, req::HTTP.Request, policy::_TrustPolicy, peer) where {H}
+    # Recorded once, by the first extractor, while `:ip` still is the socket peer. A
+    # later one used to re-record whatever `:ip` held by then (#330), which made a
+    # forwarded address the "socket peer" an audit trail relies on to spot a forged
+    # header. A global `ExtractIP` plus a `RateLimiter` at its default
+    # `auto_extract_ip = true` is exactly that chain.
+    peer === nothing || haskey(req.context, :peer_ip) || (req.context[:peer_ip] = peer)
+    # Judged against the same hop as the address header, and BEFORE `_resolve` moves
+    # `getip` on: the proxy that wrote the scheme is the one this extractor trusts.
+    policy.proto === nothing || _record_forwarded_proto!(req, policy, peer)
+    resolved = _resolve(req, policy, peer)
+    resolved === nothing || setip!(req, resolved)
+    return handle(req)
+end
+
+# A `:ip` of another type: the JIT runs the same steps on it, dynamically, as it always did; a
+# trimmed image, which has no code for it, refuses it.
+@noinline function _extract_foreign!(handle::H, req::HTTP.Request, policy::_TrustPolicy,
+                                     @nospecialize(peer)) where {H}
+    _trimmed() && throw(ArgumentError(
+        "Nitro: a trimmed image reads the client address only as an IPv4 or IPv6; got a $(nameof(typeof(peer)))"))
+    return _extract!(handle, req, policy, peer)
 end
 
 

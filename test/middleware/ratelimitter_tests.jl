@@ -670,7 +670,9 @@ end
     @test sliding isa Nitro.LifecycleMiddleware
     @test sliding.on_startup === nothing
     @test sliding.on_shutdown === nothing
-    @test typeof(sliding) === typeof(RateLimiter(strategy=:fixed_window, window=Minute(1)))
+    # Not one concrete type any more: `LifecycleMiddleware` is parameterized on its functions
+    # (#719), so each strategy's value has a type of its own. Both are still the one public type.
+    @test RateLimiter(strategy=:fixed_window, window=Minute(1)) isa Nitro.LifecycleMiddleware
     # ...and the wrapper changed nothing about the request path: `.middleware` is still the
     # composed limiter chain, which admits a request under the limit and reaches the handler.
     bare_sliding = RateLimiter(strategy=:sliding_window, rate_limit=5, window=Minute(1),
@@ -918,14 +920,16 @@ end
               (:noip, strategy, fail_open, expected...)
         fail_open || @test out.status == 503
 
-        # Post-handler bookkeeping: a non-`Response` makes `own_response_headers` throw AFTER
-        # the handler ran. That used to be caught and, under `fail_open`, run the chain again.
+        # Post-handler bookkeeping. A non-`Response` used to make `own_response_headers` throw
+        # AFTER the handler ran, which was caught and, under `fail_open`, ran the chain again.
+        # It now passes through untouched, as `SecurityHeaders` passes it (docs/design/
+        # juliac-trim.md §3.7), and the chain still runs exactly once.
         calls = Threads.Atomic{Int}(0)
         w = RateLimiter(; strategy, auto_extract_ip=false, fail_open).middleware(
             f421_counting(calls, _ -> "not a response"))
         out, _ = f421_run(() -> w(f421_req()))
-        @test (:post, strategy, fail_open, out isa MethodError, calls[]) ==
-              (:post, strategy, fail_open, true, 1)
+        @test (:post, strategy, fail_open, out, calls[]) ==
+              (:post, strategy, fail_open, "not a response", 1)
     end
 end
 

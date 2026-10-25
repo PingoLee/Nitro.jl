@@ -50,6 +50,15 @@ wall was cleared in [#571](https://github.com/PingoLee/Nitro.jl/issues/571), and
 > and the app from 59 to 27. The trimmed probe serves all six of its requests and exits, and the
 > trimmed app answers `GET /plaintext` with `200 "Hello, World!"`; before, it answered every
 > request with a `500`. The request body read is next, and it is inside HTTP.jl.
+>
+> **The lifecycle hooks, Revise and Nitro's own middleware (§3.4, §3.8):** each hook is a concrete
+> call behind a `LifecycleEntry` ([#719](https://github.com/PingoLee/Nitro.jl/issues/719)), and a
+> trimmed build refuses Revise and compiles none of it. On 1.13 the minimal app goes from 27 to 11,
+> and every error left on it is in HTTP.jl or Base. The probe now also runs eight of Nitro's
+> request-time middlewares, which took it from 6 to 300 on `main`; this branch brings that to 115.
+> The trimmed probe serves CORS, the CSRF and cross-origin refusals, the rate limiter and the
+> global middleware pipeline. What is left there is the session store's internals and the JWT
+> claims.
 
 ## 1. How to measure
 
@@ -93,7 +102,11 @@ not by the raw total: one line of Nitro can account for hundreds of Base frames 
 `app.jl` reaches the request path only through `serve` and `HTTP.listen!`. On 1.12, while any
 wall stands in front of the listener, the route path is never verified at all. `probe.jl` builds
 the pipeline with `setupmiddleware` and calls it on requests (an exact route, a converter route,
-three middleware stacks), so the request path is measured whatever the listener does. On 1.13 the
+three middleware stacks), so the request path is measured whatever the listener does. Since §3.8
+it also runs Nitro's own request-time middleware (`Cors`, `SessionMiddleware`, `CSRFMiddleware`,
+`CrossOriginProtection`, `RateLimiter`, `BearerAuth`, `GuardMiddleware`, `AccessLog`) as route
+middleware and, in a second pipeline, as a global `Tuple`, each request with the answer it should
+get. `LIFECYCLE=1` gives `app.jl` a route-owned and a serve-owned lifecycle hook. On 1.13 the
 verifier also reaches the per-request task behind the listener (§3.5), but `app.jl` has one exact
 route and no middleware, so the probe stays the measure of the route path.
 
@@ -108,29 +121,30 @@ route and no middleware, so the probe stays the measure of the route path.
 The lesson that generalizes: **`repr`/`string` of an un-inferred value is the most expensive single
 trim mistake**, and that includes a `Symbol`. Type the value, then `print` it.
 
-## 3. Remaining (40 errors on the minimal app on Julia 1.12.7; on 1.13, 96, then 87 after §3.6, 59 after the start-up walls and 27 after §3.7)
+## 3. Remaining (40 errors on the minimal app on Julia 1.12.7; on 1.13, 96, then 87 after §3.6, 59 after the start-up walls, 27 after §3.7 and 11 after §3.8)
 
 Measured 2026-10-22 on Julia 1.12.7, before and after #572. Each error is printed twice, so 20
 sites. `main` before #572 had **22**: the 20 below plus `CookieKey`'s, which arrived with a later
 merge. The `1.13` column is the recount (§3.5), 2026-10-23 at `dea736f0`, with JuliaC; a
 1.12.7 control at the same commit gives the After #572 column again, total 40. The `1.13, §3.6`
 column is the same build after the request-path change (§3.6), the next one after the start-up
-walls (below), and the last count column after the response type (§3.7).
+walls (below), then the response type (§3.7), and the last count column after the lifecycle
+hooks and Revise (§3.4, §3.8).
 
-| First frame in `src/` | Before #572 | After #572 | 1.13 | 1.13, §3.6 | start-up walls | §3.7 | What |
-|---|---:|---:|---:|---:|---:|---:|---|
-| `src/core/pipeline.jl` `setupmiddleware` | 4 | 0 | 0 | 0 | 0 | 0 | the fold (§3.2), **cleared** |
-| `src/core/lifecycle.jl` `serve` → `_serve_listener`, `startserver` | 4 | 0 | 0 | 0 | 0 | 0 | the pipeline's type through `serve`, **cleared** |
-| `src/core/lifecycle.jl` `_serve_pipeline`, the `start` closure | | 4 | 4 | 4 | 0 | 0 | `HTTP.listen!(…; kwargs...)` over the `Dict{Symbol,Any}` `startserver` passes, **cleared** (below) |
-| `src/core/lifecycle.jl` `serverwelcome`, `startserver` | | 16 | 14 | 14 | 0 | 0 | the banner and the blocking wait's `println`: `Dates.format(now(), "yyyy-mm-dd HH:MM:SS")` builds a `DateFormat` from a runtime string (4 of the 16 surface inside Dates' own `io.jl`), `IO`-typed `stdout`, `join` over `VersionNumber` fields. The control counts this row 18 (2 of them at `startserver`'s wait), which is where its 40 comes from |
-| `src/context.jl` `close`, `isopen`, `wait` | 6 | 8 | 8 | 8 | 0 | 0 | **the server field (§3.3)**, cleared |
-| `src/context.jl` `_try_cancel`; on 1.13 also `lifecycle.jl:118` | 2 | 2 | 3 | 3 | 3 | 3 | the `revise = :eager` watcher's `invokelatest`: dev-only and dynamic on purpose, so it stays |
-| `src/types.jl` `startup`/`shutdown` | 2 | 4 | 4 | 4 | 4 | 4 | the lifecycle hooks (§3.4) |
-| `src/crypto.jl` `CookieKey` | 2 | 2 | 2 | 2 | 0 | 0 | `NTuple{32,UInt8}` from a `Vector` |
-| `src/core/transport.jl`: the stream handler's body read (`_http_stream_request`, `_swallow_request_body!`), the response write and release | | | 18 | 18 | 18 | 6 | **new on 1.13**: the per-request task, reached past the `HTTP.listen!` wall (§3.5). §3.7 clears the response write and release; the 6 left are the body read, inside HTTP.jl |
-| `src/middleware/security_headers.jl` | | | 20 | 20 | 20 | 0 | **new on 1.13**: a response typed `Any`, the same rows as on the probe (§3.2); **cleared** (§3.7) |
-| `src/core/pipeline.jl` `_app_context_seed`; serializer `format_response`, `handle_error` | | | 11 | 2 | 2 | 2 | **new on 1.13**: the probe's rows of the same name (§3.2). §3.6 clears all but the seed's `@with`, which is inside Base |
-| outside `src/` (OpenSSL.jl, a Base `string`, the libuv read callback; on 1.13 also Base's `errormonitor` task, `printstyled`'s closure, `showerror`, the TLS read) | 2 | 2 | 12 | 12 | 12 | 12 | upstream |
+| First frame in `src/` | Before #572 | After #572 | 1.13 | 1.13, §3.6 | start-up walls | §3.7 | §3.8 | What |
+|---|---:|---:|---:|---:|---:|---:|---:|---|
+| `src/core/pipeline.jl` `setupmiddleware` | 4 | 0 | 0 | 0 | 0 | 0 | 0 | the fold (§3.2), **cleared** |
+| `src/core/lifecycle.jl` `serve` → `_serve_listener`, `startserver` | 4 | 0 | 0 | 0 | 0 | 0 | 0 | the pipeline's type through `serve`, **cleared** |
+| `src/core/lifecycle.jl` `_serve_pipeline`, the `start` closure | | 4 | 4 | 4 | 0 | 0 | 0 | `HTTP.listen!(…; kwargs...)` over the `Dict{Symbol,Any}` `startserver` passes, **cleared** (below) |
+| `src/core/lifecycle.jl` `serverwelcome`, `startserver` | | 16 | 14 | 14 | 0 | 0 | 0 | the banner and the blocking wait's `println`: `Dates.format(now(), "yyyy-mm-dd HH:MM:SS")` builds a `DateFormat` from a runtime string (4 of the 16 surface inside Dates' own `io.jl`), `IO`-typed `stdout`, `join` over `VersionNumber` fields. The control counts this row 18 (2 of them at `startserver`'s wait), which is where its 40 comes from |
+| `src/context.jl` `close`, `isopen`, `wait` | 6 | 8 | 8 | 8 | 0 | 0 | 0 | **the server field (§3.3)**, cleared |
+| `src/context.jl` `_try_cancel`; on 1.13 also `lifecycle.jl:118` | 2 | 2 | 3 | 3 | 3 | 3 | 0 | the `revise = :eager` watcher's `invokelatest`: dev-only and dynamic on purpose, so a trimmed build refuses Revise and compiles none of it (§3.8), **cleared** |
+| `src/types.jl` `startup`/`shutdown` | 2 | 4 | 4 | 4 | 4 | 4 | 0 | the lifecycle hooks (§3.4), **cleared** |
+| `src/crypto.jl` `CookieKey` | 2 | 2 | 2 | 2 | 0 | 0 | 0 | `NTuple{32,UInt8}` from a `Vector` |
+| `src/core/transport.jl`: the stream handler's body read (`_http_stream_request`, `_swallow_request_body!`), the response write and release | | | 18 | 18 | 18 | 6 | 6 | **new on 1.13**: the per-request task, reached past the `HTTP.listen!` wall (§3.5). §3.7 clears the response write and release; the 6 left are the body read, inside HTTP.jl |
+| `src/middleware/security_headers.jl` | | | 20 | 20 | 20 | 0 | 0 | **new on 1.13**: a response typed `Any`, the same rows as on the probe (§3.2); **cleared** (§3.7) |
+| `src/core/pipeline.jl` `_app_context_seed`; serializer `format_response`, `handle_error` | | | 11 | 2 | 2 | 2 | 2 | **new on 1.13**: the probe's rows of the same name (§3.2). §3.6 clears all but the seed's `@with`, which is inside Base |
+| outside `src/` (OpenSSL.jl, a Base `string`, the libuv read callback; on 1.13 also Base's `errormonitor` task, `printstyled`'s closure, `showerror`, the TLS read) | 2 | 2 | 12 | 12 | 12 | 12 | 3 | upstream; the 9 §3.8 removes were reached only through the Revise watcher |
 
 The verifier reports **the first dynamic call on each path**, so a cleared wall raises the count
 when it exposes code that was never verified. Every row #572 added is code that ran before #572
@@ -155,9 +169,9 @@ What #572 changed:
 | `_serve_pipeline`'s `start` closure → `HTTP.listen!` | keyword call splatting a `Dict{Symbol,Any}` | **cleared**: a `NamedTuple` (below) |
 | `compose` → the route's cached chain | a route table of differently typed chains | the route boundary (§3.2), **cleared** in [#718](https://github.com/PingoLee/Nitro.jl/issues/718) |
 | `isopen(::Service)`, `close(::Service)`, `wait` | `Service.server` holds `HTTP.Server{F}`, a UnionAll | **cleared**: `ServerHandle` (§3.3) |
-| `startup`/`shutdown` | `LifecycleMiddleware.on_startup`/`on_shutdown` are `Union{Function,Nothing}`-typed | lifecycle only (§3.4), [#719](https://github.com/PingoLee/Nitro.jl/issues/719) |
+| `startup`/`shutdown` | `LifecycleMiddleware.on_startup`/`on_shutdown` are `Union{Function,Nothing}`-typed | **cleared**: `LifecycleEntry` (§3.4), [#719](https://github.com/PingoLee/Nitro.jl/issues/719) |
 | the banner | `IO`-typed `stdout`, a runtime `DateFormat` | **cleared** (below) |
-| the `revise = :eager` watcher's cancel | `Base.invokelatest` | dev-only and dynamic on purpose, so it stays |
+| the `revise = :eager` watcher's cancel | `Base.invokelatest` | dev-only and dynamic on purpose: **refused** in a trimmed build and compiled out of it (§3.8) |
 | `OpenSSL.jl`, libuv read callback | outside Nitro | upstream |
 
 **The start-up walls, cleared.** Four rows stood in front of the request path or on the way out of
@@ -402,13 +416,65 @@ the executable ran a `sleep` inside the foreign frame and handed an exception ba
 | a supervisor task that owns the typed server, driven over typed channels | clears | moves the blocking wait and `close` onto another task, which changes where Ctrl-C lands (#426, #677) |
 | `isopen` re-derived from HTTP.jl's internal fields | clears | the wrong trade (nitro-core §4) |
 
-### 3.4 Lifecycle hooks
+### 3.4 Lifecycle hooks: cleared
 
-`on_startup`/`on_shutdown` are `Union{Function,Nothing}`-typed (abstract), live in a `Vector{LifecycleMiddleware}`, and run
-only at startup and shutdown. The typed option this section used to name,
-`FunctionWrapper{Nothing, Tuple{}}`, is ruled out: FunctionWrappers.jl fails `--trim=safe`
-wherever the wrapper is built (#625, §3.1). The hooks need a shape of their own. That is open,
-and it comes fifth in §4's order.
+`on_startup`/`on_shutdown` were `Union{Function,Nothing}`-typed (abstract), lived in a
+`Vector{LifecycleMiddleware}`, and ran only at startup and shutdown: 4 errors on the minimal app,
+`startup(lf)` and `shutdown(lf)` on an element of that vector. `FunctionWrapper{Nothing, Tuple{}}`,
+the option this section used to name, is ruled out: FunctionWrappers.jl fails `--trim=safe`
+wherever the wrapper is built (#625, §3.1).
+
+**The constraint that shaped the design: the two halves of the registry are registered at
+different times.** Route-owned entries (#82) register with their routes, at top level, which under
+`juliac` is build time. Serve-owned ones register in `serve`, which in an executable runs in
+`main`, at run time, where there is no `Core.eval`. Neither of the two erasure patterns already in
+the tree covers both:
+
+- `RouteEndpoint`'s exported thunk (§3.2) needs `Core.eval` at build time. It fits the route-owned
+  half and cannot serve the other.
+- `ServerHandle`'s static `@cfunction` (§3.3) is taken at run time, in a method specialized on the
+  concrete type. It fits the serve-owned half, as long as the hook types are concrete there, and
+  cannot serve an object built at build time, whose pointer an image does not keep.
+
+**Done in [#719](https://github.com/PingoLee/Nitro.jl/issues/719): both, one per half, behind one
+concrete entry.**
+
+- `LifecycleMiddleware{M,S,D}` is parameterized on its three functions. The keyword constructor
+  is unchanged, and the bare name still serves for `isa` and `LifecycleMiddleware[]`. A
+  `serve(middleware = (…))` tuple holding one is concrete, which also types the global fold
+  through `.middleware` (§3.8). Code that compares two of their types, or reads the registry,
+  changes; `upgrading/2026-10-24-719-lifecycle-registry-entries.md` has the edits.
+- The registry holds a `LifecycleEntry` per object (`src/routeendpoint.jl`): `mw`, which dedup and
+  promotion compare by `===` (what `∈` on the bare middleware meant, since it defines no `==`), and
+  the pointer a trimmed image calls the hooks through. `startup(e)`/`shutdown(e)` on the entry are
+  a direct call under the JIT, as before, and a `ccall` in a trimmed image.
+- A route-owned entry gets a thunk exported at registration for its middleware's type
+  (`route_lifecycle_entry`), found with `dlsym` on first use. A serve-owned entry gets a static
+  `@cfunction` taken in `register_serve_lifecycle!(ctx, ::Tuple)`, which walks the tuple member by
+  member so each member's type is concrete (`serve_lifecycle_entry`).
+- An exception never unwinds through the foreign frame: `_lifecycle_call` hands it back and the
+  caller throws it again, so the interrupt deferral of #185 holds. Promotion (#82), the LIFO
+  unwind (#74) and the lock are unchanged.
+- A trimmed image refuses what it has no code for, with an error that says so: a `Vector`-form
+  `serve(middleware = [...])` holding a lifecycle middleware, and route lifecycle registered after
+  the image was built (#71), refused when it is registered rather than when `startserver` finds
+  no code for it. A trimmed executable reports `Base.JLOptions().trim == 0` at run time with
+  `_trimmed()` true (checked with a throwaway build), which is what that refusal and
+  `route_lifecycle_entry` both rely on to tell building from running. Under the JIT both work as
+  before.
+
+`test/juliac_internals_contract_tests.jl` runs the trimmed branches in a child with `_trimmed()`
+redefined to `true`: startup, a throwing hook, an interrupting hook, shutdown, the two refusals,
+and `serve`/`terminate` end to end.
+
+| Candidate | Why not |
+|---|---|
+| **A `LifecycleEntry` per object: an exported thunk for route-owned, a `@cfunction` for serve-owned** | chosen |
+| `FunctionWrapper{Nothing, Tuple{}}` | fails `--trim=safe` wherever it is built (#625) |
+| an exported thunk only | needs `Core.eval`, which `main` does not have, so it cannot serve `serve(middleware = …)` |
+| a `@cfunction` only | its pointer is not kept in an image, so it cannot serve a route-owned object built at build time |
+| a `Tuple` of hooks typed at `serve` | cannot hold route-owned entries, promotion, or registration after `serve` |
+| `Core.OpaqueClosure` | the verifier rejects the call and the construction (§3.2) |
 
 ### 3.5 The recount on Julia 1.13
 
@@ -423,7 +489,8 @@ the driver Julia 1.12.7 ships, at the same commit (§1). The control reproduces 
 | `ENTRY=probe`, `safe` | – | fails on the same 70 |
 
 Later builds on the same 1.13 toolchain: the app goes 96 → 87 (§3.6) → 59 (the start-up walls, §3)
-→ 27 (§3.7), and the probe 70 → 20 (§3.6) → 6 (§3.7).
+→ 27 (§3.7) → 11 (§3.4, §3.8), and the probe 70 → 20 (§3.6) → 6 (§3.7). §3.8 extends the probe
+with Nitro's own middleware, which on `main` makes it 300; after §3.8 it is 115.
 
 **Most of it is one change: 1.13 verifies the closures that verified code builds.** Its trim
 compiler (`collectinvokes!` in `Compiler/src/typeinfer.jl`) gained a rule that 1.12.7's lacks.
@@ -672,10 +739,119 @@ body still gets a `500`: that is the next wall.
   [JuliaWeb/HTTP.jl#1512](https://github.com/JuliaWeb/HTTP.jl/issues/1512).
 - `_app_context_seed`'s `@with`, inside Base's `ScopedValue` HAMT (§3.5).
 - The lifecycle hooks (§3.4, [#719](https://github.com/PingoLee/Nitro.jl/issues/719)), and the
-  `revise = :eager` watcher, dynamic on purpose.
+  `revise = :eager` watcher, dynamic on purpose. **Both cleared** (§3.4, §3.8).
 - Header-adding middleware a user places inside the chain (`Cors`, the session and CSRF layers,
   the rate limiter) still receives `Any` from the layer below it. The minimal app installs none
-  of them.
+  of them. **Cleared**, with the walls behind it the extended probe found (§3.8).
+
+### 3.8 Revise, and Nitro's own middleware
+
+Built 2026-10-24 on the toolchain of §3.7 (Julia 1.13.2, JuliaC 0.3.12, HTTP.jl 2.11.2, Linux
+x86-64), from `main` at `644c7f59` (§3.7 merged) and the change on top of it. `unsafe-warn`,
+counted by first frame.
+
+**Revise in a trimmed build.** `revise = :lazy` and `:eager` reach the revised world through
+`invokelatest`, dynamic on purpose, and their branches were compiled into every build. `serve` now
+refuses `revise != :none` when `_trimmed()`, before anything starts, and every Revise branch (the
+`ReviseHandler` layer, starting and closing the eager watcher, `_try_cancel`) sits behind the same
+switch, so a trimmed image compiles none of it. That cleared the watcher's 3 errors and 9 of the 12
+outside `src/` on the app (Base's `errormonitor` task, `printstyled`'s closure, `showerror`),
+which only the watcher reached. Under the JIT nothing changes.
+
+| `ENTRY=app` | `main` | after |
+|---|---:|---:|
+| `src/types.jl` `startup`/`shutdown` (the lifecycle hooks, §3.4) | 4 | 0 |
+| `src/context.jl` `_try_cancel`, `src/core/lifecycle.jl` the `ReviseHandler`'s `invokelatest` | 3 | 0 |
+| `src/core/transport.jl`, the request body read | 6 | 6 |
+| `src/core/pipeline.jl` `_app_context_seed`'s `@with` | 2 | 2 |
+| outside `src/` | 12 | 3 |
+| **total** | **27** | **11** |
+
+The 11 left are the request body read inside HTTP.jl
+([JuliaWeb/HTTP.jl#1512](https://github.com/JuliaWeb/HTTP.jl/issues/1512), §3.7), Base's
+`ScopedValue` HAMT (§3.5), and three upstream sites: OpenSSL's `getproperty`, the libuv read
+callback, the TLS read. `LIFECYCLE=1` (one route-owned and one serve-owned hook) counts the same
+11, and the trimmed app runs both hooks through their pointers.
+
+**The probe, extended.** `probe.jl` now also runs `Cors`, `SessionMiddleware` on a `MemoryStore`,
+`CSRFMiddleware`, `CrossOriginProtection`, a fixed-window `RateLimiter`, `BearerAuth` over
+`jwt_validator`, a `GuardMiddleware` and `AccessLog`. Each runs as route middleware and, in a
+second pipeline, as a global `Tuple`, and every one of its 22 new requests has the answer it
+should get. On `main` that took the probe from 6 errors to 300. The walls, and what cleared each:
+
+| First frame in `src/` | `main` | after | What it was, and the change |
+|---|---:|---:|---|
+| `middleware/csrf_middleware.jl` | 96 | 0 | the inner layer's `Any` result (16), the parsed body read for the token through `AbstractDict` tests (62), the session and its id read from `req.context` (18). The response is checked, the cookie goes on the owned headers and the rebuild alone goes through `with_response`; the token is read from the parsers' concrete `Dict{String,String}` and `JSON.Object{String,Any}`; the session through `with_session` |
+| `middleware/session_middleware.jl` | 46 | 12 | the inner layer's result (12) and the session read back from `req.context` (22), as for CSRF. Left: the auth-marker compare and the dirty check over `Dict{String,Any}` values, and `deepcopy` (follow-up) |
+| `middleware/rate_limiter.jl` | 40 | 0 | the inner layer's result (8), and `b[2] + window + Millisecond(1)`, which Dates evaluates through a `CompoundPeriod` (32): two additions now |
+| `middleware/extract_ip.jl` | 8 | 0 | `getip(req)` is `Any`; tested against IPv4 and IPv6 first |
+| `middleware/cors_middleware.jl` | 4 | 0 | the inner layer's result |
+| `core/pipeline.jl` | 8 | 4 | the global fold over a `LifecycleMiddleware` (`.middleware::Function`, §3.4) and the rate limiter's `reduce(|>, [ … ])` composition; left: the `@with` HAMT |
+| `middleware/guards.jl` | 16 | 10 | the session read (6 cleared); left: JWT claim values compared as `Any` (follow-up) |
+| `cookies.jl` | 16 | 16 | `set_cookie!`'s `Dict{Symbol,Any}` attributes (follow-up). Once, not once per body type: the cookie is written on `HTTP.Headers` |
+| `Auth/` (`validators.jl`, `jwt.jl`, `claims.jl`), `middleware/auth_middleware.jl`, `utilities/misc.jl` | 50 | 50 | JWT claims as `Dict{String,Any}` values, `unauthorized::Function`, the validator's arity check by reflection (follow-up) |
+| `types.jl` | 9 | 9 | LRUCache.jl's untyped `by` and `finalizer` fields, under `MemoryStore` (upstream) |
+| `utilities/bodyparsers.jl` | 2 | 2 | `JSON.parse` of an `Any` target, inside JSON.jl |
+| outside `src/` | 5 | 12 | Base's logging and `showerror` writing to `stderr`, newly reached through the typed global pipeline; the libuv read callback; OpenSSL |
+| **total** | **300** | **115** | |
+
+Three things the extended probe taught that hold beyond it:
+
+- **An abstract `HTTP.Response` argument is a wall, even with one matching method.** The verifier
+  rejects `f(resp::HTTP.Response)` when `resp`'s type is the UnionAll. So after the response is
+  checked, everything that touches only headers works on `HTTP.Headers` (one concrete type
+  whatever the body), and the rebuild, the one step that needs the body's type, is the only call
+  through `with_response`. Taking the whole tail through `with_response` instead compiles it
+  once per listed body: seven copies of `set_cookie!` per site, and its own walls seven times.
+- **`req.context` is a `Dict{Symbol,Any}`, so every value read from it needs a closed dispatch**:
+  `with_session` for the session (a supported Symbol-keyed session keeps the JIT's dynamic call
+  and is refused in a trimmed image), concrete types for the session id and the client address.
+  Asserting them instead puts the value in a `TypeError`, which for a session is #612's leak;
+  `_stored_session` and `_stored_session_id` raise a value-free `SessionStoreFault`.
+- **A `::Function` return annotation, or a `reduce` over a `Vector{Function}`, erases a chain's
+  type for every layer around it.** The rate limiter's composition did both, so every global
+  middleware folded around a `RateLimiter` was abstract.
+
+**What the trimmed probe serves now:** the six original requests; CORS (a preflight and a simple
+request); the CSRF and cross-origin refusals; the session read back through its cookie; the rate
+limiter's burst (`200`, `200`, `429`); and the global pipeline's `GET /plaintext` and preflight.
+Five answer wrongly, all behind the follow-ups: a session write (`500`), the global session read
+(`500`), and the three bearer-token requests (`401`, the JWT claims).
+
+**What it asks of an application under `serialize = false`.** A raw handler value reaching
+`SecurityHeaders`, `Cors` or `RateLimiter` passes through without their headers; reaching
+`SessionMiddleware` or `CSRFMiddleware` while their cookie is due, it raises (a `500`, as the
+`MethodError` on `main` was). Both are in the upgrade entry #741 opened.
+
+**Allocations per request**, in bytes, through `setupmiddleware` / through `internalrequest`, at
+`-O2`, `main` against the branch:
+
+| Route | `main` | after |
+|---|---:|---:|
+| plaintext | 496 / 1888 | 496 / 1888 |
+| `Cors` | 800 / 2240 | 800 / 2240 |
+| `SessionMiddleware`, a new session written | 2800 / 4240 | 2656 / 4096 |
+| `SessionMiddleware` + `CSRFMiddleware`, `GET` | 1856 / 3296 | 1856 / 3296 |
+| `RateLimiter` | 1120 / 2560 | 1056 / 2496 |
+| global `Tuple` (`Cors`, `SessionMiddleware`, `RateLimiter`) | 1568 | 1504 |
+
+Throughput is pending, to be measured as §4 asks.
+
+**A finding for a later change: a fatal error in a trimmed image prints secrets.** An exception
+that escapes `main` in a trimmed executable is printed by the runtime's `jl_static_show`, which
+walks raw fields and never calls Nitro's secret-safe `show` methods (#307). The extended probe,
+crashing in `setupmiddleware` before this change, printed its CSRF secret and its JWT keyset in
+clear to `stderr`. In a served app the request path catches what a handler throws, but a failure
+at start-up (in `serve`, say) would print whatever its arguments reach.
+
+**The next walls:**
+- The session store's internals: the auth-marker compare and the dirty check over the session's
+  `Any` values, `deepcopy`, `set_cookie!`'s attribute `Dict`, and LRUCache.jl's untyped fields.
+  `SessionMiddleware` cannot answer a request in a trimmed image until they are cleared.
+- Auth: JWT claims read as `Any` (`_principal`, `_claim_int`, `_warn_iss`, the guards' claim
+  compare), `unauthorized::Function`, and the validator's arity check by reflection. The claims
+  want the same closed dispatch over JSON values that the session's values do.
+- The request body read inside HTTP.jl, and the `@with` HAMT (unchanged).
 
 ## 4. The decision: `--trim=safe` is a target
 
@@ -723,7 +899,11 @@ The order:
    the verifier shows there now: the security-header layer and the transport's response write,
    both on a route chain's `Any` result, and Base's `ScopedValue` HAMT behind `@with`. Like the
    four, these need not wait for 1–3.
-5. **§3.4, the lifecycle hooks ([#719](https://github.com/PingoLee/Nitro.jl/issues/719)).**
+5. **§3.4, the lifecycle hooks ([#719](https://github.com/PingoLee/Nitro.jl/issues/719)). Done:**
+   a `LifecycleEntry` per registered object, through an exported thunk or a `@cfunction`. With it,
+   a trimmed build refuses Revise and compiles none of it, and Nitro's own request-time middleware
+   reaches the response and the request context at concrete types (§3.8). The minimal app went
+   from 27 to 11 on 1.13; what is left on it is outside Nitro.
 6. **Outside Nitro:** OpenSSL.jl and the libuv read callback, reported upstream.
 
 Two rules come with the target:

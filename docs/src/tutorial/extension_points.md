@@ -243,7 +243,9 @@ Authenticate at the same level as the guard, or at an outer one.
     before the server starts. A `Vector` of different middleware is converted once at startup,
     and its type is only known then. Under the JIT both run the same. The `Tuple` is the form
     for an application compiled ahead of time with `juliac --trim`, which has to know every
-    type in advance.
+    type in advance. There a `Vector` holding a [`LifecycleMiddleware`](@ref Nitro.Core.Types.LifecycleMiddleware)
+    (`SessionMiddleware`, `RateLimiter` and `AccessLog` return one) is refused when `serve`
+    starts: the compiled program has no code for its startup and shutdown hooks.
 
 Global middleware runs on **every** request, including ones that match no route (404) and ones
 whose path matches but whose method does not (405). A route cannot opt out of it: passing

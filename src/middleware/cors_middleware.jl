@@ -158,7 +158,7 @@ function Cors(;
                 end
                 # Return a fresh response with the CORS headers added — never mutate the
                 # handler's response in place, which may be a shared/`const` object.
-                return add_response_headers(handle(req), frozen_headers)
+                return _with_cors_headers(handle(req), frozen_headers)
             end
         end
     end
@@ -183,9 +183,17 @@ function Cors(;
             end
             # Fresh response with CORS headers added; `headers` carries this request's
             # echoed Origin, so mutating a shared response in place would leak it to others.
-            return add_response_headers(handle(req), headers)
+            return _with_cors_headers(handle(req), headers)
         end
     end
+end
+
+# The inner layer's result with `headers` added. Only a response has headers: anything else (a raw
+# handler value under `serialize = false`) passes through untouched, as `SecurityHeaders` passes it.
+# At the response's concrete body type (`Types.with_response`), so the rebuild is a static call.
+function _with_cors_headers(resp, headers::Vector{Pair{String,String}})
+    resp isa HTTP.Response || return resp
+    return Types.with_response(add_response_headers, resp, headers)
 end
 
 end

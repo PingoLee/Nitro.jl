@@ -1,7 +1,7 @@
 module GuardsMiddleware
 
 using HTTP
-using ...Core: getsession, getprincipal
+using ...Core: getsession, getprincipal, with_session   # `getsession`: the docstrings link it
 using ...Types: Nullable, _is_identity
 using ...Util: _check_denial_factory, _deny
 
@@ -113,10 +113,13 @@ function _request_claims(req::HTTP.Request, session_key::String)::Nullable{Abstr
 	# The raw session is app data, not an authentication: it is a claims source only while
 	# it carries the login marker `login_required` checks (#337). A logout that deletes or
 	# nulls `session_key` but leaves `role` behind must not stay authorized as that role.
-	session = getsession(req)
-	session isa AbstractDict || return nothing
-	return _is_identity(_session_marker(session, session_key)) ? session : nothing
+	return with_session(_session_claims, req, session_key)
 end
+
+# The session as a claims source, at its concrete type (`with_session`).
+_session_claims(session::AbstractDict, session_key::String) =
+	_is_identity(_session_marker(session, session_key)) ? session : nothing
+_session_claims(_, ::String) = nothing
 
 # The login marker of a raw session: `session_key` as a String key, else as a Symbol key.
 # Shared by `login_required` and the claim guards so they cannot disagree about who is
@@ -194,13 +197,16 @@ function login_required(; redirect_url::Nullable{String}=nothing, session_key::S
 			return _deny(deny, req, :login_required)
 		end
 
-		session = getsession(req)
-		if session isa AbstractDict
-			_is_identity(_session_marker(session, session_key)) && return nothing
-		end
+		# Through `with_session`, as `_request_claims` reads it: the session SessionMiddleware
+		# stores is read with static calls (docs/design/juliac-trim.md §3).
+		with_session(_logged_in, req, session_key) === true && return nothing
 		return _deny(deny, req, :login_required)
 	end
 end
+
+# Does the raw session carry the login marker? At the session's concrete type (`with_session`).
+_logged_in(session::AbstractDict, session_key::String) = _is_identity(_session_marker(session, session_key))
+_logged_in(_, ::String) = false
 
 """
     claim_required(claim, value; kind=:equals, session_key="user_id", denied=<403 Forbidden>)

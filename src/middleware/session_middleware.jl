@@ -7,13 +7,13 @@ using UUIDs
 using ...Types: AbstractSessionStore, MemoryStore, SessionPayload, Nullable, is_expired,
     update_session!, delete_session!, session_store_full, SESSION_AUTH_HASH_KEY,
     _session_auth_hash_current, _session_auth_hash_of, _store_call, _store_bool
-using ...Types: CookieConfig, LifecycleMiddleware
+using ...Types: CookieConfig, LifecycleMiddleware, with_response, _stored_session, _stored_session_id
 using ..JanitorMiddleware: _janitor
 using ...Cookies: get_cookie, set_cookie!, storesession!, prunesessions!, regenerate_session!,
     _validate_cookie_prefix
 using ...Crypto: secure_uuid4
 using ...Errors: ValidatorFault, is_unrecoverable
-using ...Core: own_response_headers
+using ...Util: _rebuild_with_headers, _cookie_on_raw_value
 using ...Util: _mark_private!
 
 export SessionMiddleware, SessionPruner, rehash_session!
@@ -458,8 +458,12 @@ function SessionMiddleware(;
             # Let downstream middleware and the handler read or mutate the session.
             response = handle(req)
 
-            current_session = req.context[:session]
-            final_session_id = get(req.context, :session_id, session_id)
+            # Checked: the handler can replace either (`setsession!`, `regenerate_session!`), and
+            # both write these types. Read untyped, every use below was a dynamic call. The
+            # session itself is checked after the absolute-deadline exit below, which ends the
+            # session without reading it.
+            raw_session = req.context[:session]
+            final_session_id = _stored_session_id(get(req.context, :session_id, session_id))
 
             # Every write below -- insert, update, rotation -- and the cookie use this, so the
             # stored expiry never passes the absolute deadline (#362). A new session's clock
@@ -479,6 +483,7 @@ function SessionMiddleware(;
                 _end_session!(store, final_session_id, "past its absolute lifetime")
                 return response
             end
+            current_session = _stored_session(raw_session)
 
             # Stamp the sign-in with the user's current `session_auth_hash` (#391). Before the
             # rotation below, so the data it moves already carries the stamp.
@@ -496,7 +501,7 @@ function SessionMiddleware(;
                 current_auth_marker = _auth_marker(current_session, final_session_id, auth_key, validator)
                 if _auth_marker_changed(original_auth_marker, current_auth_marker)
                     regenerate_session!(req, store; ttl=ttl)
-                    final_session_id = req.context[:session_id]
+                    final_session_id = _stored_session_id(req.context[:session_id])
                 end
             end
 
@@ -578,18 +583,22 @@ function SessionMiddleware(;
                 session_written = false
             end
 
-            if session_written
-                # Own the headers before adding Set-Cookie: `response` may be a shared/`const`
-                # object (e.g. an auth-rejection response). Mutating it in place would attach
-                # this visitor's session cookie to every later request that returns the same
-                # object — a cross-request session leak — and races other threads.
-                response = own_response_headers(response)
-                # Append the session cookie without clobbering any sibling Set-Cookie headers.
-                set_cookie!(response, session_cookie, final_session_id; config=config, encrypted=false, maxage=ttl)
-                _mark_private!(response)
-            end
-
-            return response
+            session_written || return response
+            # Only a response carries a cookie. A raw handler value under `serialize = false`
+            # cannot, and the session is already stored, so this fails loudly rather than pass
+            # the value through without the cookie that names that session.
+            response isa HTTP.Response || throw(_cookie_on_raw_value("SessionMiddleware", response))
+            # Own the headers before adding Set-Cookie: `response` may be a shared/`const`
+            # object (e.g. an auth-rejection response). Mutating it in place would attach
+            # this visitor's session cookie to every later request that returns the same
+            # object — a cross-request session leak — and races other threads. The cookie and
+            # the `private` marking go on the copy, whose type is the same whatever the body, and
+            # the new response is built from it once, at its body type (`with_response`).
+            headers = copy(response.headers)
+            # Append the session cookie without clobbering any sibling Set-Cookie headers.
+            set_cookie!(headers, session_cookie, final_session_id; config=config, encrypted=false, maxage=ttl)
+            _mark_private!(headers)
+            return with_response(_rebuild_with_headers, response, headers)
         end
     end
 

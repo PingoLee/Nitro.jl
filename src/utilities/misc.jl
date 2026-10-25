@@ -564,6 +564,15 @@ rate limiter).
 """
 own_response_headers(resp::HTTP.Response) = _rebuild_with_headers(resp, copy(resp.headers))
 
+# What `SessionMiddleware` and `CSRFMiddleware` raise when their cookie is due on a value that is not
+# a response: a handler's raw value under `serialize = false`. Passing it through, as the
+# header-only layers do, would leave a stored session with no cookie, or a token in the body with
+# none, so the next request fails somewhere else. Names the value's type, never the value (#613).
+_cookie_on_raw_value(layer::String, @nospecialize(value)) = ArgumentError(
+    "$layer: its cookie is due, but the layer inside it returned a $(nameof(typeof(value))), not an " *
+    "HTTP.Response. Under `serialize = false`, return a response from the handler, or turn the " *
+    "value into one in a middleware inside this layer.")
+
 """
     add_response_headers(resp::HTTP.Response, extra) -> HTTP.Response
 
@@ -623,8 +632,12 @@ _rebuild_with_headers(resp::HTTP.Response{B}, headers::HTTP.Headers) where {B} =
 # Internal, not exported: import it as `using ...Util: _mark_private!`. It lives in `Util`, next to
 # `own_response_headers`, because both middleware modules use it and `csrf_middleware.jl` is
 # included before `session_middleware.jl`. Only ever call it on headers the caller already owns
-# (`own_response_headers`).
-function _mark_private!(response::HTTP.Response)
+# (`own_response_headers`, or a `copy` of a response's headers). The headers form is the one the
+# middleware call: `HTTP.Headers` is one concrete type whatever the response's body, so the call is
+# static in a trimmed build too (docs/design/juliac-trim.md §3).
+_mark_private!(response::HTTP.Response) = (_mark_private!(response.headers); response)
+
+function _mark_private!(headers::HTTP.Headers)
     # One pass over the headers, reading each list element in place (#563). This used to build a
     # `lowercase` String per header and `String[]` lists of every element: ~40 allocations per
     # cookie write, for what is usually "append two fixed lines". Names and directives fold
@@ -633,7 +646,7 @@ function _mark_private!(response::HTTP.Response)
     cache_control = false
     already_private = false
     malformed = false
-    for (name, value) in response.headers
+    for (name, value) in headers
         if _ascii_casefold_eq(name, "vary")
             for element in eachsplit(value, ',')
                 token = _ows_strip(element)
@@ -660,15 +673,15 @@ function _mark_private!(response::HTTP.Response)
 
     # `Vary` may already span several field lines -- `Cors` pushes its own `Vary: Origin` -- and
     # another line is additive by definition, so nothing already there is rewritten.
-    vary_cookie || push!(response.headers, "Vary" => "Cookie")
+    vary_cookie || push!(headers, "Vary" => "Cookie")
 
     # `private` wins over `public`; every other directive (`max-age`, `immutable`, …) is kept, so
     # the visitor's own browser still caches exactly as the handler asked. A response already
     # `private` or `no-store`, and well-formed, is left alone.
-    already_private && !malformed && return response
+    already_private && !malformed && return headers
     # `setheader` replaces EVERY existing `Cache-Control` line with this one.
-    HTTP.setheader(response, "Cache-Control" => cache_control ? _privatized_cache_control(response) : "private")
-    return response
+    HTTP.setheader(headers, "Cache-Control" => cache_control ? _privatized_cache_control(headers) : "private")
+    return headers
 end
 
 # The `Cache-Control` value `_mark_private!` writes over a response that has one: `private`, then
@@ -676,10 +689,10 @@ end
 # intact (`no-cache="a, b"` is written back as it came). Dropped: `public`, a qualified
 # `private="…"` (the bare `private` written first subsumes it), and a malformed directive -- one
 # a cache could read differently than this does, so it may not carry a `public` past us.
-function _privatized_cache_control(response::HTTP.Response)
+function _privatized_cache_control(headers::HTTP.Headers)
     io = IOBuffer()
     print(io, "private")
-    for (name, value) in response.headers
+    for (name, value) in headers
         _ascii_casefold_eq(name, "cache-control") || continue
         i = 1
         while i <= ncodeunits(value)
