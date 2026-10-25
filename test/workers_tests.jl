@@ -903,7 +903,7 @@ end
 @testset "Graceful worker drain (#176)" begin
     # Every callback below PARKS -- on the cancellation token via `timedwait`, or on a
     # `Base.Event` the test releases. None of them spins. #143 records that a CPU-bound spin
-    # probe wedges the ReTestItems worker into its 600s timeout on roughly half of `-t 2` runs
+    # probe wedged the test worker (ReTestItems' then) into its 600s timeout on roughly half of `-t 2` runs
     # once the full suite is around it, and a drain needs no spinning to be observable.
     #
     # Elapsed-time bounds are deliberately loose. The first `@warn` on the expiry path compiles

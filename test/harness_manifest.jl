@@ -1,16 +1,16 @@
 # Shared harness metadata -- the single source of truth for WHAT the suite runs and WHICH
 # tags exist. Two consumers need it, and neither can see the other:
 #
-#   * `test/runtests.jl` -- the coordinator. Builds the run list from TEST_FILES, and
-#     refuses a `--tags`/`--skip-tags`/`--name` filter that would select nothing.
-#   * `test/harness_tests.jl` -- a `@testitem`, which ReTestItems evaluates in a WORKER
-#     process where `runtests.jl` was never loaded. It re-includes this file by absolute
+#   * `test/runtests.jl` and the runner it includes (`test/runner/`) -- build the run from
+#     TEST_FILES, select with `selects`, and refuse a filter that would select nothing.
+#   * `test/harness_tests.jl` -- a `@testitem`, which runs in a fresh module where none of
+#     `runtests.jl`'s bindings are visible. It re-includes this file by absolute
 #     path, the same way `docs_deploy_tests.jl` reads the shipped `docs/make.jl`.
 #
 # Both read the same objects. A guard that instead text-parsed `runtests.jl` could be green
 # while the real list said something else -- which is the exact failure it exists to catch.
 #
-# Named `*_manifest.jl` on purpose: ReTestItems' discovery (`is_test_file`) keys on the
+# Named `*_manifest.jl` on purpose: discovery (`is_test_file`, below) keys on the
 # `_test(s).jl` / `-test(s).jl` suffixes, so this file can never be picked up AS a test
 # file by a bare-path or directory run.
 #
@@ -19,12 +19,13 @@
 
 module NitroTestHarness
 
+# The files the suite is made of -- NOT the order they run in. The run is in lexical path
+# order (see `test/runtests.jl`), as it was under ReTestItems, so a file's position here
+# changes nothing about when it runs. The groups below are for reading.
 const TEST_FILES = [
     # -- Harness self-check ---------------------------------------------------
-    # First on purpose: it validates a PRECONDITION of the run (is this list
-    # honest?), so a wrong list is reported before eighty items execute against
-    # it. `aqua_tests.jl` stays last because it summarises the PACKAGE -- opposite
-    # kind of guard, opposite end. Needs no @testsetup and binds no socket.
+    # It validates a PRECONDITION of the run (is this list honest?). Needs no
+    # @testsetup and binds no socket.
     "harness_tests.jl",
     # The runner's own checks: collection refusals, selection, `--shuffle`, and the watchdog
     # and setup/TEST_END guards provoked in child processes (#754).
@@ -162,11 +163,9 @@ const SKIPS_OK = String[]
 
 # The complete tag vocabulary.
 #
-# `--tags x` for an `x` outside this set is a typo, not a filter. ReTestItems does fail on
-# it -- `NoTestException("No test items found.")` -- but says nothing about WHY, so
-# `runtests.jl` checks against this set first and names the vocabulary instead. (#34
-# asserted ReTestItems reports a zero-match run as a *success*; that was checked against
-# the shipped package and is false.)
+# `--tags x` for an `x` outside this set is a typo, not a filter. It would fail anyway, as a
+# selection of zero items, but that says nothing about WHY, so `runtests.jl` checks against
+# this set first and names the vocabulary instead.
 #
 # `test/harness_tests.jl` asserts this set matches the tags actually in use, in BOTH
 # directions: a tag used but undocumented, and a tag documented but unused, are each a
@@ -178,18 +177,17 @@ const KNOWN_TAGS = Set([
     :handler, :auth, :pormg, :scenario, :aqua, :workers, :csrf,
 ])
 
-# ── Discovery -- deliberately mirrors ReTestItems ─────────────────────────────────────
-# Same four suffixes as ReTestItems' `is_test_file`, and the same hidden-path rule as its
-# directory walk (skip dirs AND files starting with `.`). Mirroring is what keeps the guard
-# honest: it flags exactly the files ReTestItems would have run. `test/.helpers/` holds
-# `run_auth_tests.jl`, a helper whose name ends in `_tests.jl` -- ReTestItems skips it for
-# being under a dot-directory, so this must too or the guard cries wolf. (`.TestPackage/`
-# and `extensions/protobuf/.messages/` are pruned by the same rule; nothing in them
-# currently matches the suffixes.)
+# ── Discovery -- the rule the runner itself uses ──────────────────────────────────────
+# Four suffixes, and a hidden-path rule (skip dirs AND files starting with `.`), kept from
+# ReTestItems. The runner expands a directory path with this very function
+# (`test/runner/collect.jl`), so the guard flags exactly the files a directory run would
+# execute. `test/.helpers/` holds `run_auth_tests.jl`, a helper whose name ends in
+# `_tests.jl` -- it is skipped for being under a dot-directory, so the guard does not cry
+# wolf. (`.TestPackage/` and `extensions/protobuf/.messages/` are pruned by the same rule;
+# nothing in them currently matches the suffixes.)
 #
-# Scope note: this walks `test/`, whereas ReTestItems walks the project root. A stray
-# `src/foo_tests.jl` would be invisible here -- not reachable today, since the launcher
-# always passes explicit paths, but the asymmetry is deliberate rather than overlooked.
+# Scope note: this walks `test/`. A stray `src/foo_tests.jl` would be invisible here -- not
+# reachable, since the launcher only ever passes paths under `test/` or named explicitly.
 is_test_file(p) = any(s -> endswith(p, s),
                       ("_test.jl", "_tests.jl", "-test.jl", "-tests.jl"))
 
@@ -197,7 +195,7 @@ is_test_file(p) = any(s -> endswith(p, s),
 # `walkdir` never promised in-place pruning: its producer task puts `(path, dirs, files)`
 # on an unbuffered channel and then iterates that same `dirs` itself. The producer is
 # sticky, so on one thread it waits for the consumer to yield and the prune looked like it
-# worked. Under ReTestItems the consumer is migratable, so at 2 threads the two run in
+# worked. In a test item the consumer is migratable, so at 2 threads the two run in
 # parallel. The producer then either descends before the prune (a `.helpers/` "orphan") or
 # reads the vector mid-`filter!` (`UndefRefError` → `TaskFailedException`).
 #
@@ -223,8 +221,9 @@ end
 # ── Tag extraction -- AST, not regex ──────────────────────────────────────────────────
 # A regex over source silently misses every file starting with a UTF-8 BOM, and 33 of our
 # 61 test files do (`^@testitem` simply does not match there). `Meta.parseall` handles the
-# BOM. Reimplemented rather than calling ReTestItems' internals, so a guard on the suite
-# does not depend on a private function of the package it is guarding.
+# BOM. Kept independent of the runner's own collection, so the guard is a second reader of
+# the files rather than the runner checking itself; `test/runner_tests.jl` asserts the two
+# agree on every file.
 function testitems(path)
     out = Tuple{String, Vector{Symbol}}[]
     function walk(e)
@@ -249,28 +248,20 @@ function testitems(path)
 end
 
 # ── Selection -- the one rule both the launcher and its guard read ────────────────────
-# `test/runtests.jl` re-implements ReTestItems' filter so it can say WHY a filter selected
-# nothing, instead of leaving the caller with `No test items found.`. A replica that drifts
-# from the real run is worse than no replica: it either refuses a run ReTestItems would have
-# happily executed, or waves through one ReTestItems then rejects. #214 is the receipt --
-# adding `--skip-tags` without teaching the replica about exclusion is exactly that drift.
+# The run selects items with this rule (`select_items` in `test/runner/collect.jl`), and
+# `test/harness_tests.jl` unit-tests it. Under ReTestItems the launcher kept a REPLICA of the
+# library's filter to explain a zero-item selection, and a replica that drifts from the real
+# run is worse than none -- #214 is the receipt: adding `--skip-tags` without teaching the
+# replica about exclusion was exactly that drift. Now there is one rule and no replica.
 #
-# So the rule lives HERE, where the coordinator and the `@testitem` guard can both call it,
-# and the guard can unit-test it -- which an inline loop inside `runtests.jl` could not be.
-#
-# The three clauses mirror `ReTestItems`' `TestItemFilter` (`src/filtering.jl`):
+# The three clauses keep the semantics ReTestItems' `TestItemFilter` had:
 #
 #   tags       AND-combined, `issubset(requested, item.tags)` -- "has AT LEAST all of these"
 #   name       EXACT, `name == ti.name`, never a substring (#34)
 #   skip_tags  the DUAL of `tags`, and NOT its mirror image: `isdisjoint` drops an item that
 #              carries ANY listed tag, where `issubset` demands ALL of them. So
 #              `--skip-tags network --skip-tags slow` means "neither", while
-#              `--tags network --tags slow` means "both". Threaded into the run through
-#              `runtests`' `shouldrun` positional, which is ANDed with the two above.
-#
-# Reimplemented rather than calling ReTestItems' internals, for the same reason `testitems`
-# above is: a guard on the suite must not depend on a private function of the package it is
-# guarding. `TestItemFilter` and `_shouldrun` are both unexported.
+#              `--tags network --tags slow` means "both". ANDed with the two above.
 selects(nm, tg; tags = Symbol[], skip_tags = Symbol[], name = nothing) =
     issubset(tags, tg) && isdisjoint(skip_tags, tg) && (isnothing(name) || nm == name)
 

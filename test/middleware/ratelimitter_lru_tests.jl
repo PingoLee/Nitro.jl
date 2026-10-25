@@ -310,14 +310,14 @@ end
     ip = IPv4("10.0.0.1")
 
     # Warm up: JIT the limiter closure, own_response_headers and set_rate_headers!
-    # before anything is timed. On a cold ReTestItems worker, compilation alone can
+    # before anything is timed. In a cold test process, compilation alone can
     # otherwise exceed the budget below.
     @test wrapped(make_request(ip)).status == 200
 
     responses = Vector{HTTP.Response}(undef, N)
     elapsed = @elapsed begin
-        # `@async`, not `Threads.@spawn`: ReTestItems workers default to
-        # nworker_threads = 1, and `sleep` yields, so this exercises the lock
+        # `@async`, not `Threads.@spawn`: half of the CI legs run the suite on one
+        # thread, and `sleep` yields, so this exercises the lock
         # contention identically at 1 thread and at N threads.
         @sync for i in 1:N
             @async responses[i] = wrapped(make_request(ip))

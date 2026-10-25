@@ -419,7 +419,7 @@ end
 # overflow. Drop the bound from any path and its child overflows -- which is also why they run
 # in **disposable subprocesses**. After a stack overflow Julia reports "program state may be
 # corrupted", and on some Windows hosts the process dies outright (#301); a regression must cost
-# one step of one test item, not the ReTestItems worker every later item runs on.
+# one step of one test item, not the test process every later item runs on.
 #
 # Why Windows CI kept losing these children (#273, #301) -- the record, because the answer is
 # what made #314 the fix rather than a better catch.
@@ -647,9 +647,9 @@ end
 # `--code-coverage=none` explicitly, matching test/extensions/pormg_env_tests.jl: CI runs the
 # suite under coverage in the job that uploads it (#244), and `Base.julia_cmd()` propagates
 # that flag. Inheriting it costs the child its pkgimages, so it reloads all of
-# Nitro from source -- and `test/runtests.jl` sets `nworkers = 0` under coverage, which is
-# the one configuration where `testitem_timeout` does not apply, so a slow or wedged child
-# would have no ceiling at all (#84). Everything else must come FROM `julia_cmd()`, notably
+# Nitro from source -- slow enough to matter, and until #754 the covering leg ran with no
+# per-item timeout, so a slow or wedged child there had no ceiling at all (#84). Everything
+# else must come FROM `julia_cmd()`, notably
 # `--check-bounds=yes`, or the child lands in a different cache and recompiles anyway.
 #
 # `ignorestatus` + captured streams rather than `read(cmd, String)` (#273): on a non-zero exit

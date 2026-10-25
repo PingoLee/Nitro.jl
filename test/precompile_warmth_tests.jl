@@ -201,7 +201,7 @@ try
     warmth("baseline dict_int_s=$(fmt(baseline)) limit_s=$MAX_BASELINE_SECONDS")
     @test 0 < baseline < MAX_BASELINE_SECONDS
 
-    # Two samples per numerator, not one: ReTestItems runs with `retries=0` here, so a single
+    # Two samples per numerator, not one: the test runner never retries an item, so a single
     # sample makes one GC pause or one moment of CPU steal on a shared runner a hard red.
     @testset "$shape stays warm" for (shape, limit) in SHAPES
         shape_s = best_of(shape, 2)

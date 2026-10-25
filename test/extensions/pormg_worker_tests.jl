@@ -1015,8 +1015,8 @@ PormGExt._store_transaction(f::Function, m::Union{MockTaskModel, InterloperModel
 # supported way of invoking this suite. Its absence is an environment bug, not a
 # configuration this file should accommodate -- see the bootstrap guard in
 # `test/runtests.jl`, which refuses the run before any item starts. This assertion is
-# the defence in depth behind it, for a REPL or a direct `ReTestItems.runtests` call
-# that never goes through the coordinator.
+# the defence in depth behind it, for a REPL or a direct `NitroTestRunner` call
+# that never goes through `test/runtests.jl`.
 if RealPormGWorkerStore === nothing
     error("PormG is not available, so NitroPormGExt.PormGWorkerStore cannot be loaded. " *
           "PormG is a declared `[targets].test` dependency: this is a broken test " *

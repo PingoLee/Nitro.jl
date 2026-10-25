@@ -208,7 +208,7 @@ end
 # These all throw the exception SYNTHETICALLY rather than exhausting a real stack. That is not
 # a shortcut around a hazard, it is the correct test: the narrowing is `isa` dispatch inside a
 # catch block, so `throw(StackOverflowError())` exercises the identical branch, while a real
-# stack overflow would leave the ReTestItems worker in the state Julia itself describes as
+# stack overflow would leave the test process in the state Julia itself describes as
 # "possibly corrupted" — poisoning every item scheduled after it in that process. The
 # end-to-end path — a real `[[[[…` bearer token or cookie through `jwt_validator` — runs in
 # disposable child processes: the AUTH* steps of the deeply-nested-request testitem in

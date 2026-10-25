@@ -4,7 +4,7 @@
 # process, on purpose: the whole quantity under test is time-to-first-request, and any shape
 # measured second in a process is reading a path the first one already warmed.
 #
-# Lives under `test/.helpers/` so ReTestItems' discovery walk prunes it (dot-directory) —
+# Lives under `test/.helpers/` so test discovery prunes it (dot-directory) —
 # it is named `*_probe.jl` rather than `*_tests.jl` for the same reason, belt and braces.
 #
 # Usage: julia --project=<env> precompile_warmth_probe.jl <shape>   # prints e.g. "0.183"

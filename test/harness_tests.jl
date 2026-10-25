@@ -11,11 +11,10 @@
 # new test file BY PATH, so it passes locally whether or not it was ever registered. The
 # file is green in every check its author makes and absent from every check CI makes.
 #
-# The tag half is a weaker version of the same problem. ReTestItems does fail on a
-# zero-match filter (`NoTestException("No test items found.")`) -- #34 claimed it reported
-# success, and that is false -- but the message names neither the vocabulary nor the
-# AND/exact-match semantics, so `--tags workers` failed without ever hinting that
-# `:workers` was simply a tag nobody had applied.
+# The tag half is a weaker version of the same problem. A zero-match filter does fail, but a
+# bare "no test items" names neither the vocabulary nor the AND/exact-match semantics, so
+# `--tags workers` once failed without ever hinting that `:workers` was simply a tag nobody
+# had applied.
 #
 # Both guards read `harness_manifest.jl`, the same file `runtests.jl` reads, rather than
 # text-parsing `runtests.jl`. A regex over source would decide for itself what "the list"
@@ -31,7 +30,7 @@ const TEST_ROOT = joinpath(pkgdir(Nitro), "test")
     found  = discover_test_files(TEST_ROOT)
     listed = Set(TEST_FILES)
 
-    # A file that exists, looks like a test to ReTestItems, and appears in neither list is
+    # A file that exists, looks like a test file, and appears in neither list is
     # a test nobody runs. `UNLISTED_OK` is the escape hatch, and it is deliberately a
     # written-down decision rather than an accident.
     orphans = [f for f in found if f ∉ listed && f ∉ UNLISTED_OK]
@@ -70,7 +69,7 @@ end
 
         # #297: the old walk pruned `walkdir`'s yielded `dirs` with `filter!`, while
         # `walkdir`'s own producer task iterated that same vector. Harmless on one thread;
-        # once the consumer MIGRATES (ReTestItems runs items in spawned tasks) the two ran
+        # once the consumer MIGRATES (the runner runs items in spawned tasks) the two ran
         # in parallel, and the walk either descended into `.helpers/` or died with
         # `UndefRefError`.
         #
@@ -135,22 +134,16 @@ end
     @test untagged == String[]
 end
 
-@testset "the selection rule matches ReTestItems' semantics" begin
-    # `selects` is what `test/runtests.jl` uses to decide whether a filter would select
-    # nothing, and it has to agree with what ReTestItems will then actually run. Before
-    # #214 that rule was an inline loop in the coordinator, which no test could reach --
-    # so "the replica drifted from the real filter" was a defect with no guard at all,
-    # and #214's own sketch called teaching the replica about exclusion "the half that is
-    # easy to miss".
+@testset "the selection rule's semantics" begin
+    # `selects` is the rule the run selects items with (`select_items`, in
+    # `test/runner/collect.jl`). Before #214 that rule was an inline loop in the
+    # coordinator, which no test could reach -- so "the replica drifted from the real
+    # filter" was a defect with no guard at all, and #214's own sketch called teaching the
+    # replica about exclusion "the half that is easy to miss".
     #
-    # Asserted against the DOCUMENTED semantics with synthetic items rather than by
-    # calling `ReTestItems.TestItemFilter`, for the same reason `testitems` and
-    # `skip_macros` are reimplemented: a guard on the suite must not depend on a private
-    # function of the package it is guarding. The three references are
-    # `ReTestItems/src/filtering.jl`:
-    #   `_shouldrun(tags::AbstractVector{Symbol}, ti) = issubset(tags, ti.tags)`
-    #   `_shouldrun(name::AbstractString, ti)         = name == ti.name`
-    #   `(f::TestItemFilter)(ti) = f.shouldrun(ti) && _shouldrun(f.tags, ti) && ...`
+    # Asserted against the DOCUMENTED semantics with synthetic items. They are the semantics
+    # ReTestItems' filter had, which the suite's tags and the CLI were written against:
+    #   tags  `issubset(tags, item.tags)`;  name  `name == item.name`;  all clauses ANDed.
 
     # No filter at all selects everything, including an untagged item.
     @test selects("anything", [:core])
@@ -217,8 +210,8 @@ end
     # nothing more. Named items rather than counts: a count drifts with every test added,
     # whereas these two names are the receipt for the split.
     #
-    # Looked up by scanning, NOT through a `Dict`. ReTestItems enforces unique item names
-    # only WITHIN a file (`testitem_names` is per `FileNode`), so a cross-file duplicate
+    # Looked up by scanning, NOT through a `Dict`. The runner enforces unique item names
+    # only WITHIN a file (`test/runner/collect.jl`), so a cross-file duplicate
     # is legal and a `Dict` would silently keep the last one -- checking an item that has
     # nothing to do with #210's split, and reporting a failure that points at the wrong
     # file. Asserting the match is unique keeps the receipt honest instead.
@@ -385,7 +378,7 @@ end
 
     # The both-lists diagnosis. Exclusion winning is the BEHAVIOUR (`issubset` demands the
     # tag, `isdisjoint` forbids it, so the selection is empty by construction, and
-    # "the selection rule matches ReTestItems' semantics" above asserts that directly).
+    # "the selection rule's semantics" above asserts that directly).
     # What this anchors is that the caller is TOLD so by name, instead of being handed the
     # generic "selects 0 test items, maybe a typo?" message, which is actively misleading
     # for a filter that is spelled correctly and simply contradicts itself.
