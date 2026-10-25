@@ -18,6 +18,7 @@
 #   bench/socket/run.sh "nitro@8,1 nitro@8,2 nitro@8,4"   # per-mode --threads, one interleaved run
 #   PROFILE=10 bench/socket/run.sh nitro 1 20s # one mode only; see server.jl
 #   BASE_ROOT=/path/to/other/checkout bench/socket/run.sh "baseline nitro"
+#   BASE_ROOTS="old=/path/a new=/path/b" bench/socket/run.sh "old new nitro"  # several checkouts
 #   RATE=20000 bench/socket/run.sh "nitro@8,1 nitro@8,0"  # fixed request rate, not saturation
 #   JULIA="julia +1.12" bench/socket/run.sh               # another Julia (juliaup channel)
 #   ROUTES="/health DELETE:/health" bench/socket/run.sh nitro   # a route with its method (#712)
@@ -29,6 +30,9 @@
 #
 # `baseline` is `nitro` served from the checkout at BASE_ROOT (its own bench/ env, instantiated),
 # so a change can be A/B'd against the code it replaces in the same interleaved run.
+# BASE_ROOTS generalizes it to a series of commits: each `name=path` pair makes `name` a mode
+# served as `nitro` from that checkout's bench/ env, so several builds (one worktree each) share
+# one interleaved run. Reverse the mode list in a second invocation to alternate the order.
 #
 # `go` is the Go `net/http` reference in socket/go/ (#469): same routes, same bodies, built once
 # per invocation and pinned to the same SERVER_CPUS. Its `threads` column is GOMAXPROCS, which
@@ -66,6 +70,13 @@ SERVER_CPUS="${SERVER_CPUS:-0,1,2,3,6,7,8,9}"   # 4 physical cores (8 logical)
 CLIENT_CPUS="${CLIENT_CPUS:-4,5,10,11}"         # 2 other physical cores
 ROUTES="${ROUTES:-/plaintext /json}"
 RATE="${RATE:-}"
+declare -A ROOT_OF
+for pair in ${BASE_ROOTS:-}; do
+  case "$pair" in
+    *=*) ROOT_OF[${pair%%=*}]="${pair#*=}" ;;
+    *) echo "run.sh: BASE_ROOTS entry '$pair' is not name=path" >&2; exit 1 ;;
+  esac
+done
 KEEP_JSON="${KEEP_JSON:-0}"
 GC_SNAPSHOTS="${GC_SNAPSHOTS:-0}"
 read -r -a JULIA_CMD <<<"${JULIA:-julia}"
@@ -165,6 +176,8 @@ for mode in "${MODE_LIST[@]}"; do
   if [ "$name" = baseline ]; then
     [ -n "${BASE_ROOT:-}" ] || { echo "run.sh: baseline needs BASE_ROOT" >&2; exit 1; }
     project="$BASE_ROOT/bench"; served=nitro
+  elif [ -n "${ROOT_OF[$name]:-}" ]; then
+    project="${ROOT_OF[$name]}/bench"; served=nitro
   fi
   if [ "$name" = go ]; then
     GOMAXPROCS="$threads" PORT="$port" taskset -c "$SERVER_CPUS" "$GO_BIN" >"$log" 2>&1 &
