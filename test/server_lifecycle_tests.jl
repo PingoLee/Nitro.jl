@@ -1632,7 +1632,7 @@ end
     ])
     serve_once() = Nitro.Core.serve(ctx; port = get_free_port(), host = HOST, async = true,
                                     show_banner = false, access_log = nothing)
-    # Forced on, so this exercises `startserver`'s call on the 1.12 CI runs too.
+    # Forced on, so this exercises `startserver`'s call on any Julia, a fixed 1.13.x included.
     _WAKE_GUARD_FORCED[] = true
     try
         for _ in 1:2                                 # and again after a terminate

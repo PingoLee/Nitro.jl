@@ -365,24 +365,25 @@ export SIGINT_PROBE, ctrl_c_child, report
 
 # ── A child that can never take the press (#473) ──
 #
-# Julia 1.12 on macOS can start a process whose SIGINT is ignored for its whole life. On kqueue
-# platforms the signal-listener thread sets `SIG_IGN` on every signal it watches, SIGINT
-# included (`src/signals-unix.c`), and that write races the main thread installing the real
-# SIGINT handler. When the listener writes last, every press is dropped before any delivery
-# logic runs: no `InterruptException`, nothing on stderr, nothing on stdout. Load widens the
-# race. It cost #473 three silent 120 s timeouts on a memory-starved macOS runner, on changes
-# that never touched the code under test. Fixed upstream in JuliaLang/julia#62471, which is in
-# v1.13.0 and not on release-1.12; once no CI lane runs an unfixed Julia, the retry below is
-# dead code.
+# Julia 1.12 on macOS could start a process whose SIGINT was ignored for its whole life. On
+# kqueue platforms the signal-listener thread set `SIG_IGN` on every signal it watched, SIGINT
+# included (`src/signals-unix.c`), and that write raced the main thread installing the real
+# SIGINT handler. When the listener wrote last, every press was dropped before any delivery
+# logic ran: no `InterruptException`, nothing on stderr, nothing on stdout. It cost #473 three
+# silent 120 s timeouts on a memory-starved macOS runner. Fixed upstream in
+# JuliaLang/julia#62471, which is in v1.13.0. This harness used to replace such a child; the
+# retry left with the 1.12 floor (#526).
 #
-# So every child prints its SIGINT disposition before its cue, and a child whose SIGINT is
-# ignored is killed unpressed and replaced. The retry is gated on that PROOF, never on a
-# timeout: a press that some task swallows still times out, and still goes red.
+# The probe stays, because it turns that failure from a silent timeout into a named one. Every
+# child prints its SIGINT disposition before its cue, and a child whose SIGINT is ignored is
+# killed unpressed and returned with `sigint_ignored` set, which every caller asserts against.
+# On 1.13 that is a regression, in Julia or in Nitro, never a flake to retry away. A press that
+# some task swallows still times out, and still goes red.
 #
 # The disposition is the first word of `struct sigaction`, which is the handler on macOS and
 # on glibc alike; `1` is `SIG_IGN` on both. Children run the probe FIRST, before they load
-# Nitro, on purpose: probed later, a `SIG_IGN` that Nitro itself caused would be retried away
-# instead of failing the item.
+# Nitro, on purpose: `sigint_ignored` then points at Julia's own startup, and a `SIG_IGN` that
+# Nitro itself caused still goes red, as a timeout.
 const SIGINT_PROBE = raw"""
 let act = zeros(UInt8, 256)
     ccall(:sigaction, Cint, (Cint, Ptr{Cvoid}, Ptr{UInt8}), Base.SIGINT, C_NULL, act) == 0 ||
@@ -394,7 +395,7 @@ end
 const SIG_IGN = UInt(1)
 
 """
-    ctrl_c_child(child, threads; cue, settle=2, deadline=120, dump_grace=15, attempts=3)
+    ctrl_c_child(child, threads; cue, settle=2, deadline=120, dump_grace=15)
 
 Run the Julia source `child` at `--threads=threads`, press Ctrl-C (SIGINT) `settle` seconds
 after it prints the line `cue`, and return what happened. `child` must print `SIGINT_PROBE`'s
@@ -404,20 +405,11 @@ At `deadline` the child gets a SIGQUIT first: Julia answers it by printing every
 backtrace to stderr, so a wedged child says where it is parked. `dump_grace` seconds later it
 gets a SIGKILL.
 
-A child whose SIGINT is ignored (see `SIGINT_PROBE`) is killed unpressed and replaced, up to
-`attempts` runs in all. `sigint_ignored` in the result means every run was such a child.
+A child whose SIGINT is ignored (see `SIGINT_PROBE`) is killed unpressed, and the result has
+`sigint_ignored` set.
 """
 function ctrl_c_child(child::String, threads::String; cue::String, settle::Real=2,
-                      deadline::Real=120, dump_grace::Real=15, attempts::Int=3)
-    attempts >= 1 || throw(ArgumentError("attempts must be >= 1, got $attempts"))
-    for attempt in 1:attempts
-        r = _run_child(child, threads, cue, settle, deadline, dump_grace)
-        (r.sigint_ignored && attempt < attempts) || return merge(r, (; attempts=attempt))
-        @info "Ctrl-C child started with SIGINT ignored (JuliaLang/julia#62471); replacing it" attempt threads
-    end
-end
-
-function _run_child(child, threads, cue, settle, deadline, dump_grace)
+                      deadline::Real=120, dump_grace::Real=15)
     cmd = `$(Base.julia_cmd()) --code-coverage=none --threads=$threads --project=$(Base.active_project()) --startup-file=no -e $child`
     err = IOBuffer()
     p = open(pipeline(ignorestatus(cmd); stderr=err), "r")
@@ -475,7 +467,7 @@ function report(r)
     clean && return nothing
     println("── Ctrl-C child: timed_out=", r.timed_out, " exitcode=", r.exitcode,
             " termsignal=", r.termsignal, " pressed=", r.pressed,
-            " sigint_disposition=", r.sigint_disposition, " attempts=", r.attempts)
+            " sigint_disposition=", r.sigint_disposition)
     println("── stdout ──\n", r.out)
     println("── stderr ──\n", r.err)
     println("── end of Ctrl-C child ──")

@@ -41,7 +41,7 @@ covered in [Memory and GC](@ref) below — check it on the target machine, not o
  Nitro <version>  (8 threads + 1 interactive, GC target 2.8 GiB)
 ```
 
-The thread count is the default pool, where handlers run. Julia 1.12 also starts one
+The thread count is the default pool, where handlers run. Since 1.12, Julia also starts one
 *interactive* thread, in a pool of its own: `--threads=8` means 8 default threads **and** 1
 interactive one. HTTP.jl runs its accept loop and every connection's task there, reading each
 request's head before handing it on. Nitro then starts every request on its own task in the
@@ -134,7 +134,7 @@ stop a production server with `terminate` or its process supervisor rather than 
 ### Handlers that compute
 
 A task gives up its thread only when it waits: on I/O, a lock, a `sleep` or a `yield()`. Julia
-1.12 does not preempt one, so a handler that computes for 200 ms holds its default thread for
+does not preempt one, so a handler that computes for 200 ms holds its default thread for
 200 ms. Waiting on a database, another service or a file is not computing; those handlers give
 their thread back while they wait and are not what this section is about.
 
@@ -582,7 +582,8 @@ says little about a fresh container.
 
 ## Compiling with juliac (experimental)
 
-Julia 1.12 and later can compile an application into a standalone executable with `juliac`, and
+Julia can compile an application into a standalone executable with `juliac` (on 1.13, the
+[JuliaC.jl](https://github.com/JuliaLang/JuliaC.jl) app), and
 `--trim` drops every method the program cannot reach. Nitro is working towards `--trim=safe`, but
 it does not build a Nitro app cleanly today. What is left, and how it is measured, is recorded in
 `docs/design/juliac-trim.md` in the repository. This section covers the one rule that holds

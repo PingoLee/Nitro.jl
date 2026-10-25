@@ -451,7 +451,7 @@ println("RESULT serve_returned")
 """
 
 if !Sys.iswindows()
-    @testset "with an interactive thread -- Julia 1.12's default for `julia` and `-t auto`" begin
+    @testset "with an interactive thread -- the default for `julia` and `-t auto` since Julia 1.12" begin
         r = ctrl_c_child(WATCHER_CHILD, "1,1"; cue="REVISED")
         report(r)
         @test !r.sigint_ignored

@@ -201,8 +201,8 @@ _body_view(body::AbstractVector{UInt8}) = body
 _body_view(body::AbstractString) = codeunits(body)
 
 # The body as a `String`: no copy when it already is one (a `String` body is stored as its code
-# units), otherwise exactly one. Not `String(Vector{UInt8}(bytes))`: on Julia 1.12 that copies
-# twice, because `String(::Vector)` still copies memory not allocated for a string.
+# units), otherwise exactly one. Not `String(Vector{UInt8}(bytes))`: on Julia 1.12 and 1.13 that
+# copies twice, because `String(::Vector)` still copies memory not allocated for a string.
 _view_string(bytes::Base.CodeUnits{UInt8, String}) = bytes.s
 _view_string(bytes::DenseVector{UInt8}) = GC.@preserve bytes unsafe_string(pointer(bytes), length(bytes))
 _view_string(bytes::AbstractVector{UInt8}) = String(collect(bytes))

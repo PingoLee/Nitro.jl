@@ -76,7 +76,7 @@ attaches cookies to cross-site requests too.
 
 ## Run it
 
-From this directory, with Julia 1.12 or newer:
+From this directory, with Julia 1.13 or newer:
 
 ```bash
 julia --project=AuthKit  -e 'using Pkg; Pkg.instantiate(); Pkg.test()'

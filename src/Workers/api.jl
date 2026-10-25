@@ -1680,7 +1680,7 @@ never the scheduler. Each logs at `@info` only when it did something.
 
 The scheduler runs on the `:default` thread pool and, between ticks, waits once rather than
 polling ([#369](https://github.com/PingoLee/Nitro.jl/issues/369)). While Julia has an
-interactive thread, which is the 1.12 default for `julia` and `julia -t auto`, a Ctrl-C at the
+interactive thread, the default for `julia` and `julia -t auto` since 1.12, a Ctrl-C at the
 REPL therefore reaches `serve` and not this task. Under `julia -t 1` every task shares one thread,
 and under `julia -t N,0` thread 1 is a default thread, so it can land here. The scheduler then
 logs a warning and stops normally, rather than dying with an unhandled error or swallowing that
@@ -1716,10 +1716,10 @@ function start_cleanup_scheduler(; interval_hours::Real=24, retain_days::Int=7,
     interval_seconds = max(interval_hours * 3600, 0.01)
     # `_spawn_detached` -- the `:default` pool, NOT sticky -- and that placement is the #369 fix,
     # more than the wait below is. With `exit_on_sigint(false)` (every REPL) Julia throws SIGINT
-    # into whichever task PARKED LAST on thread 1, and under Julia 1.12's default layout thread 1
-    # is the interactive thread, which a `:default`-pool task never runs on. Probed on 1.12.7:
-    # a sticky task parked there takes the interrupt even when it does not poll, the moment it is
-    # the last to park; a `:default`-pool one never does. This used to be `_schedule_detached`
+    # into whichever task PARKED LAST on thread 1, and under the default layout (since 1.12)
+    # thread 1 is the interactive thread, which a `:default`-pool task never runs on. Probed on
+    # 1.12.7: a sticky task parked there takes the interrupt even when it does not poll, the
+    # moment it is the last to park; a `:default`-pool one never does. This used to be `_schedule_detached`
     # (sticky, `@async`-shaped) on the argument that it "runs no user code" -- but its sweep is
     # `cleanup_tasks!` on a caller-supplied store, a database DELETE for `PormGWorkerStore`, which
     # is exactly the shape src/middleware/janitor.jl already refuses to pin to a request thread.

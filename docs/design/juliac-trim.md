@@ -72,11 +72,11 @@ ENTRY=probe bench/juliac/build.sh unsafe-warn   # the request path, without the 
 julia bench/juliac/frames.jl bench/results/juliac-<stamp>-<entry>-<mode>.log
 ```
 
-**The frontend.** Julia 1.12 ships a `juliac.jl` driver under `share/julia/juliac/`; Julia 1.13
-ships none, and its frontend is the JuliaC.jl app. `build.sh` runs JuliaC under `julia +1.13` by
-default. `JULIAC=bundled` (which defaults `JULIA` to `julia +1.12`) runs 1.12's driver instead,
-so a 1.12 count can be reproduced until the floor moves to 1.13
-([#526](https://github.com/PingoLee/Nitro.jl/issues/526)). Every count up to #718 below is
+**The frontend.** Julia 1.13 ships no `juliac` driver; its frontend is the JuliaC.jl app, and
+`build.sh` runs it under `julia +1.13`. Julia 1.12 shipped a `juliac.jl` driver under
+`share/julia/juliac/`, which `build.sh` ran as `JULIAC=bundled` until the floor moved to 1.13
+([#526](https://github.com/PingoLee/Nitro.jl/issues/526)); that switch is gone, so the 1.12.7
+counts below are records, no longer reproducible with `build.sh`. Every count up to #718 below is
 1.12.7's; §3.5 recounts on 1.13. Toolchain of that recount: Julia 1.13.2, JuliaC 0.3.12 (git
 tree `49a147f5`, release commit `98e82861`), gcc 13.3.0, Linux x86-64. The 1.12.7 control used
 the driver Julia 1.12.7 ships.
@@ -92,7 +92,7 @@ Three things about the JuliaC path that a count depends on:
   disagrees with its own total.
 - JuliaC builds for every target in Julia's system image unless `JULIA_CPU_TARGET` is set. The
   1.12 driver built for `native`. `build.sh` defaults to `native`, so exe size and build time
-  stay comparable; the count does not depend on it.
+  stay comparable with those records; the count does not depend on it.
 
 The verifier reports **the first dynamic call on each path** and does not look past it. A low
 count therefore means "the first wall is close", not "nearly done". Each fix can expose code that
@@ -914,9 +914,8 @@ buy is a startup and deployment win:
 
 The order:
 
-0. **The harness is on Julia 1.13. Done:** `bench/juliac/build.sh` builds with JuliaC.jl by
-   default, keeps 1.12's driver behind `JULIAC=bundled` until the floor moves (#526), and §3.5
-   gives the backlog its 1.13 counts.
+0. **The harness is on Julia 1.13. Done:** `bench/juliac/build.sh` builds with JuliaC.jl, the
+   1.12 driver left with the 1.12 floor (#526), and §3.5 gives the backlog its 1.13 counts.
 1. **§3.1, the router's type. Done (#625):** one Nitro-owned router type, and the custom
    404/405 as fixed responses on `App`. It typed every pipeline closure, but cleared no verifier
    error on its own: the fold behind it is the next wall on that path (§3).

@@ -377,7 +377,6 @@ bench/juliac/build.sh safe                              # the goal
 ENTRY=probe bench/juliac/build.sh unsafe-warn           # the request path, past whatever walls the listener
 ENTRY=fatal bench/juliac/build.sh unsafe-warn           # a start-up failure with secrets in reach
 bench/juliac/fatal_check.sh bench/juliac/out/nitro-fatal-unsafe-warn   # ...and whether its stderr leaks them
-JULIAC=bundled bench/juliac/build.sh unsafe-warn        # the same build with Julia 1.12's own driver
 julia bench/juliac/frames.jl bench/results/juliac-<stamp>-<entry>-<mode>.log   # errors by first frame in src/
 bench/juliac/smoke.sh bench/juliac/out/nitro-min-no     # first vs warm /plaintext, RSS, OS threads
 bench/juliac/smoke.sh jit                               # the same app under the JIT, as the baseline
@@ -401,23 +400,21 @@ bench/juliac/smoke.sh jit                               # the same app under the
   <exe|jit>` runs every mode and greps `stderr` for the sentinels. For an executable it exits 1
   if a judged mode leaks. An untrimmed executable's `serve` mode is expected to fail until #752.
 - `build.sh` pins `--project` to `bench/juliac`, instantiates it under the building Julia (into
-  its own `Manifest-v<major>.<minor>.toml`, so 1.12 and 1.13 builds do not re-resolve each other),
-  and logs to `results/juliac-<stamp>-<entry>-<mode>.log` with the Julia, the frontend and the
-  Nitro commit in the header; the exe lands in `juliac/out/` (gitignored), unbundled, linked
-  against that Julia's own `lib/`. The log goes through `tee` on purpose: a 1.13 build whose
+  its own `Manifest-v<major>.<minor>.toml`, so builds under two Julia minors do not re-resolve
+  each other), and logs to `results/juliac-<stamp>-<entry>-<mode>.log` with the Julia, the
+  frontend and the Nitro commit in the header; the exe lands in `juliac/out/` (gitignored),
+  unbundled, linked against that Julia's own `lib/`. The log goes through `tee` on purpose: a 1.13 build whose
   stderr went straight to a file lost the end of the verifier's output.
-- **The frontend.** `JULIAC=juliac` (the default) runs the JuliaC.jl app (`JULIAC_BIN`, default
-  `~/.julia/bin/juliac`) under `JULIA` (default `julia +1.13`): Julia 1.13 ships no driver of its
-  own. `JULIAC=bundled` runs the `juliac.jl` driver Julia 1.12 ships in `share/julia/juliac/`, with
-  `JULIA` defaulting to `julia +1.12`. The switch stays until the floor moves to 1.13 (#526), so a
-  1.12 count can still be reproduced.
-- `JULIA_CPU_TARGET` defaults to `native`, which is what the 1.12 driver built for. Left unset,
-  JuliaC builds for every target of Julia's system image, which made the untrimmed 1.13 app 512 MB
-  and a 7-minute build. The verifier's count is the same either way.
+- **The frontend** is the JuliaC.jl app (`JULIAC_BIN`, default `~/.julia/bin/juliac`), run under
+  `JULIA` (default `julia +1.13`): Julia 1.13 ships no driver of its own. Julia 1.12's bundled
+  `juliac.jl` driver was selectable as `JULIAC=bundled` until the floor moved to 1.13 (#526).
+- `JULIA_CPU_TARGET` defaults to `native`, which is also what the 1.12 driver built for, so the
+  earlier counts stay comparable. Left unset, JuliaC builds for every target of Julia's system
+  image, which made the untrimmed 1.13 app 512 MB and a 7-minute build. The verifier's count is
+  the same either way.
 - `frames.jl` counts a log's verifier errors by their first frame inside `src/`, the count
-  `docs/design/juliac-trim.md` §1 asks for. It reads both verifier formats (1.12's
-  `Verifier error #N:` and 1.13's `Error #N:`) and checks its total against the verifier's own
-  `Trim verify finished` line.
+  `docs/design/juliac-trim.md` §1 asks for. It reads 1.13's `Error #N:` format and checks its
+  total against the verifier's own `Trim verify finished` line.
 - `smoke.sh` exports `THREADS` as `JULIA_NUM_THREADS` for the exe — a compiled `main` does not
   parse Julia flags — and reports the OS thread count, which is how you see whether the layout took.
   Its `jit` baseline runs under `JULIA` (default `julia +1.13`).

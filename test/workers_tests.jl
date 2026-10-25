@@ -59,7 +59,7 @@ println("RESULT main=", got, " scheduler_failed=", istaskfailed(s.task))
 """
 
 if !Sys.iswindows()
-    @testset "with an interactive thread -- Julia 1.12's default for `julia` and `-t auto`" begin
+    @testset "with an interactive thread -- the default for `julia` and `-t auto` since Julia 1.12" begin
         r = ctrl_c_child(CTRL_C_CHILD, "1,1"; cue="READY")
         report(r)
         @test !r.sigint_ignored
@@ -2542,7 +2542,7 @@ end
     # #369. With `exit_on_sigint(false)` -- every REPL -- Julia throws SIGINT into whichever task
     # PARKED LAST on thread 1. The scheduler was `@async`-sticky and polled in `timedwait` 10x a
     # second, so it re-parked there constantly and took the user's Ctrl-C: the task died and
-    # `serve` kept running. Under Julia 1.12's default layout thread 1 is the interactive thread,
+    # `serve` kept running. Under the default layout (since 1.12) thread 1 is the interactive thread,
     # which a `:default`-pool task never runs on -- so the placement IS the fix.
     rt = WorkerRuntime(InMemoryWorkerStore())
     try
@@ -6774,7 +6774,7 @@ status(store, id) = get_task_info(store, id).status
     end
     @test err isa MethodError && occursin("require_interactive", sprint(showerror, err))
     # The heartbeat's thread, which must not be thread 1 (#636). A process with two interactive
-    # threads starts; one with fewer is refused. CI's own layouts (`-t N` on 1.12) have none at
+    # threads starts; one with fewer is refused. CI's own layouts (`-t N` on 1.13) have none at
     # N = 1 and one above, so this is the refusal there, and the two-process test, whose consumers run at
     # `--threads=2,2`, is the start.
     if Threads.nthreads(:interactive) < 2
@@ -6787,7 +6787,7 @@ status(store, id) = get_task_info(store, id).status
 end
 
 # JuliaLang/julia#63882 (#586): on 1.13.0-rc3..1.13.x a consumer holds #604's never-firing guard
-# `Timer` for its lifetime. Forced on, as #604's server test does, so it runs on the 1.12 CI too.
+# `Timer` for its lifetime. Forced on, as #604's server test does, so it runs on any Julia.
 @testset "consume! holds the wake guard while consuming, and the drain closes it" begin
     Nitro.Core.AppContext._WAKE_GUARD_FORCED[] = true
     local c

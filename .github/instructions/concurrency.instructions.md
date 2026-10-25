@@ -11,7 +11,7 @@ lives in the code comment it names, and that comment is canonical.
 ## 1. The model
 
 - **Julia tasks are cooperative.** A task gives up its thread only at `wait`, `yield`, `sleep` or
-  I/O. Julia 1.12 has no preemption, so a loop that computes without any of those holds its
+  I/O. Julia does not preempt tasks, so a loop that computes without any of those holds its
   thread until it finishes. Go preempts; #469 measured the difference (Go without preemption
   stalls another goroutine for the whole loop).
 - **Tasks are heavier than goroutines.** Each one reserves an 8 MiB stack (`JL_STACK_SIZE`). Measure
@@ -127,7 +127,7 @@ lives in the code comment it names, and that comment is canonical.
 
 ## 5. Handlers that compute
 
-- **Nothing can preempt or stop a CPU-bound handler.** Julia 1.12 has no preemption: a handler
+- **Nothing can preempt or stop a CPU-bound handler.** Julia does not preempt tasks: a handler
   that computes without waiting holds its `:default` thread until it returns, and
   `Threads.nthreads(:default)` of them stall every other request until one finishes. Measured in
   #467 (PR #584): with 8 default threads, 8 handlers each computing 200 ms took a minimal route
