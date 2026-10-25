@@ -56,9 +56,9 @@ jobs:
     #   nightly      — compiler and Base churn two releases out. Permanently advisory.
     #                  Currently PARKED (commented out in the matrix below) -- see there.
     #
-    # `~1.13.0-0` used to be listed here too, because no ReTestItems release could run on
-    # 1.13 and the job died before the first assertion. v1.35.3 runs there — the job now
-    # executes the whole suite — so that entry is back in the required set and is BLOCKING
+    # `~1.13.0-0` used to be listed here too, because no release of ReTestItems (the suite's
+    # runner until #754) could run on 1.13 and the job died before the first assertion. It
+    # executes the whole suite now, so that entry is back in the required set and is BLOCKING
     # like the rest.
     continue-on-error: ${{ matrix.version == 'nightly' }}
     strategy:
@@ -121,9 +121,10 @@ jobs:
           # not after.
           #
           # PARKED: 1.13 has just shipped, so nightly is 1.14-DEV -- a full cycle before any
-          # 1.14 pre-release -- and ReTestItems cannot run there at all (#112), so the job
-          # died before the first assertion and only painted every PR red. Restore it
-          # together with the `~1.14.0-0` bump above. `continue-on-error` stays keyed on it.
+          # 1.14 pre-release. Until #754 the job could not even collect the suite there (#112,
+          # ReTestItems' `@testsetup` parse); Nitro's own runner does, and the suite then shows
+          # the known 1.14 reds (#459), which would paint every PR red. Restore it together
+          # with the `~1.14.0-0` bump above. `continue-on-error` stays keyed on it.
           # - version: 'nightly'
           #   os: ubuntu-latest
           #   threads: 2
@@ -145,7 +146,7 @@ jobs:
           version: ${{ matrix.version }}
       # Logs the runner's CPU model and LLVM target on every job, passing or failing -- the
       # baseline #301's Windows crash needs. The #254 test prints its own environment only
-      # when it fails, because ReTestItems shows an item's output only then.
+      # when it fails, because the test runner shows an item's output only then.
       - name: Runner CPU (#301)
         run: julia --startup-file=no -e 'using InteractiveUtils; versioninfo()'
       - uses: julia-actions/cache@9353db09a0f2bbbdec6f41791918c75d37391b36 # v3.5.0
@@ -158,18 +159,19 @@ jobs:
           cache-name: julia-cache;workflow=${{ github.workflow }};job=${{ github.job }};os=${{ matrix.os }};version=${{ matrix.version }};threads=${{ matrix.threads }}
       - uses: julia-actions/julia-buildpkg@e3eb439fad4f9aba7da2667e7510e4a46ebc46e1 # v1.7.0
       # `coverage` MUST be passed, and gated exactly like the two upload steps below. The
-      # action defaults it to `true`, so a bare step runs ALL eight jobs under
-      # `--code-coverage` -- and a covering run has `test/runtests.jl` pick `nworkers = 0`,
-      # which leaves the 600s `testitem_timeout` inert: no job had a per-item hang ceiling,
-      # the exact condition #84 closed (#244). Gating only the upload decides who PUBLISHES
+      # action defaults it to `true`, so a bare step runs ALL the jobs under
+      # `--code-coverage` while one publishes the result: every leg pays for instrumenting
+      # every line, for nothing (#244). Gating only the upload decides who PUBLISHES
       # coverage, not who runs under it. `ci_workflow_tests.jl` asserts the three
-      # conditions stay identical; the coverage-vs-worker trade-off is explained in
-      # `test/runtests.jl`, above `covering`.
+      # conditions stay identical. The covering job keeps the per-item timeout: the test
+      # runner's watchdog parent kills a hung child, and a child that finishes exits
+      # normally, so it writes its `.cov` files (#754; under ReTestItems the two were
+      # mutually exclusive, #84).
       #
       # `optimize: '0'` runs the suite at `-O0` (#667). Most of a leg's item time is JIT
       # compilation of code that then runs once, and LLVM's optimization passes are a large
       # share of that compile for no benefit to a test. The action passes `--optimize=0` to its
-      # own julia; `Pkg.test`'s child and the ReTestItems worker are both spawned from
+      # own julia; `Pkg.test`'s child and the test runner's child are both spawned from
       # `Base.julia_cmd()`, which carries `-O0` on, so the items really run at `-O0`.
       #
       # What `-O0` can turn red is a probe that measures `-O2` code rather than Nitro: an
@@ -190,11 +192,12 @@ jobs:
   smoke:
     # Real coverage for a Julia version whose `test/` suite cannot run.
     #
-    # ReTestItems is a TEST-ONLY dependency, so when it does not support a Julia version
-    # `Pkg.test()` dies before the first assertion and Nitro has zero verification there —
-    # even though `src/` may be perfectly fine. That was the situation on 1.13 until
-    # ReTestItems v1.35.3; the `test` job covers 1.13 properly now, and this job stands as
-    # the standing guard for the next version where it happens again.
+    # The suite needs every TEST-ONLY dependency to load, so when one does not support a
+    # Julia version `Pkg.test()` dies before the first assertion and Nitro has zero
+    # verification there — even though `src/` may be perfectly fine. That was the situation
+    # on 1.13 until ReTestItems (the runner before #754) caught up; the `test` job covers
+    # 1.13 properly now, and this job stands as the standing guard for the next version
+    # where it happens again.
     #
     # This job runs a script that depends on nothing test-only: Nitro + HTTP + stdlib,
     # which is the surface a consuming application actually has. It loads the package
@@ -203,7 +206,7 @@ jobs:
     # listener.
     #
     # BLOCKING, and cheap enough to stay that way even while the matrix's `~1.13.0-0` entry
-    # is green: it is the one check that keeps reporting if a ReTestItems release ever
+    # is green: it is the one check that keeps reporting if a test-only dependency ever
     # stops supporting the next Julia.
     name: Smoke test (Julia ${{ matrix.version }})
     runs-on: ubuntu-latest
@@ -235,7 +238,7 @@ jobs:
           delete-old-caches: 'false'   # same reason as the `test` job above
           cache-name: julia-cache;workflow=${{ github.workflow }};job=${{ github.job }};version=${{ matrix.version }}
       - uses: julia-actions/julia-buildpkg@e3eb439fad4f9aba7da2667e7510e4a46ebc46e1 # v1.7.0
-      - name: Load, route and serve without ReTestItems
+      - name: Load, route and serve without the test environment
         run: julia --project=. .github/scripts/smoke_test.jl
   docs:
     name: Documentation

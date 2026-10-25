@@ -236,7 +236,7 @@ they **shadow** the same-named functions `using .Core` brings in. An `(app, …)
 | `src/newapp.jl` | `Nitro.newapp` (#417) — the public, unexported project scaffold: refusals, the template and the generated boot. Its `pormg = true` half is the `_newapp_pormg` stub in `src/exts.jl`, filled by `ext/NitroPormGExt.jl`; `test/extensions/newapp_pormg_tests.jl` pins the boot pasted into `docs/src/tutorial/bigger_applications.md` |
 | `src/precompile.jl` | `PrecompileTools` workload — keep in sync when the hot path changes |
 | `ext/` | Weak extensions: `NitroPormGExt`, `NitroReviseExt`, `MustacheExt`, `OteraEngineExt`, `ProtoBufExt`, `TimeZonesExt`. The **only** place a weak dependency may be imported |
-| `test/` | `ReTestItems` suite driven by the explicit ordered list in `test/runtests.jl` |
+| `test/` | `@testitem` suite, run by Nitro's own runner (`test/runner/`, #754) through `test/runtests.jl`: one child process under a per-item timeout watchdog, files in lexical path order. `TEST_FILES` in `test/harness_manifest.jl` is the list of files the harness checks for completeness, not the run order |
 | `docs/src/` | User documentation (Documenter) |
 | `docs/design/` | Design records — accepted rationale and open proposals that are not user docs |
 | `examples/` | Standalone example projects, each with its own `Project.toml` whose `[sources]` point Nitro at this checkout. `test/examples_tests.jl` instantiates and tests them in a child process, so an example that drifts from the API fails the suite. A new example owes a test item there |
@@ -272,17 +272,28 @@ julia --project=. test/runtests.jl --tags core --name "Session stores"
 julia --project=. test/runtests.jl --skip-tags network --skip-tags slow
 julia --project=. test/runtests.jl --tags middleware --skip-tags network
 
-# `--workers N` for N > 1 is refused -- the suite shares one global router and depends on
-# the TEST_FILES order, so splitting items across processes silently changes what they see.
-# `julia -t auto` still runs the items themselves multithreaded.
+# Every run is ONE child process, watched by its parent: an item that runs past
+# `--item-timeout` seconds (600 by default) gets the child killed and is named, and coverage
+# still works, because the child exits normally otherwise. Items run sequentially, files in
+# lexical path order -- the suite still shares one global router, so order matters (#755).
+# `julia -t auto` runs the items themselves multithreaded; the child gets the same layout.
 julia -t auto --project=. test/runtests.jl
+
+# Without the watchdog, for a debugger or `@show` -- no per-item timeout. (`--workers` is gone.)
+julia --project=. test/runtests.jl --in-process test/sessionstores_tests.jl
+
+# Order check: shuffle file order and item order within each file, from a printed seed.
+# Not a gate until #755 makes the suite order-independent: a red can be an order
+# dependence rather than a regression. Not run in CI yet.
+julia --project=. test/runtests.jl --shuffle 1234
 
 # Agent-docs reference lint (paths, links, symbols, § anchors, public skill/rule sets, stubs)
 julia .github/scripts/docs_lint.jl
 
 # Smoke test — loads, routes and serves using NOTHING test-only (Nitro + HTTP + stdlib).
-# Use it when ReTestItems cannot run on a Julia version: `Pkg.test()` then dies before the
-# first assertion, so the suite says nothing about whether `src/` actually works there.
+# Use it when the test environment cannot load on a Julia version (a test-only dependency
+# lagging a release): `Pkg.test()` then dies before the first assertion, so the suite says
+# nothing about whether `src/` actually works there.
 julia --project=. .github/scripts/smoke_test.jl
 
 # Docs build (the package env has no Documenter — `--project=.` fails)
