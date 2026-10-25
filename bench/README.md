@@ -20,6 +20,7 @@ bench/
 │   ├── session.jl      # MemoryStore read/write (payload-size scaling)
 │   ├── ratelimiter.jl  # limiter hot path: keying, lock contention, exempt-path scan
 │   ├── claims.jl       # a Claims{T} bind against two untyped getprincipal reads (#527)
+│   ├── jwt.jl          # decode_jwt, jwt_validator (secret, 4-key keyset), a request with and without BearerAuth (#723)
 │   ├── taskpattern.jl  # SYNTHETIC replica of parallel_stream_handler's task overhead
 │   ├── httpparse.jl    # HTTP.jl's request-head parse on the connection task
 │   ├── holds.jl        # how long one large JSON / multipart / file call holds its thread (#588)
