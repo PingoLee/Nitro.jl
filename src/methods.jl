@@ -13,6 +13,21 @@ function resetstate()
     end
 end
 
+# Called from the outermost `catch` of both `serve` forms below, so `rethrow` still sees the
+# exception being handled. In a trimmed image the runtime prints an exception that escapes `main`
+# by walking its raw fields, secrets included (#749), so there the exception is swapped for a
+# value-free one. An untrimmed juliac executable prints the same way, but nothing tells it from
+# the JIT yet (#752). `rethrow(x)` keeps the original backtrace, whose frames carry no values.
+# Unrecoverable errors (an interrupt, a stack overflow) carry nothing either and pass unchanged,
+# as does everything under the JIT, where an app can still catch, say, the
+# `HTTP.AddressInUseError` of a port already in use.
+function _rethrow_value_free(@nospecialize(e))
+    if Nitro.Core.Types._trimmed() && !Nitro.Core.Errors.is_unrecoverable(e)
+        rethrow(Nitro.Core.Errors._value_free(e))
+    end
+    rethrow()
+end
+
 """
     serve(; middleware=(), host="127.0.0.1", port=8080, kwargs...) -> Union{Server, Nothing}
 
@@ -251,28 +266,34 @@ function serve(; async::Bool = false, kwargs...)
     # post-hoc `started = true` would miss.
     ours = !isopen(CONTEXT[].service)
     try
-        # Returns the running `HTTP.Server` when async; `nothing` in blocking mode (the
-        # server is already down by then, so the handle would be useless). Either way the
-        # handle is safe to display — `Nitro.Core.NitroStreamHandler` gives it a `show`
-        # that prints only the address, never the secrets captured in handler closures.
-        return Nitro.Core.serve(CONTEXT[]; async, kwargs...)
-    finally
-        # close server on exit if we aren't running asynchronously
-        if !async && ours
-            try
-                terminate()
-            catch e
-                # This path's contract is already "Ctrl-C is the quiet exit". `terminate` now
-                # rethrows an interrupt raised inside a shutdown hook or the drain (#185), but it
-                # does so only AFTER completing the teardown, so there is nothing left to clean
-                # up — and printing a stacktrace over a clean shutdown would be noise. Anything
-                # else is a real teardown failure and stays loud.
-                e isa InterruptException || rethrow()
-            finally
-                # only reset state on exit if we aren't running asynchronously & are running it interactively
-                isinteractive() && resetstate()
+        try
+            # Returns the running `HTTP.Server` when async; `nothing` in blocking mode (the
+            # server is already down by then, so the handle would be useless). Either way the
+            # handle is safe to display — `Nitro.Core.NitroStreamHandler` gives it a `show`
+            # that prints only the address, never the secrets captured in handler closures.
+            return Nitro.Core.serve(CONTEXT[]; async, kwargs...)
+        finally
+            # close server on exit if we aren't running asynchronously
+            if !async && ours
+                try
+                    terminate()
+                catch e
+                    # This path's contract is already "Ctrl-C is the quiet exit". `terminate` now
+                    # rethrows an interrupt raised inside a shutdown hook or the drain (#185), but it
+                    # does so only AFTER completing the teardown, so there is nothing left to clean
+                    # up — and printing a stacktrace over a clean shutdown would be noise. Anything
+                    # else is a real teardown failure and stays loud.
+                    e isa InterruptException || rethrow()
+                finally
+                    # only reset state on exit if we aren't running asynchronously & are running it interactively
+                    isinteractive() && resetstate()
+                end
             end
         end
+    catch e
+        # Outside the `finally`, so a teardown failure that replaced the original is covered
+        # too. This is the outermost Nitro frame an error leaves `serve` through (#749).
+        _rethrow_value_free(e)
     end
 end
 
@@ -895,20 +916,25 @@ function serve(app::App; async::Bool = false, secret_key = nothing, kwargs...)
     # rejected `serve` never tears down the healthy server that caused the rejection.
     ours = !isopen(app.service)
     try
-        return Nitro.Core.serve(app; async, secret_key, kwargs...)
-    finally
-        if !async && ours
-            try
-                terminate(app)
-            catch e
-                # Same guard as the singleton form above, and for a sharper reason: an exception
-                # out of a `finally` REPLACES whatever was propagating. Unguarded, a second Ctrl-C
-                # landing in this teardown would overwrite the interrupt `startserver` is already
-                # carrying — or print a stacktrace over a clean shutdown. `terminate` completes
-                # its sequence before rethrowing (#185), so there is nothing left to do here.
-                e isa InterruptException || rethrow()
+        try
+            return Nitro.Core.serve(app; async, secret_key, kwargs...)
+        finally
+            if !async && ours
+                try
+                    terminate(app)
+                catch e
+                    # Same guard as the singleton form above, and for a sharper reason: an exception
+                    # out of a `finally` REPLACES whatever was propagating. Unguarded, a second Ctrl-C
+                    # landing in this teardown would overwrite the interrupt `startserver` is already
+                    # carrying — or print a stacktrace over a clean shutdown. `terminate` completes
+                    # its sequence before rethrowing (#185), so there is nothing left to do here.
+                    e isa InterruptException || rethrow()
+                end
             end
         end
+    catch e
+        # Same as the singleton form above: value-free in a trimmed image (#749).
+        _rethrow_value_free(e)
     end
 end
 

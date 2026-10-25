@@ -837,12 +837,48 @@ Five answer wrongly, all behind the follow-ups: a session write (`500`), the glo
 
 Throughput is pending, to be measured as §4 asks.
 
-**A finding for a later change: a fatal error in a trimmed image prints secrets.** An exception
-that escapes `main` in a trimmed executable is printed by the runtime's `jl_static_show`, which
-walks raw fields and never calls Nitro's secret-safe `show` methods (#307). The extended probe,
-crashing in `setupmiddleware` before this change, printed its CSRF secret and its JWT keyset in
-clear to `stderr`. In a served app the request path catches what a handler throws, but a failure
-at start-up (in `serve`, say) would print whatever its arguments reach.
+**A fatal error in a compiled executable prints secrets (#749, #750).** An exception that escapes
+`main` in a juliac executable is printed by the runtime (`fatal: error thrown and no exception
+handler available.`), which walks raw fields and never calls Nitro's secret-safe `show` methods
+(#307). The extended probe, crashing in `setupmiddleware` before this change, printed its CSRF
+secret and its JWT keyset in clear to `stderr`. In a served app the request path catches what a
+handler throws. A failure at start-up, in `serve` or in the app's own boot, printed whatever its
+arguments reached. Two parts now cover it:
+
+- **`serve` rethrows a value-free exception in a trimmed image.** Both public `serve` forms catch
+  at their outermost frame (`_rethrow_value_free`, `src/methods.jl`) and, when `_trimmed()`,
+  `rethrow` a `LoggedException` built by `Errors._value_free`. It keeps the type's name, the
+  message of an `ArgumentError` or an `ErrorException`, the address of an
+  `HTTP.AddressInUseError` (a failed bind), and nothing else. It never calls
+  `showerror`, which the image cannot dispatch for an arbitrary exception. `rethrow(x)` keeps the
+  original backtrace. Interrupts, and everything under the JIT, pass through unchanged. Both
+  helpers take `@nospecialize` arguments: without that, the call on the caught `e::Any` is itself
+  a dynamic dispatch, and in the trimmed image it failed with a `MethodError` that printed the
+  original exception as its argument.
+- **The app's `@main` catches what runs before `serve`**, printing `nameof(typeof(e))` on
+  `Core.stderr`. That is the recipe in `docs/src/tutorial/deployment.md`.
+
+`bench/juliac/fatal.jl` fails on purpose with a CSRF secret, a JWT secret and a closure-captured
+key in reach, and `bench/juliac/fatal_check.sh` greps its `stderr` for them (Julia 1.13.2, JuliaC
+0.3.12, Linux x86-64):
+
+| `FAIL=` | `--trim=unsafe-warn`, `main` | `--trim=unsafe-warn`, after | `--trim=no`, after |
+|---|---|---|---|
+| `serve` (inside `serve`) | all three leak | `LoggedException(type=:MethodError, …)`, nothing leaks | all three leak |
+| `boot` (before `serve`, under the recipe) | `start-up failed: StartupFailed` | the same | the same |
+| `bare` (before `serve`, no recipe) | all three leak | all three leak | all three leak |
+
+The `--trim=no` column answers #744's printing question: an untrimmed executable uses the same
+static printer, but `_trimmed()` stays `false` there, so `serve` cannot tell it from the JIT
+(#752). The same holds for a trimmed image that registers no route at top level, since
+`_trimmed()` flips only when the build exports one (`_flip_trimmed!`). Until then, the recipe is
+what covers both, and the deployment docs require it for every juliac executable. `bare` is the limit no change in Nitro can reach: the failure never enters
+Nitro's frames. The verifier counts do not move: the minimal app is 10 errors on `main` and after
+(this toolchain counts 10 where the count above read 11), and `ENTRY=fatal` is 63 on both.
+
+Under the JIT the same probe found that `jwt_validator` captures a string secret as a plain
+`String`, so Base's default display of an exception holding the chain prints the JWT secret, while
+the CSRF one prints masked. That is #751.
 
 **The next walls:**
 - The session store's internals: the auth-marker compare and the dirty check over the session's

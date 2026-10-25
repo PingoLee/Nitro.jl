@@ -295,6 +295,36 @@ function loggable(e)::LoggedException
 end
 
 """
+    _value_free(e) -> LoggedException
+
+What `serve` throws in place of `e` in a trimmed image (#749). There, an exception that escapes
+`main` is printed by the runtime's `jl_static_show`, which walks the object's raw fields and calls
+no `show` method, so no masking `show` applies: a `MethodError` over the middleware chain printed
+the CSRF secret and the JWT keyset in clear. A `LoggedException` has two plain fields, and this
+one is built without the original's values. Both of its fields are safe for the static printer
+to walk.
+
+- `type` is `nameof(typeof(e))`, as for `loggable`.
+- `text` is the message of an `ArgumentError` or an `ErrorException` whose `msg` is a `String`,
+  so Nitro's own start-up refusals still read in full, and the address of an
+  `HTTP.AddressInUseError`, which is how a failed bind reaches `serve`. For every other exception
+  it is a fixed line that names only the type.
+
+Unlike `loggable`, it never calls `showerror`, which a trimmed image cannot dispatch for an
+arbitrary exception. It has the same limit as `loggable`: a message that quotes a value still
+prints that value. Internal; `serve` is its only caller.
+"""
+function _value_free(@nospecialize(e))::LoggedException
+    e isa LoggedException && return e
+    type = nameof(typeof(e))
+    msg = e isa ArgumentError ? e.msg : e isa ErrorException ? e.msg :
+          e isa HTTP.AddressInUseError ? string("address already in use: ", e.address) : nothing
+    text = msg isa String ? string(type, ": ", msg) :
+        string(type, " (its contents are withheld: a trimmed image prints an uncaught exception's raw fields)")
+    return LoggedException(type, text)
+end
+
+"""
     UnsupportedMediaTypeError(msg::String)
 
 The exception Nitro raises when a request's body has the wrong `Content-Type` for the extractor
