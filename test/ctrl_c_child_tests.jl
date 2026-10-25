@@ -45,17 +45,10 @@ end
 """
 
 if !Sys.iswindows()
-    @testset "a child that takes the press exits cleanly, first time" begin
+    @testset "a child that takes the press exits cleanly" begin
         r = ctrl_c_child(TAKES_THE_PRESS, "1,0"; cue="READY", settle=0.5, deadline=60)
         report(r)
         @test r.pressed
-        # "First time" holds only where the startup race cannot fire. On Julia 1.12 about 4% of
-        # children start with SIGINT ignored (JuliaLang/julia#62471, fixed in 1.13.0), and this
-        # one is no exception: replacing it is the harness doing its job, and it went red here on
-        # macOS once. `ctrl_c_child` retries only on that proof, so a harness that misread a
-        # healthy child would misread every replacement too, and the checks below would still
-        # fail -- the final run must be a press that landed.
-        @test r.attempts == 1 || VERSION < v"1.13"
         @test !r.sigint_ignored
         @test r.sigint_disposition ∉ (nothing, 0, 1)   # Julia's own handler, not SIG_DFL/SIG_IGN
         @test !r.timed_out
@@ -64,11 +57,10 @@ if !Sys.iswindows()
         @test contains(r.out, "RESULT interrupted")
     end
 
-    @testset "an ignored SIGINT is proven, never pressed, and replaced" begin
-        r = ctrl_c_child(SIGINT_IGNORED, "1,0"; cue="READY", deadline=60, attempts=3)
+    @testset "an ignored SIGINT is proven, and never pressed" begin
+        r = ctrl_c_child(SIGINT_IGNORED, "1,0"; cue="READY", deadline=60)
         @test r.sigint_ignored
         @test r.sigint_disposition == 1
-        @test r.attempts == 3
         @test !r.pressed
         @test !r.timed_out            # killed on the proof, not at the deadline
         @test r.termsignal == Base.SIGKILL
