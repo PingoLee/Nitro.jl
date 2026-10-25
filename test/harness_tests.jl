@@ -295,11 +295,11 @@ end
 end
 
 @testset "the coordinator guards are still installed" begin
-    # `test/runtests.jl`'s three guards cannot be @testitems by construction -- ReTestItems
-    # applies `--tags`/`--name` at AST level while including each file, so a guard item
-    # would be removed by the very filter it exists to catch, and `validate_paths` is a
-    # keyword on the `runtests` call itself. They are therefore verified by invocation,
-    # by hand, and nothing would notice if one were deleted.
+    # `test/runtests.jl`'s guards cannot be @testitems by construction -- the run applies
+    # `--tags`/`--name` before any item runs, so a guard item would be removed by the very
+    # filter it exists to catch, and the path and flag checks run before there is a run at
+    # all. Their behaviour is verified by invocation (`test/runner_tests.jl` covers the
+    # runner's half); this testset checks that nothing deleted them.
     #
     # These are text assertions against the shipped file -- the same technique
     # `ci_workflow_tests.jl` and `docs_deploy_tests.jl` use, and for the same reason: the
@@ -318,18 +318,29 @@ end
     # Cf and NOT matched by `\s`, so the first comment line survives `^\s*#` and leaks into
     # `body`. Harmless for today's patterns, but a future assertion whose text happened to
     # appear in that leading comment would pass falsely.
-    src  = replace(read(joinpath(pkgdir(Nitro), "test", "runtests.jl"), String), '﻿' => "")
-    body = join(filter(l -> !occursin(r"^\s*#", l), split(src, '\n')), '\n')
+    strip_comments(path) = join(filter(l -> !occursin(r"^\s*#", l),
+                                       split(replace(read(path, String), '﻿' => ""), '\n')), '\n')
+    body   = strip_comments(joinpath(pkgdir(Nitro), "test", "runtests.jl"))
+    # The runner's collection half, where the path check and the shared selection rule live.
+    runner = strip_comments(joinpath(pkgdir(Nitro), "test", "runner", "collect.jl"))
 
     # Without this, a mistyped path is warned-and-dropped and the run still reports success
     # having never executed the file you named. That is the genuinely silent zero-test hole
-    # (#34); ReTestItems defaults it to `false`. One spelling, so anchor on it directly.
-    @test occursin(r"validate_paths\s*=\s*true", body)
+    # (#34); ReTestItems' default was exactly that. The launcher must route every path through
+    # `resolve_paths`, and `resolve_paths` must THROW on a missing one -- anchored on the call
+    # and on the message, one spelling each.
+    @test occursin(r"\bresolve_paths\(\s*paths\s*\)", body)
+    @test occursin("No such test path", runner)
 
-    # `--workers N > 1` gives each process its own `CONTEXT[]`. Anchored on the refusal
-    # message rather than on `nworkers > 1`, per the note above.
-    @test occursin("is not supported", body)
-    @test occursin("Use `--workers 0`", body)
+    # `--workers` used to choose a worker-process count, and `N > 1` gave each process its own
+    # `CONTEXT[]` (#34). It is refused by name now, and the refusal must keep pointing at
+    # `--in-process`. Anchored on the message rather than on the condition, per the note above.
+    @test occursin("`--workers` was removed", body)
+    @test occursin("Use `--in-process`", body)
+
+    # An unrecognised flag is refused rather than dropped -- the same fail-open as a dangling
+    # value, from the other direction.
+    @test occursin("Unknown option", body)
 
     # The unknown-tag layer of the filter guard. NOT anchored on `KNOWN_TAGS`: that string
     # also appears in the `using .NitroTestHarness: ...` import at the top of the file,
@@ -347,27 +358,25 @@ end
     @test occursin("\"--skip-tags\"", body)
 
     # THE load-bearing token, and the one the rest of this file cannot see (#214). The
-    # feature is one positional argument: delete `shouldrun,` from the `runtests(` call
-    # and everything else survives -- the flag still parses, the guards still fire, every
+    # feature is one keyword argument: drop `skip_tags` from the `select_items(` call and
+    # everything else survives -- the flag still parses, the guards still fire, every
     # `selects` unit assertion still passes -- while `--skip-tags network` silently runs
     # the whole suite, sockets and all, and exits 0. That is the exact fail-open this
     # flag's own validation exists to prevent, arrived at from the other direction.
-    #
-    # `shouldrun` is ReTestItems' parameter name and the POSITIONAL SLOT is the contract,
-    # so this is one spelling in the `validate_paths = true` sense, not a condition with
-    # many equivalent forms.
-    @test occursin(r"runtests\(\s*shouldrun\s*,", body)
+    # (`test/runner_tests.jl` checks that `select_items` honours it.)
+    @test occursin(r"\bselect_items\([^)]*\bskip_tags\b", body)
+    # ...and the selection is what RUNS. Handing `run_items` the collected `items` instead of
+    # `selected` would drop every filter while each anchor above stayed green.
+    @test occursin(r"\bselected\s*=\s*NitroTestRunner\.select_items\(", body)
+    @test occursin(r"\brun_items\(\s*selected\s*,", body)
 
-    # The launcher's zero-selection replica must call the SHARED rule rather than inline
-    # its own. Inlining it again is how `--tags` and `--skip-tags` drift apart: the guard
-    # would count items by one rule and ReTestItems run them by another, so a valid filter
-    # gets refused or a doomed one gets through to a bare `No test items found.`.
+    # The selection must call the SHARED rule rather than inline its own. Inlining it again
+    # is how `--tags` and `--skip-tags` drift apart: `harness_tests.jl` would pin one rule
+    # and the run would apply another.
     #
-    # `\bselects\(` and not `selects`: the bare name also appears in the
-    # `using .NitroTestHarness: ...` import at the top of runtests.jl, which survives
-    # deleting the entire guard -- the same green theater this testset already avoids with
-    # `KNOWN_TAGS`. Only the CALL form discriminates.
-    @test occursin(r"\bselects\(", body)
+    # `\bselects\(` and not `selects`: only the CALL form discriminates -- the bare name can
+    # survive in an import or a docstring after the call is gone.
+    @test occursin(r"\bselects\(", runner)
 
     # A recognised flag with no value must be refused, not dropped. Dropping `--skip-tags`
     # is fail-open in the same way a mistyped one is: nothing is excluded and the run
