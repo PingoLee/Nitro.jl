@@ -9,16 +9,8 @@
 # (empty for an anonymous closure). The verifier can report one site more than once, so the counts
 # here are the log's, not the number of distinct sites.
 #
-# It reads both verifier formats. Julia 1.12 (the bundled driver) prints the statement on the
-# header line and the stack right after it:
-#
-#   Verifier error #1: unresolved call from statement !(Nitro.isopen(…)::Any)::Any
-#   Stacktrace:
-#    [1] serve(app::App; kwargs::@Kwargs{…})
-#      @ Nitro ~/app/Nitro.jl/src/methods.jl:890
-#
-# Julia 1.13 (JuliaC) spreads the statement over several lines and leaves a blank line before
-# the stack:
+# It reads the format of Julia 1.13's verifier (JuliaC), which spreads the statement over several
+# lines and leaves a blank line before the stack. A warning has the same `Error #N:` header:
 #
 #   Error #4: unresolved call from statement getindex(
 #     getfield((…)::App, :app_context::Symbol)::Ref{Any}
@@ -28,15 +20,16 @@
 #    [1] (::Nitro.Core.var"#_app_context_seed##2#…"{…})(req::Request{HTTP.EmptyBody})
 #      @ Nitro.Core ~/app/Nitro.jl/src/core/pipeline.jl:33
 #
-# Both end with `Trim verify finished with N errors, M warnings.`, which this script checks its
-# total against.
+# The log ends with `Trim verify finished with N errors, M warnings.`, which this script checks
+# its total against. Julia 1.12's bundled driver printed `Verifier error #N:` with the statement
+# on one line; that format left with the 1.12 floor (#526).
 
 const LOG = get(ARGS, 1, "")
 isfile(LOG) || error("usage: frames.jl <build.sh log>")
 
 # An error starts at its header; its frames are the ` [k] func(…)` / `   @ Module path:line` pairs
 # after `Stacktrace:`, which keeps a statement's own text out of the frame match.
-const HEADER = r"^(?:Verifier (?:error|warning)|Error) #\d+: "
+const HEADER = r"^Error #\d+: "
 const FRAME = r"^\s*\[\d+\] (.*)$"
 const WHERE = r"^\s*@ \S+ (.+):(\d+)"
 const SUMMARY = r"^Trim verify finished with (\d+) errors?, (\d+) warnings?"
