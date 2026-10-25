@@ -96,16 +96,12 @@ using Test
 # The values go INTO the message string, not as `key=value` logging pairs, because
 # ConsoleLogger puts pairs on their own `│` lines, which a grep for the prefix would drop.
 #
-# They are written to `ReTestItems.DEFAULT_STDOUT[]`, not to the item's own logger, because
-# the item's logger would lose them. Run non-interactively (CI, `julia test/runtests.jl`),
-# ReTestItems defaults to `logs=:issues`: it redirects an item's output to a file and
-# deletes that file unless the item FAILED, so a plain `@info` appears only on exactly the
-# runs that already tell us the ratio. `DEFAULT_STDOUT` is the stream ReTestItems saves in
-# its `__init__`, before it redirects anything. On a worker that is the worker's stdout,
-# which the coordinator forwards as `Worker <pid>:  …`; in-process (`--workers 0`, the
-# coverage job) it is the run's own stdout. It is an INTERNAL of ReTestItems, so the lookup
-# falls back to `stdout` when it is missing. If an upgrade renames it, the lines go quiet
-# on a pass again, and the test itself still asserts.
+# They are written to the test runner's `report_io()`, not to the item's own logger, because
+# the item's logger would lose them. The runner (`test/runner/`) redirects an item's output to
+# a capture file and deletes that file unless the item FAILED, so a plain `@info` appears only
+# on exactly the runs that already tell us the ratio. `report_io()` is the stdout the runner
+# saved before it redirected anything; in a watched run the parent forwards it to the job log.
+# Outside the runner the lookup falls back to `stdout`, and the test itself still asserts.
 #
 # ── The #551 shapes, which need limits of their own ───────────────────────────────────────
 #
@@ -184,9 +180,8 @@ end
 best_of(shape, n) = minimum(measure(shape) for _ in 1:n)
 
 # See "Why it logs on every run" above for why this is not the item's own logger.
-rti = isdefined(Main, :ReTestItems) ? getfield(Main, :ReTestItems) : nothing
-warmth_io = rti isa Module && isdefined(rti, :DEFAULT_STDOUT) && isassigned(rti.DEFAULT_STDOUT) ?
-    rti.DEFAULT_STDOUT[] : stdout
+runner = isdefined(Main, :NitroTestRunner) ? getfield(Main, :NitroTestRunner) : nothing
+warmth_io = runner isa Module && isdefined(runner, :report_io) ? runner.report_io() : stdout
 function warmth(msg)
     Base.CoreLogging.with_logger(Base.CoreLogging.ConsoleLogger(warmth_io)) do
         @info "warmth: $msg"
