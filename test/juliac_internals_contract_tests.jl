@@ -254,12 +254,15 @@ end
     Nitro.Core.terminate(app3)
     println("SERVE=", up[], " ", down[])
     # Revise is refused, before anything starts: a trimmed image cannot make its `invokelatest`.
+    # The refusal leaves `serve` as the value-free `LoggedException` a trimmed image gets (#749),
+    # which keeps an `ArgumentError`'s message.
     rev = try
         Nitro.serve(App(); revise = :lazy, host = "127.0.0.1", port = $(get_free_port()), async = true,
                     show_banner = false, access_log = false)
         "served"
     catch e
-        e isa ArgumentError && occursin("trimmed build", e.msg) ? "refused" : string(typeof(e))
+        e isa Nitro.Errors.LoggedException && e.type === :ArgumentError &&
+            occursin("trimmed build", e.text) ? "refused" : string(typeof(e))
     end
     println("REVISE=", rev)
     """
@@ -272,5 +275,110 @@ end
                  "VECTOR=refused", "ROUTE=refused true", "SERVE=1 1", "REVISE=refused")
         @test occursin(line, out) || (line, out)
     end
+end
+end
+
+@testitem "juliac: an error leaving serve in a trimmed image carries no values (#749)" tags=[:core, :security] setup=[NitroCommon] begin
+using Test
+import Nitro
+
+# ── `_rethrow_value_free` (src/methods.jl) and `_value_free` (src/errors.jl) ────────────────────
+#
+# In a trimmed executable an exception that escapes `main` is printed by the runtime's
+# `jl_static_show`, which walks raw fields and calls no `show` method: a `SecretString`'s mask
+# does not apply. So in a trimmed image `serve` rethrows a `LoggedException` built without the
+# original's values. `sprint(dump, x)` is the raw walk here: it prints every field, as the static
+# printer does. The executable itself is checked by `bench/juliac/fatal_check.sh`.
+
+const E = Nitro.Core.Errors
+
+struct StartupFailed{T} <: Exception
+    value::T
+end
+
+@testset "_value_free keeps the type's name and a plain message, nothing else" begin
+    key = "S3NT1NEL-key"
+    sec = Nitro.SecretString("S3NT1NEL-secret")
+    held = () -> (key, sec)
+    me = MethodError(identity, (held, 1))
+    # The original is what the static printer would walk: both sentinels are in it.
+    @test occursin("S3NT1NEL-key", sprint(dump, me)) && occursin("S3NT1NEL-secret", sprint(dump, me))
+    for e in (me, StartupFailed(held), StartupFailed((sec,)))
+        lf = E._value_free(e)
+        @test lf isa E.LoggedException
+        @test lf.type === nameof(typeof(e))
+        for s in (sprint(dump, lf), repr(lf), string(lf), sprint(showerror, lf))
+            @test !occursin("S3NT1NEL", s)
+        end
+        @test occursin(string(lf.type), lf.text)
+    end
+    @test E._value_free(ArgumentError("bad value")).text == "ArgumentError: bad value"
+    @test E._value_free(ErrorException("failed")).text == "ErrorException: failed"
+    # A failed bind reaches `serve` as this, with only the address in it.
+    @test E._value_free(Nitro.Core.HTTP.AddressInUseError("127.0.0.1:8080")).text ==
+          "AddressInUseError: address already in use: 127.0.0.1:8080"
+    # A message that is not a `String` could be any `AbstractString`; it is withheld.
+    sub = E._value_free(ArgumentError(SubString("S3NT1NEL-sub", 1, 12)))
+    @test sub.type === :ArgumentError && !occursin("S3NT1NEL", sub.text)
+    lf = E.LoggedException(:KeyError, "KeyError: key not found")
+    @test E._value_free(lf) === lf
+end
+
+fail_on_fold(handler) = throw(StartupFailed(handler))
+
+@testset "under the JIT, serve rethrows the original" begin
+    app = Nitro.Core.App()
+    err = try
+        Nitro.serve(app; middleware = (fail_on_fold,), host = "127.0.0.1", port = get_free_port(),
+                    show_banner = false, access_log = false)
+        nothing
+    catch e
+        e
+    end
+    @test err isa StartupFailed
+    @test !isopen(app.service)
+end
+
+# The trimmed branch, in a child with `_trimmed()` redefined to `true` (see the server handle's
+# item above for why a child). `serve` fails while the global chain is folded, before anything
+# binds, with a CSRF secret and a closure-captured key inside the chain it is handed.
+@testset "in a trimmed image, serve rethrows a value-free LoggedException" begin
+    script = """
+    import Nitro
+    Core.eval(Nitro.Core.Types, :(_trimmed() = true))
+    struct StartupFailed{T} <: Exception
+        value::T
+    end
+    fail_on_fold(handler) = throw(StartupFailed(handler))
+    interrupt_on_fold(handler) = throw(InterruptException())
+    keyed(key::String) = handler -> (req -> (isempty(key) ? nothing : handler(req)))
+    chain = (Nitro.CSRFMiddleware("S3NT1NEL-csrf-secret-0123456789abcdef"), keyed("S3NT1NEL-key"))
+    caught(f) = try f(); nothing catch e; (e, stacktrace(catch_backtrace())) end
+    for (name, serve) in (("APP", mw -> Nitro.serve(Nitro.Core.App(); middleware = mw, host = "127.0.0.1",
+                                                    port = $(get_free_port()), show_banner = false,
+                                                    access_log = false)),
+                          ("GLOBAL", mw -> (Nitro.resetstate(); Nitro.serve(; middleware = mw,
+                                                    host = "127.0.0.1", port = $(get_free_port()),
+                                                    show_banner = false, access_log = false))))
+        e, st = caught(() -> serve((fail_on_fold, chain...)))
+        println(name, "_TYPE=", e isa Nitro.Errors.LoggedException ? "logged:\$(e.type)" : "raw")
+        println(name, "_LEAK=", occursin("S3NT1NEL", sprint(dump, e)) || occursin("S3NT1NEL", repr(e)))
+        # `rethrow(x)` keeps the original's frames: the throw site is still on the backtrace.
+        println(name, "_FRAMES=", any(fr -> fr.func === :fail_on_fold, st))
+        # An interrupt is not a failure and carries nothing: it passes through as itself.
+        i, _ = caught(() -> serve((interrupt_on_fold, chain...)))
+        println(name, "_INTERRUPT=", i isa InterruptException)
+    end
+    """
+    cmd = `$(Base.julia_cmd()) --code-coverage=none --project=$(Base.active_project()) --startup-file=no -e $script`
+    out, err = IOBuffer(), IOBuffer()
+    p = run(pipeline(ignorestatus(cmd); stdout = out, stderr = err))
+    out, err = String(take!(out)), String(take!(err))
+    @test (p.exitcode, p.termsignal) == (0, 0) || (out, last(err, 2000))
+    for name in ("APP", "GLOBAL"), line in ("_TYPE=logged:StartupFailed", "_LEAK=false", "_FRAMES=true",
+                                            "_INTERRUPT=true")
+        @test occursin(name * line, out) || (name * line, out)
+    end
+    @test !occursin("S3NT1NEL", err)
 end
 end

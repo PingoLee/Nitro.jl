@@ -373,6 +373,8 @@ bench/juliac/build.sh                                   # untrimmed exe: does HT
 bench/juliac/build.sh unsafe-warn                       # the warning list is the trim-readiness backlog
 bench/juliac/build.sh safe                              # the goal
 ENTRY=probe bench/juliac/build.sh unsafe-warn           # the request path, past whatever walls the listener
+ENTRY=fatal bench/juliac/build.sh unsafe-warn           # a start-up failure with secrets in reach
+bench/juliac/fatal_check.sh bench/juliac/out/nitro-fatal-unsafe-warn   # ...and whether its stderr leaks them
 JULIAC=bundled bench/juliac/build.sh unsafe-warn        # the same build with Julia 1.12's own driver
 julia bench/juliac/frames.jl bench/results/juliac-<stamp>-<entry>-<mode>.log   # errors by first frame in src/
 bench/juliac/smoke.sh bench/juliac/out/nitro-min-no     # first vs warm /plaintext, RSS, OS threads
@@ -388,6 +390,14 @@ bench/juliac/smoke.sh jit                               # the same app under the
   distinct middleware stacks (two through an `include_routes` group). The verifier reports only
   the first dynamic call on each path, so `app.jl` sees the request path only once every wall in
   front of `HTTP.listen!` is gone; the probe sees it now. `ENTRY=probe` selects it.
+- `fatal.jl` (#749) fails at start-up on purpose, while its exception reaches a CSRF secret, a JWT
+  secret and a closure-captured key. A trimmed executable prints an uncaught exception by walking
+  its raw fields, so no masking `show` applies. `FAIL=serve` fails inside `serve`, which in a
+  trimmed image rethrows a value-free exception. `FAIL=boot` fails before `serve`, inside the
+  `@main` recipe from the deployment docs, and `FAIL=wrapped` is the `serve` failure inside it.
+  `FAIL=bare` is the same failure as `boot` with no recipe, and it leaks. `fatal_check.sh
+  <exe|jit>` runs every mode and greps `stderr` for the sentinels. For an executable it exits 1
+  if a judged mode leaks. An untrimmed executable's `serve` mode is expected to fail until #752.
 - `build.sh` pins `--project` to `bench/juliac`, instantiates it under the building Julia (into
   its own `Manifest-v<major>.<minor>.toml`, so 1.12 and 1.13 builds do not re-resolve each other),
   and logs to `results/juliac-<stamp>-<entry>-<mode>.log` with the Julia, the frontend and the

@@ -579,3 +579,63 @@ an autoscaled replica. Two remedies, in order of effort:
 
 Either way, measure the first request on the target machine; a laptop with a warm package cache
 says little about a fresh container.
+
+## Compiling with juliac (experimental)
+
+Julia 1.12 and later can compile an application into a standalone executable with `juliac`, and
+`--trim` drops every method the program cannot reach. Nitro is working towards `--trim=safe`, but
+it does not build a Nitro app cleanly today. What is left, and how it is measured, is recorded in
+`docs/design/juliac-trim.md` in the repository. This section covers the one rule that holds
+whatever the build reports.
+
+**A fatal error in a juliac executable prints its raw fields.** Under the JIT, an exception that
+escapes your program is printed through `showerror` and the `show` methods. Nitro gives those
+methods a masked form for every secret it holds: a [`SecretString`](@ref) prints `****`. An
+executable built by `juliac`, trimmed or not (`--trim=no`), has no such display. The runtime prints
+the exception by walking its fields, so any key, password or token the exception reaches is
+written to `stderr` in clear, which in production usually means a log collector.
+
+In a trimmed image, `serve` handles its own part of this. An error that leaves `serve` (a
+middleware that fails while the pipeline is built, or a port already in use) is rethrown as a
+value-free `Nitro.Errors.LoggedException`. It keeps the original's type name, the message of an
+`ArgumentError` or an `ErrorException` (so Nitro's own refusals still read in full), the address
+of a port already in use, and the backtrace, and nothing else. That switch takes effect once the image
+has registered a route at top level, which a trimmed app does anyway (see below). Under the JIT,
+`serve` rethrows the original exception unchanged, and so does an untrimmed executable, which
+`serve` cannot yet tell apart from the JIT.
+
+So the entry point catches what escapes. That covers your own start-up code before `serve`, and
+`serve` itself in an untrimmed executable. Print the value-free text of a `LoggedException`, or
+the type name of anything else, on `Core.stderr`, and exit non-zero:
+
+```julia
+using Nitro
+
+const app = App()
+urlpatterns(app, "", path("/hello", req -> Res.send("Hello"); method = "GET"))
+
+function (@main)(args::Vector{String})::Cint
+    try
+        # load the config, resolve the secrets, run the initializers, then:
+        serve(app; host = "0.0.0.0", port = 8080)
+    catch e
+        e isa InterruptException && rethrow()
+        if e isa Nitro.Errors.LoggedException
+            println(Core.stderr, "start-up failed: ", e.text)
+        else
+            println(Core.stderr, "start-up failed: ", nameof(typeof(e)))
+        end
+        return Cint(1)
+    end
+    return Cint(0)
+end
+```
+
+Use `Core.stderr`, and the type name or a `LoggedException`'s text, not
+`@error "…" exception = e`: a trimmed image cannot dispatch the logging machinery or `showerror`
+on an arbitrary exception. The type name is the
+name only (`nameof`), never `typeof(e)` itself, because a type can carry a value as a parameter.
+The routes are registered at top level, so under `juliac` they run while the image is built and
+`main` only serves. Keep the whole life of the server inside the `try`: with `serve(app; async =
+true)`, a later `wait` on the server rethrows what the server task raised, and outside the `try`
+that is printed raw.
