@@ -22,7 +22,8 @@
 
 include(joinpath(pkgdir(Nitro), "test", "harness_manifest.jl"))
 using .NitroTestHarness: TEST_FILES, UNLISTED_OK, SKIPS_OK, KNOWN_TAGS, discover_test_files,
-                         testitems, skip_macros, selects
+                         testitems, skip_macros, selects, GLOBAL_API_BASELINE,
+                         global_api_calls
 
 const TEST_ROOT = joinpath(pkgdir(Nitro), "test")
 
@@ -285,6 +286,61 @@ end
     finally
         rm(probe; force = true)
     end
+end
+
+@testset "no new bare global-API calls (#755)" begin
+    # An item that writes to the process-wide app can leak into whatever runs next, and the
+    # per-item reset in test/runtests.jl hides that from `--shuffle`, so this is the check
+    # that sees it. `GLOBAL_API_BASELINE` (test/harness_manifest.jl) is the convenience-layer
+    # files plus the debt left over; this keeps it from growing. Exact, so a migration that
+    # removes calls must lower the number in the same change.
+    calls = Dict(f => global_api_calls(read(joinpath(TEST_ROOT, f), String)) for f in TEST_FILES)
+    drift = [string(f, ": ", length(c), " bare calls, baseline ", get(GLOBAL_API_BASELINE, f, 0),
+                    " -- ", join(("$k@$l" for (k, l) in c), ", "))
+             for (f, c) in sort(collect(calls)) if length(c) != get(GLOBAL_API_BASELINE, f, 0)]
+    @test drift == String[]
+
+    # A baseline entry for a file the suite no longer has would hold a permission slip for
+    # the next file to take that name.
+    @test sort([f for f in keys(GLOBAL_API_BASELINE) if f ∉ TEST_FILES]) == String[]
+
+    # Vacuity floor: the walk finds each spelling, qualified or not, in text handed to it
+    # directly -- and does not flag the explicit forms, a method definition named `serve`,
+    # `HTTP.serve`, or a mention in a comment or string.
+    bare = """
+        urlpatterns("", path("/a", h))
+        Nitro.urlpatterns("/x\$(v)", routes)
+        serve(port = 1, async = true)
+        Nitro.Core.serve(; middleware = mw)
+        CONTEXT[]
+        Nitro.CONTEXT[].service
+        router("/api"; tags = ["t"])
+        staticfiles(root, "static")
+        spafiles(dir)
+        dynamicfiles("content", "dyn")
+        configcookies(secret_key = k)
+        configcookies(Dict{String,Any}("httponly" => true))
+        worker_startup(; queues = String[])
+        """
+    @test sort(first.(global_api_calls(bare))) ==
+          [:CONTEXT, :CONTEXT, :configcookies, :configcookies, :dynamicfiles, :router,
+           :serve, :serve, :spafiles, :staticfiles, :urlpatterns, :urlpatterns, :worker_startup]
+    explicit = """
+        urlpatterns(app, "", path("/a", h))
+        serve(app; port = 1)
+        Nitro.Core.serve(ctx, port = 1)
+        HTTP.serve(handler; port = 1)
+        router(app, "/api")
+        staticfiles(app, root, "static")
+        configcookies(app; secret_key = k)
+        worker_startup(app; queues = String[])
+        serve(; kwargs...) = nothing
+        function serve(x; kw...) urlpatterns(x, "") end
+        # serve(port = 1) and urlpatterns("", r) in a comment
+        s = "CONTEXT[] and serve() in a string"
+        CONTEXT[1]
+        """
+    @test global_api_calls(explicit) == Tuple{Symbol, Int}[]
 end
 
 @testset "the coordinator guards are still installed" begin

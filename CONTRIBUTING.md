@@ -275,7 +275,7 @@ julia --project=. test/runtests.jl --tags middleware --skip-tags network
 # Every run is ONE child process, watched by its parent: an item that runs past
 # `--item-timeout` seconds (600 by default) gets the child killed and is named, and coverage
 # still works, because the child exits normally otherwise. Items run sequentially, files in
-# lexical path order -- the suite still shares one global router, so order matters (#755).
+# lexical path order -- a default, not a dependency: `--shuffle` checks any order (#755).
 # `julia -t auto` runs the items themselves multithreaded; the child gets the same layout.
 julia -t auto --project=. test/runtests.jl
 
@@ -283,8 +283,10 @@ julia -t auto --project=. test/runtests.jl
 julia --project=. test/runtests.jl --in-process test/sessionstores_tests.jl
 
 # Order check: shuffle file order and item order within each file, from a printed seed.
-# Not a gate until #755 makes the suite order-independent: a red can be an order
-# dependence rather than a regression. Not run in CI yet.
+# Every order is meant to pass with the in-order counts (#755), so a red is a test that leans
+# on a neighbour -- or a leak in Nitro the shuffle exposed. Give each item its own `App`; the
+# bare global-API calls left are held to a shrinking baseline (`GLOBAL_API_BASELINE` in
+# `test/harness_manifest.jl`). Not run in CI yet.
 julia --project=. test/runtests.jl --shuffle 1234
 
 # Agent-docs reference lint (paths, links, symbols, § anchors, public skill/rule sets, stubs)
