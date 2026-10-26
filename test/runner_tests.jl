@@ -472,3 +472,147 @@ end
 end
 
 end
+
+@testitem "Test runner: no Test internals in test/runner, except what is pinned (#763)" tags=[:core] begin
+
+# The runner uses `Test`'s documented surface only: `@testset` (with its `rng` option), the
+# result types for `isa`, `TestSetException`, and `get_test_counts`/`TestCounts`.
+# ReTestItems broke on 1.13 exactly where it reached past that surface (#112), so anything
+# internal the runner needs must be named here, as a contract a Julia bump fails by name, the
+# way `test/http_internals_contract_tests.jl` pins HTTP.jl. Nothing internal is needed today.
+
+const RUNNER = joinpath(pkgdir(Nitro), "test", "runner")
+
+# What the runner may name from `Test`, qualified (`Test.x`) or imported (`using Test: x`): the
+# documented surface. The result types are here for `isa`; constructing one is refused below.
+const PUBLIC = Set([Symbol("@testset"), :AbstractTestSet, :TestSetException, :get_test_counts,
+                    :TestCounts, :record, :finish, :Result, :Pass, :Fail, :Error, :Broken])
+# Never, under any spelling: the test set stack the runner used to set by hand, and the switch
+# that broke ReTestItems on 1.13 (#112).
+const STACK = Set([:CURRENT_TESTSET, :TESTSET_DEPTH, :TESTSET_PRINT_ENABLE, :get_testset,
+                   :get_testset_depth, :push_testset, :pop_testset, Symbol("@with_testset")])
+const CONSTRUCTED = Set([:Pass, :Fail, :Error, :Broken, :DefaultTestSet])
+const FIELDS = Set([:results, :results_lock, :n_passed, :anynonpass, :time_end])
+
+# Internals that must stay, as `(name, file) => why`. Empty: if one is ever added, its contract
+# goes in the testset below.
+const PINNED = Dict{Tuple{Symbol,String},String}()
+
+_test_name(x) = Meta.isexpr(x, :., 2) && x.args[1] === :Test && x.args[2] isa QuoteNode ?
+                x.args[2].value : nothing
+
+# Every use of `Test` beyond its public surface in `ex`, as `(line, name, what)`. The walk is
+# over the parsed AST, so a comment or a string can neither hide a use nor fake one.
+function test_internals(ex)
+    found = Tuple{Int,Symbol,String}[]
+    line = 0
+    function walk(x)
+        if x isa LineNumberNode
+            line = x.line
+        elseif x isa QuoteNode
+            walk(x.value)   # `:CURRENT_TESTSET`, as in `getfield(Test, :CURRENT_TESTSET)`
+        elseif x isa Symbol
+            x in STACK && push!(found, (line, x, "the test set stack, `$x`"))
+        elseif x isa Expr
+            n = _test_name(x)
+            if n !== nothing
+                n in PUBLIC || push!(found, (line, n, "`Test.$n`, which is not public"))
+                return
+            end
+            if Meta.isexpr(x, :., 2) && x.args[2] isa QuoteNode && x.args[2].value in FIELDS
+                push!(found, (line, x.args[2].value, "the DefaultTestSet field `.$(x.args[2].value)`"))
+            elseif x.head === :call
+                c = x.args[1] isa Symbol ? x.args[1] : _test_name(x.args[1])
+                c in CONSTRUCTED && push!(found, (line, c, "the constructor `$c(…)`"))
+                if c in (:getfield, :getproperty, :setfield!, :setproperty!) && length(x.args) >= 3 &&
+                   x.args[3] isa QuoteNode
+                    f = x.args[3].value
+                    f in FIELDS && push!(found, (line, f, "the DefaultTestSet field `$f`, through `$c`"))
+                    x.args[2] === :Test && !(f in PUBLIC) &&
+                        push!(found, (line, f, "`Test.$f` through `$c`, which is not public"))
+                end
+            elseif Meta.isexpr(x, :(=), 2) && x.args[2] === :Test
+                # `const T = Test`: every `T.x` after it would go unchecked.
+                push!(found, (line, :Test, "an alias of `Test`"))
+            elseif x.head in (:using, :import)
+                for a in x.args
+                    if Meta.isexpr(a, :as) && a.args[1] == Expr(:., :Test)
+                        push!(found, (line, :Test, "an alias of `Test`"))   # `import Test as T`
+                    elseif Meta.isexpr(a, :.) && length(a.args) >= 2 && a.args[1] === :Test
+                        m = a.args[end]                                   # `import Test.x`
+                        m in PUBLIC || push!(found, (line, m, "`import Test.$m`, which is not public"))
+                    elseif Meta.isexpr(a, :(:)) && a.args[1] == Expr(:., :Test)
+                        for b in a.args[2:end]
+                            # An alias would hide a constructor call: `using Test: Error as E`.
+                            Meta.isexpr(b, :as) &&
+                                push!(found, (line, b.args[1].args[end], "an alias of a `Test` name"))
+                            m = (Meta.isexpr(b, :as) ? b.args[1] : b).args[end]
+                            m in PUBLIC || push!(found, (line, m, "`using Test: $m`, which is not public"))
+                        end
+                    end
+                end
+            end
+            foreach(walk, x.args)
+        end
+    end
+    walk(ex)
+    return found
+end
+
+@testset "the runner reaches no further into Test than its public surface" begin
+    files = String[]
+    for (dir, _, fs) in walkdir(RUNNER), f in fs
+        endswith(f, ".jl") && push!(files, joinpath(dir, f))
+    end
+    @test joinpath(RUNNER, "execute.jl") in files && joinpath(RUNNER, "NitroTestRunner.jl") in files
+    hits = String[]
+    for path in files
+        rel = relpath(path, RUNNER)
+        for (line, name, what) in test_internals(Meta.parseall(read(path, String); filename = path))
+            haskey(PINNED, (name, rel)) || push!(hits, "test/runner/$rel:$line uses $what")
+        end
+    end
+    @test isempty(hits)
+    isempty(hits) || foreach(println, hits)
+
+    # The walk catches each shape it is for, so an empty `hits` is not a dead check...
+    caught = ["Base.ScopedValues.with(f, Test.CURRENT_TESTSET => ts)",
+              "using Test: DefaultTestSet, get_testset_depth",
+              "Test.TESTSET_PRINT_ENABLE[]",
+              "Test.record(ts, Test.Error(:nontest_error, Expr(:tuple), err, bt, src))",
+              "ts = DefaultTestSet(\"x\")",
+              "any(r -> r isa Test.Fail, ts.results)",
+              "getfield(ts, :n_passed)",
+              "Test.filter_errors(ts)",
+              # Spellings that route around a plain `Test.x`:
+              "import Test as T; T.CURRENT_TESTSET",
+              "const T = Test",
+              "getproperty(Test, :TESTSET_DEPTH)",
+              "getproperty(Test, :filter_errors)",
+              "using Test: Error as E",
+              "import Test.filter_errors",
+              "setfield!(ts, :results, [])"]
+    @test all(s -> !isempty(test_internals(Meta.parseall(s))), caught)
+    # ...and passes what the runner is allowed, including names that only appear in text.
+    allowed = ["r isa Test.Error || r isa Test.Fail",
+               "tc = Test.get_test_counts(ts); tc.cumulative_fails",
+               "err isa TestSetException || rethrow()",
+               "import Test; using Test: @testset, TestSetException",
+               "Test.@testset \"x\" begin end",
+               "# Test.CURRENT_TESTSET, in a comment\nx = 1",
+               "s = \"Test.Error( in a string\""]
+    @test all(s -> isempty(test_internals(Meta.parseall(s))), allowed)
+end
+
+@testset "what the runner reads from get_test_counts is still there" begin
+    # The runner totals an item through `Test.get_test_counts`, which the Test manual documents
+    # ("Creating Custom AbstractTestSet Types"). The `TestCounts` docstring lists the cumulative
+    # fields under the plain names (`passes`, `fails`, ... twice), so the four the runner reads
+    # are pinned by name.
+    @test hasmethod(Test.get_test_counts, Tuple{Test.DefaultTestSet})
+    @test issubset((:fails, :errors, :cumulative_fails, :cumulative_errors), fieldnames(Test.TestCounts))
+    # That the totals actually report a failure is checked end to end by the location probe in
+    # "Test runner: each item runs in its own @testset (#763)": exit 1, and both items listed.
+end
+
+end
