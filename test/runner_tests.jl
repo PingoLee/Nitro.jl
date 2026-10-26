@@ -440,12 +440,16 @@ end
         """)
     path = joinpath(dir, "loc_tests.jl")
     r = probe(dir)
+    # The child inherits the parent's `--color` through `Base.julia_cmd()`, and CI runs with
+    # colour on, so `Test` wraps "Error During Test", " at " and the path in separate ANSI runs.
+    # Strip them before matching: the location is what is under test, not the colouring.
+    out = replace(r.out, r"\e\[[0-9;]*m" => "")
     @test r.code == 1
-    @test occursin("Error During Test at $path:1", r.out)
-    @test occursin("Test Failed at $path:7", r.out)
+    @test occursin("Error During Test at $path:1", out)
+    @test occursin("Test Failed at $path:7", out)
     # A Broken result is not a failure: the third item is not listed.
     @test occursin("2 of 3 test items did not pass:\n  \"throws outside a test\" at loc_tests.jl:1\n" *
-                   "  \"fails a test\" at loc_tests.jl:6\n\n", r.out)
+                   "  \"fails a test\" at loc_tests.jl:6\n\n", out)
     r.code == 1 || println(r.out)
 end
 
