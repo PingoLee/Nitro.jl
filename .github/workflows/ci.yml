@@ -43,7 +43,7 @@ permissions:
 # precisely the immutability this pin exists to provide.
 jobs:
   test:
-    name: Julia ${{ matrix.version }} - ${{ matrix.os }} - ${{ matrix.threads }} thread(s)
+    name: Julia ${{ matrix.version }} - ${{ matrix.os }} - ${{ matrix.threads }} thread(s)${{ matrix.shuffle && ' - shuffled' || '' }}
     runs-on: ${{ matrix.os }}
     # This job builds and executes the pinned PormG source. No write scope, no token.
     permissions:
@@ -103,10 +103,21 @@ jobs:
           # - macos-latest   # PARKED -- see the comment above
           - windows-latest
         threads: [1, 2]
-        # No `include:` for now: the 1.13 entry that used to sit here as one ubuntu leg moved
-        # into `version` above, and the `nightly` entry is parked. Restore the key together
-        # with the first entry that comes back: a YAML `include:` with no items reads as
-        # `null`, which the workflow parser refuses.
+        # The order check (#755). This entry matches an existing combination, so it adds no
+        # leg: it turns ubuntu x 2 threads into the shuffled run, and Windows x 2 keeps the
+        # in-order one. The seed is the run id, which the runner prints and a re-run of the same
+        # workflow keeps, so a red reproduces with
+        # `julia -O0 --threads=2 --project=. test/runtests.jl --shuffle <seed>`.
+        # A shuffled red is a test that leans on a neighbour, or a leak in Nitro the order
+        # exposed -- never a reason to drop this entry.
+        #
+        # The `~1.14.0-0` leg and the `nightly` entry (both below) join this list when they
+        # come back; `include:` must keep at least one item, or the workflow parser refuses it.
+        include:
+          - version: '~1.13.0-0'
+            os: ubuntu-latest
+            threads: 2
+            shuffle: true
           #
           # The 1.13 entry had replaced a `version: '1'` (latest stable) entry, which sounded like
           # it covered the release above the floor but did not: `'1'` resolves to whatever is
@@ -178,10 +189,13 @@ jobs:
       # allocation count that relies on LLVM eliding a box, or an `@elapsed` bound over a
       # pure-Julia hot loop. If one flips, the answer is to drop this line, not to loosen the
       # probe. Reproduce a CI red locally with `julia -O0`.
+      #
+      # `test_args` is empty on every leg but the shuffled one (the `include:` above, #755).
       - uses: julia-actions/julia-runtest@6e050c8013b833b1195105ff2fce9cd802f53271 # v1.12.0
         with:
           coverage: ${{ matrix.os == 'ubuntu-latest' && matrix.threads == '1' && matrix.version == '~1.13.0-0' }}
           optimize: '0'
+          test_args: ${{ matrix.shuffle && format('--shuffle {0}', github.run_id) || '' }}
       - uses: julia-actions/julia-processcoverage@03114f09f119417c3242a9fb6e0b722676aedf38 # v1.2.2
         if: matrix.os == 'ubuntu-latest' && matrix.threads == '1' && matrix.version == '~1.13.0-0'
       - uses: coverallsapp/github-action@8d6379e14d29928660c4ba802d8e85393440b329 # v2.3.8

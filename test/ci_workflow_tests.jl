@@ -258,3 +258,28 @@ end
 end
 
 end
+
+@testitem "CI keeps one shuffled leg, seeded by the run id (#755)" tags=[:core] setup=[NitroCommon] begin
+
+# The order check is the only thing that keeps the suite order-independent, and it is invisible
+# from a green run: deleting the `include:` entry or its `test_args` leaves every leg passing,
+# in order. So the shipped file is asserted, the same way the items above guard it.
+
+const CI_SRC = let raw = read(joinpath(pkgdir(Nitro), ".github", "workflows", "ci.yml"), String)
+    s = replace(raw, '﻿' => "", "\r\n" => "\n")
+    # Drop whole-line comments: ci.yml's own explanation names the very keys asserted on.
+    join(filter(l -> !occursin(r"^\s*#", l), split(s, '\n')), '\n')
+end
+
+@testset "one matrix entry turns the shuffle on" begin
+    @test count(r"(?m)^\s+shuffle:\s*true\s*$", CI_SRC) == 1
+end
+
+@testset "the test step passes --shuffle with the run id, and only on that entry" begin
+    @test occursin(
+        r"test_args:\s*\$\{\{\s*matrix\.shuffle\s*&&\s*format\('--shuffle \{0\}',\s*github\.run_id\)\s*\|\|\s*''\s*\}\}",
+        CI_SRC,
+    )
+end
+
+end
