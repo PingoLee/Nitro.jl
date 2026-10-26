@@ -123,10 +123,14 @@ function with_testset(f, ts::Test.AbstractTestSet)
                            Test.TESTSET_DEPTH => Test.get_testset_depth() + 1)
 end
 
-function _nonpass(ts::Test.DefaultTestSet)
-    any(ts.results) do r
-        r isa Test.Fail || r isa Test.Error || (r isa Test.DefaultTestSet && _nonpass(r))
-    end
+# Whether a finished test set, or any set nested in it, holds a `Fail` or an `Error`. Read
+# through `get_test_counts`, the documented way to total a test set (the Test manual's "Creating
+# Custom AbstractTestSet Types"), not through `DefaultTestSet`'s fields. The four field names
+# are pinned in `test/runner_tests.jl`: the `TestCounts` docstring lists the cumulative ones
+# under the wrong names.
+function _failed(ts::Test.AbstractTestSet)
+    tc = Test.get_test_counts(ts)
+    return tc.fails + tc.errors + tc.cumulative_fails + tc.cumulative_errors > 0
 end
 
 # Redirect stdout and stderr into `io` for `f`, as ReTestItems' `logs = :issues` did. Julia's
@@ -240,7 +244,7 @@ function run_items(items::Vector{TestItem}, setups::Dict{Symbol,TestSetup};
                     t0 = time()
                     ts = open(io -> with_capture(() -> run_item(ctx, it), io), logfile, "w")
                     # `@testset` has already recorded the item into `fts`.
-                    bad = ts === nothing || _nonpass(ts)
+                    bad = ts === nothing || _failed(ts)
                     _progress("DONE  ($i/$n) test item $(repr(it.name)) " *
                               "$(round(time() - t0; digits = 2)) secs" * (bad ? " -- FAILED" : ""))
                     if bad

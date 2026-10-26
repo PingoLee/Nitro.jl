@@ -433,13 +433,18 @@ end
         @testitem "fails a test" begin
             @test 1 == 2
         end
+
+        @testitem "only broken" begin
+            @test_broken 1 == 2
+        end
         """)
     path = joinpath(dir, "loc_tests.jl")
     r = probe(dir)
     @test r.code == 1
     @test occursin("Error During Test at $path:1", r.out)
     @test occursin("Test Failed at $path:7", r.out)
-    @test occursin("2 of 2 test items did not pass:\n  \"throws outside a test\" at loc_tests.jl:1\n" *
+    # A Broken result is not a failure: the third item is not listed.
+    @test occursin("2 of 3 test items did not pass:\n  \"throws outside a test\" at loc_tests.jl:1\n" *
                    "  \"fails a test\" at loc_tests.jl:6\n\n", r.out)
     r.code == 1 || println(r.out)
 end
