@@ -5,6 +5,12 @@
 # body with every top-level statement in soft scope -- and runs in a `Threads.@spawn` task, which
 # is where ReTestItems' worker ran items. Its stdout, stderr and global log stream go to a capture
 # file that is printed only when the item does not pass.
+#
+# Unlike under ReTestItems, each item runs inside a real `@testset` (#763), which reseeds the
+# default RNG from a fixed seed. ReTestItems 1.35.3 entered an item's test set through
+# `ScopedValues.with` on `Test.CURRENT_TESTSET` and `Test.TESTSET_DEPTH`, not `@testset`, and
+# never reseeded, so every item drew from wherever the items before it had left the stream. (#762
+# recorded the opposite in its inventory; its source, and a probe of it, say otherwise.)
 
 # The real stdout, saved before anything is redirected. Progress lines go here, and so does
 # anything an item must show on a PASSING run (`precompile_warmth_tests.jl`'s `warmth:` lines):

@@ -5,7 +5,8 @@
 # what this suite uses:
 #
 #   collect.jl   parse files into items and setups; refuse anything it would not run faithfully
-#   execute.jl   run items sequentially, each in a fresh module, with captured output
+#   execute.jl   run items sequentially, each in a fresh module and its own `@testset`, with
+#                captured output
 #   watchdog.jl  the parent: one child process for the whole run, and a per-item timeout
 #
 # `test/runtests.jl` is the entry point and documents the CLI. This is test infrastructure: it
