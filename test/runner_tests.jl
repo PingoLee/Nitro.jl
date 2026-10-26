@@ -346,3 +346,102 @@ end
 end
 
 end
+
+@testitem "Test runner: each item runs in its own @testset (#763)" tags=[:core] begin
+
+# Each item runs inside a real `@testset` whose source is the item's own `file:line`. That is
+# where two guarantees come from: every item starts the default RNG from the same fixed seed, so
+# no item's draws depend on what ran before it (or on the process), and `Test` itself records a
+# failure at the item's location. Probed in child runs, as the guard item above does, so the
+# probes' test sets do not nest into this item's own.
+
+include(joinpath(pkgdir(Nitro), "test", "runner", "NitroTestRunner.jl"))
+using Random
+
+const PROBE = joinpath(pkgdir(Nitro), "test", ".helpers", "runner_probe.jl")
+
+function tree(files::Pair...)
+    dir = mktempdir()
+    for (name, src) in files
+        write(joinpath(dir, name), src)
+    end
+    return dir
+end
+
+function probe(args...; limit = 180)
+    cmd = `$(Base.julia_cmd()) --code-coverage=none --startup-file=no --project=$(Base.active_project()) $PROBE $args`
+    out = IOBuffer()
+    p = run(pipeline(ignorestatus(cmd); stdout = out, stderr = out); wait = false)
+    killer = Timer(_ -> process_running(p) && kill(p, Base.SIGKILL), limit)
+    wait(p)
+    close(killer)
+    return (; code = p.exitcode, out = String(take!(out)))
+end
+
+# A passing item's output is discarded with its capture, so each item writes its first draw to a
+# file next to it: one `name value` line per item, in the order the items ran.
+draw_item(name; setup = "", after = "") = """
+    @testitem "$name"$(isempty(setup) ? "" : " setup=[$setup]") begin
+        open(io -> println(io, "$name ", rand()), joinpath(@__DIR__, "draws.txt"), "a")
+        $after
+    end
+    """
+
+# A setup that draws when it loads, so its first user is the item that evaluates it.
+const DRAWING_SETUP = "@testsetup module Draws\nconst D = rand()\nend\n"
+
+function draws(dir, args...)
+    rm(joinpath(dir, "draws.txt"); force = true)
+    r = probe(dir, args...)
+    r.code == 0 || println(r.out)
+    lines = split(strip(read(joinpath(dir, "draws.txt"), String)), '\n')
+    return (; code = r.code, order = [String(first(split(l))) for l in lines],
+            value = Dict(String(first(split(l))) => String(last(split(l))) for l in lines))
+end
+
+@testset "every item starts from the same fixed draw, whatever ran before it" begin
+    # `between` draws 1000 values; `b` is the first user of a setup that draws; `c` the second.
+    with_between = tree("a_tests.jl" => DRAWING_SETUP * draw_item("a") *
+                        draw_item("between"; after = "rand(1000)") *
+                        draw_item("b"; setup = "Draws") * draw_item("c"; setup = "Draws"))
+    without = tree("a_tests.jl" => DRAWING_SETUP * draw_item("a") *
+                   draw_item("b"; setup = "Draws") * draw_item("c"; setup = "Draws"))
+    d1 = draws(with_between)
+    d2 = draws(without)
+    @test d1.code == 0 && d2.code == 0
+    @test d1.order == ["a", "between", "b", "c"]
+    expected = string(rand(Random.Xoshiro(NitroTestRunner.ITEM_RNG_SEED)))
+    @test all(==(expected), values(d1.value))
+    # Not just the same within a run: the same in another process, with an item fewer.
+    @test d2.value == Dict(k => d1.value[k] for k in ("a", "b", "c"))
+
+    # A shuffled order, in a third process, gives every item the same draw again. Seed 6 runs
+    # `between` first and makes `c` the setup's first user.
+    ds = draws(with_between, "--shuffle", "6")
+    @test ds.code == 0
+    @test ds.order == ["between", "c", "b", "a"]
+    @test ds.value == d1.value
+end
+
+@testset "a failure points at the item, and a failing @test at its own line" begin
+    dir = tree("loc_tests.jl" => """
+        @testitem "throws outside a test" begin
+            x = 1
+            error("outside any test")
+        end
+
+        @testitem "fails a test" begin
+            @test 1 == 2
+        end
+        """)
+    path = joinpath(dir, "loc_tests.jl")
+    r = probe(dir)
+    @test r.code == 1
+    @test occursin("Error During Test at $path:1", r.out)
+    @test occursin("Test Failed at $path:7", r.out)
+    @test occursin("2 of 2 test items did not pass:\n  \"throws outside a test\" at loc_tests.jl:1\n" *
+                   "  \"fails a test\" at loc_tests.jl:6\n\n", r.out)
+    r.code == 1 || println(r.out)
+end
+
+end

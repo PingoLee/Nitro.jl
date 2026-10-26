@@ -154,25 +154,50 @@ function _progress(msg)
     flush(io)
 end
 
+# Every item's test set starts the default RNG from this seed, through `@testset`'s `rng`
+# option. Fixed rather than `Test`'s default: `@testset` would copy the task's seed, and a fresh
+# task falls back to one `Random` draws from entropy once per process -- the same for every item
+# of a run, but different in the next run. A red that depends on a draw must reproduce in the
+# next process, under the same `--shuffle` seed. Any value would do; changing it changes every
+# item's draws.
+const ITEM_RNG_SEED = 763
+
+# The item's test set: `@testset` with the item's own file and line as its source, so `Test`
+# records an error outside any `@test` -- a throwing setup included -- at the item's `file:line`.
+function _item_testset_expr(it::TestItem, body)
+    src = LineNumberNode(it.line, Symbol(it.file))
+    return Expr(:macrocall, Symbol("@testset"), src,
+                Expr(:(=), :rng, Expr(:call, Random.Xoshiro, ITEM_RNG_SEED)),
+                it.name, Expr(:block, src, Expr(:call, body)))
+end
+
+# Runs one item in its own task, inside its own `@testset`, and returns that test set. An item's
+# failure never fails the task: `@testset` records it. What does is what `@testset` passes on --
+# an `InterruptException` or a fail-fast stop -- and `fetch` throws it on, as a
+# `TaskFailedException`, for `run_items` to end the run with.
 function run_item(ctx::RunContext, it::TestItem)
-    ts = Test.DefaultTestSet(it.name)
-    task = Threads.@spawn with_testset(ts) do
-        task_local_storage(:SOURCE_PATH, it.file) do
-            try
-                mods = Pair{Symbol,Module}[s => ensure_setup!(ctx, s, it) for s in it.setups]
-                Core.eval(Main, _item_module(ctx, it, mods))
-            catch err
-                # Recorded at the item's own line, as ReTestItems did, so a failure outside any
-                # `@test` still points at a file and line.
-                Test.record(ts, Test.Error(:nontest_error, Expr(:tuple), err,
-                                           Base.current_exceptions(), LineNumberNode(it.line, it.file)))
-            finally
-                run_test_end(ctx, it)
-            end
+    body = function ()
+        # Setups run inside the test set so their errors are the item's, but must not move
+        # the item's draws: the first item to need a setup would otherwise start its body
+        # further along the stream than every later one.
+        state = copy(Random.default_rng())
+        mods = Pair{Symbol,Module}[s => ensure_setup!(ctx, s, it) for s in it.setups]
+        copy!(Random.default_rng(), state)
+        Core.eval(Main, _item_module(ctx, it, mods))
+        return nothing
+    end
+    ex = _item_testset_expr(it, body)
+    task = Threads.@spawn task_local_storage(:SOURCE_PATH, it.file) do
+        try
+            Core.eval(@__MODULE__, ex)
+        finally
+            # Outside the item's test set: the result is final before the cleanup runs. The
+            # current test set here is the file's, so a `@test` in TEST_END would count there,
+            # not against the item; `test/runtests.jl`'s has none.
+            run_test_end(ctx, it)
         end
     end
-    wait(task)
-    return ts
+    return fetch(task)::Test.AbstractTestSet
 end
 
 """
@@ -214,8 +239,8 @@ function run_items(items::Vector{TestItem}, setups::Dict{Symbol,TestSetup};
                     logfile = joinpath(capture_dir, "$i.log")
                     t0 = time()
                     ts = open(io -> with_capture(() -> run_item(ctx, it), io), logfile, "w")
-                    bad = _nonpass(ts)
-                    Test.finish(ts)   # records into `fts`
+                    # `@testset` has already recorded the item into `fts`.
+                    bad = ts === nothing || _nonpass(ts)
                     _progress("DONE  ($i/$n) test item $(repr(it.name)) " *
                               "$(round(time() - t0; digits = 2)) secs" * (bad ? " -- FAILED" : ""))
                     if bad
