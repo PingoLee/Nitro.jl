@@ -346,3 +346,277 @@ end
 end
 
 end
+
+@testitem "Test runner: each item runs in its own @testset (#763)" tags=[:core] begin
+
+# Each item runs inside a real `@testset` whose source is the item's own `file:line`. That is
+# where two guarantees come from: every item starts the default RNG from the same fixed seed, so
+# no item's draws depend on what ran before it (or on the process), and `Test` itself records a
+# failure at the item's location. Probed in child runs, as the guard item above does, so the
+# probes' test sets do not nest into this item's own.
+
+include(joinpath(pkgdir(Nitro), "test", "runner", "NitroTestRunner.jl"))
+using Random
+
+const PROBE = joinpath(pkgdir(Nitro), "test", ".helpers", "runner_probe.jl")
+
+function tree(files::Pair...)
+    dir = mktempdir()
+    for (name, src) in files
+        write(joinpath(dir, name), src)
+    end
+    return dir
+end
+
+function probe(args...; limit = 180, env = ())
+    cmd = addenv(`$(Base.julia_cmd()) --code-coverage=none --startup-file=no --project=$(Base.active_project()) $PROBE $args`, env...)
+    out = IOBuffer()
+    p = run(pipeline(ignorestatus(cmd); stdout = out, stderr = out); wait = false)
+    killer = Timer(_ -> process_running(p) && kill(p, Base.SIGKILL), limit)
+    wait(p)
+    close(killer)
+    return (; code = p.exitcode, out = String(take!(out)))
+end
+
+# A passing item's output is discarded with its capture, so each item writes its first draw to a
+# file next to it: one `name value` line per item, in the order the items ran.
+draw_item(name; setup = "", after = "") = """
+    @testitem "$name"$(isempty(setup) ? "" : " setup=[$setup]") begin
+        open(io -> println(io, "$name ", rand()), joinpath(@__DIR__, "draws.txt"), "a")
+        $after
+    end
+    """
+
+# A setup that draws when it loads, so its first user is the item that evaluates it.
+const DRAWING_SETUP = "@testsetup module Draws\nconst D = rand()\nend\n"
+
+function draws(dir, args...)
+    rm(joinpath(dir, "draws.txt"); force = true)
+    r = probe(dir, args...)
+    r.code == 0 || println(r.out)
+    lines = split(strip(read(joinpath(dir, "draws.txt"), String)), '\n')
+    return (; code = r.code, order = [String(first(split(l))) for l in lines],
+            value = Dict(String(first(split(l))) => String(last(split(l))) for l in lines))
+end
+
+@testset "every item starts from the same fixed draw, whatever ran before it" begin
+    # `between` draws 1000 values; `b` is the first user of a setup that draws; `c` the second.
+    with_between = tree("a_tests.jl" => DRAWING_SETUP * draw_item("a") *
+                        draw_item("between"; after = "rand(1000)") *
+                        draw_item("b"; setup = "Draws") * draw_item("c"; setup = "Draws"))
+    without = tree("a_tests.jl" => DRAWING_SETUP * draw_item("a") *
+                   draw_item("b"; setup = "Draws") * draw_item("c"; setup = "Draws"))
+    d1 = draws(with_between)
+    d2 = draws(without)
+    @test d1.code == 0 && d2.code == 0
+    @test d1.order == ["a", "between", "b", "c"]
+    expected = string(rand(Random.Xoshiro(NitroTestRunner.ITEM_RNG_SEED)))
+    @test all(==(expected), values(d1.value))
+    # Not just the same within a run: the same in another process, with an item fewer.
+    @test d2.value == Dict(k => d1.value[k] for k in ("a", "b", "c"))
+
+    # A shuffled order, in a third process, gives every item the same draw again. Seed 6 runs
+    # `between` first and makes `c` the setup's first user.
+    ds = draws(with_between, "--shuffle", "6")
+    @test ds.code == 0
+    @test ds.order == ["between", "c", "b", "a"]
+    @test ds.value == d1.value
+end
+
+@testset "a failure points at the item, and a failing @test at its own line" begin
+    dir = tree("loc_tests.jl" => """
+        @testitem "throws outside a test" begin
+            x = 1
+            error("outside any test")
+        end
+
+        @testitem "fails a test" begin
+            @test 1 == 2
+        end
+
+        @testitem "only broken" begin
+            @test_broken 1 == 2
+        end
+        """)
+    path = joinpath(dir, "loc_tests.jl")
+    r = probe(dir)
+    # The child inherits the parent's `--color` through `Base.julia_cmd()`, and CI runs with
+    # colour on, so `Test` wraps "Error During Test", " at " and the path in separate ANSI runs.
+    # Strip them before matching: the location is what is under test, not the colouring.
+    out = replace(r.out, r"\e\[[0-9;]*m" => "")
+    @test r.code == 1
+    @test occursin("Error During Test at $path:1", out)
+    @test occursin("Test Failed at $path:7", out)
+    # A Broken result is not a failure: the third item is not listed.
+    @test occursin("2 of 3 test items did not pass:\n  \"throws outside a test\" at loc_tests.jl:1\n" *
+                   "  \"fails a test\" at loc_tests.jl:6\n\n", out)
+    r.code == 1 || println(r.out)
+end
+
+@testset "a stop that gets past an item's test set ends the run, and names the item" begin
+    # `@testset` passes on an `InterruptException` and a fail-fast stop instead of recording
+    # them. Either must end the run where it happened, with no COMPLETE event, as a crash would --
+    # not be recorded by the file's test set and run past. Fail-fast is the one a probe can
+    # provoke deterministically.
+    dir = tree("ff_tests.jl" => """
+        @testitem "first red" begin
+            @test 1 == 2
+        end
+
+        @testitem "never reached" begin
+            @test true
+        end
+        """)
+    r = probe(dir, "--watch", "60"; env = ("JULIA_TEST_FAILFAST" => "true",))
+    @test r.code == 1
+    @test occursin("ended before the run did", r.out)
+    @test occursin("during test item \"first red\" at ff_tests.jl:1", r.out)
+    @test !occursin("START (2/2)", r.out)
+    r.code == 1 || println(r.out)
+end
+
+end
+
+@testitem "Test runner: no Test internals in test/runner, except what is pinned (#763)" tags=[:core] begin
+
+# The runner uses `Test`'s documented surface only: `@testset` (with its `rng` option), the
+# result types for `isa`, `TestSetException`, and `get_test_counts`/`TestCounts`.
+# ReTestItems broke on 1.13 exactly where it reached past that surface (#112), so anything
+# internal the runner needs must be named here, as a contract a Julia bump fails by name, the
+# way `test/http_internals_contract_tests.jl` pins HTTP.jl. Nothing internal is needed today.
+
+const RUNNER = joinpath(pkgdir(Nitro), "test", "runner")
+
+# What the runner may name from `Test`, qualified (`Test.x`) or imported (`using Test: x`): the
+# documented surface. The result types are here for `isa`; constructing one is refused below.
+const PUBLIC = Set([Symbol("@testset"), :AbstractTestSet, :TestSetException, :get_test_counts,
+                    :TestCounts, :record, :finish, :Result, :Pass, :Fail, :Error, :Broken])
+# Never, under any spelling: the test set stack the runner used to set by hand, and the switch
+# that broke ReTestItems on 1.13 (#112).
+const STACK = Set([:CURRENT_TESTSET, :TESTSET_DEPTH, :TESTSET_PRINT_ENABLE, :get_testset,
+                   :get_testset_depth, :push_testset, :pop_testset, Symbol("@with_testset")])
+const CONSTRUCTED = Set([:Pass, :Fail, :Error, :Broken, :DefaultTestSet])
+const FIELDS = Set([:results, :results_lock, :n_passed, :anynonpass, :time_end])
+
+# Internals that must stay, as `(name, file) => why`. Empty: if one is ever added, its contract
+# goes in the testset below.
+const PINNED = Dict{Tuple{Symbol,String},String}()
+
+_test_name(x) = Meta.isexpr(x, :., 2) && x.args[1] === :Test && x.args[2] isa QuoteNode ?
+                x.args[2].value : nothing
+
+# Every use of `Test` beyond its public surface in `ex`, as `(line, name, what)`. The walk is
+# over the parsed AST, so a comment or a string can neither hide a use nor fake one.
+function test_internals(ex)
+    found = Tuple{Int,Symbol,String}[]
+    line = 0
+    function walk(x)
+        if x isa LineNumberNode
+            line = x.line
+        elseif x isa QuoteNode
+            walk(x.value)   # `:CURRENT_TESTSET`, as in `getfield(Test, :CURRENT_TESTSET)`
+        elseif x isa Symbol
+            x in STACK && push!(found, (line, x, "the test set stack, `$x`"))
+        elseif x isa Expr
+            n = _test_name(x)
+            if n !== nothing
+                n in PUBLIC || push!(found, (line, n, "`Test.$n`, which is not public"))
+                return
+            end
+            if Meta.isexpr(x, :., 2) && x.args[2] isa QuoteNode && x.args[2].value in FIELDS
+                push!(found, (line, x.args[2].value, "the DefaultTestSet field `.$(x.args[2].value)`"))
+            elseif x.head === :call
+                c = x.args[1] isa Symbol ? x.args[1] : _test_name(x.args[1])
+                c in CONSTRUCTED && push!(found, (line, c, "the constructor `$c(…)`"))
+                if c in (:getfield, :getproperty, :setfield!, :setproperty!) && length(x.args) >= 3 &&
+                   x.args[3] isa QuoteNode
+                    f = x.args[3].value
+                    f in FIELDS && push!(found, (line, f, "the DefaultTestSet field `$f`, through `$c`"))
+                    x.args[2] === :Test && !(f in PUBLIC) &&
+                        push!(found, (line, f, "`Test.$f` through `$c`, which is not public"))
+                end
+            elseif Meta.isexpr(x, :(=), 2) && x.args[2] === :Test
+                # `const T = Test`: every `T.x` after it would go unchecked.
+                push!(found, (line, :Test, "an alias of `Test`"))
+            elseif x.head in (:using, :import)
+                for a in x.args
+                    if Meta.isexpr(a, :as) && a.args[1] == Expr(:., :Test)
+                        push!(found, (line, :Test, "an alias of `Test`"))   # `import Test as T`
+                    elseif Meta.isexpr(a, :.) && length(a.args) >= 2 && a.args[1] === :Test
+                        m = a.args[end]                                   # `import Test.x`
+                        m in PUBLIC || push!(found, (line, m, "`import Test.$m`, which is not public"))
+                    elseif Meta.isexpr(a, :(:)) && a.args[1] == Expr(:., :Test)
+                        for b in a.args[2:end]
+                            # An alias would hide a constructor call: `using Test: Error as E`.
+                            Meta.isexpr(b, :as) &&
+                                push!(found, (line, b.args[1].args[end], "an alias of a `Test` name"))
+                            m = (Meta.isexpr(b, :as) ? b.args[1] : b).args[end]
+                            m in PUBLIC || push!(found, (line, m, "`using Test: $m`, which is not public"))
+                        end
+                    end
+                end
+            end
+            foreach(walk, x.args)
+        end
+    end
+    walk(ex)
+    return found
+end
+
+@testset "the runner reaches no further into Test than its public surface" begin
+    files = String[]
+    for (dir, _, fs) in walkdir(RUNNER), f in fs
+        endswith(f, ".jl") && push!(files, joinpath(dir, f))
+    end
+    @test joinpath(RUNNER, "execute.jl") in files && joinpath(RUNNER, "NitroTestRunner.jl") in files
+    hits = String[]
+    for path in files
+        rel = relpath(path, RUNNER)
+        for (line, name, what) in test_internals(Meta.parseall(read(path, String); filename = path))
+            haskey(PINNED, (name, rel)) || push!(hits, "test/runner/$rel:$line uses $what")
+        end
+    end
+    @test isempty(hits)
+    isempty(hits) || foreach(println, hits)
+
+    # The walk catches each shape it is for, so an empty `hits` is not a dead check...
+    caught = ["Base.ScopedValues.with(f, Test.CURRENT_TESTSET => ts)",
+              "using Test: DefaultTestSet, get_testset_depth",
+              "Test.TESTSET_PRINT_ENABLE[]",
+              "Test.record(ts, Test.Error(:nontest_error, Expr(:tuple), err, bt, src))",
+              "ts = DefaultTestSet(\"x\")",
+              "any(r -> r isa Test.Fail, ts.results)",
+              "getfield(ts, :n_passed)",
+              "Test.filter_errors(ts)",
+              # Spellings that route around a plain `Test.x`:
+              "import Test as T; T.CURRENT_TESTSET",
+              "const T = Test",
+              "getproperty(Test, :TESTSET_DEPTH)",
+              "getproperty(Test, :filter_errors)",
+              "using Test: Error as E",
+              "import Test.filter_errors",
+              "setfield!(ts, :results, [])"]
+    @test all(s -> !isempty(test_internals(Meta.parseall(s))), caught)
+    # ...and passes what the runner is allowed, including names that only appear in text.
+    allowed = ["r isa Test.Error || r isa Test.Fail",
+               "tc = Test.get_test_counts(ts); tc.cumulative_fails",
+               "err isa TestSetException || rethrow()",
+               "import Test; using Test: @testset, TestSetException",
+               "Test.@testset \"x\" begin end",
+               "# Test.CURRENT_TESTSET, in a comment\nx = 1",
+               "s = \"Test.Error( in a string\""]
+    @test all(s -> isempty(test_internals(Meta.parseall(s))), allowed)
+end
+
+@testset "what the runner reads from get_test_counts is still there" begin
+    # The runner totals an item through `Test.get_test_counts`, which the Test manual documents
+    # ("Creating Custom AbstractTestSet Types"). The `TestCounts` docstring lists the cumulative
+    # fields under the plain names (`passes`, `fails`, ... twice), so the four the runner reads
+    # are pinned by name.
+    @test hasmethod(Test.get_test_counts, Tuple{Test.DefaultTestSet})
+    @test issubset((:fails, :errors, :cumulative_fails, :cumulative_errors), fieldnames(Test.TestCounts))
+    # That the totals actually report a failure is checked end to end by the location probe in
+    # "Test runner: each item runs in its own @testset (#763)": exit 1, and both items listed.
+end
+
+end

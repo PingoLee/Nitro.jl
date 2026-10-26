@@ -5,11 +5,12 @@
 # what this suite uses:
 #
 #   collect.jl   parse files into items and setups; refuse anything it would not run faithfully
-#   execute.jl   run items sequentially, each in a fresh module, with captured output
+#   execute.jl   run items sequentially, each in a fresh module and its own `@testset`, with
+#                captured output
 #   watchdog.jl  the parent: one child process for the whole run, and a per-item timeout
 #
 # `test/runtests.jl` is the entry point and documents the CLI. This is test infrastructure: it
-# depends on `Test` and on `harness_manifest.jl` only, and nothing in `src/` may load it.
+# depends on `Test`, `Random` and `harness_manifest.jl` only, and nothing in `src/` may load it.
 #
 # Deliberately NOT here:
 #   * parallel items -- the suite shares the process-global `Nitro.CONTEXT[]`, so items in
@@ -23,6 +24,7 @@
 module NitroTestRunner
 
 using Test
+using Random
 
 include(joinpath(@__DIR__, "..", "harness_manifest.jl"))
 using .NitroTestHarness
