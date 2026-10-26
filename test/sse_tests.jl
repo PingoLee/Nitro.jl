@@ -7,11 +7,11 @@ import Nitro: App
 # Every wait in this file is a bounded `timedwait` whose sentinel is asserted, and NOT the
 # `while !eof(io)` loop this file used before #160.
 #
-# That is not style. CI runs the suite under coverage, which forces ReTestItems to `nworkers = 0`,
-# which makes `testitem_timeout` inert (#244) -- so an unbounded read against a stream the server
-# never closes hangs the CI leg until GitHub's job ceiling instead of failing at 600s. A hang is a
-# strictly worse outcome than a failure, and an SSE endpoint is the easiest thing in the suite to
-# hang on. Pattern follows test/middleware_cache_race_tests.jl.
+# That is not style. An unbounded read against a stream the server never closes hangs the item
+# until the runner's 600s watchdog stops the whole run, and every item after it goes unrun (until
+# #754 the coverage leg had no such ceiling at all, #244, and hung until GitHub's job limit). A
+# hang is a strictly worse outcome than a failure, and an SSE endpoint is the easiest thing in the
+# suite to hang on. Pattern follows test/middleware_cache_race_tests.jl.
 #
 # `sse_callback` is HTTP.jl's public client-side SSE reader: it hands us one parsed `SSEEvent` at a
 # time, and `close(stream)` from inside it stops consumption -- which is what lets the client bound
@@ -113,8 +113,8 @@ end
 # The producer is BOUNDED and PACED, and both matter.
 #
 # Bounded (`HEAD_EVENTS` iterations, not `while true`) because an open-ended producer reproduces
-# the real hang, and under CI coverage `nworkers = 0` makes `testitem_timeout` inert (#244) -- a
-# regression would take the whole leg down instead of failing.
+# the real hang, and a hang stops the whole run at the watchdog's timeout -- a regression would
+# take the whole leg down instead of failing one item.
 #
 # Paced because without a `sleep` the producer can run to completion before `_release_response_body!`
 # (which fires in `stream_handler`'s `finally`, after the whole chain unwinds) ever closes the

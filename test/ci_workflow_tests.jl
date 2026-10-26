@@ -168,13 +168,15 @@ end
 #
 # `julia-actions/julia-runtest` defaults its `coverage` input to `true`. ci.yml called it
 # with no `with:` block and gated only the processing and upload steps, so all eight matrix
-# jobs ran under `--code-coverage` while one published the result. `test/runtests.jl` sets
-# `nworkers = 0` whenever it is covering, and ReTestItems applies `testitem_timeout` only on
-# the worker path -- so no CI job had a per-item hang ceiling, the condition #84 closed.
+# jobs ran under `--code-coverage` while one published the result. Under ReTestItems that also
+# removed the per-item timeout from every job: a covering run had no worker process, and the
+# timeout was enforced only on one (#84). The runner that replaced it (#754) keeps the timeout
+# under coverage, so an ungated default now costs a slower matrix -- every job instrumenting
+# every line for a figure only one of them uploads -- rather than a missing ceiling.
 #
-# Nothing about that is visible from a green run: the suite passes exactly as before, it
-# just cannot be stopped if an item hangs. So the three conditions are asserted equal here,
-# against the shipped file, the same way the item above guards least privilege.
+# Nothing about that is visible from a green run: the suite passes exactly as before. So the
+# three conditions are asserted equal here, against the shipped file, the same way the item
+# above guards least privilege.
 
 const CI_SRC = let raw = read(joinpath(pkgdir(Nitro), ".github", "workflows", "ci.yml"), String)
     s = replace(raw, '﻿' => "", "\r\n" => "\n")
@@ -199,8 +201,7 @@ end
     @test occursin("matrix.", cond)
 
     # ...and it is the SAME job that processes and uploads coverage. If these drift, either
-    # the uploader finds no `.cov` files, or a second job is back under coverage with no
-    # timeout.
+    # the uploader finds no `.cov` files, or a second job runs under coverage for nothing.
     uploads = [strip(m[1]) for m in eachmatch(
         r"(?:julia-actions/julia-processcoverage|coverallsapp/github-action)@\S+[^\n]*\n\s+if:\s*(.+)",
         CI_SRC,

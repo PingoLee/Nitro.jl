@@ -74,8 +74,8 @@ try
     @testset "neither app touched the global singleton" begin
         # The point of the handle: no global mutation.
         #
-        # Asserted on a route UNIQUE to this item, not on "/". ReTestItems runs items in
-        # alphabetical file order, not `TEST_FILES` order, and `extractor_tests.jl` registers
+        # Asserted on a route UNIQUE to this item, not on "/". The suite runs files in
+        # lexical path order, not `TEST_FILES` order, and `extractor_tests.jl` registers
         # `path("/", …)` on the global context without resetting — so a "/" assertion here is
         # green only because `app_tests` sorts first, and would flip on a rename.
         @test internalrequest(HTTP.Request("GET", "/subtract/1/2")).status == 404

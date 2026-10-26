@@ -1,26 +1,25 @@
 #!/usr/bin/env julia
 #
-# smoke_test.jl — verify Nitro loads and serves, without ReTestItems.
+# smoke_test.jl — verify Nitro loads and serves, with nothing test-only.
 #
 # Why this exists.
 #
-# The `test/` suite is driven by ReTestItems, which is a *test-only* dependency
-# (`[extras]` / `[targets].test`). When ReTestItems cannot run on a given Julia
-# version, `Pkg.test()` fails before executing a single assertion — and Nitro then
+# The `test/` suite needs its whole test environment: the `[extras]` / `[targets].test`
+# packages (PormG, Aqua, ProtoBuf, Revise, ...). When one of them cannot load on a given
+# Julia version, `Pkg.test()` fails before executing a single assertion — and Nitro then
 # has zero verification on that version, even though nothing in `src/` is at fault.
 #
-# That is not hypothetical: ReTestItems v1.35.2 cannot run on Julia 1.13 at all
-# (`Test.TESTSET_PRINT_ENABLE` changed from `Ref{Bool}` to `ScopedValue{Bool}`, and
-# ReTestItems assigns to it), nor on 1.14-DEV (`@testsetup` cannot parse a `module`).
-# See the tracking issue for both.
+# That is not hypothetical. ReTestItems, the suite's runner until #754, could not run on
+# Julia 1.13 until v1.35.3, nor on 1.14-DEV (#112). The runner is Nitro's own now, but any
+# test-only dependency can lag a release the same way.
 #
 # So this script deliberately depends on NOTHING test-only. It is Nitro plus HTTP
 # plus stdlib, which is exactly the surface a consuming application has. It answers
 # the question the suite cannot: *does Nitro actually work on this Julia?*
 #
 # It is a smoke test, not a substitute for the suite. It should stay small and stay
-# green; when ReTestItems supports the version again, the real suite takes over and
-# this keeps serving as the fast "does it load and serve" check.
+# green; when the test environment loads on the version again, the real suite takes over
+# and this keeps serving as the fast "does it load and serve" check.
 #
 # Run:  julia --project=. .github/scripts/smoke_test.jl
 

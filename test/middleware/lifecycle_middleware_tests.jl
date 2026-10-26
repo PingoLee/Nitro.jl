@@ -453,8 +453,8 @@ Base.delete!(s::FlakyBucketStore, k)     = (delete!(s.inner, k); s)
     token = Ref(true)
     # Silence the loop's OWN logger, not the spawn expression: `@suppress_err` restores stderr
     # the moment `Threads.@spawn` hands back the Task, microseconds before the first tick, so
-    # it would leave all three deliberate `@error` lines (with backtraces) in the worker log.
-    # ReTestItems flushes that log when an item goes red — exactly when the one line that
+    # it would leave all three deliberate `@error` lines (with backtraces) in the item's log.
+    # The test runner prints that log when an item goes red — exactly when the one line that
     # matters must not be buried under failures the test caused on purpose.
     # `Base.CoreLogging`, not `using Logging`: Logging is not a declared test dependency, and
     # adding one for a null logger would trip the Aqua [compat] guard for no reason.
@@ -1002,7 +1002,7 @@ end # @testitem
 #
 #  1. The interrupt has to arrive in a task already parked in `wait(ctx.service)`, and
 #     `schedule(t, exc; error = true)` is documented as incorrect for a started, blocked task.
-#     Doing it anyway does not fail this item — it tears down the ReTestItems runner itself with
+#     Doing it anyway does not fail this item — it tears down the test runner itself with
 #     a `TaskFailedException`, which is how this comment came to be written.
 #  2. No IN-PROCESS test is honest, and the out-of-process one is not portable. A subprocess that
 #     opts in with `Base.exit_on_sigint(false)` WOULD reproduce it — that is a normal pattern for

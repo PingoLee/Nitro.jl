@@ -8,10 +8,10 @@ using Nitro
 # NOTE ON WHAT THIS TESTS, AND WHY IT IS NOT `__init__`.
 #
 # The bridge reaches `ENV["PORMG_ENV"]` from `NitroPormGExt.__init__`, but `__init__` runs
-# ONCE PER PROCESS and ReTestItems runs the whole suite in a single worker
-# (`nworkers = 1`, test/runtests.jl). `extensions/pormg_worker_tests.jl` already triggers the
-# extension load earlier in TEST_FILES, so by the time this item runs the module is loaded and
-# a second `using PormG` is a no-op. Driving `__init__` in-process would test nothing, and
+# ONCE PER PROCESS and the whole suite runs in one process (test/runtests.jl). Whether this
+# item would see the extension's first load depends on what ran before it in that process, and
+# once the module is loaded a second `using PormG` is a no-op. Driving `__init__` in-process
+# would test nothing, and
 # could not reach both branches (seeds-a-default vs. respects-a-pre-set-value) anyway.
 #
 # So the bridge logic lives in `sync_pormg_env!` -- a named function declared as a stub in

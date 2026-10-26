@@ -11,11 +11,10 @@
 # new test file BY PATH, so it passes locally whether or not it was ever registered. The
 # file is green in every check its author makes and absent from every check CI makes.
 #
-# The tag half is a weaker version of the same problem. ReTestItems does fail on a
-# zero-match filter (`NoTestException("No test items found.")`) -- #34 claimed it reported
-# success, and that is false -- but the message names neither the vocabulary nor the
-# AND/exact-match semantics, so `--tags workers` failed without ever hinting that
-# `:workers` was simply a tag nobody had applied.
+# The tag half is a weaker version of the same problem. A zero-match filter does fail, but a
+# bare "no test items" names neither the vocabulary nor the AND/exact-match semantics, so
+# `--tags workers` once failed without ever hinting that `:workers` was simply a tag nobody
+# had applied.
 #
 # Both guards read `harness_manifest.jl`, the same file `runtests.jl` reads, rather than
 # text-parsing `runtests.jl`. A regex over source would decide for itself what "the list"
@@ -31,7 +30,7 @@ const TEST_ROOT = joinpath(pkgdir(Nitro), "test")
     found  = discover_test_files(TEST_ROOT)
     listed = Set(TEST_FILES)
 
-    # A file that exists, looks like a test to ReTestItems, and appears in neither list is
+    # A file that exists, looks like a test file, and appears in neither list is
     # a test nobody runs. `UNLISTED_OK` is the escape hatch, and it is deliberately a
     # written-down decision rather than an accident.
     orphans = [f for f in found if f ∉ listed && f ∉ UNLISTED_OK]
@@ -70,7 +69,7 @@ end
 
         # #297: the old walk pruned `walkdir`'s yielded `dirs` with `filter!`, while
         # `walkdir`'s own producer task iterated that same vector. Harmless on one thread;
-        # once the consumer MIGRATES (ReTestItems runs items in spawned tasks) the two ran
+        # once the consumer MIGRATES (the runner runs items in spawned tasks) the two ran
         # in parallel, and the walk either descended into `.helpers/` or died with
         # `UndefRefError`.
         #
@@ -135,22 +134,16 @@ end
     @test untagged == String[]
 end
 
-@testset "the selection rule matches ReTestItems' semantics" begin
-    # `selects` is what `test/runtests.jl` uses to decide whether a filter would select
-    # nothing, and it has to agree with what ReTestItems will then actually run. Before
-    # #214 that rule was an inline loop in the coordinator, which no test could reach --
-    # so "the replica drifted from the real filter" was a defect with no guard at all,
-    # and #214's own sketch called teaching the replica about exclusion "the half that is
-    # easy to miss".
+@testset "the selection rule's semantics" begin
+    # `selects` is the rule the run selects items with (`select_items`, in
+    # `test/runner/collect.jl`). Before #214 that rule was an inline loop in the
+    # coordinator, which no test could reach -- so "the replica drifted from the real
+    # filter" was a defect with no guard at all, and #214's own sketch called teaching the
+    # replica about exclusion "the half that is easy to miss".
     #
-    # Asserted against the DOCUMENTED semantics with synthetic items rather than by
-    # calling `ReTestItems.TestItemFilter`, for the same reason `testitems` and
-    # `skip_macros` are reimplemented: a guard on the suite must not depend on a private
-    # function of the package it is guarding. The three references are
-    # `ReTestItems/src/filtering.jl`:
-    #   `_shouldrun(tags::AbstractVector{Symbol}, ti) = issubset(tags, ti.tags)`
-    #   `_shouldrun(name::AbstractString, ti)         = name == ti.name`
-    #   `(f::TestItemFilter)(ti) = f.shouldrun(ti) && _shouldrun(f.tags, ti) && ...`
+    # Asserted against the DOCUMENTED semantics with synthetic items. They are the semantics
+    # ReTestItems' filter had, which the suite's tags and the CLI were written against:
+    #   tags  `issubset(tags, item.tags)`;  name  `name == item.name`;  all clauses ANDed.
 
     # No filter at all selects everything, including an untagged item.
     @test selects("anything", [:core])
@@ -217,8 +210,8 @@ end
     # nothing more. Named items rather than counts: a count drifts with every test added,
     # whereas these two names are the receipt for the split.
     #
-    # Looked up by scanning, NOT through a `Dict`. ReTestItems enforces unique item names
-    # only WITHIN a file (`testitem_names` is per `FileNode`), so a cross-file duplicate
+    # Looked up by scanning, NOT through a `Dict`. The runner enforces unique item names
+    # only WITHIN a file (`test/runner/collect.jl`), so a cross-file duplicate
     # is legal and a `Dict` would silently keep the last one -- checking an item that has
     # nothing to do with #210's split, and reporting a failure that points at the wrong
     # file. Asserting the match is unique keeps the receipt honest instead.
@@ -295,11 +288,11 @@ end
 end
 
 @testset "the coordinator guards are still installed" begin
-    # `test/runtests.jl`'s three guards cannot be @testitems by construction -- ReTestItems
-    # applies `--tags`/`--name` at AST level while including each file, so a guard item
-    # would be removed by the very filter it exists to catch, and `validate_paths` is a
-    # keyword on the `runtests` call itself. They are therefore verified by invocation,
-    # by hand, and nothing would notice if one were deleted.
+    # `test/runtests.jl`'s guards cannot be @testitems by construction -- the run applies
+    # `--tags`/`--name` before any item runs, so a guard item would be removed by the very
+    # filter it exists to catch, and the path and flag checks run before there is a run at
+    # all. Their behaviour is verified by invocation (`test/runner_tests.jl` covers the
+    # runner's half); this testset checks that nothing deleted them.
     #
     # These are text assertions against the shipped file -- the same technique
     # `ci_workflow_tests.jl` and `docs_deploy_tests.jl` use, and for the same reason: the
@@ -318,18 +311,29 @@ end
     # Cf and NOT matched by `\s`, so the first comment line survives `^\s*#` and leaks into
     # `body`. Harmless for today's patterns, but a future assertion whose text happened to
     # appear in that leading comment would pass falsely.
-    src  = replace(read(joinpath(pkgdir(Nitro), "test", "runtests.jl"), String), '﻿' => "")
-    body = join(filter(l -> !occursin(r"^\s*#", l), split(src, '\n')), '\n')
+    strip_comments(path) = join(filter(l -> !occursin(r"^\s*#", l),
+                                       split(replace(read(path, String), '﻿' => ""), '\n')), '\n')
+    body   = strip_comments(joinpath(pkgdir(Nitro), "test", "runtests.jl"))
+    # The runner's collection half, where the path check and the shared selection rule live.
+    runner = strip_comments(joinpath(pkgdir(Nitro), "test", "runner", "collect.jl"))
 
     # Without this, a mistyped path is warned-and-dropped and the run still reports success
     # having never executed the file you named. That is the genuinely silent zero-test hole
-    # (#34); ReTestItems defaults it to `false`. One spelling, so anchor on it directly.
-    @test occursin(r"validate_paths\s*=\s*true", body)
+    # (#34); ReTestItems' default was exactly that. The launcher must route every path through
+    # `resolve_paths`, and `resolve_paths` must THROW on a missing one -- anchored on the call
+    # and on the message, one spelling each.
+    @test occursin(r"\bresolve_paths\(\s*paths\s*\)", body)
+    @test occursin("No such test path", runner)
 
-    # `--workers N > 1` gives each process its own `CONTEXT[]`. Anchored on the refusal
-    # message rather than on `nworkers > 1`, per the note above.
-    @test occursin("is not supported", body)
-    @test occursin("Use `--workers 0`", body)
+    # `--workers` used to choose a worker-process count, and `N > 1` gave each process its own
+    # `CONTEXT[]` (#34). It is refused by name now, and the refusal must keep pointing at
+    # `--in-process`. Anchored on the message rather than on the condition, per the note above.
+    @test occursin("`--workers` was removed", body)
+    @test occursin("Use `--in-process`", body)
+
+    # An unrecognised flag is refused rather than dropped -- the same fail-open as a dangling
+    # value, from the other direction.
+    @test occursin("Unknown option", body)
 
     # The unknown-tag layer of the filter guard. NOT anchored on `KNOWN_TAGS`: that string
     # also appears in the `using .NitroTestHarness: ...` import at the top of the file,
@@ -347,27 +351,25 @@ end
     @test occursin("\"--skip-tags\"", body)
 
     # THE load-bearing token, and the one the rest of this file cannot see (#214). The
-    # feature is one positional argument: delete `shouldrun,` from the `runtests(` call
-    # and everything else survives -- the flag still parses, the guards still fire, every
+    # feature is one keyword argument: drop `skip_tags` from the `select_items(` call and
+    # everything else survives -- the flag still parses, the guards still fire, every
     # `selects` unit assertion still passes -- while `--skip-tags network` silently runs
     # the whole suite, sockets and all, and exits 0. That is the exact fail-open this
     # flag's own validation exists to prevent, arrived at from the other direction.
-    #
-    # `shouldrun` is ReTestItems' parameter name and the POSITIONAL SLOT is the contract,
-    # so this is one spelling in the `validate_paths = true` sense, not a condition with
-    # many equivalent forms.
-    @test occursin(r"runtests\(\s*shouldrun\s*,", body)
+    # (`test/runner_tests.jl` checks that `select_items` honours it.)
+    @test occursin(r"\bselect_items\([^)]*\bskip_tags\b", body)
+    # ...and the selection is what RUNS. Handing `run_items` the collected `items` instead of
+    # `selected` would drop every filter while each anchor above stayed green.
+    @test occursin(r"\bselected\s*=\s*NitroTestRunner\.select_items\(", body)
+    @test occursin(r"\brun_items\(\s*selected\s*,", body)
 
-    # The launcher's zero-selection replica must call the SHARED rule rather than inline
-    # its own. Inlining it again is how `--tags` and `--skip-tags` drift apart: the guard
-    # would count items by one rule and ReTestItems run them by another, so a valid filter
-    # gets refused or a doomed one gets through to a bare `No test items found.`.
+    # The selection must call the SHARED rule rather than inline its own. Inlining it again
+    # is how `--tags` and `--skip-tags` drift apart: `harness_tests.jl` would pin one rule
+    # and the run would apply another.
     #
-    # `\bselects\(` and not `selects`: the bare name also appears in the
-    # `using .NitroTestHarness: ...` import at the top of runtests.jl, which survives
-    # deleting the entire guard -- the same green theater this testset already avoids with
-    # `KNOWN_TAGS`. Only the CALL form discriminates.
-    @test occursin(r"\bselects\(", body)
+    # `\bselects\(` and not `selects`: only the CALL form discriminates -- the bare name can
+    # survive in an import or a docstring after the call is gone.
+    @test occursin(r"\bselects\(", runner)
 
     # A recognised flag with no value must be refused, not dropped. Dropping `--skip-tags`
     # is fail-open in the same way a mistyped one is: nothing is excluded and the run
@@ -376,7 +378,7 @@ end
 
     # The both-lists diagnosis. Exclusion winning is the BEHAVIOUR (`issubset` demands the
     # tag, `isdisjoint` forbids it, so the selection is empty by construction, and
-    # "the selection rule matches ReTestItems' semantics" above asserts that directly).
+    # "the selection rule's semantics" above asserts that directly).
     # What this anchors is that the caller is TOLD so by name, instead of being handed the
     # generic "selects 0 test items, maybe a typo?" message, which is actively misleading
     # for a filter that is spelled correctly and simply contradicts itself.

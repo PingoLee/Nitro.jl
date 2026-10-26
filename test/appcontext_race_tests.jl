@@ -35,8 +35,8 @@ tenant_b = Tenant("B")
 # Refs the handler dereferences at call time; each installs fresh ones via `fresh_latches!`.
 #
 # `parked` is a Channel rather than an Event so the test can wait on it with a TIMEOUT. A test
-# that hangs is strictly worse than one that fails: `runtests.jl`'s `testitem_timeout` covers
-# the default worker path but not `--workers 0`, so a handler that never reaches `put!` (route
+# that hangs is strictly worse than one that fails: the runner's per-item timeout stops the
+# whole run, and `--in-process` has none, so a handler that never reaches `put!` (route
 # gone, 404, a throw before this line) would otherwise wedge the run instead of reporting.
 # Capacity > 1 deliberately: nothing ever drains this channel, so a second entry into `/park`
 # within one testset would block forever on `put!` — and `notify(release[])` cannot rescue a

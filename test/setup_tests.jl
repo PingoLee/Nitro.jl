@@ -459,8 +459,8 @@ end
     report(r)
 
 Print a child's whole stdout and stderr unless it ran cleanly. A timed-out child's stderr
-carries its SIGQUIT task dump. Under the suite's non-interactive `logs = :issues`, ReTestItems
-shows an item's output only when the item fails, so this costs a green run nothing.
+carries its SIGQUIT task dump. The test runner shows an item's captured output only when the
+item fails, so this costs a green run nothing.
 """
 function report(r)
     clean = !r.timed_out && r.exitcode == 0 && r.termsignal == 0 && occursin("RESULT", r.out)
