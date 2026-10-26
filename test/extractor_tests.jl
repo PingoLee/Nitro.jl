@@ -1264,7 +1264,10 @@ const E = Nitro.Core.Extractors
 
 # Fresh types nothing else in the process binds, so every specialization found is this item's own.
 # `Kw508`'s last two fields are the field-level case: a field's type takes one of the same two
-# parses, and is just as unknown to the compiler.
+# parses, and is just as unknown to the compiler. `Vector{String}` is the exception, and on
+# purpose: no path anywhere should compile a keyword walk for it, so its assertion holds for the
+# whole process. The `--shuffle` sweep (#755) found one that did, the `Claims{T}` refusal path,
+# whenever its item happened to run before this one.
 struct Inner508; x::Int; end
 Base.@kwdef struct Kw508
     id::Int = 0
@@ -1320,6 +1323,59 @@ end
 
 end
 
+
+# -- #755 -----------------------------------------------------------------------------------
+#
+# The `Claims{T}` twin of #508. Naming the claim a refusal is about binds each field on its own
+# (`claims_field_bind`), and it chose the parse as a TYPE, `binds_by_keyword(FT) ? KwdefBind{FT} :
+# FT`, so `make` was compiled for both: every plain claim field also compiled a keyword walk it
+# never takes. Found by `--shuffle`: the #508 item's `Vector{String}` assertion went red whenever
+# the `Claims{T}` item ran first.
+@testitem "a Claims{T} refusal compiles only the parse each field takes (#755)" tags=[:core, :auth] setup=[NitroCommon] begin
+
+using Test
+using JSON
+using Nitro
+
+const E = Nitro.Core.Extractors
+
+# Fresh types, so whatever specialization is found is this item's own, in any order.
+struct Scope755; name::String; end
+@kwdef struct Limits755; rps::Int = 10; end
+@kwdef struct Claims755
+    sub::String
+    scope::Scope755 = Scope755("read")
+    limits::Limits755 = Limits755()
+    org::Int = 0
+end
+
+function makes(target)
+    found = Any[]
+    for m in methods(JSON.StructUtils.make), mi in Base.specializations(m)
+        mi === nothing && continue
+        sig = Base.unwrap_unionall(mi.specTypes)
+        length(sig.parameters) == 4 && sig.parameters[3] === Type{target} &&
+            push!(found, sig.parameters[4])
+    end
+    return found
+end
+
+# Every field has a claim that binds, until `org`, which does not: the walk binds each field in
+# turn, and the refusal names the first one that fails.
+claims = Dict{String, Any}("sub" => "u", "scope" => Dict{String, Any}("name" => "write"),
+                           "limits" => Dict{String, Any}("rps" => 5), "org" => "acme")
+@test E.claims_mismatch(Claims755, claims) == "claim 'org' is not of type Int64"
+
+@testset "a plain field compiles its own parse and not the keyword walk" begin
+    @test !isempty(makes(Scope755))
+    @test isempty(makes(E.KwdefBind{Scope755}))
+end
+
+@testset "a @kwdef field compiles the keyword walk" begin
+    @test !isempty(makes(E.KwdefBind{Limits755}))
+end
+
+end
 
 # -- #577 -----------------------------------------------------------------------------------
 #

@@ -330,4 +330,154 @@ function skip_macros(path)
     return out
 end
 
+# ── Bare global-API calls: a ratchet (#755) ───────────────────────────────────────────
+#
+# A call that reaches the process-wide `CONTEXT[]` app is how one test item leaks routes,
+# middleware or a running server into the next, and that makes the suite pass only in some
+# orders. `App` (#31) is the cure: an item that builds its own and uses the `(app, …)` forms
+# cannot be reached by a neighbour. `global_api_calls` counts the calls that WRITE to the
+# global app, by their argument-less spelling:
+#
+#   * `urlpatterns("…", …)` and `router("…")` -- a string literal where the `App` goes;
+#   * `serve(…)` and `worker_startup(…)` with no positional argument;
+#   * `staticfiles`/`spafiles`/`dynamicfiles` with one or two positional arguments (the
+#     `App` form is written with all three);
+#   * `configcookies(…)` with no positional argument, or a `Dict(…)` literal;
+#   * `CONTEXT[]` -- the singleton itself.
+#
+# Syntax cannot see types, so two spellings slip through: a prefix or a `Dict` held in a
+# variable (`urlpatterns(p, …)`, `configcookies(d)`) reads as the `App` form. Write the
+# literal. The readers -- `terminate()`, `internalrequest(req)`, `url`, `getexternalurl` --
+# are not counted: they see only what a counted call put there.
+#
+# This is the guard that matters for leaks through the global app: the per-item reset in
+# `test/runtests.jl` means `--shuffle` no longer sees them.
+#
+# `GLOBAL_API_BASELINE` is how many of them each `TEST_FILES` entry holds today, and
+# `test/harness_tests.jl` asserts every file matches its number EXACTLY (a file not listed
+# here must hold none). Exact rather than "at most", so the number cannot drift: a new bare
+# call fails, and so does a migration that forgets to lower the baseline. The counts only go
+# down.
+#
+# Two kinds of entry, and only the first is permanent:
+#
+#   * the files that TEST the argument-less convenience layer -- `src/methods.jl`'s global
+#     methods, `resetstate`, the singleton `serve`/`terminate` -- and `original_tests.jl`,
+#     the retained Oxygen suite, whose style is kept. The global app is what they are
+#     about, and the cleanup net hands each of them a fresh one;
+#   * everything else, which is debt. The per-item cleanup net in `test/runtests.jl` resets
+#     the global app after every item, so these calls no longer leak into a neighbour, and
+#     they are not rewritten for their own sake. They are still debt: an item that serves
+#     on the singleton tests the convenience layer by accident, never `App`, and is one
+#     missing reset away from a leak again. An item that is rewritten moves to an explicit
+#     `App` and lowers its file's number; a file leaves the list at zero.
+const GLOBAL_API_BASELINE = Dict{String, Int}(
+    # Permanent: the convenience layer, and the retained Oxygen suite.
+    "app_tests.jl"                         => 3,   # CONTEXT[] untouched by an explicit App
+    "appcontext_race_tests.jl"             => 5,   # the global app under concurrency
+    "cookies_tests.jl"                     => 14,  # argument-less cookie helpers (#308)
+    "original_tests.jl"                    => 10,
+    "server_lifecycle_tests.jl"            => 5,   # the singleton serve guard
+    "workers_tests.jl"                     => 5,   # bare worker_startup (#322)
+    # Debt: lower the number when the file moves to an explicit App.
+    "appcontext_tests.jl"                  => 4,
+    "environment_tests.jl"                 => 2,
+    "extensions/templating_tests.jl"       => 1,
+    "extensions/timezone_tests.jl"         => 2,
+    "extractor_tests.jl"                   => 1,
+    "handler_tests.jl"                     => 2,
+    "max_body_bytes_tests.jl"              => 6,
+    "middleware/authmiddleware_tests.jl"   => 2,
+    "middleware/cors_middleware_tests.jl"  => 10,
+    "middleware/ratelimitter_lru_tests.jl" => 9,
+    "middleware/ratelimitter_tests.jl"     => 10,
+    "middleware_tests.jl"                  => 1,
+    "parallel_tests.jl"                    => 4,
+    "path_prefix_tests.jl"                 => 2,
+    "revise_test.jl"                       => 5,
+    "routing_tests.jl"                     => 8,
+    "scenarios/thunderingherd_test.jl"     => 2,
+    "server_show_tests.jl"                 => 2,
+    "session_tests.jl"                     => 13,
+    "spa_tests.jl"                         => 7,
+    "staticfiles_security_tests.jl"        => 43,
+    "streaming_tests.jl"                   => 2,
+    "websocket_tests.jl"                   => 2,
+)
+
+# The callee's own name for `f(...)` and `Mod.f(...)`; `nothing` for anything else.
+_calleename(x::Symbol) = x
+_calleename(x::Expr) = (x.head === :. && length(x.args) == 2 && x.args[2] isa QuoteNode) ?
+                       x.args[2].value : nothing
+_calleename(::Any) = nothing
+
+# The leftmost module of `A.B.f`, so `HTTP.serve` is not mistaken for Nitro's.
+_rootname(x::Symbol) = x
+_rootname(x::Expr) = x.head === :. ? _rootname(x.args[1]) : nothing
+_rootname(::Any) = nothing
+
+# Positional arguments of a call expression: neither `;`-parameters nor `k = v` keywords.
+_positional(e::Expr) = [a for a in e.args[2:end]
+                        if !(a isa Expr && a.head in (:parameters, :kw))]
+
+# A string literal, interpolated or not. An `App` is never one, so a string where the `App`
+# goes marks the argument-less form.
+_stringish(x) = x isa String || (x isa Expr && x.head === :string)
+
+# Whether a call to `nm` with positional arguments `pos` is the argument-less form.
+function _bare_call(nm::Symbol, pos::Vector)
+    nm in (:serve, :worker_startup) && return isempty(pos)
+    nm === :urlpatterns && return !isempty(pos) && _stringish(pos[1])
+    nm === :router && return isempty(pos) || _stringish(pos[1])
+    # `staticfiles(folder, mount)` and `staticfiles(app, folder)` parse alike, so two
+    # positional arguments count as the global form: spell the `App` form with its mount,
+    # `staticfiles(app, folder, "static")`, as every test does.
+    nm in (:staticfiles, :spafiles, :dynamicfiles) && return length(pos) in (1, 2)
+    # `configcookies(Dict(…))` is the global form; a `Dict` held in a variable reads as an `App`.
+    if nm === :configcookies
+        isempty(pos) && return true
+        length(pos) == 1 && pos[1] isa Expr && pos[1].head === :call || return false
+        f = pos[1].args[1]
+        return f === :Dict || (f isa Expr && f.head === :curly && f.args[1] === :Dict)
+    end
+    return false
+end
+
+"""
+    global_api_calls(src::AbstractString) -> Vector{Tuple{Symbol, Int}}
+
+Every bare global-API call in the source text `src`, as `(kind, line)`: `kind` is the
+callee's name (`:urlpatterns`, `:serve`, `:router`, `:staticfiles`, `:spafiles`,
+`:dynamicfiles`, `:configcookies`, `:worker_startup`) or `:CONTEXT`. An AST walk, so
+comments, strings and docstrings that mention the calls are not counted. See
+`GLOBAL_API_BASELINE`.
+"""
+function global_api_calls(src::AbstractString)
+    out = Tuple{Symbol, Int}[]
+    line = 0
+    function walk(e)
+        e isa Expr || return
+        # A method definition's signature parses as a `:call` too; walk only its body, so a
+        # local helper named `serve` is not read as a call to Nitro's.
+        if (e.head === :function || (e.head === :(=) && e.args[1] isa Expr &&
+                                     e.args[1].head in (:call, :where))) && length(e.args) == 2
+            return walk(e.args[2])
+        end
+        if e.head === :call && !isempty(e.args)
+            nm = _calleename(e.args[1])
+            if nm isa Symbol && _rootname(e.args[1]) !== :HTTP && _bare_call(nm, _positional(e))
+                push!(out, (nm, line))
+            end
+        elseif e.head === :ref && length(e.args) == 1 && _calleename(e.args[1]) === :CONTEXT
+            push!(out, (:CONTEXT, line))
+        end
+        for a in e.args
+            a isa LineNumberNode && (line = a.line)
+            walk(a)
+        end
+    end
+    walk(Meta.parseall(src))
+    return out
+end
+
 end # module NitroTestHarness

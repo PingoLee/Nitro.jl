@@ -13,11 +13,12 @@
 # depends on `Test`, `Random` and `harness_manifest.jl` only, and nothing in `src/` may load it.
 #
 # Deliberately NOT here:
-#   * parallel items -- the suite shares the process-global `Nitro.CONTEXT[]`, so items in
-#     separate processes see different routers (#34). #755 removes that dependency first.
+#   * parallel items -- decided on #755: processes side by side would share ports, pkgimages
+#     and the temp directory, and the allocation and warmth probes need a quiet machine. The
+#     `--workers` refusal in `test/runtests.jl` records it.
 #   * retries -- a retried item is a flake nobody files.
-#   * a process per item -- a package load per item, and it would change what the items that
-#     still depend on their predecessors see.
+#   * a process per item -- a package load per item, and the compile-state probes measure what
+#     the items before them left compiled, which is the run that was asked for.
 #   * a restart after a timeout -- for the same reason: the items after a hung one would run in
 #     a fresh process, which is not the run that was asked for.
 

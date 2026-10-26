@@ -147,9 +147,12 @@ using .NitroTestRunner.NitroTestHarness: TEST_FILES, KNOWN_TAGS
 #
 #   julia --project=. test/runtests.jl --shuffle 1234
 #
-# Not yet a gate: several items mutate the global router and never reset it, so a red here
-# can be an order dependence rather than a regression. #755 removes that and puts this
-# check in CI; until then it is run by hand, and a seed that fails is a finding for #755.
+# Shuffles the file order, then the item order within each file, from the printed seed. The
+# suite is meant to pass in ANY order with the same item and assertion counts (#755): a seed
+# that fails is a test that depends on a neighbour, and that is a bug in the test -- or, as
+# the #755 sweep found once, in Nitro. `--shuffle <seed>` with the printed seed reproduces it.
+# Leaks through the global app are the exception: the per-item reset below hides them from a
+# shuffle, so `GLOBAL_API_BASELINE` (test/harness_manifest.jl) is what catches those.
 #
 # ── Without the watchdog: debugging, or a REPL ────────────────────────────────
 #
@@ -160,11 +163,12 @@ using .NitroTestRunner.NitroTestHarness: TEST_FILES, KNOWN_TAGS
 # `--in-process` -- one code path, not two.
 #
 # THE RUN ORDER is lexical by path (`app_tests.jl` first, a directory's files where the
-# directory sorts), and items in source order -- which is what ReTestItems did, and therefore
-# the order this suite has always passed in. It is NOT the order of `TEST_FILES`, whatever
-# older comments said: that list is the set of files the harness checks for completeness. Order
-# still matters, because several items mutate the global Nitro router via `urlpatterns(...)`
-# and never reset it, which is why the run is one process and `--shuffle` is not a gate yet (#755).
+# directory sorts), and items in source order -- which is what ReTestItems did. It is a
+# default, not a dependency: `--shuffle` checks that any order passes (#755). It is NOT the
+# order of `TEST_FILES` either: that list is the set of files the harness checks for
+# completeness. What keeps it that way is an explicit `App` per item; `test/harness_tests.jl`
+# holds the bare global-API calls that remain (`GLOBAL_API_BASELINE`) to a number that only
+# goes down.
 
 
 # ── Per-item cleanup net ───────────────────────────────────────────────────────
@@ -180,16 +184,37 @@ using .NitroTestRunner.NitroTestHarness: TEST_FILES, KNOWN_TAGS
 # `terminate()` is a cheap no-op when nothing is serving. Items that use their own
 # `App` are NOT covered by this (it only reaches the global
 # `CONTEXT[]`) and must still clean up after themselves.
+#
+# Then `resetstate()`, so every item starts from a fresh global app whatever ran before it
+# (#755). An item that registers routes or middleware on `CONTEXT[]` -- the argument-less
+# `urlpatterns("…", …)`, `serve(; …)` -- used to leave them for the rest of the run, and a
+# later item could pass only because of them. It also resets the default worker runtime.
+# Not after a failed `terminate()`: the server it could not stop is reachable only through
+# this app, and a fresh one would orphan it.
 const TEST_END = quote
     using Nitro
     # Swallow-and-report, never rethrow. An exception raised here must not REPLACE the item's
     # own failure -- you would be told the cleanup broke and never learn which assertion did.
     # Cleanup is best-effort by definition; the item's result is the signal. (The runner adds
     # the same guard around this whole block, so a throw that escapes it is logged too.)
-    try
+    # Reported to `report_io()`: this runs inside the item's capture, which a pass deletes.
+    report = Main.NitroTestRunner.report_io()
+    stopped = try
         Nitro.terminate()
+        true
     catch err
-        @error "TEST_END: terminate() failed; a later :network item may hit a bound port" exception=err
+        println(report, "TEST_END: terminate() failed; a later :network item may hit a bound port, ",
+                "and resetstate() is skipped, so the global app's routes carry into the next item: ",
+                sprint(showerror, err))
+        false
+    end
+    if stopped
+        try
+            Nitro.resetstate()
+        catch err
+            println(report, "TEST_END: resetstate() failed; the next item may see this one's routes: ",
+                    sprint(showerror, err))
+        end
     end
 end
 
@@ -291,14 +316,20 @@ let args = copy(ARGS)
         elseif a == "--workers"
             # Refused by name, not as an unknown flag, because it used to mean something.
             # ReTestItems ran items on worker PROCESSES, and `--workers N > 1` was already
-            # refused (#34): each process gets its own `Nitro.CONTEXT[]`, and this suite's
-            # isolation is still one shared, accumulating router. The runner now always uses
-            # exactly one child process, so there is no count left to choose, and the old
-            # `--workers 0` (in-process, no timeout) is spelled `--in-process`.
+            # refused (#34). The runner now always uses exactly one child process, so there is
+            # no count left to choose, and the old `--workers 0` (in-process, no timeout) is
+            # spelled `--in-process`.
+            #
+            # Order independence (#755) did not bring parallel processes back, by decision.
+            # It shows that no item depends on what ran BEFORE it; items running AT THE SAME
+            # TIME in several processes is a different property. They would share the machine's
+            # ports, the depot's pkgimages, the temp directory, and the allocation and warmth
+            # probes' quiet. Several items bind real sockets and time compiles, so the gain
+            # would be paid for in flakes.
             error(
                 "`--workers` was removed with ReTestItems (#754).\n\n" *
                 "Every run uses one child process under a timeout watchdog. Items cannot run in\n" *
-                "several processes: they share one process-global `Nitro.CONTEXT[]` (#34, #755).\n\n" *
+                "several processes: they would share ports, pkgimages and the temp directory (#34, #755).\n\n" *
                 "Use `--in-process` to run without the watchdog (no per-item timeout)."
             )
         elseif startswith(a, "--")

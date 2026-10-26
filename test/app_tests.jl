@@ -74,10 +74,9 @@ try
     @testset "neither app touched the global singleton" begin
         # The point of the handle: no global mutation.
         #
-        # Asserted on a route UNIQUE to this item, not on "/". The suite runs files in
-        # lexical path order, not `TEST_FILES` order, and `extractor_tests.jl` registers
-        # `path("/", …)` on the global context without resetting — so a "/" assertion here is
-        # green only because `app_tests` sorts first, and would flip on a rename.
+        # The runner resets the global app after every item (#755), so this item starts from a
+        # fresh one in any order. Before that reset, `original_tests.jl`'s `/add/{a}/{b}` on the
+        # global app turned this red under `--shuffle`.
         @test internalrequest(HTTP.Request("GET", "/subtract/1/2")).status == 404
         @test internalrequest(HTTP.Request("GET", "/add/1/2")).status == 404
     end
