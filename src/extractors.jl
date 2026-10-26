@@ -891,8 +891,13 @@ function claims_mismatch(::Type{T}, claims::Dict{String, Any}) :: String where {
     return "the claims do not bind to $T"
 end
 
+# The same two parses as `bind_field!`, behind the same barrier. Choosing the TYPE with a ternary
+# handed `make` a union, so every claim field compiled the keyword walk too, plain or not (#755).
+# The value is a decoded claim, not JSON text, so `make` reports no position: assert on the value.
 claims_field_bind(::Type{FT}, value) where {FT} =
-    first(_SU.make(NITRO_READ_STYLE, binds_by_keyword(FT) ? KwdefBind{FT} : FT, value))
+    binds_by_keyword(FT) ?
+        first(Base.inferencebarrier(KwdefBind{FT}())(NITRO_READ_STYLE, value)) :: FT :
+        first(_SU.make(NITRO_READ_STYLE, FT, value))
 
 """
 Extracts a cookie from a request and converts it into a custom type.
