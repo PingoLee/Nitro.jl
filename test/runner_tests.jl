@@ -368,8 +368,8 @@ function tree(files::Pair...)
     return dir
 end
 
-function probe(args...; limit = 180)
-    cmd = `$(Base.julia_cmd()) --code-coverage=none --startup-file=no --project=$(Base.active_project()) $PROBE $args`
+function probe(args...; limit = 180, env = ())
+    cmd = addenv(`$(Base.julia_cmd()) --code-coverage=none --startup-file=no --project=$(Base.active_project()) $PROBE $args`, env...)
     out = IOBuffer()
     p = run(pipeline(ignorestatus(cmd); stdout = out, stderr = out); wait = false)
     killer = Timer(_ -> process_running(p) && kill(p, Base.SIGKILL), limit)
@@ -446,6 +446,28 @@ end
     # A Broken result is not a failure: the third item is not listed.
     @test occursin("2 of 3 test items did not pass:\n  \"throws outside a test\" at loc_tests.jl:1\n" *
                    "  \"fails a test\" at loc_tests.jl:6\n\n", r.out)
+    r.code == 1 || println(r.out)
+end
+
+@testset "a stop that gets past an item's test set ends the run, and names the item" begin
+    # `@testset` passes on an `InterruptException` and a fail-fast stop instead of recording
+    # them. Either must end the run where it happened, with no COMPLETE event, as a crash would --
+    # not be recorded by the file's test set and run past. Fail-fast is the one a probe can
+    # provoke deterministically.
+    dir = tree("ff_tests.jl" => """
+        @testitem "first red" begin
+            @test 1 == 2
+        end
+
+        @testitem "never reached" begin
+            @test true
+        end
+        """)
+    r = probe(dir, "--watch", "60"; env = ("JULIA_TEST_FAILFAST" => "true",))
+    @test r.code == 1
+    @test occursin("ended before the run did", r.out)
+    @test occursin("during test item \"first red\" at ff_tests.jl:1", r.out)
+    @test !occursin("START (2/2)", r.out)
     r.code == 1 || println(r.out)
 end
 

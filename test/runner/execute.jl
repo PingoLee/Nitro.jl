@@ -115,14 +115,6 @@ function run_test_end(ctx::RunContext, it::TestItem)
     return nothing
 end
 
-# Make `ts` the current test set the way `@testset` does, but WITHOUT `@testset`'s reset of the
-# global RNG on entry. ReTestItems never reseeded per item either, so an item that draws from
-# the default RNG gets a fresh draw rather than the same one as every other item.
-function with_testset(f, ts::Test.AbstractTestSet)
-    Base.ScopedValues.with(f, Test.CURRENT_TESTSET => ts,
-                           Test.TESTSET_DEPTH => Test.get_testset_depth() + 1)
-end
-
 # Whether a finished test set, or any set nested in it, holds a `Fail` or an `Error`. Read
 # through `get_test_counts`, the documented way to total a test set (the Test manual's "Creating
 # Custom AbstractTestSet Types"), not through `DefaultTestSet`'s fields. The four field names
@@ -204,6 +196,32 @@ function run_item(ctx::RunContext, it::TestItem)
     return fetch(task)::Test.AbstractTestSet
 end
 
+# Item `i` of `n`, with its events, progress lines and captured output. `@testset` has already
+# recorded it into its file's test set by the time `run_item` returns.
+function _run_listed!(failed::Vector{TestItem}, ctx::RunContext, it::TestItem, i::Int, n::Int,
+                      capture_dir::AbstractString)
+    what = "test item $(repr(it.name)) at $(it.relfile):$(it.line)"
+    emit_event(capture_dir, "START $i $what")
+    _progress("START ($i/$n) $what")
+    logfile = joinpath(capture_dir, "$i.log")
+    t0 = time()
+    ts = open(io -> with_capture(() -> run_item(ctx, it), io), logfile, "w")
+    bad = _failed(ts)
+    _progress("DONE  ($i/$n) test item $(repr(it.name)) " *
+              "$(round(time() - t0; digits = 2)) secs" * (bad ? " -- FAILED" : ""))
+    if bad
+        push!(failed, it)
+        io = report_io()
+        println(io, "\n── Captured output of test item $(repr(it.name)) at $(it.relfile):$(it.line) ──")
+        write(io, read(logfile))
+        println(io, "── End of captured output of $(repr(it.name)) ──\n")
+        flush(io)
+    end
+    rm(logfile; force = true)
+    emit_event(capture_dir, "DONE $i")
+    return nothing
+end
+
 """
     run_items(items, setups; imports, test_end, name) -> Int
 
@@ -227,53 +245,50 @@ function run_items(items::Vector{TestItem}, setups::Dict{Symbol,TestSetup};
     ctx = RunContext(imports, test_end, setups, Dict{Symbol,Module}(), Dict{Symbol,String}())
     n = length(items)
     failed = TestItem[]
-    root = Test.DefaultTestSet(name)
-    with_testset(root) do
-        i = 0
-        while i < n
-            file = items[i+1].file
-            fts = Test.DefaultTestSet(items[i+1].relfile)
-            with_testset(fts) do
-                while i < n && items[i+1].file == file
-                    i += 1
-                    it = items[i]
-                    what = "test item $(repr(it.name)) at $(it.relfile):$(it.line)"
-                    emit_event(capture_dir, "START $i $what")
-                    _progress("START ($i/$n) $what")
-                    logfile = joinpath(capture_dir, "$i.log")
-                    t0 = time()
-                    ts = open(io -> with_capture(() -> run_item(ctx, it), io), logfile, "w")
-                    # `@testset` has already recorded the item into `fts`.
-                    bad = ts === nothing || _failed(ts)
-                    _progress("DONE  ($i/$n) test item $(repr(it.name)) " *
-                              "$(round(time() - t0; digits = 2)) secs" * (bad ? " -- FAILED" : ""))
-                    if bad
-                        push!(failed, it)
-                        io = report_io()
-                        println(io, "\n── Captured output of test item $(repr(it.name)) at $(it.relfile):$(it.line) ──")
-                        write(io, read(logfile))
-                        println(io, "── End of captured output of $(repr(it.name)) ──\n")
-                        flush(io)
+    status = 0
+    # The root and each file are `@testset`s too, so the nesting and the summary come from
+    # `Test`. An item's test set finds its file's through `Test`'s scoped current test set, which
+    # its `Threads.@spawn` task inherits. The root takes the items' seed, so the "RNG of the
+    # outermost testset" a failing summary prints is theirs. At the top level, `@testset` throws
+    # `TestSetException` after printing the summary when anything failed.
+    #
+    # Anything that escapes `_run_listed!` is not an item's failure, which its test set records,
+    # but an interrupt, a fail-fast stop or the runner's own error. It must end the run the way it
+    # did before these test sets existed: thrown out of `run_items`, with no COMPLETE event, so
+    # the watchdog names the item it stopped in. Left to the file's `@testset`, it would be
+    # recorded as one more error and the run would go on. So it is caught here, the loops
+    # stop, and it is rethrown once the root has printed what ran.
+    stopped = nothing
+    try
+        @testset rng = Random.Xoshiro(ITEM_RNG_SEED) "$name" begin
+            i = 0
+            while i < n && stopped === nothing
+                file = items[i+1].file
+                @testset "$(items[i+1].relfile)" begin
+                    while i < n && items[i+1].file == file
+                        i += 1
+                        try
+                            _run_listed!(failed, ctx, items[i], i, n, capture_dir)
+                        catch err
+                            stopped = CapturedException(err, catch_backtrace())
+                            break
+                        end
                     end
-                    rm(logfile; force = true)
-                    emit_event(capture_dir, "DONE $i")
                 end
             end
-            Test.finish(fts)      # records into `root`
+            # Inside the root, so the list comes before `Test`'s summary.
+            if !isempty(failed)
+                println(report_io(), "\n$(length(failed)) of $n test items did not pass:")
+                foreach(it -> println(report_io(), "  $(repr(it.name)) at $(it.relfile):$(it.line)"), failed)
+                println(report_io())
+            end
         end
-    end
-    if !isempty(failed)
-        println(report_io(), "\n$(length(failed)) of $n test items did not pass:")
-        foreach(it -> println(report_io(), "  $(repr(it.name)) at $(it.relfile):$(it.line)"), failed)
-        println(report_io())
-    end
-    status = isempty(failed) ? 0 : 1
-    try
-        Test.finish(root)        # prints the summary table
     catch err
-        err isa Test.TestSetException || rethrow()
+        err isa TestSetException || rethrow()
         status = 1
     end
+    stopped === nothing || throw(stopped)
+    isempty(failed) || (status = 1)
     # The end of the run, said explicitly. A child that exits WITHOUT this -- an item calling
     # `exit(0)`, a crash, a kill -- did not finish the run, whatever its exit code says.
     emit_event(capture_dir, "COMPLETE $status")
