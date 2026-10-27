@@ -5,6 +5,8 @@
 # what this suite uses:
 #
 #   collect.jl   parse files into items and setups; refuse anything it would not run faithfully
+#   monitored.jl in the watched child, fail the run on an `errormonitor`'d task the items left
+#                running (#772)
 #   execute.jl   run items sequentially, each in a fresh module and its own `@testset`, with
 #                captured output
 #   watchdog.jl  the parent: one child process for the whole run, and a per-item timeout
@@ -31,6 +33,7 @@ include(joinpath(@__DIR__, "..", "harness_manifest.jl"))
 using .NitroTestHarness
 
 include("collect.jl")
+include("monitored.jl")
 include("execute.jl")
 include("watchdog.jl")
 

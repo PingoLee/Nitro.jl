@@ -83,7 +83,8 @@ function watch(cmd::Cmd; timeout::Real, grace::Real = 10)
     events = joinpath(capture_dir, EVENTS_FILE)
     cmd = addenv(cmd, "NITRO_TEST_WATCHED" => "1", "NITRO_TEST_CAPTURE_DIR" => capture_dir)
     # What the child is doing now, and since when: (item number, description, t0). Item 0 is
-    # the stretch before the first item; -1 is the exit after the last one.
+    # the stretch before the first item, or a runner stage the child names after the last one
+    # (a STAGE event); -1 is the exit after the last one.
     current = (0, "collection, before the first test item", time())
     status = nothing      # the child's own verdict, from its COMPLETE event
     pos = 0
@@ -104,6 +105,9 @@ function watch(cmd::Cmd; timeout::Real, grace::Real = 10)
                 current = (parse(Int, n), String(what), time())
             elseif kind == "DONE"
                 current = (current[1], "the gap between test items", time())
+            elseif kind == "STAGE"
+                # Runner work between the last item and the end of the run, named by the child.
+                current = (0, String(rest), time())
             elseif kind == "COMPLETE"
                 status = parse(Int, rest)
                 current = (-1, "the child's exit, after the last test item", time())

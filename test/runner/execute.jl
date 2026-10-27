@@ -207,6 +207,7 @@ end
 function _run_listed!(failed::Vector{TestItem}, ctx::RunContext, it::TestItem, i::Int, n::Int,
                       capture_dir::AbstractString)
     what = "test item $(repr(it.name)) at $(it.relfile):$(it.line)"
+    CURRENT_ITEM[] = "during $what"
     emit_event(capture_dir, "START $i $what")
     _progress("START ($i/$n) $what")
     logfile = joinpath(capture_dir, "$i.log")
@@ -224,6 +225,7 @@ function _run_listed!(failed::Vector{TestItem}, ctx::RunContext, it::TestItem, i
         flush(io)
     end
     rm(logfile; force = true)
+    CURRENT_ITEM[] = "after $what, before the next"
     emit_event(capture_dir, "DONE $i")
     return nothing
 end
@@ -235,6 +237,9 @@ Run `items` in order and print `Test`'s summary, under a root test set called `n
 `0` when every item passed, else `1`. Each item's output is captured under
 `NITRO_TEST_CAPTURE_DIR` (a fresh temporary directory when unset), next to the events file the
 watchdog follows.
+
+In the watched child, a task started under `errormonitor` and still running after the last item
+fails the run (monitored.jl).
 """
 function run_items(items::Vector{TestItem}, setups::Dict{Symbol,TestSetup};
                    imports::Vector{Symbol} = [:Test], test_end::Union{Nothing,Expr} = nothing,
@@ -243,7 +248,9 @@ function run_items(items::Vector{TestItem}, setups::Dict{Symbol,TestSetup};
     # Consumed, not just read: a julia that an item starts must not inherit them, or it would
     # take itself for a watched child -- and exit at once, when the orphan guard reads EOF from
     # a stdin nobody holds open.
-    pop!(ENV, "NITRO_TEST_WATCHED", "0") == "1" && start_orphan_guard()
+    watched = pop!(ENV, "NITRO_TEST_WATCHED", "0") == "1"
+    watched && start_orphan_guard()
+    watched && monitor_tasks!()
     capture_dir = something(pop!(ENV, "NITRO_TEST_CAPTURE_DIR", nothing), mktempdir())
     # An item that calls `exit` must not take its own buffered output with it: that output is
     # what the watchdog prints to say why the run ended early.
@@ -280,6 +287,16 @@ function run_items(items::Vector{TestItem}, setups::Dict{Symbol,TestSetup};
                             break
                         end
                     end
+                end
+            end
+            # A background task the items left running (#772). Not after a stop: the item it
+            # stopped in may still own its tasks, and the stop is the result that matters.
+            if watched && stopped === nothing
+                emit_event(capture_dir, "STAGE the check for background tasks left running, after the last test item")
+                @testset "background tasks left running at the end of the run" begin
+                    left = monitored_left()
+                    isempty(left) || report_monitored(report_io(), left)
+                    @test length(left) == 0
                 end
             end
             # Inside the root, so the list comes before `Test`'s summary.

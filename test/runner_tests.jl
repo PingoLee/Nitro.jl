@@ -345,6 +345,83 @@ end
     @test g.code == 0
 end
 
+@testset "an errormonitor'd task left running fails the watched run, named by item and site (#772)" begin
+    leak = """
+        @testitem "tidy" begin
+            @test true
+        end
+
+        @testitem "leaks" begin
+            ev = Base.Event()
+            start(ev) = errormonitor(Threads.@spawn wait(ev))
+            start(ev)
+            @test true
+        end
+
+        @testitem "leaks a loop that starts another task late" begin
+            errormonitor(Threads.@spawn begin
+                sleep(2)
+                errormonitor(Threads.@spawn wait(Base.Event()))
+                wait(Base.Event())
+            end)
+            @test true
+        end
+        """
+    r = probe(tree("a_tests.jl" => leak), "--watch", "60")
+    @test r.code == 1
+    # The loop's late task is started during the grace wait, and still counted.
+    @test occursin("3 background tasks were still running at the end of the run.", r.out)
+    # The item that started it, then the call site as the first frame: not Base's
+    # `errormonitor`, the runner's replacement of it, or `Threads.@spawn`'s expansion.
+    @test occursin(r"started during test item \"leaks\" at a_tests\.jl:5:\n    start at \S*a_tests\.jl:7\n", r.out)
+    @test !occursin("started during test item \"tidy\"", r.out)
+    r.code == 1 || println(r.out)
+    # The same item unwatched: the record is never installed, so nothing is checked.
+    @test probe(tree("b_tests.jl" => leak)).code == 0
+
+    # Stopped by its item, or still on its way out when the run ends: both pass.
+    ok = probe(tree("c_tests.jl" => """
+        @testitem "stops its task" begin
+            ev = Base.Event()
+            t = errormonitor(Threads.@spawn wait(ev))
+            notify(ev)
+            wait(t)
+            @test istaskdone(t)
+        end
+
+        @testitem "its task ends just after it" begin
+            errormonitor(Threads.@spawn sleep(2))
+            @test true
+        end
+        """), "--watch", "60")
+    @test ok.code == 0
+    ok.code == 0 || println(ok.out)
+end
+
+@testset "a failed errormonitor'd task prints as Base prints it, with the item's own methods" begin
+    # The replacement calls Base's method in the current world, so a `showerror` the item
+    # defined after the record was installed is the one that prints.
+    r = probe(tree("a_tests.jl" => """
+        @testitem "prints" begin
+            struct ProbeError <: Exception end
+            Base.showerror(io::IO, ::ProbeError) = print(io, "probe error, shown by the item's method")
+            path, io = mktemp()
+            redirect_stderr(io) do
+                t = errormonitor(Threads.@spawn throw(ProbeError()))
+                @test_throws TaskFailedException wait(t)
+                # The monitor writes without flushing, so flush for it.
+                timedwait(() -> (flush(io); occursin("probe error", read(path, String))), 30.0)
+            end
+            close(io)
+            out = read(path, String)
+            # Base upper-cases the banner when the stream has no color.
+            @test occursin(r"unhandled task error: probe error, shown by the item's method"i, out)
+        end
+        """), "--watch", "60")
+    @test r.code == 0
+    r.code == 0 || println(r.out)
+end
+
 end
 
 @testitem "Test runner: each item runs in its own @testset (#763)" tags=[:core] begin
