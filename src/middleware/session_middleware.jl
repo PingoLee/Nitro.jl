@@ -50,8 +50,8 @@ export SessionMiddleware, SessionPruner, rehash_session!
 # Builds the `(on_startup, on_shutdown)` pair for a store-pruning janitor.
 #
 # The whole lifecycle discipline — `Threads.@spawn`/`errormonitor`, the per-activation stop token,
-# the post-`sleep` re-check, the per-tick `try` with its `InterruptException` rethrow, and the
-# `finally` that retires the activation so a later `on_startup()` can respawn — lives in
+# the wakeable park and its re-check, the per-tick `try` with its `InterruptException` rethrow,
+# and the `finally` that retires the activation so a later `on_startup()` can respawn — lives in
 # `_janitor` (src/middleware/janitor.jl) and is shared with `FixedRateLimiter`. This used to be a
 # hand-rolled copy of it, and the copies had drifted: only the rate limiter's rethrew
 # `InterruptException`, and a session prune over a user store (a blocking SQL DELETE for

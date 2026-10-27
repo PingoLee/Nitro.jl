@@ -301,7 +301,7 @@ end
 # extracting it removed. This divergence is by design; the three that collapsed were not.
 #
 # The optional RETENTION pruner (#159) is the opposite case, and does use `_janitor`: it is
-# exactly "sleep `prune_interval`, then call the app's `prune`", over app code that may block on a
+# exactly "wait `prune_interval`, then call the app's `prune`", over app code that may block on a
 # SQL DELETE -- the session prune's shape, not this writer's. See `AccessLog`.
 #
 # ── An interrupt (#649) ──

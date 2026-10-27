@@ -529,7 +529,7 @@ _sweep_work(stripes::Vector{<:_Stripe}, window::Period) =
     () -> _sweep_expired!(stripes, window, now(UTC))
 
 # The janitor loop, now this limiter's `work` bound to the shared loop in `_janitor_loop`
-# (src/middleware/janitor.jl), which owns the `try` placement (#169), the post-`sleep` token
+# (src/middleware/janitor.jl), which owns the `try` placement (#169), the wakeable park, the token
 # re-check and the `InterruptException` rethrow for every janitor in Nitro (#190).
 #
 # Still a named function with this signature, for the reason it always had one: it lets a test
