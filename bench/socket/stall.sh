@@ -146,7 +146,20 @@ mode_threads() {
 }
 
 PIDS=()
-cleanup() { for p in ${PIDS[@]+"${PIDS[@]}"}; do kill "$p" 2>/dev/null; done; wait 2>/dev/null; }
+# A server still alive STOP_GRACE_S (default 30) seconds after SIGTERM gets SIGKILL; see run.sh.
+cleanup() {
+  local p alive
+  for p in ${PIDS[@]+"${PIDS[@]}"}; do kill "$p" 2>/dev/null; done
+  for _ in $(seq 1 "${STOP_GRACE_S:-30}"); do
+    alive=; for p in ${PIDS[@]+"${PIDS[@]}"}; do kill -0 "$p" 2>/dev/null && alive=1; done
+    [ -z "$alive" ] && break; sleep 1
+  done
+  for p in ${PIDS[@]+"${PIDS[@]}"}; do
+    kill -0 "$p" 2>/dev/null || continue
+    echo "stall.sh: pid $p still alive ${STOP_GRACE_S:-30}s after SIGTERM; sending SIGKILL" >&2; kill -9 "$p" 2>/dev/null
+  done
+  wait 2>/dev/null
+}
 trap cleanup EXIT
 
 wait_up() {
