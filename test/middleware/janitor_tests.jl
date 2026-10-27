@@ -104,25 +104,36 @@ end
 end
 
 @testset "a stale task cannot retire a live activation" begin
-    # The subtle half of the `finally`. The retirement is guarded on `active[] === token`, so a
+    # The subtle half of the `finally`. The retirement is guarded on `active[] === mine`, so a
     # task from a PREVIOUS activation that exits after a restart must leave the current
     # activation's state alone. An unguarded `finally` would clear it, and the next
     # `on_startup()` would then spawn a SECOND live task -- #82's leak, reached from the other
     # side.
     #
-    # Long interval: the first task must still be parked in `sleep` when the restart happens, so
-    # it exits strictly after the second activation is installed.
-    on_startup, on_shutdown = _janitor(() -> nothing, Millisecond(50),
+    # The first task must still be alive when the restart happens, so it exits strictly after the
+    # second activation is installed. This used to rely on t1 being parked in `sleep`, which
+    # `on_shutdown` could not cut short. Since #772 it wakes a parked task at once, so t1 is held
+    # inside its first tick instead -- the overlap that remains, since a tick is never waited for.
+    release = Base.Event()
+    entered = Threads.Atomic{Int}(0)
+    first_tick_blocks = function ()
+        Threads.atomic_add!(entered, 1) == 0 && wait(release)
+        return nothing
+    end
+    on_startup, on_shutdown = _janitor(() -> first_tick_blocks(), Millisecond(20),
                                        "JanitorTest", "idle work", "interval")
 
     t1 = on_startup()
     @test t1 isa Task
-    @test on_shutdown() === t1        # signalled, but still parked in its sleep
+    @test timedwait(() -> entered[] >= 1, 10.0) === :ok   # t1 is inside its first tick
+    @test on_shutdown() === t1        # signalled, but still in its tick
     t2 = on_startup()                 # second activation installed while t1 is still alive
     @test t2 isa Task
     @test t2 !== t1
+    @test !istaskdone(t1)
 
-    # Now let t1 notice and run its `finally`.
+    # Now let t1 finish its tick, notice, and run its `finally`.
+    notify(release)
     @test timedwait(() -> istaskdone(t1), 10.0) === :ok
 
     # t1's exit must NOT have retired t2's activation: a start is still a no-op, and a shutdown
@@ -150,6 +161,70 @@ end
     on_shutdown()
     @test on_shutdown() === nothing    # idempotent when already stopped
     @test timedwait(() -> istaskdone(t1) && istaskdone(t2), 10.0) === :ok
+end
+
+@testset "on_shutdown ends a parked janitor at once, whatever its interval (#772)" begin
+    # The janitor used to `sleep(interval)`, which nothing could wake, so after `on_shutdown` it
+    # stayed alive for up to a whole interval. A process that exited in that window closed the
+    # sleep's `Timer` under it, the `EOFError` failed the task, and `errormonitor` printed it while
+    # the process was exiting -- which crashed the test child in LLVM (#772). An hour-long interval
+    # makes the difference unmistakable: against the unpatched loop every `timedwait` below times
+    # out.
+    #
+    # Each task is stopped only once it is PARKED: started, and in some wait queue. Stopped sooner,
+    # it would find its token already cleared at the top of the loop and return without ever
+    # parking -- which passes against the unpatched loop too, and proves nothing. `istaskstarted`
+    # is the half that matters at one thread, where a task spawned but not yet run is in a work
+    # queue as well.
+    parked(t) = timedwait(() -> istaskstarted(t) && t.queue !== nothing, 10.0) === :ok
+    on_startup, on_shutdown = _janitor(() -> nothing, Hour(1), "JanitorTest", "idle work", "interval")
+    t = on_startup()
+    @test t isa Task
+    @test parked(t)
+    @test on_shutdown() === t
+    @test timedwait(() -> istaskdone(t), 5.0) === :ok
+    @test !istaskfailed(t)                 # it returned; nothing was thrown into it
+
+    # A restart of the same hooks starts a fresh activation, and stopping it ends it as promptly.
+    t2 = on_startup()
+    @test t2 isa Task && t2 !== t
+    @test parked(t2)
+    @test on_shutdown() === t2
+    @test timedwait(() -> istaskdone(t2), 5.0) === :ok
+    @test !istaskfailed(t2)
+
+    # The two real callers whose defaults are long, through their public constructors: the rate
+    # limiter's 10-minute sweep (the task #772 caught still parked at exit) and the session prune.
+    limiter = Nitro.RateLimiter(rate_limit = 5, window = Second(1))    # cleanup_period: 10 minutes
+    t = limiter.on_startup()
+    @test parked(t)
+    limiter.on_shutdown()
+    @test timedwait(() -> istaskdone(t), 5.0) === :ok
+    @test !istaskfailed(t)
+
+    pruner = SessionPruner(Nitro.MemoryStore{String, Dict{String,Any}}(); interval = Hour(1))
+    t = pruner.on_startup()
+    @test parked(t)
+    pruner.on_shutdown()
+    @test timedwait(() -> istaskdone(t), 5.0) === :ok
+    @test !istaskfailed(t)
+end
+
+@testset "_janitor_loop stops when its wake is notified, mid-interval (#772)" begin
+    # The loop itself, driven directly: the token is cleared and the `Event` notified, as
+    # `on_shutdown` does, and the loop returns well inside an interval it would otherwise park for.
+    token = Ref(true)
+    wake = Base.Event(true)
+    calls = Threads.Atomic{Int}(0)
+    task = Threads.@spawn _janitor_loop(() -> Threads.atomic_add!(calls, 1), token, Hour(1),
+                                        "JanitorTest", "idle work"; wake)
+    @test timedwait(() -> istaskstarted(task) && task.queue !== nothing, 10.0) === :ok   # parked
+    @test !istaskdone(task)
+    token[] = false
+    notify(wake)
+    @test timedwait(() -> istaskdone(task), 5.0) === :ok
+    @test !istaskfailed(task)
+    @test calls[] == 0                      # woken to stop, not to tick
 end
 
 @testset "the interval is validated at construction, naming the caller's own keyword" begin
@@ -258,3 +333,50 @@ end
 end
 
 end # @testitem
+
+# #772: a janitor still parked when the process exits must end it quietly. Exit runs every
+# finalizer, reachable objects' included, and a `Timer`'s wakes its waiters with `false`. A janitor
+# in `sleep(interval)` got an `EOFError` from that, rethrew it past its loop, and `errormonitor`
+# compiled code to print it while the process was being torn down -- which crashed the test child
+# in LLVM. Parked on its `Event`, the janitor is never woken: only its `Timer` callback task ends.
+#
+# A child process, because only an exit can show it. Two things make the outcome deterministic
+# rather than a race: a default thread kept awake to run whatever the finalizers wake, and a
+# finalizer that waits before it reports, so the janitor's has run by then. That ordering is
+# Julia's: exit runs finalizers newest first, list by list, and the janitor's `Timer` is on a
+# default thread's list and this one on thread 1's. A GC that promoted the `Timer` to the marked
+# list first would reverse it -- the test would then pass against the unpatched loop, never fail
+# against the fixed one. Here it reported `failed=true` against the unpatched loop in every run.
+@testitem "Janitor — a janitor parked at exit ends without an exception (#772)" tags=[:middleware, :slow] setup=[NitroCommon] begin
+    using Test
+    using Nitro
+
+    code = """
+    using Nitro, Dates
+    using Nitro.Core.Middleware.JanitorMiddleware: _janitor
+    on_startup, _ = _janitor(() -> nothing, Hour(1), "ExitTest", "idle work", "interval")
+    const T = on_startup()
+    timedwait(() -> istaskstarted(T) && T.queue !== nothing, 10.0) === :ok ||
+        error("the janitor never parked")
+    Threads.@spawn while true
+        yield()
+    end
+    const CHECK = finalizer(Ref(0)) do _
+        Libc.systemsleep(2.0)
+        Core.println("JANITOR AT EXIT: failed=", istaskfailed(T))
+    end
+    println("exiting")
+    """
+    cmd = `$(Base.julia_cmd()) --code-coverage=none --startup-file=no --threads=2
+           --project=$(Base.active_project()) -e $code`
+    out, err = IOBuffer(), IOBuffer()
+    p = run(pipeline(ignorestatus(cmd); stdout = out, stderr = err))
+    stdout_text, stderr_text = String(take!(out)), String(take!(err))
+    failure = (p.exitcode, p.termsignal) == (0, 0) ? nothing :
+        "child exit $(p.exitcode), signal $(p.termsignal); stderr: $(stderr_text)"
+    @test failure === nothing
+    @test occursin("exiting", stdout_text)
+    # The report came from inside the exit, after the finalizers ran: the check really ran.
+    @test occursin("JANITOR AT EXIT: failed=false", stdout_text)
+    @test !occursin("Unhandled Task", stderr_text)
+end

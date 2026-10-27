@@ -45,13 +45,13 @@ using ...Errors: loggable
 # `AccessLog`'s writer (src/middleware/access_log.jl) is EVENT-driven, not interval-driven: it
 # parks on `take!` of a `Channel`, is stopped by `close`ing that channel rather than by a stop
 # token, and because closing is immediate its `on_shutdown` can bound-WAIT for the drain
-# (`timedwait(..., 5.0)`) where the two janitors here can only signal. `_janitor`'s whole contract
-# is "sleep for `interval`, then do `work`"; generalising it to also cover a blocking-wait loop
+# (`timedwait(..., 5.0)`) where the janitors here only signal and wake. `_janitor`'s whole contract
+# is "wait `interval`, then do `work`"; generalising it to also cover a blocking-wait loop
 # with a bounded shutdown would put two shapes back into the helper, which is the opposite of what
 # extracting it bought. That divergence is legitimate, unlike the three copies this replaced.
 #
 # `AccessLog`'s optional RETENTION pruner (#159) is a different task and does use this: it is
-# plain "sleep, then call the app's `prune(cutoff)`", a caller-supplied and possibly blocking
+# plain "wait, then call the app's `prune(cutoff)`", a caller-supplied and possibly blocking
 # DELETE -- the session prune's shape exactly. Only the writer stays out.
 
 # The loop, named rather than written inline into the `Threads.@spawn` in `_janitor`.
@@ -63,12 +63,28 @@ using ...Errors: loggable
 # way. (2) It keeps `_janitor`'s `on_startup` short enough that the spawn's rationale stays next to
 # the spawn.
 #
-# `token` is per ACTIVATION, never a shared `running` flag -- see `_janitor`.
+# `token` is per ACTIVATION, never a shared `running` flag -- see `_janitor`. So is `wake`, which
+# `on_shutdown` notifies after clearing the token. A caller that drives the loop directly and
+# passes no `wake` stops it by clearing the token, and the loop sees that at its next tick.
+#
+# ── The park (#772) ──
+#
+# Between ticks the loop parks once on `wake`, which a `Timer` callback notifies after `interval`
+# (concurrency §3, the retention scheduler's shape). It used to `sleep(interval)`, and that had two
+# consequences. `on_shutdown` could not wake it, so a stopped janitor outlived its server by up to
+# a whole interval: ten minutes for the rate limiter's default sweep, an hour for the session
+# prune's. And a `sleep` is a wait on the `Timer` itself, which throws `EOFError` when the `Timer`
+# is closed under it. Process exit runs every finalizer, reachable objects' included, and a
+# `Timer`'s wakes its waiters exactly that way. So a janitor still parked at exit died there, on
+# another thread, under `errormonitor`, which then compiled code to print the error while the
+# process was being torn down. That could print a spurious `Unhandled Task ERROR` and crash the
+# process in LLVM (#772). A closed callback `Timer` throws nothing: its callback task just ends,
+# and the janitor stays parked on the `Event` until the process is gone.
 #
 # ── An interrupt (#369) ──
 #
 # The outer `try` ends the loop NORMALLY on an `InterruptException`, with one `@warn`, wherever it
-# lands -- in the `sleep` or, through the per-tick rethrow, in `work`. It is the same decision the
+# lands -- in the park or, through the per-tick rethrow, in `work`. It is the same decision the
 # Workers retention scheduler records next to `_cleanup_scheduler_loop` (src/Workers/api.jl), and
 # the reasoning there is canonical. In short: with `exit_on_sigint(false)` Julia throws SIGINT into
 # whichever task parked last on thread 1. This task is `Threads.@spawn`, so under the default
@@ -79,11 +95,12 @@ using ...Errors: loggable
 # later press too. Stopping frees the next press for the server, and `_janitor`'s `finally`
 # still retires the activation, so a later `on_startup()` respawns it.
 function _janitor_loop(work::Function, token::Ref{Bool}, interval::Period,
-                       label::String, what::String)
+                       label::String, what::String; wake::Base.Event = Base.Event(true))
+    seconds = Dates.toms(interval) / 1000
     try
         while token[]
-            sleep(interval)
-            # Re-check AFTER the sleep: `on_shutdown` may have fired while we were parked, and this
+            _park(wake, seconds)
+            # Re-check AFTER the park: `on_shutdown` may have fired while we were parked, and this
             # is the point a stale task from a previous activation leaves for good.
             token[] || break
             # The `try` is INSIDE the `while` on purpose. Hoisting it out turns one transient
@@ -107,6 +124,27 @@ function _janitor_loop(work::Function, token::Ref{Bool}, interval::Period,
               "Outside a REPL, that press can end the process without running its shutdown hooks."
     end
     return nothing
+end
+
+# One tick's park: until the `Timer` fires or `on_shutdown` notifies. `wake` autoresets, so a
+# notify that lands before the `wait` is held, not lost. The `Timer` inherits this task's pool and
+# non-stickiness (#369), and it is closed on every path, so no tick leaves one behind.
+function _park(wake::Base.Event, seconds::Float64)
+    timer = Timer(_ -> notify(wake), seconds)
+    try
+        wait(wake)
+    finally
+        close(timer)
+    end
+    return nothing
+end
+
+# One activation's stop token and the `Event` its task parks on. Concrete, and the token a
+# `Base.RefValue{Bool}` rather than a `Ref{Bool}`: `Ref{T}` is abstract, so the stop write in
+# `on_shutdown` was a dynamic `setindex!`, which a trimmed image cannot make (#571, #719).
+struct _Activation
+    token :: Base.RefValue{Bool}
+    wake  :: Base.Event
 end
 
 """
@@ -137,17 +175,25 @@ activation's task actually exits. **Keep these return values.**
 # Per-activation state, and why it is not one shared flag
 
 The hooks must be idempotent across a `serve(); terminate(); serve()` cycle, because route-owned
-lifecycle middleware survives a `terminate()` (#82). `on_shutdown` cannot *wait* for the task — it
-is parked in `sleep(interval)`, up to a whole interval from its next check — so a restart overlaps
-the old task with the new activation. With one shared `running` flag the sequence was:
+lifecycle middleware survives a `terminate()` (#82). `on_shutdown` wakes a parked task but does not
+*wait* for it, because a task in the middle of a tick finishes its `work` first, and that can be a
+caller's blocking DELETE. So a restart can overlap the old task with the new activation. With one
+shared `running` flag the sequence was:
 
-    on_shutdown : running[] = false ; janitor_task[] = nothing   (old task still sleeping)
+    on_shutdown : running[] = false ; janitor_task[] = nothing   (old task still in its tick)
     on_startup  : running[] = true  ; isnothing(janitor_task[]) -> spawns a SECOND task
-    old task    : wakes, reads running[] == true, keeps looping
+    old task    : finishes the tick, reads running[] == true, keeps looping
 
 i.e. one leaked task per restart, unbounded, in components whose entire job is to bound resource
-use. Each activation therefore gets its own `Ref{Bool}`, which a stale task is the only observer
-of, and which `on_shutdown` already set `false`.
+use. Each activation therefore gets its own token, which a stale task is the only observer of, and
+which `on_shutdown` already set `false`, and its own `Event`, so the wake reaches only that task.
+
+# Shutdown ends a parked task at once (#772)
+
+Before #772 the task parked in `sleep(interval)`, which nothing could wake, so it outlived
+`on_shutdown` by up to a whole interval, and a process that exited in that window killed it with
+an `EOFError` (see *The park* above `_janitor_loop`). Now `on_shutdown` notifies the activation's
+`Event` and an idle task returns at once, so a `terminate()` leaves no janitor behind.
 
 # The `finally`, which is the half #185 was about
 
@@ -156,12 +202,12 @@ If anything escapes the loop, the activation `Ref`s used to stay **populated**, 
 janitor was then gone for the life of the process while the thing it bounds kept growing. The
 `finally` below retires the activation so a later `on_startup()` can respawn.
 
-It retires the activation only when it is still **ours** (`active[] === token`). A stale task
+It retires the activation only when it is still **ours** (`active[] === mine`). A stale task
 clearing the *current* activation's `Ref`s would let the next `on_startup` spawn a second live
 task — the leak above, reached from the other side.
 
 That check-and-clear races `on_startup`, so all three transitions take one `ReentrantLock`: the
-task could read `active[] === token`, be descheduled while the serve thread runs
+task could read `active[] === mine`, be descheduled while the serve thread runs
 `on_shutdown(); on_startup()`, and then wipe the *new* activation's state. The lock costs nothing —
 these run once per activation, never on the request path — and it fixes a second ordering hazard
 for free: a task that dies immediately blocks in the retirement until `on_startup` has finished
@@ -172,16 +218,14 @@ function _janitor(work::Function, interval::Period, label::String, what::String,
 
     # One lock over all three activation transitions -- see the docstring. Not on the request path.
     activation = ReentrantLock()
-    # `Base.RefValue{Bool}`, not `Ref{Bool}`: `Ref{T}` is abstract, so the stop write in
-    # `on_shutdown` was a dynamic `setindex!`, which a trimmed image cannot make (#571, #719).
-    active = Ref{Union{Base.RefValue{Bool},Nothing}}(nothing)
+    active = Ref{Union{_Activation,Nothing}}(nothing)
     janitor_task = Ref{Union{Task,Nothing}}(nothing)
 
     # Retire the activation this task owns, so a later `on_startup()` can respawn. A no-op unless
     # the slot is still ours: `on_shutdown` may have emptied it, or a newer activation may own it.
-    retire! = function (token::Base.RefValue{Bool})
+    retire! = function (mine::_Activation)
         lock(activation) do
-            active[] === token || return nothing
+            active[] === mine || return nothing
             active[] = nothing
             janitor_task[] = nothing
             return nothing
@@ -191,23 +235,26 @@ function _janitor(work::Function, interval::Period, label::String, what::String,
     on_startup = function ()
         lock(activation) do
             isnothing(active[]) || return nothing      # idempotent across restarts
-            token = Ref(true)
-            active[] = token
+            mine = _Activation(Ref(true), Base.Event(true))
+            active[] = mine
             janitor_task[] = errormonitor(Threads.@spawn try
-                _janitor_loop(work, token, interval, label, what)
+                _janitor_loop(work, mine.token, interval, label, what; wake = mine.wake)
             finally
-                retire!(token)
+                retire!(mine)
             end)
             return janitor_task[]
         end
     end
 
-    # Signalling is all this can do; blocking `terminate` for up to a whole interval would be worse
-    # than letting the task drain.
+    # Signal and wake, never wait: a tick may be in the middle of a caller's blocking `work`, a
+    # session store's DELETE, and `terminate` must not sit behind it. A parked task ends at once.
     on_shutdown = function ()
         lock(activation) do
-            token = active[]
-            isnothing(token) || (token[] = false)
+            mine = active[]
+            if !isnothing(mine)
+                mine.token[] = false
+                notify(mine.wake)
+            end
             stopped = janitor_task[]
             active[] = nothing
             janitor_task[] = nothing
