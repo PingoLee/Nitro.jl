@@ -1,0 +1,12 @@
+[deps]
+DataFrames = "a93c6f00-e57d-5684-b7b6-d8193f3e46c0"
+HTTP = "cd3eb016-35fb-5094-929b-558a96fad6f3"
+JSON = "682c06a0-de6a-54ab-a142-c8b1cf79cde6"
+LibPQ = "194296ae-ab2e-5f79-8cd4-7183a0a5a0d1"
+Nitro = "e5efdb2c-68ee-4494-894d-55bb80f0a340"
+PormG = "7d8d7541-4d3d-4580-80a2-17064efb0993"
+SQLite = "0aa819cd-b072-5ff4-a722-6bc24af294d9"
+
+[sources]
+Nitro = {path = "../../.."}
+PormG = {url = "https://github.com/PingoLee/PormG.jl.git", rev = "6f558894c68046a948e30bad3018a791a5f9898e"}

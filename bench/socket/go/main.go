@@ -10,6 +10,8 @@
 //	AGG_ROWS=<n>  Build n aggregation rows at startup and serve /aggregate?n=<N>&op=<sum|mean|groupby>
 //	              over the first N, as server.jl does (#590): aggregate.go, a plain loop in the
 //	              handler. Default 0: no rows.
+//	DB=postgres   Also serve the database routes of #589 (db.go), with DB_POOL and
+//	              DB_CONNINFO_FILE.
 //
 // GOMAXPROCS is set by run.sh to the number of server CPUs. Every response is built per request,
 // as in every other mode: no cached bodies, no cached headers.
@@ -146,6 +148,8 @@ func main() {
 		w.Header().Set("Content-Type", "application/json")
 		w.Write(lagBody())
 	})
+
+	dbRoutes(mux)
 
 	if os.Getenv("LAG") == "1" {
 		go lagProbe()

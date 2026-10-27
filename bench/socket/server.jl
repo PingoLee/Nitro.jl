@@ -79,6 +79,10 @@
 #   PRELOAD="Pkg ..."   Load these packages before serving, so `rss.sh` can measure what one adds
 #                       to the process (PRELOAD=PormG also loads NitroPormGExt). The project
 #                       passed to `--project` must have them; the bench env does not.
+#   DB=postgres|sqlite  With PRELOAD="PormG LibPQ" (or "PormG SQLite") and the `db/` env, also serve
+#                       `/db`, `/queries?n=`, `/updates?n=` and `/db_wait?ms=` through PormG, in
+#                       every mode (#589). `db/world.jl` has the routes and the DB_* knobs, and
+#                       `db/seed.jl` writes the table; `run.sh` and `stall.sh` set all of it from DB.
 #   PROBE=1             Stamp every request `go/fairness -stamp` sends at the connection task, the
 #                       handler task's start, the handler's return and the end of the write, and
 #                       answer the rows at `/probe` (#618; see `probe_begin`). PROBE_CAP rows at
@@ -124,6 +128,10 @@ const BURST_K    = parse(Int, get(ENV, "BURST_K", string(max(Threads.nthreads(:d
 for pkg in split(get(ENV, "PRELOAD", ""))
     @eval using $(Symbol(pkg))
 end
+
+# The database routes (#589), only when PormG was preloaded: `db/world.jl` says what they serve.
+const DB_ROUTES = isdefined(Main, :PormG)
+DB_ROUTES && include(joinpath(@__DIR__, "db", "world.jl"))
 
 const PLAINTEXT = "Hello, World!"
 json_body() = JSON.json(Dict("message" => "Hello, World!"))
@@ -338,6 +346,10 @@ function bare_handler(req::HTTP.Request)::HTTP.Response
         (parsed === nothing || yield_ms === nothing) && return HTTP.Response(400, "bad n, op or yield")
         return HTTP.Response(200, ["Content-Type" => "application/json"], agg_body(AGG_DATA, parsed..., yield_ms))
     end
+    if DB_ROUTES
+        resp = db_bare(target)
+        resp === nothing || return resp
+    end
     return HTTP.Response(404)
 end
 
@@ -466,6 +478,7 @@ function start_nitro()
     end
     urlpatterns(app, "", path("/aggregate", aggregate_route(agg_job); method = "GET"))
     bench_routes!(app)
+    DB_ROUTES && db_routes!(app)
     # PROBE=1: Nitro's own `stream_handler`, at its defaults as `serve` builds it, wrapped to stamp
     # the request's task at its start, after the pipeline and after the write. It runs on the task
     # `serve` spawns per request, so `conn` stays 0 here.
