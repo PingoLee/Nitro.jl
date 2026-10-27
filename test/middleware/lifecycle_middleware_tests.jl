@@ -365,12 +365,13 @@ import Nitro: RateLimiter
 # Companion to #82, and a defect the issue body explicitly (and wrongly) ruled out: it claims
 # `RateLimiter`'s hooks "are idempotent across cycles". They were not.
 #
-# `on_shutdown` cannot wait for the cleanup task — it is parked in `sleep(cleanup_period)`,
-# up to 10 minutes from its next flag check by default. With a single shared `running` flag:
+# `on_shutdown` cannot wait for the cleanup task. It was parked in `sleep(cleanup_period)` then,
+# up to 10 minutes from its next flag check by default; since #772 a parked task is woken, but one
+# in the middle of a sweep still finishes it first. With a single shared `running` flag:
 #
-#   on_shutdown : running[] = false ; cleanup_task[] = nothing   (old task still sleeping)
+#   on_shutdown : running[] = false ; cleanup_task[] = nothing   (old task not yet done)
 #   on_startup  : running[] = true  ; isnothing(cleanup_task[]) -> spawns a SECOND task
-#   old task    : wakes, reads running[] == true, keeps looping
+#   old task    : carries on, reads running[] == true, keeps looping
 #
 # One extra task leaked per restart, unbounded. Before #82 this only bit serve-owned
 # limiters; fixing #82 made route-owned ones restart too, which widened it.
