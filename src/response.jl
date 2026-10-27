@@ -583,11 +583,12 @@ Prefer this; reach for `STREAM` only when you need to control the response head 
 
 # Pacing, and what `max_len` does not cover
 
-`max_len` caps one serialized event. It does **not** bound the stream's buffer, which is a
-`Base.BufferStream` and grows without limit — so a producer that writes far faster than the client
-reads accumulates in memory. Pace the producer (as the loop above does) and check `isopen(events)`
-each iteration; that check is also how a disconnected client stops the work rather than merely
-stopping the writes.
+`max_len` caps one serialized event. The events the client has not read yet are bounded only
+loosely: past four times `max_len` (64 MiB at the default), and never under 16 MiB, the next
+`write` closes the stream and throws `IOError`, as it does once the client has gone (HTTP.jl
+2.12). So a producer that writes far faster than the client reads holds that much in memory and
+then fails. Pace the producer (as the loop above does) and check `isopen(events)` each iteration;
+that check is also how a disconnected client stops the work rather than merely stopping the writes.
 
 # Keeping the connection alive
 

@@ -197,7 +197,7 @@ _response_started(stream::HTTP.Stream)::Bool = (@atomic :acquire stream.response
 
 # ── Has the client gone? (#466) ──────────────────────────────────────────────────────────────────
 #
-# HTTP.jl (2.9 through 2.11) cannot tell a server: on HTTP/1.1 nothing reads the socket while the
+# HTTP.jl (2.9 through 2.13) cannot tell a server: on HTTP/1.1 nothing reads the socket while the
 # handler runs, and every `isopen` it offers reports only this side's own closes. So
 # `cancel_reason(req)` asks the kernel, on the caller's own task, only when a handler asks:
 #
@@ -542,7 +542,7 @@ everything past that as it is written; `stream_handler`'s `closewrite` flushes w
 
 HTTP enforces the declared length too, but Nitro checks it first, for the log. A client only ever
 sees a status or a cut connection, so the server side is the one place a failure can be noticed —
-and HTTP's own line for it would carry the live exception and the query string, so Nitro writes it
+and HTTP's own line for it would carry the live exception, so Nitro writes it
 and marks the error reported (`_mark_reported!`). (There used to be a second reason, the status:
 through 2.9 HTTP answered its own length `ProtocolError` with **400**, blaming the client for the
 server's `Content-Length`. Since 2.10 that error is a 500 (JuliaWeb/HTTP.jl#1404), and HTTP, like
@@ -652,7 +652,8 @@ const _MAX_SWALLOW_BYTES = 2 * 1024 * 1024
 # open for as long as it liked, since no deadline is armed once the head has been parsed (#316).
 # For a 413 that also held a `max_concurrent_requests` slot. Five seconds is nginx's
 # `lingering_timeout` default, its name for this same wait. Past it the close goes ahead, and a
-# client with unread data in flight eats an RST, as it does past the byte budget.
+# client with unread data in flight eats an RST, as it does past the byte budget. (Since HTTP.jl
+# 2.12, JuliaWeb/HTTP.jl#1494, HTTP half-closes first and drains up to 1 MiB for 500 ms more.)
 const _SWALLOW_TIMEOUT_NS = Int64(5_000_000_000)
 
 # Arm that bound before swallowing. HTTP/1.1 only: an HTTP/2 connection's read deadline belongs to
@@ -1102,11 +1103,16 @@ const _ADMISSION_KEY = :__nitro_admission
 #
 # HTTP.jl frames the two differently. For a `GET` it picks `FIXED` mode and `setheader`s
 # `Content-Length` from `response.content_length` — which is why `Res.json`/`send`/`html`/`status`
-# can leave the header out. For a `HEAD` it picks `NONE` mode, which only ever *removes* a header
-# the status forbids and never synthesizes one, so every builder that leaves the header to HTTP.jl
-# lost it on `HEAD`. Adding it here, once, from the same `content_length` field the `GET` path
-# reads keeps the two equal by construction — for every builder, raw return and hand-built
-# `HTTP.Response` alike — where a per-builder header would only ever cover `Res`.
+# can leave the header out. For a `HEAD` it picks `NONE` mode, which through 2.11 never synthesized
+# the header, so every builder that leaves the header to HTTP.jl lost it on `HEAD`. Adding it here,
+# once, from the same `content_length` field the `GET` path reads keeps the two equal by
+# construction — for every builder, raw return and hand-built `HTTP.Response` alike — where a
+# per-builder header would only ever cover `Res`.
+#
+# Since 2.12 (JuliaWeb/HTTP.jl#1454) `NONE` mode sets the header from `content_length` whenever it
+# is known, which would undo the skips below: `0` for every empty body, written over an explicit
+# header too. So `_send_response!` hands HTTP a `HEAD` response with `content_length = -1`, and the
+# header is decided here alone.
 #
 # This assumes the `HEAD` handler returned the body `GET` would send. That holds when one function
 # is registered for both methods, and for the auto-`HEAD` every `GET` route gets (#277). RFC 9110
@@ -1246,9 +1252,13 @@ function _send_response!(produced::Union{Nothing,HTTP.Response}, stream::HTTP.St
     try
         if !_response_started(stream)
             resp = produced === nothing ? HTTP.Response(200) : produced
-            stream.message.method == "HEAD" && (resp = _with_head_content_length(resp))
+            is_head = stream.message.method == "HEAD"
+            is_head && (resp = _with_head_content_length(resp))
             # Only the pipeline's own value needs it: the two above are built here.
             resp === produced && (resp = _handoff_copy(resp))
+            # Fresh by now, so this writes no response the pipeline holds. `-1` keeps HTTP from
+            # setting a `HEAD`'s `Content-Length` itself (see `_with_head_content_length`).
+            is_head && (resp.content_length = -1)
             resp.request = req
             stream.response = resp
             # A bodyless response — a `HEAD`, or a 1xx, 204 or 304 status — gets the head and
@@ -1379,10 +1389,10 @@ end
 # a 500, so a `read_timeout` expiring mid-body told the client the server had crashed.
 #
 # Since HTTP.jl 2.11 (JuliaWeb/HTTP.jl#1425) that path also LOGS every error but the one it recorded
-# itself, and it logs the live exception with `request.target` — query string included. Nitro keeps
-# both out of its logs (#613; `access_log_query = false`), so nothing unreported reaches HTTP: the
-# request's task reports what it throws itself (`_handle_reporting`), and an interrupted `wait` is
-# marked here.
+# itself, and it logs the live exception, with `request.target` (its query string too, until 2.12
+# dropped it, JuliaWeb/HTTP.jl#1473). Nitro keeps live exceptions out of its logs (#613), so nothing
+# unreported reaches HTTP: the request's task reports what it throws itself (`_handle_reporting`),
+# and an interrupted `wait` is marked here.
 function parallel_stream_handler(handle_stream::Function)
     function(stream::HTTP.Stream)
         task = Threads.@spawn _handle_reporting(handle_stream, stream)
@@ -1391,7 +1401,7 @@ function parallel_stream_handler(handle_stream::Function)
         catch err
             err isa TaskFailedException && throw(err.task.result)
             # The `wait` itself was interrupted (Ctrl-C): not the request's failure, so not logged,
-            # but marked, or HTTP would log it with the target.
+            # but marked, or HTTP would log the live exception.
             _mark_reported!(stream, err)
             rethrow()
         end

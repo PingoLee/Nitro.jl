@@ -109,9 +109,11 @@ A producer that returns without closing holds the connection open for the life o
 
 ### Pace the producer, and check `isopen`
 
-`max_len` caps one serialized event (16 MiB by default, [`Res.SSE_MAX_EVENT_BYTES`](@ref)). It does
-**not** bound the stream's buffer, which grows without limit — so a producer that writes much faster
-than the client reads accumulates in memory. Two habits avoid it:
+`max_len` caps one serialized event (16 MiB by default, [`Res.SSE_MAX_EVENT_BYTES`](@ref)). The
+events the client has not read yet are bounded only loosely: past four times `max_len` (64 MiB at
+the default), and never under 16 MiB, the next `write` closes the stream and throws `IOError`, as
+it does once the client has gone. So a producer that writes much faster than the client reads holds
+that much in memory and then fails. Two habits avoid it:
 
 - give the producer a natural cadence (a `sleep`, a poll interval, or waiting on a `Channel`);
 - check `isopen(events)` each iteration.

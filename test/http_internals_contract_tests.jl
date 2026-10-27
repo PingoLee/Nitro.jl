@@ -16,7 +16,8 @@ import Sockets
 #       `getproperty`, which calls it. Rename it upstream and the session, CSRF, auth and
 #       app-context paths all break at once.
 #   • src/utilities/bodyparsers.jl — the `EmptyBody` / `BytesBody` body hierarchy, and
-#       `parse_multipart_body`, which `multipart` calls with a boundary it parsed itself (#345).
+#       `parse_multipart_body`, which `multipart` calls with a boundary it parsed itself (#345)
+#       and its `max_parts` cap, whose plain-`error` message `_too_many_parts` reads (HTTP 2.13).
 #   • src/core/pipeline.jl — `_allowed_methods` walks the router's route tree to build a 405's
 #       `Allow` header (#281): `Router.routes`, the `Node`/`Leaf`/`Variable` fields, `match`,
 #       `_route_variable_matches` and `_router_request_path`.
@@ -51,7 +52,7 @@ import Sockets
 #
 # None of these are part of HTTP's public, SemVer-guaranteed API, so a 2.x bump
 # can rename or remove them WITHOUT a breaking-version signal. The compat pin
-# (`HTTP = "~2.11"`) caps that exposure to 2.11 patch releases; this testset is the
+# (`HTTP = "~2.13"`) caps that exposure to 2.13 patch releases; this testset is the
 # canary — if an upgrade moves the ground, it fails HERE, loud and naming the
 # missing symbol, instead of deep inside request handling.
 #
@@ -69,6 +70,21 @@ import Sockets
     # the public `parse_multipart_form` matches one exact spelling of the Content-Type. Pinned by
     # signature, since Nitro calls it with a byte vector and a `String` boundary.
     @test hasmethod(HTTP.parse_multipart_body, Tuple{Vector{UInt8}, String})
+    # ...with the field cap as `max_parts` (JuliaWeb/HTTP.jl#1453). HTTP marks the refusal only by
+    # its message, which `_too_many_parts` reads: change it upstream and a body over the cap binds
+    # as no fields instead of a 400.
+    mp_body = Vector{UInt8}(join(("--b\r\nContent-Disposition: form-data; name=\"k$i\"\r\n\r\n$i\r\n"
+                                  for i in 1:3)) * "--b--\r\n")
+    @test length(HTTP.parse_multipart_body(mp_body, "b"; max_parts = 3)) == 3
+    @test length(HTTP.parse_multipart_body(mp_body, "b"; max_parts = 0)) == 3
+    mp_err = try
+        HTTP.parse_multipart_body(mp_body, "b"; max_parts = 2)
+        nothing
+    catch e
+        e
+    end
+    @test Nitro.Core.Util.BodyParsers._too_many_parts(mp_err)
+    @test !Nitro.Core.Util.BodyParsers._too_many_parts(ErrorException("no delimiter found"))
     # `_buffered_stream_request` deliberately is NOT asserted here any more. Until #17 Nitro
     # delegated its whole request build to it; the body cap replaced that call with a
     # reimplementation over supported API, so the reach is gone and canarying it would pin a
@@ -712,7 +728,7 @@ end
 
 @testset "HTTP's SSE body contract, which Res.sse is built on (#160)" begin
     # `Res.sse` hands the transport an `HTTP.SSEStream` and nothing else. Three properties of that
-    # type are load-bearing for Nitro, and `HTTP = "~2.11"` is a deliberately tight pin, so they are
+    # type are load-bearing for Nitro, and `HTTP = "~2.13"` is a deliberately tight pin, so they are
     # pinned here next to the rest of the HTTP contract.
 
     # 1. It is an `AbstractBody`, so it dispatches to the STREAMING method of
@@ -860,10 +876,11 @@ import Sockets
 const Logging = Base.CoreLogging
 
 # Since HTTP.jl 2.11 (JuliaWeb/HTTP.jl#1425) the stream loop logs every error a stream handler
-# throws at `@error`, with the live exception and `request.target` -- the query string included --
-# except the one it recorded itself as `stream.io_error`, which it treats as the peer's. Nitro's
-# `_mark_reported!` (src/core/transport.jl) relies on exactly that: it records an error Nitro has
-# already logged there, so HTTP derives the status and logs nothing. This pins HTTP's half on a raw
+# throws at `@error`, with the live exception and `request.target` (the query string included
+# until 2.12, JuliaWeb/HTTP.jl#1473) -- except the one it recorded itself as `stream.io_error`,
+# which it treats as the peer's. Nitro's `_mark_reported!` (src/core/transport.jl) relies on
+# exactly that: it records an error Nitro has already logged there, so HTTP derives the status and
+# logs nothing. This pins HTTP's half on a raw
 # listener, with no Nitro in the path: if HTTP stops keying on identity, or keys on another field,
 # the unmarked cases below still log and the marked ones start to.
 #
@@ -899,8 +916,12 @@ try
         if logs
             record = only(http_records())
             @test record.message == "server handler error"
-            # Why Nitro must not let an unreported error through: the target is logged whole.
-            @test occursin("Q5ECRET", string(record.kwargs[:target]))
+            # Why Nitro must not let an unreported error through: the record carries the live
+            # exception, where Nitro's carry a `LoggedException` (#613). Since 2.12
+            # (JuliaWeb/HTTP.jl#1473) the target is logged without its query.
+            live = kind == "parse" ? HTTP.ParseError : ErrorException
+            @test first(record.kwargs[:exception]) isa live
+            @test string(record.kwargs[:target]) == "/x"
         else
             @test isempty(http_records())
         end
