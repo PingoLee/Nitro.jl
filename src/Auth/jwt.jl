@@ -28,7 +28,7 @@ end
 # `JWTKeyset` first, which is also where its values are checked -- before anything reads
 # them (#260, `src/Auth/keyset.jl`).
 
-const _JWT_SECRET_TYPES = "a string, a JWTKeyset, or a Dict of kid => secret"
+const _JWT_SECRET_TYPES = "a string, a SecretString, a JWTKeyset, or a Dict of kid => secret"
 
 # The encoded JOSE header segment `_decode_jwt` accepts, in bytes. Nitro's own header --
 # `{"alg":"HS256","typ":"JWT","kid":…}` -- is well under 100 bytes; 1 KB leaves room for a
@@ -73,6 +73,11 @@ function _verify_candidates(secret::AbstractString, header_kid::Nullable{String}
     return (_VerifyCandidate(header_kid, String(_check_string_secret(secret))),)
 end
 
+# The same single secret, held masked (#751). `jwt_validator` normalizes a plain string to this,
+# so its closure never captures the raw key; the reveal happens here, per call.
+_verify_candidates(secret::SecretString, header_kid::Nullable{String}) =
+    _verify_candidates(reveal(secret), header_kid)
+
 function _verify_candidates(keyset::JWTKeyset, header_kid::Nullable{String})
     if header_kid !== nothing
         # A token that names its key gets that key and no other: the steady-state path
@@ -103,6 +108,7 @@ _verify_candidates(other, ::Nullable{String}) =
 # a keyset signs with, and stamps, its signing key. A token signed with an empty key is
 # one anyone can forge, so it is refused rather than issued (#264).
 _signing_secret(secret::AbstractString) = (String(_check_string_secret(secret)), nothing)
+_signing_secret(secret::SecretString) = _signing_secret(reveal(secret))
 
 function _signing_secret(keyset::JWTKeyset)
     key = _signing_key(keyset)

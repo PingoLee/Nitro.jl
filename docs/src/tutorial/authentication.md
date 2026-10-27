@@ -302,6 +302,11 @@ urlpatterns("",
 )
 ```
 
+The secret may also be a [`SecretString`](@ref), the form an app config struct holds it in —
+`jwt_validator(config.jwt_secret)`. Either way the validator keeps it as a `SecretString`, so an
+error or log line that prints the middleware chain shows `SecretString("****")`, never the key.
+`encode_jwt` and `decode_jwt` accept a `SecretString` too.
+
 Every token is **always** signature-verified and **always** time-bounded: an `exp` claim is
 honored, and a token without one is accepted only as a short-lived access token bounded by
 `iat + exp_timeout` (15 minutes by default). There is no permissive mode; hardening below is

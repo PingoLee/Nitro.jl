@@ -164,9 +164,12 @@ end
             ("jwt_validator(Dict)", () -> jwt_validator(Dict("default" => weak))),
             ("JWTKeyset", () -> JWTKeyset("current" => weak)),
             ("JWTKeyset(SecretString)", () -> JWTKeyset("current" => SecretString(weak))),
+            ("jwt_validator(SecretString)", () -> jwt_validator(SecretString(weak))),
             ("encode_jwt", () -> encode_jwt(Dict("sub" => "1"), weak)),
+            ("encode_jwt(SecretString)", () -> encode_jwt(Dict("sub" => "1"), SecretString(weak))),
             # The direct-caller path has no construction time; it is checked per call.
-            ("decode_jwt", () -> decode_jwt(signed, weak)))
+            ("decode_jwt", () -> decode_jwt(signed, weak)),
+            ("decode_jwt(SecretString)", () -> decode_jwt(signed, SecretString(weak))))
         err = caught(f)
         @test (label, err isa ArgumentError) == (label, true)
         text = sprint(showerror, err)
@@ -188,6 +191,7 @@ end
     # but is still the empty HMAC key, and an unset env var is still named as the cause.
     @test occursin("empty HMAC key", message(() -> jwt_validator("\0"^40)))
     @test occursin("JWT_SECRET", message(() -> jwt_validator("")))
+    @test occursin("JWT_SECRET", message(() -> jwt_validator(SecretString(""))))
 end
 
 @testset "signing as a peer of a registry" begin
@@ -240,6 +244,10 @@ end
     @test !occursin(jwtkey("s1"), sprint(show, MIME("text/plain"), Nitro.Auth._verify_candidates(jwtkey("s1"), nothing)))
     @test (@inferred Nitro.Auth._signing_secret(ks)) == (jwtkey("s1"), "current")
     @test (@inferred Nitro.Auth._signing_secret(jwtkey("s1"))) == (jwtkey("s1"), nothing)
+    # A `SecretString` single secret takes the same concrete shapes (#751).
+    @test (@inferred Nitro.Auth._verify_candidates(SecretString(jwtkey("s1")), "label")) isa Tuple{C}
+    @test only(Nitro.Auth._verify_candidates(SecretString(jwtkey("s1")), "label")).kid == "label"
+    @test (@inferred Nitro.Auth._signing_secret(SecretString(jwtkey("s1")))) == (jwtkey("s1"), nothing)
 
     # `_decode_jwt` is what the validator calls: one tuple shape, no `with_kid` Union (#265),
     # and a CONCRETE claims container (#274). This allowed type used to be
@@ -248,6 +256,7 @@ end
     token = encode_jwt(Dict("sub" => "1"), ks; expires_in = 60)
     @test (@inferred DT Nitro.Auth._decode_jwt(token, jwtkey("s1"))) isa DT
     @test (@inferred DT Nitro.Auth._decode_jwt(token, ks)) isa DT
+    @test (@inferred DT Nitro.Auth._decode_jwt(token, SecretString(jwtkey("s1")))) isa DT
     @test decode_jwt(token, ks; with_kid = true) == Nitro.Auth._decode_jwt(token, ks)
     @test decode_jwt(token, ks) == first(Nitro.Auth._decode_jwt(token, ks))
 end
@@ -281,6 +290,7 @@ end
     token = encode_jwt(Dict("sub" => "1", "iss" => "i", "aud" => "a"), ks; expires_in = 60)
     for (label, v) in (
             ("default", jwt_validator(jwtkey("s1"))),
+            ("secret_string", jwt_validator(SecretString(jwtkey("s1")))),
             ("keyset", jwt_validator(ks; identity_from = :kid)),
             ("strict", jwt_validator(ks; profile = :strict, issuer = "i", audience = "a")),
             ("warn_claims", jwt_validator(ks; warn_claims = ["iss"])))
@@ -294,8 +304,53 @@ end
         # And `claims` itself is concrete, so `validate_claims`, `_claim_value` and
         # `Principal` specialize rather than dispatch per request (#274).
         @test (label, ci.slottypes[findfirst(==(:claims), ci.slotnames)]) == (label, Dict{String, Any})
-        @test (label, v(token).kid) == (label, label == "default" ? nothing : "current")
+        # A single secret's header kid is an unverified label, so it is discarded.
+        @test (label, v(token).kid) == (label, label in ("default", "secret_string") ? nothing : "current")
     end
+end
+
+# Base's default `show` of an exception walks into the closures it holds and prints their
+# captures. An application exception holding the middleware chain is enough: the CSRF key
+# printed masked beside it, and the JWT key printed in clear (#751).
+struct ChainHoldingFailure <: Exception
+    chain::Any
+end
+
+@testset "a string secret is held masked, and a SecretString is accepted (#751)" begin
+    raw = jwtkey("jwt-751-sentinel")
+    csrf_key = rpad("csrf-751-sentinel", 40, '.')
+    for (label, secret) in (("String", raw), ("SecretString", SecretString(raw)))
+        validator = jwt_validator(secret)
+        err = ChainHoldingFailure(Any[CSRFMiddleware(csrf_key), BearerAuth(validator), validator])
+        for (how, text) in (("repr", repr(err)), ("show", sprint(show, err)),
+                            ("text/plain", sprint(show, MIME("text/plain"), err)),
+                            ("showerror", sprint(showerror, err)))
+            @test (label, how, occursin(raw, text)) == (label, how, false)
+            @test (label, how, occursin(csrf_key, text)) == (label, how, false)
+        end
+        # The mask is what the closure holds, not a missing field. Counted against the CSRF
+        # layer alone, which prints one mask of its own whether or not the JWT key is held masked.
+        masks(x) = count("SecretString(\"****\")", repr(x))
+        @test (label, masks(err) > masks(ChainHoldingFailure(Any[CSRFMiddleware(csrf_key)]))) == (label, true)
+    end
+
+    # `jwt_validator(SecretString(s))` is `jwt_validator(s)`: the same principals, the same
+    # refusals.
+    plain, sealed = jwt_validator(raw), jwt_validator(SecretString(raw))
+    good = encode_jwt(Dict("sub" => "7", "role" => "reader"), raw; expires_in = 60)
+    @test sealed(good) == plain(good)
+    @test (sealed(good).id, sealed(good).kid, sealed(good)["role"]) == ("7", nothing, "reader")
+    for bad in (encode_jwt(Dict("sub" => "7"), jwtkey("someone-else"); expires_in = 60),
+                encode_jwt(Dict("sub" => "7", "iat" => 1, "exp" => 2), raw))
+        @test caught(() -> plain(bad)) isa Nitro.Auth.AuthError
+        @test caught(() -> sealed(bad)) isa Nitro.Auth.AuthError
+    end
+    # A SecretString is a single secret, so its header kid is still not a verified identity.
+    @test occursin("requires a keyset", message(() -> jwt_validator(SecretString(raw); identity_from = :kid)))
+
+    # And the free functions take one too, interchangeably with the plain string.
+    @test decode_jwt(encode_jwt(Dict("sub" => "7"), SecretString(raw); expires_in = 60), raw)["sub"] == "7"
+    @test decode_jwt(good, SecretString(raw))["sub"] == "7"
 end
 
 @testset "a scoped key asserts only what its scope allows (#349)" begin
