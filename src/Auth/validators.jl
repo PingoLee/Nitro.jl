@@ -77,6 +77,20 @@ function _report_missing_claim!(seen::Set{NTuple{3, Nullable{String}}}, seen_loc
     return nothing
 end
 
+# What the `jwt_validator` closure holds: a `JWTKeyset`, or a single secret as a `SecretString`.
+# A plain string is wrapped here, because `repr` of a closure prints its captures -- an
+# exception holding the middleware chain printed the JWT key in clear beside a masked CSRF key
+# (#751, the #307 rule `CSRFMiddleware` follows). One method per shape, so the capture is
+# concrete and assigned once (#265).
+_validator_key(keyset::JWTKeyset) = keyset
+_validator_key(keymap::AbstractDict) = JWTKeyset(keymap)
+# At construction, which is app startup: an empty string secret -- typically an unset env var
+# read with a "" default -- makes every token forged with "" authenticate (#264).
+_validator_key(secret::SecretString) = (_check_string_secret(reveal(secret)); secret)
+_validator_key(secret::AbstractString) = _validator_key(SecretString(secret))
+_validator_key(other) = throw(ArgumentError(
+    "jwt_validator: the secret must be $_JWT_SECRET_TYPES, got a $(typeof(other))"))
+
 """
     jwt_validator(secret_or_keyset; user_validator=nothing, identity_from=:claim,
                   identity_claim="sub", profile=:default, kwargs...)
@@ -107,8 +121,9 @@ claim-guarded route, remain the alternatives.
 
 # Keysets
 
-`secret_or_keyset` is a string secret, a [`JWTKeyset`](@ref), or a `Dict` of
-`kid => secret`. A `Dict` is lifted into a `JWTKeyset` **once, here**, so every keyset
+`secret_or_keyset` is a string secret, a [`SecretString`](@ref), a [`JWTKeyset`](@ref), or a
+`Dict` of `kid => secret`. A string secret is held as a `SecretString`, so the validator prints
+without it. A `Dict` is lifted into a `JWTKeyset` **once, here**, so every keyset
 misconfiguration — a multi-key `Dict` with no `"default"`, two entries that are the same
 HMAC key, a non-string secret — is an `ArgumentError` at construction, which is app
 startup. The validator keeps that snapshot: mutating the `Dict` afterwards has no effect.
@@ -200,13 +215,7 @@ function jwt_validator(secret_or_keyset;
     # `JWTKeyset` owns those checks now (distinct kids, distinct HMAC keys, string-or-
     # SecretString values refused before they are read), so a direct `decode_jwt` caller
     # gets them too.
-    keyset = secret_or_keyset isa AbstractDict ? JWTKeyset(secret_or_keyset) : secret_or_keyset
-    keyset isa Union{AbstractString, JWTKeyset} || throw(ArgumentError(
-        "jwt_validator: the secret must be $_JWT_SECRET_TYPES, got a $(typeof(keyset))"))
-    # At construction, which is app startup: an empty string secret -- typically an unset
-    # env var read with a "" default -- makes every token forged with "" authenticate
-    # (#264). `JWTKeyset` already refused this for its own secrets; a plain string did not.
-    keyset isa AbstractString && _check_string_secret(keyset)
+    keyset = _validator_key(secret_or_keyset)
 
     # Only a keyset-resolved kid is verified; `decode_jwt` with a single string secret
     # passes the attacker-chosen header kid through as an unverified label.
