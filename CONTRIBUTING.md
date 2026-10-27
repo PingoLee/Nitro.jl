@@ -286,7 +286,8 @@ julia --project=. test/runtests.jl --in-process test/sessionstores_tests.jl
 # Every order is meant to pass with the in-order counts (#755), so a red is a test that leans
 # on a neighbour -- or a leak in Nitro the shuffle exposed. Give each item its own `App`; the
 # bare global-API calls left are held to a shrinking baseline (`GLOBAL_API_BASELINE` in
-# `test/harness_manifest.jl`). Not run in CI yet.
+# `test/harness_manifest.jl`). CI runs one shuffled leg (ubuntu x 2 threads) seeded with the
+# run id, which the log prints; pass that seed here to reproduce its order.
 julia --project=. test/runtests.jl --shuffle 1234
 
 # Agent-docs reference lint (paths, links, symbols, § anchors, public skill/rule sets, stubs)
@@ -305,7 +306,8 @@ julia --project=docs docs/make.jl
 
 - **CI runs the suite on Julia 1.13 on Linux and Windows at `JULIA_NUM_THREADS` 1 **and** 2.** (1.12 left the matrix and the floor moved to `^1.13`, both by decision on #526. The macOS legs are parked for the pre-release phase: over 40 runs they never failed alone and were the only legs cancelled for runner capacity. The matrix comment in `ci.yml` says what they stop covering and when to restore them.)
   It runs them at **`-O0`** (#667), so reproduce a CI red with `julia -O0`: an allocation probe can
-  read differently at the default `-O2`.
+  read differently at the default `-O2`. The ubuntu 2-thread leg runs in **shuffled** order
+  (#755), seeded with the run id the log prints; reproduce it with `--shuffle <seed>`.
   A change that only passes single-threaded is not green.
 - **`PormG` is a git-pinned source dependency** (`[sources] PormG = {url = …, rev = <sha>}`) and a
   hard test dependency: Pkg fetches that exact commit into the depot, so `Pkg.test()` resolves with
