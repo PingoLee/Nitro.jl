@@ -22,6 +22,7 @@
 #   RATE=20000 bench/socket/run.sh "nitro@8,1 nitro@8,0"  # fixed request rate, not saturation
 #   JULIA="julia +1.12" bench/socket/run.sh               # another Julia (juliaup channel)
 #   ROUTES="/health DELETE:/health" bench/socket/run.sh nitro   # a route with its method (#712)
+#   DB=postgres DB_POOL=32 ROUTES="/db /queries?n=20" bench/socket/run.sh "nitro bare_spawn go"  # #589
 #
 # RATE sets oha's `-q` (requests per second across all connections) with `--latency-correction`,
 # so a server that falls behind is charged the time requests spent waiting to be sent: p50/p99 at
@@ -55,10 +56,17 @@
 # its `/gc` (every `Base.gc_num()` field), a `go` mode's is the line count of its log, which with
 # GODEBUG=gctrace=1 in the environment is one line per collection.
 #
+# DB=postgres|sqlite adds the database routes of #589 (`/db`, `/queries?n=`, `/updates?n=`,
+# `/db_wait?ms=`): db/env.sh serves the Julia modes from the db/ env with PormG preloaded and hands
+# DB_POOL and DB_CONNINFO_FILE to every server, go included; db/world.jl says what each route does
+# and db/seed.jl writes its table. `go` serves PostgreSQL only. A BASE_ROOT/BASE_ROOTS mode is
+# still served from its own checkout's bench/ env, which has no PormG.
+#
 # Results: one TSV per invocation under bench/results/ (gitignored).
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
+. "$HERE/db/env.sh"
 
 MODES="${1:-nitro bare_spawn bare_nospawn}"
 RUNS="${2:-5}"
@@ -89,6 +97,7 @@ WANT_GO=0
 for mode in "${MODE_LIST[@]}"; do [ "${mode%%@*}" = go ] && WANT_GO=1; done
 if [ "$WANT_GO" = 1 ]; then
   command -v go >/dev/null || { echo "run.sh: go not on PATH (needed by the go mode)" >&2; exit 1; }
+  [ "$DB" = sqlite ] && { echo "run.sh: the go mode serves no SQLite route" >&2; exit 1; }
 fi
 if [ "${PROFILE:-0}" != "0" ] && [ "${#MODE_LIST[@]}" -ne 1 ]; then
   echo "run.sh: PROFILE takes exactly one mode" >&2; exit 1
@@ -128,7 +137,22 @@ if [ "$WANT_GO" = 1 ]; then
 fi
 
 PIDS=()
-cleanup() { for p in ${PIDS[@]+"${PIDS[@]}"}; do kill "$p" 2>/dev/null; done; wait 2>/dev/null; }
+# A server still alive STOP_GRACE_S (default 30) seconds after SIGTERM gets SIGKILL, and is named.
+# An unbounded `wait` once held a run for four hours: a Julia server on PostgreSQL that took SIGTERM
+# with statements in flight never exited, and kept its connections open in a transaction.
+cleanup() {
+  local p alive
+  for p in ${PIDS[@]+"${PIDS[@]}"}; do kill "$p" 2>/dev/null; done
+  for _ in $(seq 1 "${STOP_GRACE_S:-30}"); do
+    alive=; for p in ${PIDS[@]+"${PIDS[@]}"}; do kill -0 "$p" 2>/dev/null && alive=1; done
+    [ -z "$alive" ] && break; sleep 1
+  done
+  for p in ${PIDS[@]+"${PIDS[@]}"}; do
+    kill -0 "$p" 2>/dev/null || continue
+    echo "run.sh: pid $p still alive ${STOP_GRACE_S:-30}s after SIGTERM; sending SIGKILL" >&2; kill -9 "$p" 2>/dev/null
+  done
+  wait 2>/dev/null
+}
 trap cleanup EXIT
 
 wait_up() {
@@ -157,6 +181,7 @@ echo "socket bench: server CPUs $SERVER_CPUS (--threads=$THREADS unless mode@thr
 echo "julia: $("${JULIA_CMD[@]}" --version)"
 echo "governor: $(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || echo unknown)"
 [ "$WANT_GO" = 1 ] && echo "go: $(go version)"
+db_banner
 
 declare -A PORT_OF LOG_OF SPID_OF RSS_REST
 i=0
@@ -172,7 +197,7 @@ for mode in "${MODE_LIST[@]}"; do
   fi
   log="$OUT/socket-$STAMP-$mode.log"
   name="$(mode_name "$mode")"; threads="$(mode_threads "$mode")"
-  project="$ROOT/bench"; served="$name"
+  project="$SERVER_PROJECT"; served="$name"
   if [ "$name" = baseline ]; then
     [ -n "${BASE_ROOT:-}" ] || { echo "run.sh: baseline needs BASE_ROOT" >&2; exit 1; }
     project="$BASE_ROOT/bench"; served=nitro
@@ -201,8 +226,11 @@ done
 
 # Warm every route on every server before anything is recorded: compiles the route and fills
 # HTTP.jl's connection paths.
+# WARM_DUR (default 3s) is that warm-up's length per route; a DB run is first warmed one request
+# at a time (db/env.sh says why).
 for mode in "${MODE_LIST[@]}"; do
-  for route in $ROUTES; do oha_json 3s "${PORT_OF[$mode]}" "$route" >/dev/null; done
+  db_prewarm "${PORT_OF[$mode]}" $ROUTES
+  for route in $ROUTES; do oha_json "${WARM_DUR:-3s}" "${PORT_OF[$mode]}" "$route" >/dev/null; done
 done
 
 slug() { printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_'; }
@@ -220,6 +248,7 @@ declare -A RPS P50 P99
 for run in $(seq 1 "$RUNS"); do
   for route in $ROUTES; do
     for mode in "${MODE_LIST[@]}"; do
+      db_settle
       [ "$GC_SNAPSHOTS" = 1 ] && gc_snapshot "$mode" "$route" "$run" before
       js=$(oha_json "$DUR" "${PORT_OF[$mode]}" "$route")
       [ "$GC_SNAPSHOTS" = 1 ] && gc_snapshot "$mode" "$route" "$run" after

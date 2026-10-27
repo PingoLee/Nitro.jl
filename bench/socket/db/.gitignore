@@ -1,0 +1,4 @@
+# The PostgreSQL connection string (it carries the password) and the SQLite files: local only.
+conninfo
+*.sqlite
+*.sqlite-*

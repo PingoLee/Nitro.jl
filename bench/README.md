@@ -28,8 +28,9 @@ bench/
 │   └── aggregate.jl    # the /aggregate kernel alone, plain and yielding every 2 ms, at N = 10^3..10^7 (#590)
 ├── socket/             # real-socket load: server.jl (Nitro vs bare HTTP.jl), run.sh, contention.sh, stall.sh, wake.sh,
 │   │                   #   slow_stream.sh, fairness.sh, quiet.sh (oha, curl, go/fairness), probe_report.jl
-│   └── go/             # the Go net/http reference server run.sh's `go` mode builds; `go test -bench Aggregate`;
-│                       #   fairness/, the per-connection client fairness.sh drives
+│   ├── go/             # the Go net/http reference server run.sh's `go` mode builds; `go test -bench Aggregate`;
+│   │                   #   fairness/, the per-connection client fairness.sh drives; db.go, its pgx routes (#589)
+│   └── db/             # the database routes (#589): PormG env, world.jl, seed.jl, env.sh (DB=…), smoke.sh
 ├── tasks/              # Julia tasks vs goroutines, no HTTP: tasks.jl, go/, run.sh
 ├── scope/              # collide.jl: what one @with costs when its ScopedValue key shares a HAMT slot (#633)
 ├── workers/            # store_throughput.jl: one process's submit/finish rate through a worker store's task lock (#548)
@@ -274,6 +275,40 @@ julia bench/socket/probe_report.jl bench/results/fairness-<stamp>-raw  # the PRO
 - Every `run.sh` row also carries the server's resident memory, read from `/proc` for the process
   that owns the listening socket: at rest (once it answers `/health`), after the last run, and the
   peak (`VmHWM`).
+
+### Database routes (#589)
+
+`DB=postgres` or `DB=sqlite` adds TechEmpower's `/db`, `/queries?n=`, `/updates?n=` and (PostgreSQL
+only) `/db_wait?ms=` to every mode, through PormG's model layer in the Julia modes and `pgx` v5 in
+`go`. The bench env carries no PormG, so those servers run from `socket/db/`'s own env with
+`PRELOAD="PormG LibPQ"` (or `SQLite`); `db/env.sh` sets that up for `run.sh` and `stall.sh`.
+`db/world.jl` has the routes and their knobs (`DB_POOL`, `DB_CONNINFO_FILE`, `DB_SQLITE`).
+
+```bash
+julia --project=bench/socket/db -e 'using Pkg; Pkg.instantiate()'
+printf 'host=127.0.0.1 port=5432 user=… dbname=… password=…\n' > bench/socket/db/conninfo  # gitignored
+DB=postgres julia --project=bench/socket/db bench/socket/db/seed.jl   # drops and refills `world`
+DB=postgres bench/socket/db/smoke.sh                                  # every route, every mode
+DB=postgres DB_POOL=32 CONNS=500 ROUTES="/db /queries?n=20 /updates?n=20" \
+  bench/socket/run.sh "nitro bare_spawn go" 5 6s
+DB=postgres DB_POOL=40 KS="4 8 16 32" ROUTE_MS=200 VARIANTS="route:/db_wait?ms=200 cpu" \
+  bench/socket/stall.sh "nitro go" 3 6s                                # does a waiting query hold a thread?
+```
+
+- **Use a throwaway database.** `seed.jl` drops `world`, and `/updates` writes. The conninfo
+  carries the password: it stays in the gitignored file, `db_psql` hands it to `psql` through the
+  environment, and nothing prints it.
+- **Pin PostgreSQL** with `taskset` to CPUs that are neither `SERVER_CPUS` nor `CLIENT_CPUS`, or it
+  competes with the server it serves; `run.sh` and `stall.sh` print the postmaster's CPUs. The
+  default CPU sets use all six cores, so a database run needs its own split, stated with the table.
+- **Pools.** `DB_POOL` is PormG's `pool_size`, and PormG grows a pool lazily to `pool_size × 10`;
+  the Go server mirrors both (`MinConns`, `MaxConns`). Every mode's server holds its connections for
+  the whole run, so `max_connections` must cover the sum of the modes' ceilings, or a server's
+  connect fails with `too many clients`.
+- **Warm-up and settling.** A PormG route's first request compiles for seconds, so each route is
+  first requested alone (`db_prewarm`) before the concurrent warm-up (`WARM_DUR`, default 3s). A
+  route slower than the window leaves requests running after `oha` stops, so before every window
+  `db_settle` waits until PostgreSQL runs no statement for the database (SQLite: `DB_SETTLE_S`).
 
 ## Comparing with Go
 

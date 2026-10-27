@@ -58,12 +58,18 @@
 #   KS="1 2 4 8 16" VARIANTS="cpu cpu_yield cpu_job" CPU_MS=200 bench/socket/stall.sh
 #   VARIANTS="login login_bcrypt" bench/socket/stall.sh "nitro go" 3 6s
 #   AGG_ROWS=10000000 ROUTE_MS=120 VARIANTS="route:/aggregate?n=10000000&op=groupby" bench/socket/stall.sh "nitro go"
+#   DB=postgres DB_POOL=40 KS="4 8 16 32" ROUTE_MS=200 VARIANTS="route:/db_wait?ms=200" bench/socket/stall.sh "nitro go"
+#
+# DB=postgres|sqlite serves the database routes of #589 as run.sh does (db/env.sh): the probe for
+# #589's H2 is `route:/db_wait?ms=200`, K statements waiting in PostgreSQL. Keep DB_POOL above the
+# largest K, or the probe measures the pool's queue instead of the wait.
 #
 # Results: one TSV per invocation under bench/results/ (gitignored). KEEP_JSON=1 also keeps every
 # oha JSON report, the load's and /plaintext's, under bench/results/stall-<stamp>-raw/.
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
+. "$HERE/db/env.sh"
 
 MODES="${1:-nitro go}"
 ROUNDS="${2:-3}"
@@ -113,6 +119,7 @@ for v in "${VARIANT_LIST[@]}"; do
 done
 if [ "$WANT_GO" = 1 ]; then
   command -v go >/dev/null || { echo "stall.sh: go not on PATH (needed by the go mode)" >&2; exit 1; }
+  [ "$DB" = sqlite ] && { echo "stall.sh: the go mode serves no SQLite route" >&2; exit 1; }
 fi
 
 OUT="$ROOT/bench/results"
@@ -139,7 +146,20 @@ mode_threads() {
 }
 
 PIDS=()
-cleanup() { for p in ${PIDS[@]+"${PIDS[@]}"}; do kill "$p" 2>/dev/null; done; wait 2>/dev/null; }
+# A server still alive STOP_GRACE_S (default 30) seconds after SIGTERM gets SIGKILL; see run.sh.
+cleanup() {
+  local p alive
+  for p in ${PIDS[@]+"${PIDS[@]}"}; do kill "$p" 2>/dev/null; done
+  for _ in $(seq 1 "${STOP_GRACE_S:-30}"); do
+    alive=; for p in ${PIDS[@]+"${PIDS[@]}"}; do kill -0 "$p" 2>/dev/null && alive=1; done
+    [ -z "$alive" ] && break; sleep 1
+  done
+  for p in ${PIDS[@]+"${PIDS[@]}"}; do
+    kill -0 "$p" 2>/dev/null || continue
+    echo "stall.sh: pid $p still alive ${STOP_GRACE_S:-30}s after SIGTERM; sending SIGKILL" >&2; kill -9 "$p" 2>/dev/null
+  done
+  wait 2>/dev/null
+}
 trap cleanup EXIT
 
 wait_up() {
@@ -162,6 +182,7 @@ echo "  /cpu burns ${CPU_MS} ms (cpu_yield yields every ${YIELD_MS} ms); /plaint
 echo "  server CPUs $SERVER_CPUS, client CPUs $CLIENT_CPUS; julia: $("${JULIA_CMD[@]}" --version)"
 [ "$WANT_GO" = 1 ] && echo "  go: $(go version)"
 echo "  governor: $(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || echo unknown)"
+db_banner
 
 declare -A PORT_OF
 i=0
@@ -186,7 +207,7 @@ for mode in "${MODE_LIST[@]}"; do
     # `env`, because an assignment produced by an expansion is not an assignment to the shell.
     env MODE=nitro PORT="$port" WORKERS=1 LOGIN="$LOGIN" CPU_MS="$CPU_MS" YIELD_MS="$YIELD_MS" ${BURST_K:+"BURST_K=$BURST_K"} \
       ${extra[@]+"${extra[@]}"} \
-      taskset -c "$SERVER_CPUS" "${julia_cmd[@]}" --project="$ROOT/bench" --threads="$threads" \
+      taskset -c "$SERVER_CPUS" "${julia_cmd[@]}" --project="$SERVER_PROJECT" --threads="$threads" \
       "$HERE/server.jl" >"$log" 2>&1 &
   fi
   pid=$!
@@ -239,6 +260,7 @@ for mode in "${MODE_LIST[@]}"; do
   base="http://127.0.0.1:${PORT_OF[$mode]}"
   taskset -c "$CLIENT_CPUS" oha -z 3s -c "$CONNS" --no-tui "$base/plaintext" >/dev/null 2>&1
   for v in "${VARIANT_LIST[@]}"; do
+    [[ $v == route:* && $v != *@* ]] && db_prewarm "${PORT_OF[$mode]}" "${v#route:}"
     applies "$mode" "$v" || continue
     mapfile -t args < <(load_args "$base" "$v")
     taskset -c "$CLIENT_CPUS" oha -n 8 -c 2 --no-tui "${args[@]}" >/dev/null 2>&1
@@ -301,6 +323,7 @@ for round in $(seq 1 "$ROUNDS"); do
         sleep "$(awk -v ms="$(cost_ms "$variant")" -v k="$k" 'BEGIN { printf "%.1f", 0.5 + ms * k / 1000 / 4 }')"
         { [ "$variant" = cpu_job ] || queued "$variant"; } && drain_jobs "$base"
       fi
+      db_settle
     done
   done
 done
