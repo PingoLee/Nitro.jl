@@ -143,6 +143,10 @@ Base.@kwdef struct QueryArgs
     id::Int = 0
     name::String = ""
 end
+# Evaluated only where Nitro is loaded: a closure's argument types are resolved when the function
+# around it is defined, so `Query{QueryArgs}` written inside `start_nitro` stops every `bare_*`
+# process at load with an `UndefVarError`.
+MODE in ("nitro", "nitro_log") && @eval query_route() = (req, q::Query{QueryArgs}) -> Res.send(q.payload.name)
 
 include(joinpath(@__DIR__, "aggregate.jl"))
 const AGG_DATA = agg_rows(AGG_ROWS)
@@ -422,7 +426,7 @@ function start_nitro()
         path("/gc",        req -> Res.send(gc_body(); content_type = "application/json"); method = "GET"),
         path("/probe",     req -> Res.send(probe_body(); content_type = "text/tab-separated-values"); method = "GET"),
         path("/mem",       req -> Res.send(mem_body(app); content_type = "application/json"); method = "GET"),
-        path("/query",     (req, q::Query{QueryArgs}) -> Res.send(q.payload.name); method = "GET"),
+        path("/query",     query_route(); method = "GET"),
         # `/links` reverses 20 links with `url`, as a page template would; `/links_prebuilt`
         # prints the same body by hand, so the gap is `url` alone (#557).
         path("/items/<int:id>", (req, id::Int) -> Res.send("item"); method = "GET", name = "item"),
