@@ -729,6 +729,9 @@ Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
     path("/h/split",  (req::HTTP.Request) -> Res.status(200);      methods = ["HEAD"]),
     path("/h/none",   (req::HTTP.Request) -> Res.status(204);      methods = ["HEAD"]),
     path("/h/304",    (req::HTTP.Request) -> SHARED_304;           methods = ["HEAD"]),
+    # A HEAD-only handler that states the length itself, with no body to count it from.
+    path("/h/declared", (req::HTTP.Request) -> HTTP.Response(200, ["Content-Length" => "5000"]);
+         methods = ["HEAD"]),
     # `/h/split` in the other order: the explicit HEAD first, then the GET (#277).
     path("/h/split2", (req::HTTP.Request) -> Res.status(200);      methods = ["HEAD"]),
     path("/h/split2", (req::HTTP.Request) -> Res.send(BODY_TEXT)),
@@ -792,6 +795,11 @@ try
         @test !HTTP.hasheader(split_head, "Content-Length")
         @test HTTP.header(HTTP.get("http://$HOST:$port/h/empty"), "Content-Length") == "0"
         @test !HTTP.hasheader(HTTP.request("HEAD", "http://$HOST:$port/h/empty"), "Content-Length")
+        # Since HTTP.jl 2.12 (JuliaWeb/HTTP.jl#1454) its own HEAD write sets the header from
+        # `content_length` -- which wrote `0` on every HEAD above and over the handler's own value
+        # here. The header on a HEAD is Nitro's call alone (`_send_response!`).
+        declared = HTTP.request("HEAD", "http://$HOST:$port/h/declared")
+        @test HTTP.header(declared, "Content-Length") == "5000"
 
         # No representation, so no length: a 204 must not send the header at all, and a 304's
         # empty body says nothing about the size of what it stands in for. (Regression guards

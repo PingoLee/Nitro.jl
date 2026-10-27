@@ -104,11 +104,30 @@ end
     @test @with(capped(0), length(json(big))) == 1001
     @test length(json(HTTP.Response(200, jobject(1001)))) == 1001
     @test length(json(HTTP.Response(200, jobject(1001)), Dict{String,Int})) == 1001
+    # HTTP.jl's multipart parser has a part cap of its own since 2.13, 1000 by default
+    # (JuliaWeb/HTTP.jl#1453), and refuses past it with a plain error -- which read as a malformed
+    # body, so 1001 parts bound as no fields at all instead of a 400, and lifting the cap did not
+    # lift HTTP's.
+    mp(n) = HTTP.Request("POST", "/", MP_T, multipart_body(n))
+    @test length(multipart(mp(1000))) == 1000
+    err = try
+        multipart(mp(1001))
+        nothing
+    catch e
+        e
+    end
+    @test err isa ValidationError
+    @test err.msg == "The multipart body has more than 1000 fields"
+    @test @with(capped(0), length(multipart(mp(1500)))) == 1500
+    @test @with(capped(1200), length(multipart(mp(1200)))) == 1200
 end
 
 @testset "max_fields = 0 on the app means unlimited" begin
     app.service.max_fields[] = 0
     @test send(HTTP.Request("GET", "/query?" * fields(2000))).status == 200
+    r = send(HTTP.Request("POST", "/multipart", MP_T, multipart_body(1500)))
+    @test r.status == 200
+    @test Nitro.text(r) == "1500"
     app.service.max_fields[] = 3
 end
 

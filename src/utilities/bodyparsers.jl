@@ -681,6 +681,11 @@ end
 @noinline _throw_too_many_fields(source::String, cap::Int) =
     throw(ValidationError("$source has more than $cap fields"))
 
+# HTTP.jl refuses a multipart body past `max_parts` with a plain `error` (JuliaWeb/HTTP.jl#1453),
+# so its message is the only mark; test/http_internals_contract_tests.jl pins it.
+_too_many_parts(e)::Bool =
+    e isa ErrorException && startswith(e.msg, "multipart body has more than max_parts")
+
 """
     _check_field_count(s, source) -> nothing
 
@@ -966,17 +971,18 @@ function multipart(req::HTTP.Request) :: Dict{String, Union{FormFile, Vector{For
     # The part parser reads each part's headers through `pointer`, which wants dense memory.
     bytes isa DenseVector{UInt8} || (bytes = collect(bytes))
 
+    # The field cap (#327) is HTTP's part cap too (JuliaWeb/HTTP.jl#1453): the boundary scan stops
+    # one part past it, before any part is built, and `0` lifts both. HTTP's own default is 1000,
+    # so it is always passed -- an app that raised or lifted the cap would otherwise get no parts.
+    cap = request_max_fields()
     parts = try
-        HTTP.parse_multipart_body(bytes, boundary)
+        HTTP.parse_multipart_body(bytes, boundary; max_parts = cap)
     catch e
         # A malformed multipart body is "no parts"; a corrupted process is not (#254).
         is_unrecoverable(e) && rethrow()
+        _too_many_parts(e) && _throw_too_many_fields("The multipart body", cap)
         return result
     end
-
-    # The part list is a plain vector; the hash tables below are what the cap protects (#327).
-    cap = request_max_fields()
-    cap > 0 && length(parts) > cap && _throw_too_many_fields("The multipart body", cap)
 
     # Collect files and text into separate, homogeneously-typed buckets. This
     # keeps the per-field vectors correctly typed (`Vector{FormFile}` /
