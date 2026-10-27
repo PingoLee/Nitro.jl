@@ -2030,6 +2030,68 @@ end
 end
 end
 
+@testitem "Claims{T} binds a nested @kwdef field (#765)" tags=[:core, :auth, :security] setup=[NitroCommon] begin
+using Base: @kwdef
+using Test
+using HTTP
+using JSON
+using Nitro
+
+const E = Nitro.Core.Extractors
+
+@kwdef struct Leaf765; y::Int = 1; end
+@kwdef struct Inner765; x::Int = 0; leaf::Leaf765 = Leaf765(); end
+@kwdef struct Outer765
+    sub::String
+    inner::Inner765 = Inner765()
+end
+
+secret = jwtkey("nested-claims-secret")
+validator = Nitro.Auth.jwt_validator(secret)
+token(claims) = Nitro.Auth.encode_jwt(claims, secret; expires_in = 60)
+bearer(target, t) = HTTP.Request("GET", target, ["Authorization" => "Bearer $t"])
+
+nested(req, c::Claims{Outer765}) = Res.json(Dict("x" => c.payload.inner.x, "y" => c.payload.inner.leaf.y))
+app = App(mod = @__MODULE__)
+urlpatterns(app, "", path("/nested", nested; middleware = [BearerAuth(validator)]))
+call(claims) = internalrequest(app, bearer("/nested", token(claims)))
+
+@testset "a nested @kwdef claim binds, and each level takes its own defaults" begin
+    r = call(Dict("sub" => "u", "inner" => Dict("x" => 2)))
+    @test r.status == 200
+    @test Nitro.json(r) == Dict("x" => 2, "y" => 1)
+    @test Nitro.json(call(Dict("sub" => "u"))) == Dict("x" => 0, "y" => 1)
+    @test Nitro.json(call(Dict("sub" => "u", "inner" => Dict{String, Any}()))) == Dict("x" => 0, "y" => 1)
+    @test Nitro.json(call(Dict("sub" => "u", "inner" => Dict("x" => 3, "leaf" => Dict("y" => 4))))) ==
+        Dict("x" => 3, "y" => 4)
+    bound = E.claims_bind(Outer765, Dict{String, Any}("sub" => "u", "inner" => Dict{String, Any}("x" => 5)))
+    @test bound isa Outer765 && bound.inner.x == 5
+end
+
+@testset "a mistyped nested claim is still a 403 naming it" begin
+    # A scalar is not an object: StructUtils alone walked it as a struct with no fields and bound
+    # every default, where `Json{T}` refuses the same shape.
+    for inner in (Dict("x" => "no"), Dict("leaf" => Dict("y" => "no")), "flat", 5, true, nothing)
+        r = call(Dict("sub" => "u", "inner" => inner))
+        @test r.status == 403
+        @test occursin("claim 'inner'", Nitro.text(r))
+    end
+end
+
+# A JSON body's nested bind still reports an `Int` position, the byte JSON.jl's walk resumes from,
+# and a decoded claim's reports `nothing`. Read from the inferred type: JSON.jl skips a value
+# itself when the callback returns no `Int`, so a bind result alone passes with the assert dropped.
+@testset "each source keeps its own position type" begin
+    style = typeof(JSON.StructUtils.DefaultStyle())
+    @test only(Base.return_types(E.bind_nested, (Type{Inner765}, style, JSON.LazyValue{String}))) ==
+        Tuple{Inner765, Int}
+    @test only(Base.return_types(E.bind_nested, (Type{Inner765}, style, Dict{String, Any}))) ==
+        Tuple{Inner765, Nothing}
+    bound = E.json_bind(Outer765, """{"inner":{"leaf":{"y":7},"x":2},"sub":"after"}""")
+    @test bound.sub == "after" && bound.inner.x == 2 && bound.inner.leaf.y == 7
+end
+end
+
 @testitem "a validator that throws never logs the value it was handed (#595)" tags=[:core, :auth, :security] setup=[NitroCommon] begin
 using Test
 using HTTP

@@ -678,7 +678,7 @@ end
 # so a plain field keeps its static call and only a nested `@kwdef` field pays the dynamic one.
 function bind_field!(fields::KwdefFields, name::Symbol, ::Type{FT}, value) where {FT}
     bound, pos = binds_by_keyword(FT) ?
-        Base.inferencebarrier(KwdefBind{FT}())(fields.style, value) :: Tuple{FT, Int} :
+        bind_nested(FT, fields.style, value) :
         _SU.make(fields.style, FT, value)
     # A repeated key replaces the earlier value, so the last one binds. Every occurrence is parsed,
     # though, so an invalid one refuses the body even when a later one is valid -- as JSON.jl's
@@ -687,6 +687,15 @@ function bind_field!(fields::KwdefFields, name::Symbol, ::Type{FT}, value) where
     i === nothing ? push!(fields.kwargs, name => bound) : (fields.kwargs[i] = name => bound)
     return pos
 end
+
+# The barrier's result is asserted to what its source reports as a position. A JSON body's lazy
+# value reports the byte after it, which the walk hands back to JSON.jl. A decoded claim is a Julia
+# value and reports StructUtils' default state, `nothing`: asserting `Int` for both refused every
+# `Claims{T}` with a nested `@kwdef` field (#765).
+bind_nested(::Type{FT}, style, value::JSON.LazyValue) where {FT} =
+    Base.inferencebarrier(KwdefBind{FT}())(style, value) :: Tuple{FT, Int}
+bind_nested(::Type{FT}, style, value) where {FT} =
+    Base.inferencebarrier(KwdefBind{FT}())(style, value) :: Tuple{FT, Nothing}
 
 """
 Extracts a part of a json object from the body of a request and converts it into a custom struct
@@ -845,6 +854,10 @@ struct ClaimsBinder{P} end
 @noinline _throw_scalar_for_collection() = throw(ArgumentError("expected a JSON array or object"))
 _SU.make(::NitroReadStyle, ::Type{T}, ::Union{AbstractString, Number, Nothing}) where
     {T <: Union{AbstractArray, AbstractSet, AbstractDict}} = _throw_scalar_for_collection()
+# The same for a nested `@kwdef` field, which takes only an object: StructUtils walked a scalar as a
+# struct with no fields, so `"inner" => "x"` bound every default where `Json{T}` refuses it (#765).
+_SU.make(::NitroReadStyle, ::Type{KwdefBind{T}}, ::Union{AbstractString, Number, Nothing}) where {T} =
+    _throw_not_an_object()
 
 claims_binder(::Type{T}) where {T} = binds_by_keyword(T) ? ClaimsBinder{KwdefBind{T}}() : ClaimsBinder{T}()
 
