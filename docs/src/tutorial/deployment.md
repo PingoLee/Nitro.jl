@@ -136,7 +136,11 @@ stop a production server with `terminate` or its process supervisor rather than 
 A task gives up its thread only when it waits: on I/O, a lock, a `sleep` or a `yield()`. Julia
 does not preempt one, so a handler that computes for 200 ms holds its default thread for
 200 ms. Waiting on a database, another service or a file is not computing; those handlers give
-their thread back while they wait and are not what this section is about.
+their thread back while they wait and are not what this section is about. Measured
+([#589](https://github.com/PingoLee/Nitro.jl/issues/589#issuecomment-6458357081)): on the same
+8 default threads, 32 PormG queries each waiting 200 ms on PostgreSQL left the minimal route at
+96% of its idle rate, where 8 handlers computing for 200 ms took it to 1.4%. A database wait
+needs no queue; the connection pool, not the thread count, bounds how many run at once.
 
 On the machine above (`--threads=8`, so 8 default threads), `bench/socket/stall.sh` kept k
 requests computing 200 ms each in flight while a load generator held 50 connections on a minimal
