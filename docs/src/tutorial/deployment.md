@@ -147,6 +147,13 @@ synchronous `ccall` that returns only with the result, holds its default thread 
 query exactly as computing does: measure it before relying on this, and treat it like the CPU
 work below, which does need the queue.
 
+Size that pool for the requests that hold a connection at once, not for the database's cores.
+PormG grows a pool up to 10 × its configured `pool_size`, and on its Postgres.jl driver a ceiling
+below the requests holding a connection makes the rest queue for one: throughput drops and the
+median latency rises ([#589, *Run 4b*](https://github.com/PingoLee/Nitro.jl/issues/589#issuecomment-6476507622)).
+The answer that holds for a Go server on `pgx`, a pool about the size of the database's cores,
+does not carry over.
+
 On the machine above (`--threads=8`, so 8 default threads), `bench/socket/stall.sh` kept k
 requests computing 200 ms each in flight while a load generator held 50 connections on a minimal
 route, and measured that route. The same 200 ms of work was run three ways in Nitro: computing in
