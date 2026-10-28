@@ -141,6 +141,11 @@ their thread back while they wait and are not what this section is about. Measur
 8 default threads, 32 PormG queries each waiting 200 ms on PostgreSQL left the minimal route at
 96% of its idle rate, where 8 handlers computing for 200 ms took it to 1.4%. A database wait
 needs no queue; the connection pool, not the thread count, bounds how many run at once.
+Those numbers are for PormG's default PostgreSQL driver, LibPQ, which parks the request task on
+the socket while the query runs. A driver that waits inside a blocking call instead, such as a
+synchronous `ccall` that returns only with the result, holds its default thread for the whole
+query exactly as computing does: measure it before relying on this, and treat it like the CPU
+work below, which does need the queue.
 
 On the machine above (`--threads=8`, so 8 default threads), `bench/socket/stall.sh` kept k
 requests computing 200 ms each in flight while a load generator held 50 connections on a minimal
