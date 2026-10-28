@@ -28,6 +28,10 @@
 #                       `:interactive` threads only, C frames included, headed by the window's GC
 #                       time -- where HTTP.jl accepts, parses every request head and wakes the
 #                       per-request task, #462). 0 (the default) disables it.
+#   PROFILE_SAVE=0|1    With PROFILE, also serialize the window's raw samples, `(data, lidict)` from
+#                       `Profile.retrieve()`, to `<stem>.jlprof`, so a view the reports do not carry
+#                       -- the callers of one frame, a default-pool tree -- can be printed afterwards
+#                       in another process: `Profile.print(data, lidict; …)` (#782).
 #   WARMUP=<seconds>    Delay before the profile window opens. Default 8.
 #   CPU_MS=50           What `/cpu` burns: a loop that never yields, holding its thread for this many
 #                       milliseconds (#491: does a CPU-bound handler starve `/health`?).
@@ -670,6 +674,8 @@ end
 # profiling: `rss.sh` must not count it. The function is evaluated after the `using`, not defined
 # at top level, because `Profile.@profile` needs the module when the macro expands.
 PROFILE_S > 0 && @eval using Profile
+const PROFILE_SAVE = PROFILE_S > 0 && get(ENV, "PROFILE_SAVE", "0") == "1"
+PROFILE_SAVE && @eval using Serialization
 PROFILE_S > 0 && @eval function profile_window()
     sleep(WARMUP_S)
     Profile.init(n = 10^7, delay = 0.001)
@@ -704,6 +710,7 @@ PROFILE_S > 0 && @eval function profile_window()
                       threads = interactive, mincount = 20, maxdepth = 80)
     end
     open(io -> sched_share(io, interactive), "$stem-sched.txt", "w")
+    PROFILE_SAVE && open(io -> serialize(io, Profile.retrieve()), "$stem.jlprof", "w")
     @info "bench: profile written" stem
 end
 
