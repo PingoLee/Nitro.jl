@@ -283,6 +283,8 @@ only) `/db_wait?ms=` to every mode, through PormG's model layer in the Julia mod
 `go`. The bench env carries no PormG, so those servers run from `socket/db/`'s own env with
 `PRELOAD="PormG LibPQ"` (or `SQLite`); `db/env.sh` sets that up for `run.sh` and `stall.sh`.
 `db/world.jl` has the routes and their knobs (`DB_POOL`, `DB_CONNINFO_FILE`, `DB_SQLITE`).
+`PG_DRIVER=Postgres` runs the Julia modes on PormG's Postgres.jl driver instead of LibPQ (the
+default): `db/env.sh` preloads `Postgres` and sets `PORMG_POSTGRES_DRIVER`. Go always runs `pgx`.
 
 ```bash
 julia --project=bench/socket/db -e 'using Pkg; Pkg.instantiate()'
