@@ -340,13 +340,22 @@ end # @testitem
 # compiled code to print it while the process was being torn down -- which crashed the test child
 # in LLVM. Parked on its `Event`, the janitor is never woken: only its `Timer` callback task ends.
 #
-# A child process, because only an exit can show it. Two things make the outcome deterministic
-# rather than a race: a default thread kept awake to run whatever the finalizers wake, and a
-# finalizer that waits before it reports, so the janitor's has run by then. That ordering is
-# Julia's: exit runs finalizers newest first, list by list, and the janitor's `Timer` is on a
-# default thread's list and this one on thread 1's. A GC that promoted the `Timer` to the marked
-# list first would reverse it -- the test would then pass against the unpatched loop, never fail
-# against the fixed one. Here it reported `failed=true` against the unpatched loop in every run.
+# A child process, because only an exit can show it. Two things widen the window in which the
+# unpatched loop shows its failure: a default thread kept awake to run whatever the finalizers
+# wake, and a finalizer that waits before it reports, so the janitors' `Timer`s have been
+# finalized by then. That ordering is Julia's: exit runs finalizers newest first, list by list,
+# and a janitor's `Timer` is on a default thread's list where this one is on thread 1's. Against
+# the unpatched loop it reported `failed=true` in every run on Linux.
+#
+# What the item asserts is what the bug produces, and only that (#774): the child exits `(0, 0)`
+# and its stderr carries no `Unhandled Task` and no `EOFError`. The report line is NOT required.
+# It is printed by a finalizer during exit, and on `windows-latest` that finalizer ran in some
+# runs and not in others (the child was gone in about 1 s, under the finalizer's 2 s wait), so
+# a test that demanded the line failed with the fix working: 3 of 5 Windows attempts after #773
+# merged, on a docs-only PR among them. When the line is present it must say `failed=0`; when it
+# is absent, the child's exit and stderr already said what the item is for. Twenty janitors
+# rather than one, so that whatever window the exit leaves, the unpatched loop has twenty
+# chances to throw inside it.
 @testitem "Janitor — a janitor parked at exit ends without an exception (#772)" tags=[:middleware, :slow] setup=[NitroCommon] begin
     using Test
     using Nitro
@@ -354,16 +363,18 @@ end # @testitem
     code = """
     using Nitro, Dates
     using Nitro.Core.Middleware.JanitorMiddleware: _janitor
-    on_startup, _ = _janitor(() -> nothing, Hour(1), "ExitTest", "idle work", "interval")
-    const T = on_startup()
-    timedwait(() -> istaskstarted(T) && T.queue !== nothing, 10.0) === :ok ||
-        error("the janitor never parked")
+    const TASKS = map(1:20) do i
+        on_startup, _ = _janitor(() -> nothing, Hour(1), "ExitTest\$i", "idle work", "interval")
+        on_startup()
+    end
+    timedwait(() -> all(t -> istaskstarted(t) && t.queue !== nothing, TASKS), 10.0) === :ok ||
+        error("a janitor never parked")
     Threads.@spawn while true
         yield()
     end
     const CHECK = finalizer(Ref(0)) do _
         Libc.systemsleep(2.0)
-        Core.println("JANITOR AT EXIT: failed=", istaskfailed(T))
+        Core.println("JANITOR AT EXIT: failed=", count(istaskfailed, TASKS))
     end
     println("exiting")
     """
@@ -375,8 +386,14 @@ end # @testitem
     failure = (p.exitcode, p.termsignal) == (0, 0) ? nothing :
         "child exit $(p.exitcode), signal $(p.termsignal); stderr: $(stderr_text)"
     @test failure === nothing
+    # The script ran to its end: the janitors were parked when the exit began.
     @test occursin("exiting", stdout_text)
-    # The report came from inside the exit, after the finalizers ran: the check really ran.
-    @test occursin("JANITOR AT EXIT: failed=false", stdout_text)
+    # What the unpatched loop produced: an `EOFError` out of a janitor, printed by `errormonitor`
+    # as an `Unhandled Task` error, or the crash of that print during teardown (the exit above).
     @test !occursin("Unhandled Task", stderr_text)
+    @test !occursin("EOFError", stderr_text)
+    # The report line is optional (#774): it comes from a finalizer during exit, which Julia does
+    # not promise to run. When it is there, no janitor may have failed.
+    report = match(r"JANITOR AT EXIT: failed=(\d+)", stdout_text)
+    @test report === nothing || report[1] == "0"
 end
