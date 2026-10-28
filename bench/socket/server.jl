@@ -13,6 +13,11 @@
 #   MODE=bare_pool      `bare_spawn` with the per-request spawn replaced by POOL long-lived tasks on
 #                       `:default` (default `nthreads(:default)`), fed by a channel (#468): is
 #                       CREATING a task per request a material cost, or is a pool no cheaper?
+#   MODE=bare_scoped    `bare_spawn` with the database routes run under `@with` of one `ScopedValue`
+#                       nothing reads, bound to a mutable object: the one-key scope Nitro's
+#                       pipeline binds around every handler (`_app_context_seed`), and nothing else
+#                       of Nitro (#782 run 1). Is a bound scope alone what PormG's per-statement
+#                       `ScopedValue` reads pay for?
 #
 #   POOL=<n>            bare_pool only: how many pooled handler tasks.
 #   PORT=8080           Loopback port.
@@ -329,6 +334,16 @@ function lag_body()
                           "max" => round(samples[end]; digits = 2)))
 end
 
+# MODE=bare_scoped (#782): one key, bound to a mutable object every request shares, as Nitro's
+# `RequestScope` is (#444), so the scope holds one insert and no box. Nothing reads it.
+using Base.ScopedValues: ScopedValue, @with
+mutable struct BenchScope
+    const n::Int
+end
+const BARE_SCOPED       = MODE == "bare_scoped"
+const BENCH_SCOPE       = ScopedValue{BenchScope}(BenchScope(0))
+const BENCH_SCOPE_VALUE = BenchScope(1)
+
 function bare_handler(req::HTTP.Request)::HTTP.Response
     target = req.target
     target == "/plaintext" && return HTTP.Response(200, ["Content-Type" => "text/plain; charset=utf-8"], PLAINTEXT)
@@ -347,7 +362,7 @@ function bare_handler(req::HTTP.Request)::HTTP.Response
         return HTTP.Response(200, ["Content-Type" => "application/json"], agg_body(AGG_DATA, parsed..., yield_ms))
     end
     if DB_ROUTES
-        resp = db_bare(target)
+        resp = BARE_SCOPED ? (@with BENCH_SCOPE => BENCH_SCOPE_VALUE db_bare(target)) : db_bare(target)
         resp === nothing || return resp
     end
     return HTTP.Response(404)
@@ -768,10 +783,10 @@ end
 end
 
 handle = MODE in ("nitro", "nitro_log") ? start_nitro() :
-         MODE == "bare_spawn"   ? start_bare(true) :
+         MODE in ("bare_spawn", "bare_scoped") ? start_bare(true) :
          MODE == "bare_nospawn" ? start_bare(false) :
          MODE == "bare_pool"    ? start_bare_pool() :
-         error("unknown MODE=$(MODE): expected nitro, nitro_log, bare_spawn, bare_nospawn or bare_pool")
+         error("unknown MODE=$(MODE): expected nitro, nitro_log, bare_spawn, bare_scoped, bare_nospawn or bare_pool")
 
 @info "bench: serving" MODE PORT threads = Threads.nthreads() interactive = Threads.nthreads(:interactive)
 PROFILE_S > 0 && Threads.@spawn profile_window()

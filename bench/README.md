@@ -138,8 +138,10 @@ julia bench/socket/probe_report.jl bench/results/fairness-<stamp>-raw  # the PRO
   `nitro` (`serve()` with no middleware), `nitro_log` (the same with the access log on),
   `bare_spawn` (HTTP.jl `listen!` + `streamhandler` with a `Threads.@spawn` per request, the shape
   Nitro takes and the ceiling to compare it with), `bare_nospawn` (the handler on HTTP.jl's
-  connection task), and `bare_pool` (`bare_spawn` with the spawn replaced by `POOL` long-lived
-  tasks, default `nthreads(:default)`, fed by a `Channel`: no task created per request, #468). `/cpu` burns `CPU_MS` (default 50) without yielding; `/lag` is live only with
+  connection task), `bare_pool` (`bare_spawn` with the spawn replaced by `POOL` long-lived
+  tasks, default `nthreads(:default)`, fed by a `Channel`: no task created per request, #468), and
+  `bare_scoped` (`bare_spawn` with the database routes under `@with` of one unread `ScopedValue`,
+  the one-key scope Nitro binds around every handler, #782). `/cpu` burns `CPU_MS` (default 50) without yielding; `/lag` is live only with
   `LAG=1`. `/cpu_yield` burns the same but calls `yield()` every `YIELD_MS` (default 2).
   The Nitro modes also serve `/query?id=7&name=bench`, which binds a `Query{T}` of a `@kwdef`
   struct and answers `name`, so typed binding is measurable beside `/plaintext` (#537):
