@@ -25,8 +25,10 @@ case " $MODES " in *" go "*) (cd "$HERE/go" && go build -o "$GO_BIN" .) || fail 
 
 # The rows the table holds for these ids, as `id randomnumber` lines, read the way each backend's
 # own client would: a one-off Julia process through PormG, so nothing here needs psql or sqlite3.
+# It always reads PostgreSQL through LibPQ, so a server on PG_DRIVER=Postgres is checked by the
+# other driver.
 read_back() {
-  julia --startup-file=no --project="$HERE/db" -e '
+  env -u PORMG_POSTGRES_DRIVER julia --startup-file=no --project="$HERE/db" -e '
     using PormG, HTTP, JSON
     ENV["DB"] == "sqlite" ? (@eval using SQLite) : (@eval using LibPQ)
     redirect_stderr(devnull) do

@@ -3,11 +3,20 @@
 # PormG and the driver preloaded, and passes DB, DB_POOL and DB_CONNINFO_FILE to every server
 # (db/world.jl, go/db.go). PostgreSQL itself runs outside the script; pin it with taskset to CPUs
 # that are neither SERVER_CPUS nor CLIENT_CPUS, and say which beside the table.
+#
+# PG_DRIVER=LibPQ|Postgres picks PormG's PostgreSQL driver for the Julia modes (default LibPQ, as
+# PormG's own default): Postgres preloads Postgres.jl and sets PORMG_POSTGRES_DRIVER, which PormG
+# reads when its configuration names no driver. Go always runs pgx.
 SERVER_PROJECT="$ROOT/bench"
 DB="${DB:-}"
 if [ -n "$DB" ]; then
   case "$DB" in
-    postgres) db_preload="PormG LibPQ" ;;
+    postgres)
+      case "${PG_DRIVER:=LibPQ}" in
+        LibPQ)    db_preload="PormG LibPQ" ;;
+        Postgres) db_preload="PormG Postgres"; export PORMG_POSTGRES_DRIVER=Postgres ;;
+        *) echo "$(basename "$0"): PG_DRIVER=$PG_DRIVER: expected LibPQ or Postgres" >&2; exit 1 ;;
+      esac ;;
     sqlite)   db_preload="PormG SQLite" ;;
     *) echo "$(basename "$0"): DB=$DB: expected postgres or sqlite" >&2; exit 1 ;;
   esac
@@ -21,6 +30,7 @@ db_banner() {
   [ -n "$DB" ] || return 0
   local line="database: DB=$DB, DB_POOL=$DB_POOL (PormG grows to $((DB_POOL * 10)); go mirrors both)"
   if [ "$DB" = postgres ]; then
+    line="$line, driver $PG_DRIVER"
     local port pid
     port="$(grep -o 'port=[0-9]*' "$DB_CONNINFO_FILE" | head -1 | cut -d= -f2)"
     pid="$(ss -Hltnp "sport = :${port:-5432}" 2>/dev/null | grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2)"
