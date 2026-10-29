@@ -330,7 +330,10 @@ makes, and `L2` is `HTTP.listen!` with both timeouts set, after one request on e
 cells are `A0` (no idle socket), `A1` (50, no deadline), `A2` (50, 120 s), `A3` (500, 120 s) and
 `A4` (50, 1 s, re-armed every 0.5 s). `A5` and `A6` hold no idle socket. Instead, every round trip
 (`A5`) or every 20th one (`A6`, one request per 20 statements) re-arms its own socket in the order
-HTTP.jl's keep-alive loop does per request: +120 s, then +15 s, then 0. `LOCK_PROFILE=1` adds the
+HTTP.jl's keep-alive loop does per request: +120 s, then +15 s, then 0. `A7` (every 20th) and `A7e`
+(every round trip) send that churn to a second connection each worker owns and never reads, so the
+socket the round trips wait on carries no deadline (`deadlines.sh probe-c2` checks that the deadline
+reaches it). `LOCK_PROFILE=1` adds the
 window's count of contended `ReentrantLock` acquisitions to each log. Each cell and round is a fresh
 process with one 6 s window, because a 120 s deadline must not expire inside a pass. Per-thread CPU
 is read from `/proc` at the window's edges, split into the default threads, the poller and the main

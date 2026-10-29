@@ -6,6 +6,7 @@
 # Usage:
 #   bench/socket/deadlines.sh validate                          # the controls; nothing here is a number to keep
 #   bench/socket/deadlines.sh probe <L1|L2> <deadline_s> [SILENT=1]   # one timeout probe
+#   bench/socket/deadlines.sh probe-c2                          # a 2 s deadline on each worker's c2 (A7's target)
 #   bench/socket/deadlines.sh block <threads> "<cells>" [rounds=3] [passes=2]
 #   bench/socket/deadlines.sh strace "<cells>"                  # syscall counts, outside any timed window
 #
@@ -19,6 +20,9 @@
 #   A4  50 idle sockets, 1 s deadline re-armed every 0.5 s by the client
 #   A5  no idle socket; every round trip re-arms its own socket as HTTP.jl does per request
 #   A6  no idle socket; every 20th round trip does (one request per 20 statements, /queries?n=20)
+#   A7  as A6, but the churn re-arms a SECOND connection each worker owns and never reads (c2,
+#       parked in a 1-byte read by a helper task); the round trips' own socket carries no deadline
+#   A7e as A7 on every round trip (A5's twin)
 # L1 arms each idle socket with Reseau's `TCP.set_read_deadline!`; L2 is HTTP.jl's `listen!` with
 # `idle_timeout` and `read_header_timeout` set to the deadline (0 when off).
 #
@@ -67,8 +71,8 @@ wait_port_free() {
   for i in $(seq 1 300); do ss -Hltn "sport = :$IDLE_PORT" | grep -q . || return 0; sleep 0.2; done
   die "port $IDLE_PORT still taken after 60 s"
 }
-cell_env() {   # sets N D R C
-  C=0
+cell_env() {   # sets N D R C X (X=1: the churn goes to the worker's second connection)
+  C=0; X=0
   case "$1" in
     A0) N=0;   D=0;   R=0 ;;
     A1) N=50;  D=0;   R=0 ;;
@@ -77,7 +81,9 @@ cell_env() {   # sets N D R C
     A4) N=50;  D=1;   R=0.5 ;;
     A5) N=0;   D=0;   R=0; C=1 ;;
     A6) N=0;   D=0;   R=0; C=20 ;;
-    *) die "cell $1: expected A0..A6" ;;
+    A7) N=0;   D=0;   R=0; C=20; X=1 ;;
+    A7e) N=0;  D=0;   R=0; C=1;  X=1 ;;
+    *) die "cell $1: expected A0..A7, A7e" ;;
   esac
 }
 start_peer() {
@@ -103,7 +109,7 @@ run_one() {
   local tag="p$pass-r$round-${spec//:/_}-t${threads/,/_}"
   local log="$OUT/$tag.log" ilog="$OUT/$tag.idle.log"
   wait_port_free
-  env ARMING="$arming" N="$N" DEADLINE_S="$D" CHURN_EVERY="$C" W="$w" LABEL="$tag" "$@" \
+  env ARMING="$arming" N="$N" DEADLINE_S="$D" CHURN_EVERY="$C" CHURN_C2="$X" W="$w" LABEL="$tag" "$@" \
     taskset -c "$SERVER_CPUS" "${JL[@]}" --threads="$threads" "$HERE/deadlines.jl" > "$log" 2>&1 &
   local pid=$! ipid=""
   wait_for "$log" '^READY' 120 || { kill "$pid"; die "$tag: no READY"; }
@@ -118,13 +124,18 @@ run_one() {
   row="$(grep -P '^RESULT\t' "$log" | cut -f2-)"
   total="$(sed -n 's/^TOTAL rt=\([0-9]*\) faults=0 .*/\1/p' "$log")"
   ppid="$(sed -n 's/^READY pid=\([0-9]*\) .*/\1/p' "$log")"
-  # The peer prints a connection's count when it closes; give it a moment.
+  # The peer prints a connection's count when it closes; give it a moment. A7's second connections
+  # (`silent`) must have carried no message at all, and none may have ended before the run did.
   for _ in $(seq 1 25); do
-    [ "$(awk -v p="$ppid" '$1 == "CONN" && $2 == p' "$OUT/peer.log" | wc -l)" -ge "$w" ] && break; sleep 0.2
+    [ "$(awk -v p="$ppid" '$1 == "CONN" && $2 == p' "$OUT/peer.log" | wc -l)" -ge $((w * (1 + X))) ] && break; sleep 0.2
   done
-  peer="$(awk -v p="$ppid" '$1 == "CONN" && $2 == p { s += $4 } END { print s + 0 }' "$OUT/peer.log")"
+  peer="$(awk -v p="$ppid" '$1 == "CONN" && $2 == p && $5 != "silent" { s += $4 } END { print s + 0 }' "$OUT/peer.log")"
+  local silent
+  silent="$(awk -v p="$ppid" '$1 == "CONN" && $2 == p && $5 == "silent" { n++; s += $4 } END { printf "%d:%d", n, s }' "$OUT/peer.log")"
   if [ -z "$row" ] || [ -z "$total" ]; then check="no-result"
   elif [ "$peer" != "$total" ]; then check="peer-$peer-vs-$total"
+  elif [ "$silent" != "$((w * X)):0" ]; then check="c2-conns-$silent"
+  elif grep -q '^C2END' "$log"; then check="c2-ended-early"
   else
     local t1 closed sc early
     t1="$(cut -f19 <<<"$row")"; closed="$(cut -f16 <<<"$row")"; sc="$(cut -f15 <<<"$row")"
@@ -195,6 +206,30 @@ case "$CMD" in
     summary ;;
   probe)
     probe "$@" ;;
+  probe-c2)
+    # A7's target is real: a 2 s deadline on each worker's c2 must end its helper's read at 2.0 ± 0.2 s,
+    # while the round trips on the first connection run on through a window that spans the 2 s mark.
+    start_peer
+    log="$OUT/probe-c2.log"
+    wait_port_free
+    env ARMING=L1 N=0 DEADLINE_S=0 W=50 C2_DEADLINE_S=2 WARM_S=1 WINDOW_S=3 \
+      taskset -c "$SERVER_CPUS" "${JL[@]}" --threads=8,1 "$HERE/deadlines.jl" > "$log" 2>&1 &
+    pid=$!
+    wait_exit "$pid" 120
+    ppid="$(sed -n 's/^READY pid=\([0-9]*\) .*/\1/p' "$log")"
+    sleep 1
+    awk -v p="$ppid" '
+      FILENAME ~ /peer/ { if ($1 == "CONN" && $2 == p) { if ($5 == "silent") { sn++; ss += $4 } else ps += $4 }; next }
+      $1 == "C2ARMED" { armed = $2 }
+      $1 == "C2END" { n++; split($3, r, "="); reason[r[2]]++; split($4, a, "="); x = a[2] + 0
+                      if (lo == "" || x < lo) lo = x; if (x > hi) hi = x }
+      $1 == "RESULT" { split($0, f, "\t"); rt = f[8]; rate = f[10]; t0 = f[19]; t1 = f[20] }
+      $1 == "TOTAL" { total = $2 }
+      END {
+        printf "probe-c2: %d of 50 c2 reads ended,", n; for (k in reason) printf " %s %d", k, reason[k]
+        printf ", after %.2f-%.2f s\n", lo, hi
+        printf "probe-c2: first connections: %d round trips (%.0f/s) in a window from %.2f to %.2f s after the first arm; %s; peer echoed %d, silent connections %d carrying %d messages\n",
+          rt, rate, (t0 - armed) / 1000, (t1 - armed) / 1000, total, ps, sn, ss }' "$OUT/peer.log" "$log" ;;
   block)
     threads="${1:?threads}"; read -ra cells <<<"${2:?cells}"; rounds="${3:-3}"; passes="${4:-2}"
     say "block $threads: ${cells[*]}, $rounds rounds x $passes passes -> $OUT"
@@ -215,7 +250,7 @@ case "$CMD" in
       IFS=: read -r arming cell wspec <<<"$spec"; cell_env "$cell"
       tag="strace-${spec//:/_}"; log="$OUT/$tag.log"
       wait_port_free
-      env ARMING="$arming" N="$N" DEADLINE_S="$D" CHURN_EVERY="$C" W=50 STRACE_S=18 LABEL="$tag" \
+      env ARMING="$arming" N="$N" DEADLINE_S="$D" CHURN_EVERY="$C" CHURN_C2="$X" W=50 STRACE_S=18 LABEL="$tag" \
         taskset -c "$SERVER_CPUS" "${JL[@]}" --threads=8,1 "$HERE/deadlines.jl" > "$log" 2>&1 &
       pid=$!
       wait_for "$log" '^READY' 120 || die "$tag: no READY"
