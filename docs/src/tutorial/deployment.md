@@ -142,10 +142,13 @@ their thread back while they wait and are not what this section is about. Measur
 96% of its idle rate, where 8 handlers computing for 200 ms took it to 1.4%. A database wait
 needs no queue; the connection pool, not the thread count, bounds how many run at once.
 Those numbers are for PormG's default PostgreSQL driver, LibPQ, which parks the request task on
-the socket while the query runs. A driver that waits inside a blocking call instead, such as a
-synchronous `ccall` that returns only with the result, holds its default thread for the whole
-query exactly as computing does: measure it before relying on this, and treat it like the CPU
-work below, which does need the queue.
+the socket while the query runs. PormG's Postgres.jl driver does the same, measured the same way
+([run 3b](https://github.com/PingoLee/Nitro.jl/issues/589#issuecomment-6495113599)): the same
+32 waits left the route at 99.9% and completed at 160 per second, where 8 held threads would
+allow 40. A driver that waits inside a blocking call instead, such as a synchronous `ccall`
+that returns only with the result, holds its default thread for the whole query exactly as
+computing does: measure it before relying on this, and treat it like the CPU work below, which
+does need the queue.
 
 Size that pool for the requests that hold a connection at once, not for the database's cores.
 PormG grows a pool up to 10 × its configured `pool_size`, and on its Postgres.jl driver a ceiling
