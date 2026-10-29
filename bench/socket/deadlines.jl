@@ -21,6 +21,12 @@
 #   (now + 120 s) while the read waits, then the next request's header deadline (now + 15 s), then
 #   the body's clear to 0 (`read_timeout = 0`). Three `schedule_deadlines!` per churned round trip.
 #
+#   CHURN_C2=1 sends those three calls to a SECOND connection each worker owns instead (`c2`): it
+#   says hello once (marked silent, so the peer never writes to it), then a helper task holds it
+#   parked in a 1-byte read, the shape of an HTTP.jl connection between requests. The round trips
+#   stay on the first connection, which then never carries a deadline. C2_DEADLINE_S > 0 is the
+#   probe: one deadline on each `c2`, no churn; the helper reports when its read ends and why.
+#
 # One measured window per process. The idle deadlines are 120 s, and a process alive through a whole
 # interleaved pass would see them expire mid-pass. Per-thread CPU is read from /proc/self/task/*/stat
 # at the window's two edges. Thread roles follow #782 run 3: main is tid == pid, the poller is the
@@ -41,6 +47,10 @@ const WINDOW_S = parse(Float64, get(ENV, "WINDOW_S", "6"))
 const HOLD_S = parse(Float64, get(ENV, "HOLD_S", "0"))      # W=0: keep the idle side up this long, then exit
 const STRACE_S = parse(Float64, get(ENV, "STRACE_S", "0"))  # >0: no window; print TICK lines for strace
 const CHURN_EVERY = parse(Int, get(ENV, "CHURN_EVERY", "0"))
+const CHURN_C2 = get(ENV, "CHURN_C2", "0") == "1"
+const C2_DEADLINE_S = parse(Float64, get(ENV, "C2_DEADLINE_S", "0"))
+const NEED_C2 = CHURN_C2 || C2_DEADLINE_S > 0
+const SILENT = Int64(0x544e454c4953)   # "SILENT": the hello's 4th word, so the peer never writes back
 const LOCK_PROFILE = get(ENV, "LOCK_PROFILE", "0") == "1"   # diagnostic: count contended locks over the window
 const LABEL = get(ENV, "LABEL", "-")
 const MSG = 64
@@ -150,7 +160,27 @@ const SLOT = 8                         # one 64-byte line per worker counter
 const COUNTS = zeros(Int, SLOT * max(W, 1))
 const FAULT = Threads.Atomic{Int}(0)
 
-function worker(conn, w::Int)
+# A worker's second connection, never read by the worker: a parked 1-byte read. Its end is reported
+# only if a deadline or the peer ended it; the worker closing it at the end of the run is silent.
+const C2_ENDED = Threads.Atomic{Int}(0)
+function hold_c2(c2, w::Int, armed_at::Float64)
+    buf = zeros(UInt8, 1)
+    try
+        n = readbytes!(c2, buf, 1; all = false)
+        Threads.atomic_add!(C2_ENDED, 1)
+        say("C2END worker=$w reason=$(n == 0 ? "eof" : "data") after=$(round(time() - armed_at; digits = 2))")
+    catch err
+        if err isa TCP.DeadlineExceededError
+            Threads.atomic_add!(C2_ENDED, 1)
+            say("C2END worker=$w reason=deadline after=$(round(time() - armed_at; digits = 2))")
+        elseif !(err isa TCP.NetClosingError)
+            rethrow()
+        end
+    end
+end
+
+# `target` is the socket the churn re-arms: `conn` itself (A5, A6) or the worker's `c2` (A7).
+function worker(conn, w::Int, target)
     out = zeros(UInt8, MSG)
     inb = zeros(UInt8, MSG)
     me = getpid()
@@ -165,13 +195,13 @@ function worker(conn, w::Int)
         while PHASE_RUN[]
             seq += 1
             churn = CHURN_EVERY > 0 && seq % CHURN_EVERY == 0
-            churn && TCP.set_read_deadline!(conn, Int64(time_ns()) + Int64(120_000_000_000))
+            churn && TCP.set_read_deadline!(target, Int64(time_ns()) + Int64(120_000_000_000))
             GC.@preserve out unsafe_store!(Ptr{Int64}(pointer(out)), Int64(seq), 3)
             write(conn, out)
             n = readbytes!(conn, inb, MSG; all = true)
             if churn
-                TCP.set_read_deadline!(conn, Int64(time_ns()) + Int64(15_000_000_000))
-                TCP.set_read_deadline!(conn, Int64(0))
+                TCP.set_read_deadline!(target, Int64(time_ns()) + Int64(15_000_000_000))
+                TCP.set_read_deadline!(target, Int64(0))
             end
             if n != MSG || inb != out
                 Threads.atomic_add!(FAULT, 1)
@@ -182,6 +212,7 @@ function worker(conn, w::Int)
         end
     finally
         close(conn)
+        target === conn || close(target)
     end
 end
 
@@ -220,7 +251,19 @@ function main()
     tasks = Task[]
     for w in 1:W
         conn = TCP.connect(TCP.loopback_addr(PEER_PORT))
-        push!(tasks, Threads.@spawn worker(conn, w))
+        target = conn
+        if NEED_C2
+            c2 = TCP.connect(TCP.loopback_addr(PEER_PORT))
+            hello = zeros(Int64, MSG ÷ 8)
+            hello[1] = pid; hello[2] = w; hello[4] = SILENT
+            write(c2, reinterpret(UInt8, hello))
+            armed_at = time()
+            C2_DEADLINE_S > 0 && TCP.set_read_deadline!(c2, Int64(time_ns()) + round(Int64, C2_DEADLINE_S * 1e9))
+            w == 1 && say("C2ARMED $(round(Int, 1000armed_at)) deadline_s=$C2_DEADLINE_S")
+            Threads.@spawn hold_c2(c2, w, armed_at)
+            CHURN_C2 && (target = c2)
+        end
+        push!(tasks, Threads.@spawn worker(conn, w, target))
     end
     sleep(WARM_S)
     if STRACE_S > 0
@@ -254,7 +297,7 @@ function main()
     end
     PHASE_RUN[] = false
     foreach(wait, tasks)
-    say("TOTAL rt=$(total_rt()) faults=$(FAULT[]) closed=$(CLOSED[])")
+    say("TOTAL rt=$(total_rt()) faults=$(FAULT[]) closed=$(CLOSED[]) c2_ended=$(C2_ENDED[])")
 end
 
 main()

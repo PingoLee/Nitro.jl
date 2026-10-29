@@ -4,7 +4,9 @@
 #   julia deadlines_peer.jl echo <port>
 #     Echoes every 64-byte message back on the connection it came on. When a connection ends it prints
 #     `CONN <pid> <worker> <messages>`, the first two read from the connection's first message, so the
-#     driver can check the echo count against the process's own count of round trips.
+#     driver can check the echo count against the process's own count of round trips. A connection
+#     whose first message carries the SILENT marker in its 4th word is never written to; it ends with
+#     `CONN <pid> <worker> <messages after the hello> silent`, which must be 0.
 #
 #   julia deadlines_peer.jl idle <L1|L2> <port> <n> [rearm_s]
 #     Opens n connections to the process under test and holds them. L2 sends one HTTP request on each
@@ -20,6 +22,7 @@
 const Reseau = Base.require(Base.PkgId(Base.UUID("802f3686-a58f-41ce-bb0c-3c43c75bba36"), "Reseau"))
 const TCP = Reseau.TCP
 const MSG = 64
+const SILENT = Int64(0x544e454c4953)   # deadlines.jl's marker for a worker's second, unread connection
 const OUT_LOCK = ReentrantLock()
 say(xs...) = lock(OUT_LOCK) do
     println(stdout, xs...)
@@ -31,26 +34,29 @@ function echo_conn(conn)
     n_msgs = 0
     pid = -1
     w = -1
+    silent = false
     try
         while true
             n = readbytes!(conn, buf, MSG; all = true)
             n == 0 && break
             n == MSG || (say("PARTIAL $pid $w $n"); break)
-            if n_msgs == 0
+            if pid == -1
                 GC.@preserve buf begin
                     p = Ptr{Int64}(pointer(buf))
                     pid = unsafe_load(p, 1)
                     w = unsafe_load(p, 2)
+                    silent = unsafe_load(p, 4) == SILENT
                 end
+                silent && continue        # the hello of a silent connection: not a message
             end
-            write(conn, buf)
+            silent || write(conn, buf)
             n_msgs += 1
         end
     catch err
         say("ERROR $pid $w $(typeof(err))")
     finally
         close(conn)
-        say("CONN $pid $w $n_msgs")
+        say("CONN $pid $w $n_msgs", silent ? " silent" : "")
     end
 end
 
