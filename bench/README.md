@@ -27,7 +27,8 @@ bench/
 │   ├── passwords.jl    # one check_password at the default pbkdf2 and bcrypt costs (#587)
 │   └── aggregate.jl    # the /aggregate kernel alone, plain and yielding every 2 ms, at N = 10^3..10^7 (#590)
 ├── socket/             # real-socket load: server.jl (Nitro vs bare HTTP.jl), run.sh, contention.sh, stall.sh, wake.sh,
-│   │                   #   slow_stream.sh, fairness.sh, quiet.sh (oha, curl, go/fairness), probe_report.jl
+│   │                   #   slow_stream.sh, fairness.sh, quiet.sh (oha, curl, go/fairness), probe_report.jl,
+│   │                   #   deadlines.sh with deadlines.jl and deadlines_peer.jl (Reseau alone, #782)
 │   ├── go/             # the Go net/http reference server run.sh's `go` mode builds; `go test -bench Aggregate`;
 │   │                   #   fairness/, the per-connection client fairness.sh drives; db.go, its pgx routes (#589)
 │   └── db/             # the database routes (#589): PormG env, world.jl, seed.jl, env.sh (DB=…), smoke.sh
@@ -316,6 +317,31 @@ DB=postgres DB_POOL=40 KS="4 8 16 32" ROUTE_MS=200 VARIANTS="route:/db_wait?ms=2
   first requested alone (`db_prewarm`) before the concurrent warm-up (`WARM_DUR`, default 3s). A
   route slower than the window leaves requests running after `oha` stops, so before every window
   `db_settle` waits until PostgreSQL runs no statement for the database (SQLite: `DB_SETTLE_S`).
+
+### The deadline repro (#782)
+
+`serve`'s default `read_header_timeout` and `idle_timeout` arm read deadlines in Reseau's poller,
+the poller every database socket's wait goes through as well. `deadlines.sh` asks whether armed
+deadlines alone make an *unrelated* socket's round trips dearer, with no web framework (in `L1`), no
+ORM and no database. `deadlines.jl` runs W workers doing 64-byte round trips against the echo peer
+`deadlines_peer.jl`, each read parked in `pollwait!` as a Postgres.jl statement's read is. It also
+holds N idle connections: `L1` arms each with `TCP.set_read_deadline!`, the call HTTP.jl's server
+makes, and `L2` is `HTTP.listen!` with both timeouts set, after one request on each connection. The
+cells are `A0` (no idle socket), `A1` (50, no deadline), `A2` (50, 120 s), `A3` (500, 120 s) and
+`A4` (50, 1 s, re-armed every 0.5 s). `A5` and `A6` hold no idle socket. Instead, every round trip
+(`A5`) or every 20th one (`A6`, one request per 20 statements) re-arms its own socket in the order
+HTTP.jl's keep-alive loop does per request: +120 s, then +15 s, then 0. `LOCK_PROFILE=1` adds the
+window's count of contended `ReentrantLock` acquisitions to each log. Each cell and round is a fresh
+process with one 6 s window, because a 120 s deadline must not expire inside a pass. Per-thread CPU
+is read from `/proc` at the window's edges, split into the default threads, the poller and the main
+thread as in #782 run 3. A run is discarded unless every echo matches, the peer's count equals the
+process's, and no idle socket closed early.
+
+```bash
+bench/socket/deadlines.sh validate                   # timeout probes (2 s, off) and one run per cell
+bench/socket/quiet.sh dl bench/socket/deadlines.sh block 8,1 "L1:A0 L1:A2 L1:A5 L1:A6" 3 2
+bench/socket/deadlines.sh strace "L1:A0 L1:A6"       # syscall counts per round trip, outside any window
+```
 
 ## Comparing with Go
 
