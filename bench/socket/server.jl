@@ -18,6 +18,12 @@
 #                       pipeline binds around every handler (`_app_context_seed`), and nothing else
 #                       of Nitro (#782 run 1). Is a bound scope alone what PormG's per-statement
 #                       `ScopedValue` reads pay for?
+#   MODE=bare_timeouts  `bare_spawn` with `HTTP.listen!` given the two server timeouts `serve()`
+#                       defaults (`read_header_timeout = 15`, `idle_timeout = 120`, #316), and
+#                       nothing else of `serve`'s `listen!` arguments (#782): do the deadlines
+#                       alone cost what Nitro costs?
+#   MODE=nitro_notimeouts  `nitro` with both of those timeouts turned off
+#                       (`serve(read_header_timeout = 0, idle_timeout = 0)`): the mirror cell.
 #
 #   POOL=<n>            bare_pool only: how many pooled handler tasks.
 #   PORT=8080           Loopback port.
@@ -112,12 +118,13 @@ using HTTP
 using JSON
 
 const MODE       = get(ENV, "MODE", "nitro")
+const NITRO_MODE = MODE in ("nitro", "nitro_log", "nitro_notimeouts")
 
 # Only where it is used, so a `bare_*` process has no Nitro in it at all: `rss.sh` reports that
 # mode as the HTTP.jl-only floor (#451), and a loaded-but-idle Nitro would be counted in it.
-MODE in ("nitro", "nitro_log") && @eval using Nitro
+NITRO_MODE && @eval using Nitro
 # FILLER_ROUTES / ROUTE_MW: the route table's size and middleware shape (#718); see the file.
-MODE in ("nitro", "nitro_log") && include(joinpath(@__DIR__, "..", "route_table.jl"))
+NITRO_MODE && include(joinpath(@__DIR__, "..", "route_table.jl"))
 
 const PORT      = parse(Int, get(ENV, "PORT", "8080"))
 const ACCESS_LOG = get(ENV, "ACCESS_LOG", "0") == "1" || MODE == "nitro_log"
@@ -163,7 +170,7 @@ end
 # Evaluated only where Nitro is loaded: a closure's argument types are resolved when the function
 # around it is defined, so `Query{QueryArgs}` written inside `start_nitro` stops every `bare_*`
 # process at load with an `UndefVarError`.
-MODE in ("nitro", "nitro_log") && @eval query_route() = (req, q::Query{QueryArgs}) -> Res.send(q.payload.name)
+NITRO_MODE && @eval query_route() = (req, q::Query{QueryArgs}) -> Res.send(q.payload.name)
 
 include(joinpath(@__DIR__, "aggregate.jl"))
 const AGG_DATA = agg_rows(AGG_ROWS)
@@ -379,7 +386,10 @@ function probed_bare_handler(req::HTTP.Request)::HTTP.Response
     return resp
 end
 
-function start_bare(spawn::Bool)
+# `timeouts = true` (MODE=bare_timeouts): the values are Nitro's `DEFAULT_READ_HEADER_TIMEOUT_SECONDS`
+# and `DEFAULT_IDLE_TIMEOUT_SECONDS` (src/constants.jl), written out because a bare process loads
+# no Nitro.
+function start_bare(spawn::Bool; timeouts::Bool = false)
     inner = HTTP.streamhandler(PROBE ? probed_bare_handler : bare_handler)
     handler = if !PROBE
         spawn ? (stream -> wait(Threads.@spawn inner(stream))) : inner
@@ -400,6 +410,7 @@ function start_bare(spawn::Bool)
             probe_done!(rec)
         end
     end
+    timeouts && return HTTP.listen!(handler, "127.0.0.1", PORT; read_header_timeout = 15.0, idle_timeout = 120.0)
     return HTTP.listen!(handler, "127.0.0.1", PORT)
 end
 
@@ -515,7 +526,8 @@ function start_nitro()
         end
     end)
     serve(app; host = "127.0.0.1", port = PORT, async = true, show_banner = false,
-          access_log = ACCESS_LOG, (PROBE ? probed : (;))...)
+          access_log = ACCESS_LOG, (PROBE ? probed : (;))...,
+          (MODE == "nitro_notimeouts" ? (; read_header_timeout = 0, idle_timeout = 0) : (;))...)
     return app
 end
 
@@ -789,11 +801,12 @@ function sched_share(io::IO, interactive::Vector{Int})
 end
 end
 
-handle = MODE in ("nitro", "nitro_log") ? start_nitro() :
+handle = NITRO_MODE ? start_nitro() :
          MODE in ("bare_spawn", "bare_scoped") ? start_bare(true) :
+         MODE == "bare_timeouts" ? start_bare(true; timeouts = true) :
          MODE == "bare_nospawn" ? start_bare(false) :
          MODE == "bare_pool"    ? start_bare_pool() :
-         error("unknown MODE=$(MODE): expected nitro, nitro_log, bare_spawn, bare_scoped, bare_nospawn or bare_pool")
+         error("unknown MODE=$(MODE): expected nitro, nitro_log, nitro_notimeouts, bare_spawn, bare_scoped, bare_timeouts, bare_nospawn or bare_pool")
 
 @info "bench: serving" MODE PORT threads = Threads.nthreads() interactive = Threads.nthreads(:interactive)
 PROFILE_S > 0 && Threads.@spawn profile_window()
