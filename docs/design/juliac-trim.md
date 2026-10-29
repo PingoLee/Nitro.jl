@@ -59,6 +59,15 @@ wall was cleared in [#571](https://github.com/PingoLee/Nitro.jl/issues/571), and
 > The trimmed probe serves CORS, the CSRF and cross-origin refusals, the rate limiter and the
 > global middleware pipeline. What is left there is the session store's internals and the JWT
 > claims.
+>
+> **HTTP 2.13 clears the request body read (§3.9).** The fix is upstream
+> ([JuliaWeb/HTTP.jl#1512](https://github.com/JuliaWeb/HTTP.jl/issues/1512)); no Nitro code
+> changed. The minimal app goes from 10 to 4, and all 6 body-read rows are gone. The trimmed app
+> now answers a request with a body as the JIT does (`405`, `404`), where it answered `500`. The 4
+> left are Base's `ScopedValue` HAMT and two upstream sites. The probe does not move on HTTP: it
+> calls the pipeline directly. It reads 231 on a fresh resolve, but 110 of those come from
+> JSON.jl 1.13.0, whose `parse` with a `dicttype` keyword no longer resolves statically; on
+> JSON 1.12.2 the probe reads 121.
 
 ## 1. How to measure
 
@@ -121,7 +130,7 @@ route and no middleware, so the probe stays the measure of the route path.
 The lesson that generalizes: **`repr`/`string` of an un-inferred value is the most expensive single
 trim mistake**, and that includes a `Symbol`. Type the value, then `print` it.
 
-## 3. Remaining (40 errors on the minimal app on Julia 1.12.7; on 1.13, 96, then 87 after §3.6, 59 after the start-up walls, 27 after §3.7 and 11 after §3.8)
+## 3. Remaining (40 errors on the minimal app on Julia 1.12.7; on 1.13, 96, then 87 after §3.6, 59 after the start-up walls, 27 after §3.7, 11 after §3.8 and 4 on HTTP 2.13, §3.9)
 
 Measured 2026-10-22 on Julia 1.12.7, before and after #572. Each error is printed twice, so 20
 sites. `main` before #572 had **22**: the 20 below plus `CookieKey`'s, which arrived with a later
@@ -728,10 +737,10 @@ Throughput is pending, to be measured as §4 asks.
 (`/plaintext`, a path parameter, a route with two middleware, two routes of an `include_routes` group, a miss) and exits `0`.
 The trimmed app answers `GET /plaintext` with `200 "Hello, World!"`, as many times as asked, and a
 miss with `404`. On `main` the same build answered every request with a `500`. A request with a
-body still gets a `500`: that is the next wall.
+body still gets a `500`: that is the next wall. (On HTTP 2.13 it answers as the JIT does, §3.9.)
 
 **The next walls:**
-- **The request body read**, 6 on the app. Every server stream is already concrete,
+- **The request body read**, 6 on the app. **Cleared upstream** on HTTP 2.13 (§3.9). Every server stream is already concrete,
   `Stream{false, Request{EmptyBody}}`. The rows are inside HTTP.jl: `_stream_request_body_read!`
   calls `body_read!` on `Stream.request_body::AbstractBody`, which it narrows only to the UnionAlls
   `FixedLengthBody{I}`, `ChunkedBody{I}` and `EOFBody{I}`. Nitro could only work around it by
@@ -937,7 +946,85 @@ the CSRF one prints masked. That is #751.
 - Auth: JWT claims read as `Any` (`_principal`, `_claim_int`, `_warn_iss`, the guards' claim
   compare), `unauthorized::Function`, and the validator's arity check by reflection. The claims
   want the same closed dispatch over JSON values that the session's values do.
-- The request body read inside HTTP.jl, and the `@with` HAMT (unchanged).
+- The `@with` HAMT (unchanged). The request body read inside HTTP.jl is cleared on HTTP 2.13
+  (§3.9).
+- **New since this count:** JSON.jl 1.13.0's `parse` with a `dicttype` keyword, which the JWT
+  claims read passes. On the probe it is 106 rows at `_parse_json_bounded`, plus 4 inside
+  StructUtils.jl (§3.9).
+
+### 3.9 The recount on HTTP 2.13
+
+Built 2026-10-29 with Julia 1.13.2 and JuliaC 0.3.12 on Linux x86-64, `unsafe-warn`, counted by
+first frame, from two trees:
+- `main` before #778 (`71b3fd1f`), on HTTP.jl 2.11.2;
+- `main` after it (`050d7782`), on HTTP.jl 2.13.1.
+
+Both use Reseau 1.6.3 and JSON.jl 1.13.0 (each tree's bench environment resolved fresh). No
+Nitro code on these paths changed between the two trees
+([#779](https://github.com/PingoLee/Nitro.jl/issues/779)).
+
+| `ENTRY=app` | HTTP 2.11.2 | HTTP 2.13.1 |
+|---|---:|---:|
+| `src/core/transport.jl` `_http_stream_request` (the body read) | 3 | 0 |
+| `src/core/transport.jl` `_swallow_request_body!` | 3 | 0 |
+| `src/core/pipeline.jl` `_app_context_seed`'s `@with` | 2 | 2 |
+| outside `src/`: the libuv read callback (`uv_readcb`), OpenSSL's `getproperty` | 2 | 2 |
+| **total** | **10** | **4** |
+
+All six body-read rows are gone; none survived. The 4 left are Base's `ScopedValue` HAMT (§3.5)
+and two upstream sites.
+
+**What the trimmed app serves.** It answered every request the same way in both trees, except
+the ones with a body:
+
+| request | HTTP 2.11.2 | HTTP 2.13.1 |
+|---|---|---|
+| `GET /plaintext`, before and after the rest | `200 "Hello, World!"` | the same |
+| `GET` of a miss | `404` | the same |
+| `POST /plaintext`, a JSON body | `500` | `405`, as under the JIT |
+| `POST` of a miss, a JSON body | `500` | `404` |
+| `POST /plaintext`, a chunked body | `500` | `405` |
+
+`app.jl` has no route that binds a body (`Json{T}`). These bodies are read by the transport,
+which reads every request's body before routing, and that read was the wall.
+
+**The probe does not move on HTTP.** It calls the pipeline directly, so the transport's body read
+was never on its path. It reads **231 in both trees, row for row**, and answers its 22 requests
+identically. The 5 wrong answers are §3.8's, all behind #747 and #748:
+- a session write (`500`) and the global session read (`500`);
+- the three bearer-token requests (`401`).
+
+None of its `POST`s carries a body.
+
+**JSON.jl 1.13.0 is a new wall on the probe.** Built again with JSON.jl pinned at 1.12.2, the
+version this record's earlier counts were built with, the after tree's probe reads **121**:
+
+| rows that move | JSON 1.13.0 | JSON 1.12.2 |
+|---|---:|---:|
+| `src/utilities/bodyparsers.jl` `_parse_json_bounded` | 108 | 2 |
+| outside `src/`: StructUtils.jl | 4 | 0 |
+| outside `src/`: `show.jl` `gettypeinfos` | 1 | 0 |
+| outside `src/`: `util.jl` `with_output_color` | 1 | 2 |
+| **probe total** | **231** | **121** |
+
+- **The call.** It is the JWT claims read's `_parse_json_bounded(…; dicttype = Dict{String, Any})`
+  (`src/Auth/jwt.jl`). The keyword's value travels as a `DataType`, and JSON.jl 1.13.0's `parse`
+  dispatches on it at run time.
+- **Who clears it.** Nitro can avoid it by passing the dict type in a form the compiler sees as a
+  constant, or JSON.jl can resolve it. It is not chosen here.
+- **The other 6 rows.** 121 is 6 more than §3.8's 115: 4 at `csrf_middleware.jl`
+  `_foreign_binding` (the trimmed image's refusal of a non-`String` session id) and 2 more
+  outside `src/`. Neither is root-caused here.
+
+**The fatal check (#749, #752) still passes on HTTP 2.13.** On the after tree, `fatal_check.sh`
+gives the table at the end of §3.8, mode for mode, for all three builds:
+- `--trim=no`;
+- `--trim=unsafe-warn`;
+- `--trim=unsafe-warn` with no route.
+
+Only `bare` leaks. The verifier counts are 59 errors with 2 warnings (`ENTRY=fatal`) and 107 with
+4 (no route), against §3.8's 63 and 113. No before-tree build was made, so those two moves are
+not split by first frame.
 
 ## 4. The decision: `--trim=safe` is a target
 
@@ -989,7 +1076,15 @@ The order:
    a trimmed build refuses Revise and compiles none of it, and Nitro's own request-time middleware
    reaches the response and the request context at concrete types (§3.8). The minimal app went
    from 27 to 11 on 1.13; what is left on it is outside Nitro.
-6. **Outside Nitro:** OpenSSL.jl and the libuv read callback, reported upstream.
+6. **Outside Nitro.** HTTP.jl's request body read: **cleared** on HTTP 2.13 (§3.9). OpenSSL.jl
+   and the libuv read callback: reported upstream. With those gone, the last row on the minimal
+   app with a frame in `src/` is Base's `ScopedValue` HAMT, behind `_app_context_seed`'s `@with`
+   (§3.5).
+7. **The extended probe's walls, largest first** (§3.9):
+   - JSON.jl 1.13.0's `parse` with a `dicttype` keyword, 110 rows;
+   - Auth's claims, 60 with the guards' claim compare ([#747](https://github.com/PingoLee/Nitro.jl/issues/747));
+   - the session store's internals, 37 with `set_cookie!` and LRUCache.jl
+     ([#748](https://github.com/PingoLee/Nitro.jl/issues/748)).
 
 Two rules come with the target:
 
