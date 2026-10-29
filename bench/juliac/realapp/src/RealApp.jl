@@ -6,6 +6,11 @@ using Nitro, PormG, Postgres
 
 const app = App(mod = @__MODULE__)
 
+# The app's directory, set by `main` (#744). Not the scaffold's `pkgdir(@__MODULE__)` alone: in a
+# JuliaC executable `pkgdir` and `@__DIR__` name the temporary copy of the project JuliaC built
+# from, which is gone at run time. REALAPP_ROOT names the real one; `pkgdir` is the fallback.
+const ROOT = Ref{String}("")
+
 PormG.@import_models "../db/models.jl" models
 const appM = models
 
@@ -23,7 +28,8 @@ at least 32 bytes); keyword arguments go to `serve` (tests pass `async = true`).
 function main(; kwargs...)
     sync_pormg_env!()  # NITRO_ENV -> PORMG_ENV, only when NITRO_ENV is set
     # PormG parses db/connection.yml, validates it and connects, from any working directory
-    PormG.Configuration.load_many(["db"]; root = pkgdir(@__MODULE__))
+    ROOT[] = get(ENV, "REALAPP_ROOT", pkgdir(@__MODULE__))
+    PormG.Configuration.load_many(["db"]; root = ROOT[])
     workers = worker_startup(app; queues = ["reports"], store = pormg_nitro_worker(db_key = "db"))
     session = SessionMiddleware(store = pormg_nitro_session(db_key = "db"), secure = false)
     bearer = BearerAuth(Auth.jwt_validator(SecretString(ENV["JWT_SECRET"])))

@@ -11,6 +11,7 @@
 # does, so nothing warms the request path before the measured request. `listen` is launch to
 # listening socket. `warm` is the median of WARM_N requests after the first.
 #
+# REALAPP_ROOT is set to this directory for both: see src/RealApp.jl.
 # Env: SECRETS (required) a file of `API_SECRET_KEY=…` / `JWT_SECRET=…` lines, AUTH_HEADER
 #        (required) a file holding `Authorization: Bearer <token>` signed with JWT_SECRET;
 #        both stay outside the repository. db/connection.yml (gitignored) holds the database.
@@ -66,10 +67,10 @@ start() {
   local t0
   t0=$(date +%s.%N)
   if [ "$TARGET" = jit ]; then
-    ( set -a; . "$SECRETS"; set +a; cd "$LOGS" && PORT=$PORT PORMG_POSTGRES_DRIVER=Postgres \
+    ( set -a; . "$SECRETS"; set +a; cd "$LOGS" && PORT=$PORT REALAPP_ROOT="$HERE" PORMG_POSTGRES_DRIVER=Postgres \
       exec "$JULIA_BIN" --startup-file=no --project="$HERE" --threads="$THREADS" "$HERE/main.jl" ) >"$1" 2>&1 &
   else
-    ( set -a; . "$SECRETS"; set +a; cd "$LOGS" && PORT=$PORT PORMG_POSTGRES_DRIVER=Postgres \
+    ( set -a; . "$SECRETS"; set +a; cd "$LOGS" && PORT=$PORT REALAPP_ROOT="$HERE" PORMG_POSTGRES_DRIVER=Postgres \
       JULIA_NUM_THREADS=$THREADS exec "$TARGET" ) >"$1" 2>&1 &
   fi
   pid=$!
