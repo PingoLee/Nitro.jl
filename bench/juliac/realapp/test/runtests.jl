@@ -3,7 +3,7 @@ using Test, HTTP, Nitro, RealApp
 @testset "RealApp" begin
     # A fresh App, so the test never touches `RealApp.app`, the one `main()` serves.
     app = App(mod = RealApp)
-    urlpatterns(app, "", RealApp.Routes.urlpatterns())
+    urlpatterns(app, "", RealApp.Routes.urlpatterns(; session = h -> h, bearer = h -> h))
     res = internalrequest(app, HTTP.Request("GET", "/health"))
     @test res.status == 200
 end

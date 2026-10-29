@@ -4,19 +4,19 @@ version = "0.1.0"
 
 [deps]
 HTTP = "cd3eb016-35fb-5094-929b-558a96fad6f3"
-LibPQ = "194296ae-ab2e-5f79-8cd4-7183a0a5a0d1"
+Postgres = "8f23287e-300e-4f50-bc2b-9f1dfe95da84"
 Nitro = "e5efdb2c-68ee-4494-894d-55bb80f0a340"
 PormG = "7d8d7541-4d3d-4580-80a2-17064efb0993"
 
 [sources]
-Nitro = {url = "https://github.com/PingoLee/Nitro.jl.git", rev = "050d77823f14c344a9e9fb94bd67b2c3c34aedfe"}
+Nitro = {path = "../../.."}
 PormG = {url = "https://github.com/PingoLee/PormG.jl.git", rev = "6f558894c68046a948e30bad3018a791a5f9898e"}
 
 [compat]
 HTTP = "~2.13"
-LibPQ = "1"
 Nitro = "0.6.0"
 PormG = "^0.8"
+Postgres = "2.4"
 julia = "^1.13"
 
 [extras]
