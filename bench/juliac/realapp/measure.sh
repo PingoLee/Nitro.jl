@@ -52,9 +52,17 @@ ROUTES=(
 INVALID='{"name":"widget","category":"tools","quantity":-1}'
 
 pid=""
+# Still alive STOP_GRACE_S (default 30) seconds after SIGTERM: SIGKILL, named, as bench/socket/run.sh
+# does. The JIT server once never exited after a SIGTERM that landed during start-up (#744).
 stop() {
   [ -n "$pid" ] || return 0
-  kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null; pid=""
+  kill "$pid" 2>/dev/null
+  for _ in $(seq 1 "${STOP_GRACE_S:-30}"); do kill -0 "$pid" 2>/dev/null || break; sleep 1; done
+  if kill -0 "$pid" 2>/dev/null; then
+    echo "measure.sh: pid $pid still alive ${STOP_GRACE_S:-30}s after SIGTERM; sending SIGKILL" >&2
+    kill -9 "$pid" 2>/dev/null
+  fi
+  wait "$pid" 2>/dev/null; pid=""
   for _ in $(seq 1 100); do [ -z "$(ss -Hltn "sport = :$PORT")" ] && return 0; sleep 0.05; done
 }
 trap stop EXIT
