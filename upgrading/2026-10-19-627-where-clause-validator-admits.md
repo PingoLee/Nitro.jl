@@ -1,6 +1,6 @@
 ## A token or user validator written with a `where` clause is called, instead of answering 401 (#627)
 
-- **Version**: Unreleased
+- **Version**: 0.7.0
 - **Nitro ref**: [#627](https://github.com/PingoLee/Nitro.jl/issues/627) ; `src/utilities/misc.jl`
 - **Recorded**: 2026-10-19
 - **Severity**: **behavior change (auth).** Requests that were refused with a `401` are now

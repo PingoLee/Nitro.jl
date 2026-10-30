@@ -1,6 +1,6 @@
 ## `Res.file(req, path)` streams a file over 8 MiB by default (#588)
 
-- **Version**: Unreleased
+- **Version**: 0.7.0
 - **Nitro ref**: [#588](https://github.com/PingoLee/Nitro.jl/issues/588) ; `src/response.jl`, `src/constants.jl`
 - **Recorded**: 2026-10-22
 - **Severity**: behavior change (response body type)

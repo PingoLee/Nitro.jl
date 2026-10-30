@@ -1,6 +1,6 @@
 ## In a juliac executable, an error leaving `serve` is a value-free `LoggedException`, and `@main` prints `Nitro.startup_failure_text` (#749, #752)
 
-- **Version**: Unreleased
+- **Version**: 0.7.0
 - **Nitro ref**: #749, #752; `src/methods.jl`, `src/errors.jl`, `src/Nitro.jl`
 - **Recorded**: 2026-10-25
 - **Severity**: behavior change, only in an executable built by `juliac` (trimmed or not). Under the JIT nothing changes.

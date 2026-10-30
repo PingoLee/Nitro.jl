@@ -1,6 +1,6 @@
 ## `serveparallel()` is removed — call `serve()` (#579)
 
-- **Version**: Unreleased
+- **Version**: 0.7.0
 - **Nitro ref**: [#579](https://github.com/PingoLee/Nitro.jl/issues/579) ; `src/methods.jl`
 - **Recorded**: 2026-10-15
 - **Severity**: **breaking (removed function)** — a call to `Nitro.serveparallel` no longer

@@ -1,6 +1,6 @@
 ## HTTP compat moves to `~2.13` — an app pinning `~2.11` must move too
 
-- **Version**: Unreleased
+- **Version**: 0.7.0
 - **Nitro ref**: `Project.toml` `[compat]`; `src/utilities/bodyparsers.jl` (`multipart`,
   `_too_many_parts`); `src/core/transport.jl` (`_send_response!`); `test/http_internals_contract_tests.jl`,
   `test/max_fields_tests.jl`, `test/response_tests.jl`

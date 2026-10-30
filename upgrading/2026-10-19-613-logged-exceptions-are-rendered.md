@@ -1,6 +1,6 @@
 ## Error log records carry a `LoggedException`, not the exception that was thrown (#613)
 
-- **Version**: Unreleased
+- **Version**: 0.7.0
 - **Nitro ref**: [#613](https://github.com/PingoLee/Nitro.jl/issues/613) ; `src/errors.jl`, `src/utilities/misc.jl`, `src/middleware/access_log.jl`, `src/core/framework_middleware.jl` ; [#651](https://github.com/PingoLee/Nitro.jl/issues/651) ; `src/Workers/`, `src/types.jl` ; [#658](https://github.com/PingoLee/Nitro.jl/issues/658) ; `src/middleware/janitor.jl`, `src/core/lifecycle.jl`, `src/context.jl`, `src/utilities/fileutil.jl`
 - **Recorded**: 2026-10-19
 - **Severity**: behavior change (logging). The client response is unchanged, and so is the console

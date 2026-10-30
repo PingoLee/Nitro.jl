@@ -1,6 +1,6 @@
 ## `Json{T}` refuses an invalid string escape in a member `T` does not declare (#721)
 
-- **Version**: Unreleased
+- **Version**: 0.7.0
 - **Nitro ref**: [#721](https://github.com/PingoLee/Nitro.jl/issues/721) ; [#577](https://github.com/PingoLee/Nitro.jl/issues/577) ; `Project.toml` (`JSON` compat)
 - **Recorded**: 2026-10-22
 - **Severity**: behavior change (request bodies)

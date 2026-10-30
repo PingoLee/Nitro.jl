@@ -1,6 +1,6 @@
 ## `RateLimiter` no longer sends `Retry-After` on an admitted response (#560)
 
-- **Version**: Unreleased
+- **Version**: 0.7.0
 - **Nitro ref**: [#560](https://github.com/PingoLee/Nitro.jl/issues/560) ; `src/middleware/rate_limiter.jl`
 - **Recorded**: 2026-10-21
 - **Severity**: behavior change (response headers)

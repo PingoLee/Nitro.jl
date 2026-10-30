@@ -1,6 +1,6 @@
 ## `RunningTaskRef` gains `claimed_by`, and `nitro_task` gains four columns (#514)
 
-- **Version**: Unreleased
+- **Version**: 0.7.0
 - **Nitro ref**: [#514](https://github.com/PingoLee/Nitro.jl/issues/514) ; `src/Workers/registry.jl`
 - **Recorded**: 2026-10-15
 - **Severity**: **breaking (custom worker stores, and a `PormGWorkerStore` built directly)** — a

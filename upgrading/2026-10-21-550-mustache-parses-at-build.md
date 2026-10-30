@@ -1,6 +1,6 @@
 ## `mustache` parses its template when the handler is built, so a malformed one throws there (#550)
 
-- **Version**: Unreleased
+- **Version**: 0.7.0
 - **Nitro ref**: [#550](https://github.com/PingoLee/Nitro.jl/issues/550) ; `ext/MustacheExt.jl`
 - **Recorded**: 2026-10-21
 - **Severity**: behavior change (when a template error is raised)

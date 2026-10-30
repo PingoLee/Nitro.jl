@@ -1,6 +1,6 @@
 ## HTTP compat moves to `~2.11` — an app pinning `~2.9` must move too, and a failure HTTP answered silently is now logged
 
-- **Version**: Unreleased
+- **Version**: 0.7.0
 - **Nitro ref**: `Project.toml` `[compat]`; `src/core/transport.jl` (`parallel_stream_handler`,
   `_report_escaped!`, `_mark_reported!`, `_write_fixed_body!`); `test/http_internals_contract_tests.jl`,
   `test/streaming_write_tests.jl`, `test/middleware/middleware_error_boundary_tests.jl`
