@@ -41,10 +41,12 @@ This skill keeps the common path lean. Read the sibling file **only when the tas
 ## 1. Project layout
 
 Nitro apps follow the Django separation: route declarations in one place, handler logic in modules.
+`Nitro.newapp("MyApp")` writes this layout; start from it rather than by hand.
 
 ```
+main.jl                     # the program: `julia --project main.jl`, or the file a JuliaC build compiles
 src/
-├── App.jl                  # entry point: config, middleware, serve()
+├── MyApp.jl                # the module: `const app = App(mod = @__MODULE__)` and its main()
 ├── Routes.jl               # every path() declaration
 └── Handlers/
     └── ProductHandlers.jl  # handler logic, one module per domain
@@ -61,6 +63,8 @@ Compose groups with `include_routes(prefix, routes)`.
 ```julia
 using Nitro
 
+const app = App(mod = @__MODULE__)       # the application handle: every routing/serving call takes it first
+
 routes = [
     path("/api/products",            ProductHandlers.list_products,  method="GET"),
     path("/api/products/<int:id>",   ProductHandlers.get_product,    method="GET", name="product-detail"),
@@ -69,8 +73,8 @@ routes = [
     path("/api/products/<int:id>",   ProductHandlers.update_product, methods=["PUT", "PATCH"]),
 ]
 
-urlpatterns("", routes)                  # register at the root — the prefix argument is REQUIRED
-urlpatterns("/api", api_routes)          # or under a prefix
+urlpatterns(app, "", routes)             # register at the root — the prefix argument is REQUIRED
+urlpatterns(app, "/api", api_routes)     # or under a prefix
 include_routes("v2/", v2_routes)         # compose a sub-router into a route vector
 include_routes("/api", api_routes; middleware=[BearerAuth(validator)])   # group middleware (#439)
 ```
@@ -86,15 +90,22 @@ leaves the global chain as anything else (a `String`, a `Dict`, `nothing`) is a 
 Under `serve(serialize = false)` a handler's raw value is fine *inside* the chain, as long as some
 middleware turns it into a response.
 
-There is **no single-argument `urlpatterns(routes)`** — the prefix comes first, `""` for root.
-Registration is a separate step from starting the server: declare routes, call `urlpatterns(...)`,
-*then* call `serve()`.
+There is **no `urlpatterns(app, routes)` without a prefix** — the app comes first, then the
+prefix, `""` for root. Registration is a separate step from starting the server: declare routes,
+call `urlpatterns(app, …)`, *then* call `serve(app; …)`.
+
+**Use the explicit `App` form everywhere**: `urlpatterns`, `serve`/`terminate`,
+`staticfiles`/`spafiles`/`dynamicfiles`, `worker_startup`, `url`, `configcookies` and
+`set_cookie!`/`get_cookie` all take the app first; `path()` and `include_routes()` build values
+and take none. The argument-less forms (`urlpatterns("", routes)`, `serve()`) bind to a hidden
+process-wide app; they still work, but new code and tests do not use them, and one file never
+mixes the two.
 
 **Path converters — there are exactly five**: `<int:…>`, `<str:…>`, `<float:…>`, `<bool:…>`,
 `<uuid:…>`. An unknown converter name throws at `path()` time, not at request time.
 
 `path()` keywords: `method` (default `"GET"`), `methods` (a vector, overrides `method`), `name` (for
-reverse lookup with `url()`), `middleware` (route-scoped).
+reverse lookup with `url(app, name; params…)`), `middleware` (route-scoped).
 
 **Never** use `@get` / `@post` / `@route` macros or `get()` / `post()` functions — they do not exist
 in Nitro. Neither does `serveparallel()`. If you find them in an Oxygen.jl example, they were removed
@@ -245,7 +256,7 @@ own response unless you need a custom body.
 ## 6. Auth: middleware authenticates, guards authorize
 
 ```julia
-serve(middleware=[
+serve(app; middleware=[
     ExtractIP(forwarded_header=:x_forwarded_for, trusted_proxies=[ip"127.0.0.1"]),
     SessionMiddleware(store=MemoryStore()),
     BearerAuth(jwt_validator(secret; issuer="myapp", audience="api", profile=:strict)),
@@ -380,9 +391,9 @@ or a JWT with `exp`.
 ## 8. Static files and SPA
 
 ```julia
-staticfiles("public", "static")   # serve ./public at /static
-spafiles("dist", "/")             # SPA history-mode fallback; "" and "/" both mean the root
-dynamicfiles("build", "media")    # re-read from disk per request
+staticfiles(app, "public", "static")   # serve ./public at /static
+spafiles(app, "dist", "/")             # SPA history-mode fallback; "" and "/" both mean the root
+dynamicfiles(app, "build", "media")    # re-read from disk per request
 ```
 
 `staticfiles` snapshots file contents at startup; `dynamicfiles` reads per request. Use `spafiles`
@@ -398,7 +409,7 @@ mount time** — `dynamicfiles` re-reads file *contents* per request, not the ru
 directory untrusted users can write to** (an uploads folder): put it behind a reverse proxy, or serve
 it from a handler that authorizes each request. See `docs/design/static-serving-boundary.md`. `include_hidden=true` and
 `allow_symlink_escape=true` opt out per mount and widen what is publicly reachable. To serve a
-dotted directory, mount it as its own root — `staticfiles("public/.well-known", ".well-known")` —
+dotted directory, mount it as its own root — `staticfiles(app, "public/.well-known", ".well-known")` —
 since the rule tests components *below* the folder, never the folder's own name. Only files present
 at startup get a route, so a directory that gains files at runtime needs a handler, not a mount.
 
@@ -497,14 +508,23 @@ Explicit startup only: **load config → resolve secrets → run initializers �
 middleware → `serve(context=…)`.**
 
 ```julia
-config = AppConfig(...)                  # your struct — Nitro has no config global
+config = AppConfig(...)                       # your struct — Nitro has no config global
 
-urlpatterns("", Routes.routes(config))   # register routes FIRST
+urlpatterns(app, "", Routes.routes(config))   # register routes FIRST
 
-serve(host="0.0.0.0", port=8080,         # serve() is keyword-only — no positional routes
-      middleware=[...],
-      context=config)                    # reach it from a handler with getcontext(req)
+serve(app; host="0.0.0.0", port=8080,         # the app is serve's ONLY positional argument —
+      middleware=[...],                       # never a port, never the routes
+      context=config)                         # reach it from a handler with getcontext(req)
 ```
+
+Inside a package, all of this runs in `main()`, never in the module body: a module body runs once,
+in the precompile worker, so anything it connects or starts is gone at run time. The program is
+`main.jl` at the project root, as `Nitro.newapp` writes it: its `(@main)` calls `MyApp.main()`
+inside a `try`, and on failure prints one line, `Nitro.startup_failure_text(e)`, on `Core.stderr`
+and returns `1`. In a compiled executable an exception that escapes `@main` is printed field by
+field, secrets included, and `serve` only sanitizes its own errors, not the start-up code before
+it. Never interpolate a secret into an `error(...)` or `ArgumentError` message thrown at start-up:
+the line keeps those messages verbatim.
 
 There is **no `Nitro.config`**. Applications own their typed config structs; inject through the app
 context, never a hidden global. Config must be swappable in tests without mutating framework state.
@@ -528,11 +548,23 @@ set; the `"dev"` fallback is **not** published. Set `NITRO_ENV` **before** `usin
 `RAILS_ENV`/`MIX_ENV`.
 
 **Load and bind PormG in `main()`, include models in the module body.** `include("../db/models.jl")`
-defines the `models` module; `main()` calls `load_many` and then
-`PormG.Models.set_models(models, joinpath(pkgdir(@__MODULE__), "db"))`. Do not put
-`@import_models` in a package's module body with `load_many` in `main()`: it registers the models
-as it includes them, PormG refuses that before their folder is loaded, and a precompile is never a
-REPL — the package does not precompile.
+defines the `models` module; `main(; root::AbstractString = pkgdir(@__MODULE__), kwargs...)` calls
+`PormG.Configuration.load_many(["db"]; root, env)` and then
+`PormG.Models.set_models(models, joinpath(root, "db"))`. Do not put `@import_models` in a
+package's module body with `load_many` in `main()`: it registers the models as it includes them,
+PormG refuses that before their folder is loaded, and a precompile is never a REPL — the package
+does not precompile. Loading in the module body instead would read `db/connection.yml`, password
+included, at precompile time, and a JuliaC image keeps it.
+
+**Find `db/` from `root`, not from `pkgdir` alone.** In a JuliaC executable `pkgdir` and
+`@__DIR__` name the temporary copy of the project the image was built from, gone at run time. So
+`main.jl` passes `root = get(ENV, "APP_ROOT", pwd())`: set `APP_ROOT` to the folder that holds
+`db/`, or start the program there. Called from the REPL, `MyApp.main()` keeps the `pkgdir` default.
+
+**Close the pools when the server stops**, if the app serves and terminates in one process (a test,
+a re-serve): add `pormg_nitro_pools(keys = ["db"])` to `serve`'s middleware. It closes them after
+`terminate` has stopped accepting and the requests in flight have finished, never during the
+drain. A key that is not loaded is an error when it is built, so build it after `load_many`.
 
 `current_env()` **reports**; it must never **gate**. Selecting a config file, log verbosity, seed
 data: fine. Deciding whether a cookie gets `Secure`, whether CSRF is enforced, or whether error

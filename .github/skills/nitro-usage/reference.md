@@ -20,13 +20,15 @@ path(pattern::String, handler::Function;
 ```
 
 ```julia
-urlpatterns(prefix::String, routes...)                 # prefix is REQUIRED — "" for root
-urlpatterns(prefix::String, routes::Vector{RouteDefinition})
+urlpatterns(app::App, prefix::String, routes...)       # prefix is REQUIRED — "" for root
+urlpatterns(app::App, prefix::String, routes::Vector{RouteDefinition})
 include_routes(prefix::String, routes::Vector{RouteDefinition}; middleware = nothing)
 include_routes(prefix::String, routes::RouteDefinition...;       middleware = nothing)
 # middleware (#439): the group's list, prepended to each route's own. global -> group (outer
 # first) -> route -> handler. Shared instances; never runs on a 404/405.
-url(name::String; kwargs...)                           # reverse lookup by route name
+url(app::App, name::String; kwargs...)                 # reverse lookup by route name
+# Each app-first call also has an argument-less form bound to a hidden process-wide app
+# (`urlpatterns(prefix, routes)`, `url(name; …)`). It still works; new code does not use it.
 ```
 
 ### Path converters
@@ -350,7 +352,8 @@ object. A `kid` header on a single-secret token is never trusted — only keyset
 
 ## `serve()`
 
-Keyword-only. Register routes with `urlpatterns(...)` first.
+`serve(app; …)`: the app is the only positional argument, everything else is a keyword. Register
+routes with `urlpatterns(app, …)` first.
 
 | Keyword | Default | Notes |
 |---------|---------|-------|
@@ -372,8 +375,9 @@ Keyword-only. Register routes with `urlpatterns(...)` first.
 | `revise` | `:none` | `:lazy` / `:eager` with the Revise extension |
 | `secret_key`, `httponly`, `secure`, `samesite` | `nothing` | Cookie defaults. `secret_key` is a `String` or `SecretString` of ≥ 32 bytes, validated before `serve` changes anything |
 
-Lifecycle: `terminate(; timeout=…)`, `resetstate()`, `internalrequest(req; …)` (in-process request,
-no socket), `App(mod = @__MODULE__)` for a self-contained router isolated from the global one.
+Lifecycle: `terminate(app; timeout=…)`, `internalrequest(app, req; …)` (in-process request, no
+socket), `resetstate()` (the hidden global app only). `App(mod = @__MODULE__)` is the handle every
+call above takes; several can coexist, and each test builds its own.
 
 `terminate` is a **bounded** graceful shutdown: the listener is released immediately, in-flight
 requests get up to `timeout` seconds (default 10, or `serve(shutdown_timeout=…)`), then whatever is
@@ -382,7 +386,9 @@ in-flight request reads `cancel_reason(req) === :shutdown` (#466), so a handler 
 finish inside the drain. Long-lived WebSocket/SSE/STREAM handlers hold their connection for their
 whole lifetime and are therefore always cut at the timeout unless they stop themselves: poll
 `cancel_requested(req)` where `req` is in hand, or notify them from a `LifecycleMiddleware`'s
-`on_shutdown`, which runs before the drain. Calling `serve()` on a context
+`on_shutdown`, which runs before the drain. A `LifecycleMiddleware`'s `on_stopped` runs after it,
+once the listener is closed and the drain is over: the place to release what a request could still
+have been using, such as a database pool (`pormg_nitro_pools`). Calling `serve()` on a context
 that is already serving throws; terminate THAT app first, or give the second listener its own `App`.
 
 ---
@@ -390,11 +396,11 @@ that is already serving throws; terminate THAT app first, or give the second lis
 ## Static and SPA serving
 
 ```julia
-staticfiles(folder::String,  mountdir::String="static"; headers=[], loadfile=nothing,
+staticfiles(app::App, folder::String,  mountdir::String="static"; headers=[], loadfile=nothing,
             include_hidden::Bool=false, allow_symlink_escape::Bool=false)
-spafiles(folder::String,     mountdir::String="static"; headers=[], loadfile=nothing,
+spafiles(app::App, folder::String,     mountdir::String="static"; headers=[], loadfile=nothing,
          include_hidden::Bool=false, allow_symlink_escape::Bool=false)
-dynamicfiles(folder::String, mountdir::String="static"; headers=[], loadfile=nothing,
+dynamicfiles(app::App, folder::String, mountdir::String="static"; headers=[], loadfile=nothing,
              include_hidden::Bool=false, allow_symlink_escape::Bool=false)
 ```
 
@@ -412,7 +418,7 @@ proxy, not behind these checks (`docs/design/static-serving-boundary.md`):
 | Filenames the router reads as patterns: `*`/`**` (HTTP.jl wildcards — they shadow sibling URLs) and any name containing `{` or `}` (parsed as a path parameter, which threw at registration and stopped `serve()` booting) | none |
 | Anything that is not a regular file — symlinked directories, FIFOs, devices | none |
 
-The folder's own name is never tested, so `staticfiles("public/.well-known", ".well-known")` works.
+The folder's own name is never tested, so `staticfiles(app, "public/.well-known", ".well-known")` works.
 Enumeration is `Nitro.Core.Util.mountable_files(root; include_hidden, allow_symlink_escape)`.
 All three mount functions return `Vector{Pair{String,String}}` — `route => filepath`, in registration
 order; `first.(result)` gives the routes alone. `spafiles` registers its history-mode fallback only
@@ -465,6 +471,7 @@ set_queue_authorizer!(worker_store(app), f)                   # policy stays on 
 set_queue_authorizer!(store, authorizer)                      # (queue, user_id) -> Bool
 set_watch_authorizer!(store, authorizer)                      # (task_key, watchers, user_id) -> Bool
 pormg_nitro_worker(; db_key = "db")                           # needs `using PormG`
+pormg_nitro_pools(; keys, drain_seconds = 5.0)                # needs `using PormG`; closes the pools in `on_stopped`, after terminate's drain
 update_progress!(task_info, value)                            # NEVER assign .progress directly
 ```
 
