@@ -1,16 +1,18 @@
 ﻿# Cookie Configuration
 
-Nitro allows you to define application-wide defaults for your cookies using the `configcookies()` function. This ensures consistency and security across your application without repeating code in every route.
+Nitro allows you to define application-wide defaults for your cookies using the `configcookies(app; ...)` function. This ensures consistency and security across your application without repeating code in every route.
 
 ## Global Configuration
 
-You should configure your cookies at the start of your application, before calling `serve()`.
+You should configure your cookies at the start of your application, before calling `serve(app)`.
 
 ```julia
 using Nitro
 
+const app = App(mod = @__MODULE__)
+
 # Configure defaults for ALL cookies
-configcookies(
+configcookies(app;
     secret_key = SecretString(ENV["COOKIE_SECRET"]), # Required for encryption; ≥ 32 bytes
     httponly   = true,      # Default: true (Safety first)
     samesite   = "Lax",     # Default: "Lax"
@@ -47,18 +49,18 @@ You can override global defaults for specific cookies by passing keyword argumen
 
 ```julia
 # Global default is HttpOnly=true
-configcookies(httponly=true)
+configcookies(app; httponly=true)
 
 function ui_settings(req)
     res = Response("Settings")
     
     # Override: Allow JS to read this specific cookie
-    set_cookie!(res, "language", "pt-BR", httponly=false)
+    set_cookie!(app, res, "language", "pt-BR", httponly=false)
     
     return res
 end
 
-urlpatterns("",
+urlpatterns(app, "",
     path("/ui-settings", ui_settings, method="GET"),
 )
 ```
@@ -70,7 +72,7 @@ urlpatterns("",
 If your frontend (React/Vue) is on a different domain than your Nitro API (e.g., API on `localhost:8080`, Frontend on `localhost:3000`), you need specific settings to allow the browser to send cookies.
 
 ```julia
-configcookies(
+configcookies(app;
     samesite = "None", # Required for Cross-Origin
     secure   = true    # Required if SameSite=None
 )
@@ -86,5 +88,5 @@ Sometimes you want a session to last weeks, not hours.
 # 30 Days in seconds
 const MONTH = 60 * 60 * 24 * 30
 
-set_cookie!(res, "remember_token", token, maxage=MONTH)
+set_cookie!(app, res, "remember_token", token, maxage=MONTH)
 ```

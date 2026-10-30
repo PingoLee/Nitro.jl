@@ -32,8 +32,10 @@ proxy still does all of it upstream, and with `sendfile`. The reasoning is recor
 Cache lifetime is yours to state, because only you know which assets are content-hashed:
 
 ```julia
-staticfiles("dist/assets", "assets"; cache_control = "public, immutable, max-age=31536000")
-spafiles("dist", "";        cache_control = "no-cache")   # the shell must revalidate
+const app = App(mod = @__MODULE__)
+
+staticfiles(app, "dist/assets", "assets"; cache_control = "public, immutable, max-age=31536000")
+spafiles(app, "dist", "";        cache_control = "no-cache")   # the shell must revalidate
 ```
 
 There is deliberately no default — a `max-age` guessed on your behalf is wrong more often than
@@ -459,7 +461,7 @@ written to the error log, so the stock `nginx-limit-req` jail works as shipped.
 ### Set HSTS in one place
 
 `Strict-Transport-Security` can come from the proxy (`add_header … always`, as in the worked
-config) or from Nitro (`serve(security_headers = SecurityHeaders(hsts = Day(365)))`). Choose
+config) or from Nitro (`serve(app; security_headers = SecurityHeaders(hsts = Day(365)))`). Choose
 **one**. Two copies do not add up: a browser that receives two obeys only the first (RFC 6797
 §8.1), so the other is silently ignored, and the two drift apart the first time one is edited. The
 proxy is usually the better home. It is where TLS terminates — Nitro speaks plain HTTP and cannot
@@ -489,14 +491,14 @@ the body caps, the dotfile denial and the `location /admin/` rule all evaporate 
 Nitro already defaults to `host = "127.0.0.1"`. Keep it there when the proxy is on the same machine:
 
 ```julia
-serve(host = "127.0.0.1", port = 8080)     # the default
+serve(app; host = "127.0.0.1", port = 8080)     # the default
 ```
 
 Only widen it when the proxy genuinely lives elsewhere, and then constrain the listener at the
 network layer too — a firewall rule, a Kubernetes `NetworkPolicy`, or a private-subnet bind:
 
 ```julia
-serve(host = "10.0.1.14", port = 8080)     # a specific private interface, not "0.0.0.0"
+serve(app; host = "10.0.1.14", port = 8080)     # a specific private interface, not "0.0.0.0"
 ```
 
 ## Recovering the client IP
@@ -511,7 +513,7 @@ end of the socket.
 Out of the box Nitro uses the socket peer address and ignores every forwarding header:
 
 ```julia
-serve(middleware = [ExtractIP()])
+serve(app; middleware = [ExtractIP()])
 ```
 
 This is always safe and sometimes wrong. Behind a proxy, every client shares the proxy's address,
@@ -523,7 +525,7 @@ That is a *degradation*, not a vulnerability — which is the trade-off Nitro pi
 To read a forwarding header you must declare two things together:
 
 ```julia
-serve(middleware = [
+serve(app; middleware = [
     ExtractIP(forwarded_header = :x_forwarded_for,
               trusted_proxies  = [ip"127.0.0.1"]),
 ])
@@ -681,7 +683,7 @@ real work on the other two inputs: a hop your proxy wrote into `X-Forwarded-For`
 `RateLimiter` builds an `ExtractIP` internally, so it takes the same two keywords:
 
 ```julia
-serve(middleware = [
+serve(app; middleware = [
     RateLimiter(rate_limit = 100, window = Minute(1),
                 forwarded_header = :x_forwarded_for,
                 trusted_proxies  = [ip"127.0.0.1"]),
@@ -695,7 +697,7 @@ them to the limiter as well is an `ArgumentError`, because with `auto_extract_ip
 limiter builds no extractor and they would silently do nothing:
 
 ```julia
-serve(middleware = [
+serve(app; middleware = [
     ExtractIP(forwarded_header = :x_forwarded_for, trusted_proxies = [ip"127.0.0.1"]),
     RateLimiter(rate_limit = 100, window = Minute(1), auto_extract_ip = false),
 ])
@@ -766,7 +768,7 @@ for every browser. Tell `ExtractIP` which header the proxy writes the client's s
 configs above already send it (`X-Forwarded-Proto $scheme`; Caddy does it by default):
 
 ```julia
-serve(middleware = [
+serve(app; middleware = [
     ExtractIP(forwarded_header = :x_forwarded_for,
               forwarded_proto  = :x_forwarded_proto,
               trusted_proxies  = [ip"127.0.0.1"]),
@@ -799,10 +801,10 @@ whatever the proxy reports. List the page's origin with `WebSocketOrigins` inste
 check:
 
 ```julia
-serve(middleware = [WebSocketOrigins(["https://app.example.com"])])
+serve(app; middleware = [WebSocketOrigins(["https://app.example.com"])])
 
 # or only on the routes that need it:
-urlpatterns("",
+urlpatterns(app, "",
     path("/ws/chat", chat; method = "WEBSOCKET",
          middleware = [WebSocketOrigins(["https://app.example.com"])]),
 )

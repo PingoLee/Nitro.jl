@@ -7,7 +7,7 @@ Security is paramount when handling user state. Nitro's cookie module is designe
 Unlike standard cookies which are plain text, Nitro supports **AES-256 GCM encryption** out of the box. This prevents users from reading or tampering with the cookie contents.
 
 ### How to Enable
-1. Set a `secret_key` in `configcookies()`: at least **32 random bytes**, read from the
+1. Set a `secret_key` in `configcookies(app; ...)`: at least **32 random bytes**, read from the
    environment. A shorter key is refused with an `ArgumentError` at startup.
 2. Every `set_cookie!`/`get_cookie` then encrypts and decrypts by default; `encrypted=true`
    says so explicitly.
@@ -16,15 +16,17 @@ Unlike standard cookies which are plain text, Nitro supports **AES-256 GCM encry
 # Generate a key ONCE, store it in your secret manager / .env, never in source:
 #   julia -e 'using Nitro; println(bytes2hex(Nitro.Crypto.secure_random_bytes(32)))'
 
+const app = App(mod = @__MODULE__)
+
 # 1. Setup
-configcookies(secret_key = SecretString(ENV["COOKIE_SECRET"]))
+configcookies(app; secret_key = SecretString(ENV["COOKIE_SECRET"]))
 
 # 2. Set (Encrypted)
-set_cookie!(res, "cart", "item-17,item-42", encrypted=true, maxage=86400)
+set_cookie!(app, res, "cart", "item-17,item-42", encrypted=true, maxage=86400)
 # Browser sees: "cart=AdDn3j4rX0x..."
 
 # 3. Get (Decrypted)
-val = get_cookie(req, "cart", encrypted=true)
+val = get_cookie(app, req, "cart", encrypted=true)
 # Server sees: "item-17,item-42"
 ```
 
@@ -40,7 +42,7 @@ things the browser cannot change:
   server refuses the value once it has passed — `Max-Age` alone is only a hint to the browser,
   and a copied cookie would otherwise decrypt forever. A cookie with neither has **no**
   server-side expiry; set `maxage` on it, or give every cookie one with
-  `configcookies(maxage = …)`.
+  `configcookies(app; maxage = …)`.
 
 A cookie that does not open — tampered, sealed under another key, copied from another cookie,
 expired, or written before the current format — reads as **absent**: `get_cookie` returns your
@@ -74,7 +76,7 @@ Here `token` is a signed JWT carrying its own `exp`, so the server can still ref
 the cookie is copied (see the warning above):
 
 ```julia
-set_cookie!(res, "auth_token", token,
+set_cookie!(app, res, "auth_token", token,
     httponly = true,    # No JS access
     secure   = true,    # HTTPS only
     samesite = "Strict",# No cross-site usage
@@ -91,7 +93,7 @@ set_cookie!(res, "auth_token", token,
 
 ```julia
 # For an API serving a separate Frontend domain:
-set_cookie!(res, "session", id, samesite="None", secure=true)
+set_cookie!(app, res, "session", id, samesite="None", secure=true)
 ```
 
 ## Transport Security and HSTS
@@ -106,8 +108,8 @@ Use [`SecurityHeaders`](@ref), which carries HSTS alongside the rest of the base
 ```julia
 using Dates
 
-serve(security_headers = SecurityHeaders(hsts = Day(365)),
-      middleware = [SessionMiddleware(store=MemoryStore(), secure=true)])
+serve(app; security_headers = SecurityHeaders(hsts = Day(365)),
+           middleware = [SessionMiddleware(store=MemoryStore(), secure=true)])
 ```
 
 Pass it as `security_headers`, not inside `middleware`. In the middleware list it only reaches

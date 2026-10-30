@@ -12,6 +12,8 @@ Nitro treats session storage and authenticated user resolution as separate conce
 using Nitro
 using PormG
 
+const app = App(mod = @__MODULE__)
+
 # 1. Configure PormG
 PormG.Configuration.load("db"; env = something(sync_pormg_env!(), current_env()))
 PormG.@import_models "db/models.jl" models
@@ -63,14 +65,14 @@ function logout_handler(req::HTTP.Request)
 end
 
 # 4. Routes
-urlpatterns("/api",
+urlpatterns(app, "/api",
     path("/login",  login_handler,  method="POST"),
     path("/me",     me_handler,     method="GET"),
     path("/logout", logout_handler, method="POST"),
 )
 
 # 5. Serve
-serve(middleware=[
+serve(app; middleware=[
     SessionMiddleware(store=store, cookie_name="nitro_sess", secure=false, samesite="Lax"),
 ])
 ```
@@ -96,7 +98,7 @@ once. A flood of new sessions therefore logs idle users out instead of exhaustin
 store = MemoryStore()                          # up to 100_000 sessions
 store = MemoryStore(max_sessions = 500_000)    # raise the bound
 
-serve(middleware=[
+serve(app; middleware=[
     SessionMiddleware(store=store, secure=false),
 ])
 ```
@@ -109,11 +111,13 @@ sets up the expiry index, and returns a ready-to-use store.
 ```julia
 using Nitro, PormG
 
+const app = App(mod = @__MODULE__)
+
 PormG.Configuration.load("db"; env = something(sync_pormg_env!(), current_env()))
 
 store = pormg_nitro_session(db_key="db")
 
-serve(middleware=[
+serve(app; middleware=[
     SessionMiddleware(store=store, max_age=3600, secure=true),
 ])
 ```
@@ -226,7 +230,7 @@ end
 ```
 
 `SessionMiddleware` calls it from a **background janitor**, not from the request path: the
-janitor starts on `serve()`, stops on `terminate()`, and ticks every `prune_interval`
+janitor starts on `serve(app)`, stops on `terminate(app)`, and ticks every `prune_interval`
 (default 10 minutes). That is what the [`LifecycleMiddleware`](@ref Nitro.Core.Types.LifecycleMiddleware)
 `SessionMiddleware` returns is for — its `on_startup`/`on_shutdown` hooks own the janitor's
 lifetime.
@@ -240,7 +244,7 @@ store straight off the app context — add [`SessionPruner`](@ref) instead, or t
 grows for the life of the process:
 
 ```julia
-serve(middleware = [SessionPruner(store; interval = Minute(5))], context = store)
+serve(app; middleware = [SessionPruner(store; interval = Minute(5))], context = store)
 ```
 
 The context must be the store itself, an `AbstractSessionStore{String}`. Any other context is not
@@ -448,7 +452,7 @@ function SessionAuthMiddleware(handle)
     end
 end
 
-urlpatterns("",
+urlpatterns(app, "",
     path("/dashboard", dashboard, method="GET", middleware=[
         SessionAuthMiddleware,
         GuardMiddleware(login_required()),
@@ -473,7 +477,7 @@ function profile(req::HTTP.Request)
     return Res.json(Dict("sub" => getuser(req)["sub"]))
 end
 
-urlpatterns("",
+urlpatterns(app, "",
     path("/profile", profile, method="GET", middleware=[BearerAuth(validator)]),
 )
 ```
@@ -543,7 +547,7 @@ function generate_report(req::HTTP.Request)
     return Res.json(Dict("status" => "queued", "requested_by" => getuser(req)["app"]))
 end
 
-urlpatterns("",
+urlpatterns(app, "",
     path("/reports/generate", generate_report, method="POST", middleware=[
         BearerAuth(jwt_validator(jwt_secret)),
         GuardMiddleware(authorize_generate),
@@ -644,7 +648,7 @@ For cookie-authenticated browsers, load the CSRF secret from the environment and
 csrf_secret = get(ENV, "CSRF_SECRET", nothing)
 isnothing(csrf_secret) && error("CSRF_SECRET must be set")
 
-serve(middleware=[
+serve(app; middleware=[
     SessionMiddleware(store=store),       # must be OUTSIDE CSRFMiddleware
     CSRFMiddleware(csrf_secret),
 ])
@@ -698,7 +702,7 @@ function login_form(req::HTTP.Request)
         </form>""")
 end
 
-urlpatterns("",
+urlpatterns(app, "",
     path("/login", login_form, method="GET"),
     path("/login", AuthHandlers.login, method="POST"),
 )
@@ -731,7 +735,7 @@ endpoint that does, and call it once at startup:
 ```julia
 csrf(req::HTTP.Request) = Res.json(Dict("token" => csrf_token!(req)))
 
-urlpatterns("", path("/api/csrf", csrf, method="GET"))
+urlpatterns(app, "", path("/api/csrf", csrf, method="GET"))
 ```
 
 ```javascript
@@ -817,7 +821,7 @@ browser = include_routes("", [
 
 api = include_routes("/api/v1", api_routes; middleware=[BearerAuth(validator)])
 
-urlpatterns("", vcat(browser, api))
+urlpatterns(app, "", vcat(browser, api))
 ```
 
 The API then never touches the session store, cookies or not. **Every route that renders a form
@@ -880,7 +884,7 @@ has CSRF protection without a token, a cookie or a session. [`CrossOriginProtect
 `net/http.CrossOriginProtection`:
 
 ```julia
-serve(middleware=[
+serve(app; middleware=[
     CrossOriginProtection(trusted_origins=["https://app.example.com"]),
     SessionMiddleware(store=store),
 ])

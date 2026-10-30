@@ -13,6 +13,8 @@ using HTTP
 using Nitro
 using DotEnv
 
+const app = App(mod = @__MODULE__)
+
 required_env(name::String) = get(ENV, name, nothing) === nothing ? error("$name must be set") : ENV[name]
 
 # 1. Load your `.env` file (optional, depends on your deployment)
@@ -25,14 +27,14 @@ function health(req::HTTP.Request)
     return Res.send("ok")
 end
 
-urlpatterns("",
+urlpatterns(app, "",
     path("/", health, method="GET"),
 )
 
 # 3. Pass the secret to the components that need it.
 #    SessionMiddleware must stay OUTSIDE CSRFMiddleware: CSRF tokens are bound to the
 #    session id, and without one the CSRF gate fails closed.
-serve(middleware=[
+serve(app; middleware=[
     SessionMiddleware(store=MemoryStore()),
     CSRFMiddleware(SECRET_KEY),
 ])
@@ -59,7 +61,7 @@ function sign_payload(req::HTTP.Request, ctx::Context{AppConfig})
 end
 
 # Inject config into the context for all routes
-serve(context=config)
+serve(app; context=config)
 ```
 
 For a comprehensive guide on building `AppConfig`, refer to the [Application Config Example](app_config.md).

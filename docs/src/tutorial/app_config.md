@@ -2,7 +2,7 @@
 
 Nitro should not own your application configuration. Keep the config struct, file loading,
 and environment-variable resolution in the app layer, then pass the resulting object into
-Nitro with `serve(context=...)`.
+Nitro with `serve(app; context=...)`.
 
 This is the right pattern for an application that uses Nitro for HTTP, `Nitro.Auth` for
 authentication helpers, `Nitro.Workers` for in-process jobs, and `PormG` as an external
@@ -164,6 +164,8 @@ using HTTP
 using Nitro
 using .MyAppConfig
 
+const app = App(mod = @__MODULE__)
+
 function health(req::HTTP.Request, ctx::Context{AppConfig})
     return Res.json(Dict(
         "env" => ctx.payload.env,
@@ -172,12 +174,12 @@ function health(req::HTTP.Request, ctx::Context{AppConfig})
     ))
 end
 
-urlpatterns("",
+urlpatterns(app, "",
     path("/health", health, method="GET"),
 )
 
 config = load_config(current_env())
-serve(host=config.server_host, port=config.server_port, context=config)
+serve(app; host=config.server_host, port=config.server_port, context=config)
 ```
 
 ### Reading A Secret Back Out
@@ -185,14 +187,14 @@ serve(host=config.server_host, port=config.server_port, context=config)
 `SecretString` is deliberately **not** an `AbstractString`, so it cannot flow into a string
 operation or a log line unnoticed. A `JWTKeyset` takes `SecretString`s directly, so
 `encode_jwt(claims, config.auth.api_keys)` and `jwt_validator(config.auth.api_keys)` need no
-unwrapping. The cookie and CSRF keys take one directly too — `configcookies(secret_key = …)`,
-`serve(secret_key = …)`, the `secret_key` of `set_cookie!`/`get_cookie`, `CookieAuthMiddleware` and
-`CSRFMiddleware` — and hold it as a `SecretString` from then on. `encode_jwt` and `jwt_validator`
+unwrapping. The cookie and CSRF keys take one directly too — `configcookies(app; secret_key = …)`,
+`serve(app; secret_key = …)`, the `secret_key` of `set_cookie!`/`get_cookie`, `CookieAuthMiddleware`
+and `CSRFMiddleware` — and hold it as a `SecretString` from then on. `encode_jwt` and `jwt_validator`
 with one plain secret take a `String`, so unwrap with `reveal` at the call itself rather than
 storing a revealed copy in the config:
 
 ```julia
-serve(
+serve(app;
     host=config.server_host,
     port=config.server_port,
     context=config,
@@ -241,18 +243,19 @@ for everything downstream of it. On a hot path that difference is one dynamic
 3. Build `AppConfig`.
 4. Initialize external packages such as `PormG` from the app layer.
 5. Build routes, middleware, and worker hooks.
-6. If you use `Nitro.Workers`, attach `worker_startup(...)` in the `serve(middleware=[...])` list.
-7. Start Nitro with `serve(context=config)`.
+6. If you use `Nitro.Workers`, attach `worker_startup(app; ...)` in the
+   `serve(app; middleware=[...])` list.
+7. Start Nitro with `serve(app; context=config)`.
 
 For example:
 
 ```julia
-serve(
+serve(app;
     host=config.server_host,
     port=config.server_port,
     context=config,
     middleware=[
-        worker_startup(
+        worker_startup(app;
             queues=["reports"],
             cleanup_interval_hours=24,
             cleanup_retain_days=7,

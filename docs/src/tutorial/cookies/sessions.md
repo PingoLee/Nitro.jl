@@ -10,6 +10,8 @@ For the broader auth story, including guards and JWT helpers, see [Sessions and 
 using HTTP
 using Nitro
 
+const app = App(mod = @__MODULE__)
+
 # Use the in-memory store for local development.
 store = MemoryStore()
 
@@ -53,13 +55,13 @@ function logout_handler(req::HTTP.Request)
     return Res.json(Dict("message" => "logged out"))
 end
 
-urlpatterns("/api",
+urlpatterns(app, "/api",
     path("/login", login_handler, method="POST"),
     path("/dashboard", dashboard_handler, method="GET"),
     path("/logout", logout_handler, method="POST"),
 )
 
-serve(middleware=[
+serve(app; middleware=[
     SessionMiddleware(store=store, max_age=3600, secure=false),
 ])
 ```
@@ -280,7 +282,7 @@ For local development:
 ```julia
 store = MemoryStore()
 
-serve(middleware=[
+serve(app; middleware=[
     SessionMiddleware(store=store, secure=false),
 ])
 ```
@@ -293,11 +295,13 @@ For persistent sessions in production:
 using Nitro
 using PormG
 
+const app = App(mod = @__MODULE__)
+
 PormG.Configuration.load("db"; env = something(sync_pormg_env!(), current_env()))
 
 store = pormg_nitro_session(db_key="db")
 
-serve(middleware=[
+serve(app; middleware=[
     SessionMiddleware(store=store, max_age=3600, secure=true),
 ])
 ```
