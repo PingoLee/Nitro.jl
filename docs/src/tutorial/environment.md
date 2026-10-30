@@ -77,9 +77,9 @@ service, a script, a test run and a precompile worker are all outside one. Name 
 `Nitro.newapp` writes does:
 
 ```julia
-# In your package's main(), as Nitro.newapp writes it
+# In your package's main(; root = pkgdir(@__MODULE__), kwargs...), as Nitro.newapp writes it
 env = something(sync_pormg_env!(), current_env())
-PormG.Configuration.load_many(["db"]; root = pkgdir(@__MODULE__), env)
+PormG.Configuration.load_many(["db"]; root, env)
 ```
 
 That is a `PORMG_ENV` the deployment set, else `NITRO_ENV` (or `GENIE_ENV`), which

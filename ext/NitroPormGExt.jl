@@ -2065,6 +2065,9 @@ function Nitro._newapp_pormg(write_app::Function, root::String)
         # precedence minus its guesses: a set `PORMG_ENV` still wins, as it did when the bridge
         # left it alone and `load` read it; else `NITRO_ENV` (the bridge publishes it, and
         # returns `PORMG_ENV`); else `current_env()`'s "dev", in place of `default_env:`.
+        # `db/` is found from `root` (#798): `pkgdir` by default, which a JuliaC executable cannot
+        # use -- it names the temporary copy of the project the image was built from -- so the
+        # entry passes `APP_ROOT`, else the working directory.
         module_body = [
             "# Once db/models.jl defines models, include them here for the handlers (`import ..appM`).",
             "# Including only defines them: `main` binds them to the connection.",
@@ -2072,12 +2075,23 @@ function Nitro._newapp_pormg(write_app::Function, root::String)
             "#   const appM = models",
         ],
         boot = [
-            "# PormG reads db/connection.yml, from any working directory, in the environment",
-            "# `PORMG_ENV` names, else `NITRO_ENV` (or `GENIE_ENV`), else \"dev\"",
+            "# PormG reads `root`/db/connection.yml in the environment `PORMG_ENV` names,",
+            "# else `NITRO_ENV` (or `GENIE_ENV`), else \"dev\"",
             "env = something(sync_pormg_env!(), current_env())",
-            "PormG.Configuration.load_many([\"db\"]; root = pkgdir(@__MODULE__), env)",
+            "PormG.Configuration.load_many([\"db\"]; root, env)",
             "# Once the models are included above, bind them to that connection:",
-            "#   PormG.Models.set_models(models, joinpath(pkgdir(@__MODULE__), \"db\"))",
+            "#   PormG.Models.set_models(models, joinpath(root, \"db\"))",
+        ],
+        main_kwargs = "root::AbstractString = pkgdir(@__MODULE__), ",
+        main_doc = [
+            "",
+            "`root` is the folder that holds `db/`. `main.jl` passes `APP_ROOT`, else the working",
+            "directory: in a JuliaC executable `pkgdir` names the folder it was built from.",
+        ],
+        entry_kwargs = "root = get(ENV, \"APP_ROOT\", pwd())",
+        entry_comment = [
+            "# The folder that holds db/. Not `pkgdir`: in a JuliaC executable that is the",
+            "# temporary copy of the project it was built from, gone by the time it runs.",
         ],
         store = "pormg_nitro_worker(db_key = \"db\")",
         deps = ["PormG" => string(Base.PkgId(PormG).uuid); [n => drivers[n][1] for n in names]],

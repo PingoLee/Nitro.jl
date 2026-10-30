@@ -651,6 +651,11 @@ function (@main)(args::Vector{String})::Cint
 end
 ```
 
+An app written by `Nitro.newapp` already has this entry point, as `main.jl` (see
+[Bigger Applications](bigger_applications.md)). Its `main` takes the folder that holds `db/` as
+`root`, and `main.jl` passes `APP_ROOT`, else the working directory: an executable cannot find it
+with `pkgdir` or `@__DIR__`, which name the temporary copy of the project JuliaC built from.
+
 Use `Core.stderr` and `Nitro.startup_failure_text`, not `@error "…" exception = e`: a trimmed
 image cannot dispatch the logging machinery or `showerror` on an arbitrary exception, and an
 untrimmed one would print what `showerror` prints, values included. `startup_failure_text` calls
