@@ -114,10 +114,20 @@ using Test
 #
 # Those lines are for two things. Over a few CI runs they give the per-OS distribution of
 # each ratio. With the memory fraction beside them, a red can be read against the runner's
-# state, not guessed at. That data decides #610's third proposal (a per-OS limit, a third
-# numerator sample, or a free-memory floor). Until then the limits and sample counts above
-# stay as they are, and a ratio logged on a loaded developer box is not evidence for moving
-# them.
+# state, not guessed at. A ratio logged on a loaded developer box is not evidence for moving a
+# limit or a sample count; these lines are.
+#
+# They settled #610's third proposal (a per-OS limit, a third numerator sample, or a
+# free-memory floor) as NONE of the three. The leg it went red on, macOS at Julia 1.12, left the
+# CI matrix with the 1.13 floor (#526). No red since these lines exist was a numerator outlier
+# that a third sample would have absorbed: #736 was the probe's caller (CI), #766 a fast
+# denominator (a developer box), and #710's `url` a step that holds on every sample of a run
+# (CI). `MAX_RATIO` stays global, because #508 was a real regression caught at a tight limit.
+#
+# What #610's data did show is the leg running closest to the line: ubuntu at 1 thread reads
+# `json_ext` at up to ~7.4x against 8.0. That is not noise. Its `dict_int` is systematically
+# lower there (0.021–0.038 s against 0.047–0.076 s on the other legs), while `json_ext` takes
+# about the same time everywhere. It is #710's to settle, with the `caller_s` field below.
 #
 # Compare the memory fraction WITHIN one OS only. On macOS `Sys.free_memory()` counts only
 # pages that are completely free, not cached or inactive ones. The first CI run with this
