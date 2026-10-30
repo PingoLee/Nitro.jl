@@ -16,7 +16,7 @@ using ..Errors: ValidationError, StoreInterfaceError, ValidatorFault, SessionSto
 using ..Crypto: SecretString, CookieKey, _cookie_secret
 
 export Server, Nullable, Context,
-    LifecycleMiddleware, startup, shutdown, require_fixed_period,
+    LifecycleMiddleware, startup, shutdown, stopped, require_fixed_period,
     Param, isrequired, LazyRequest, headers, pathparams, queryvars, jsonbody, formbody, textbody, multipartbody,
     CookieConfig, Cookie, Session, SessionPayload,
     AbstractSessionStore, get_session, set_session!, update_session!, rotate_session!,
@@ -1087,7 +1087,8 @@ function require_fixed_period(name::String, p::Dates.Period)
 end
 
 """
-    LifecycleMiddleware(; middleware, on_startup = nothing, on_shutdown = nothing)
+    LifecycleMiddleware(; middleware, on_startup = nothing, on_shutdown = nothing,
+                        on_stopped = nothing)
 
 A middleware that owns a resource for as long as the server runs — a background task, a
 connection, a buffer to flush. Bundles the request function with the hooks that start and stop
@@ -1102,13 +1103,39 @@ This is a **return type users meet**, not something most apps construct: `RateLi
   chain actually runs.
 - `on_startup::Union{Function,Nothing}` — called once by `serve()`, with no arguments. Its
   return value is discarded.
-- `on_shutdown::Union{Function,Nothing}` — called once by `terminate()`, with no arguments.
+- `on_shutdown::Union{Function,Nothing}` — called once by `terminate()`, with no arguments,
+  **before** the HTTP drain: the listener is still accepting, and requests are still running.
+- `on_stopped::Union{Function,Nothing}` — called once by `terminate()`, with no arguments,
+  **after** the listener has closed and the drain has finished or been forced (#161).
 
-Both hooks are optional; `nothing` means "nothing to do", which is why a middleware with no
+All three hooks are optional; `nothing` means "nothing to do", which is why a middleware with no
 resource to own can still be one of these rather than a bare function (`RateLimiter`'s
 `:sliding_window` strategy is exactly that case).
 
-The struct is parameterized on the three fields' types, `LifecycleMiddleware{M,S,D}`, so each
+# Which teardown hook
+
+`on_shutdown` is for what the drain should *see*: a background task told to stop, a stream told
+to wind down, a queue told to take no more work. `on_stopped` is for what a request may still be
+**using** while the drain runs — a database pool, a final flush. Releasing such a resource in
+`on_shutdown` cuts off the requests the drain is waiting for, and a request served during the
+drain may re-acquire it. This is Spring's phased shutdown: the web server stops, then the beans
+it served from are destroyed; and Go's `db.Close()` after `srv.Shutdown()` returns.
+[`pormg_nitro_pools`](@ref Nitro.pormg_nitro_pools) is the in-tree user.
+
+`on_stopped` is best effort in two cases:
+
+- When the drain hits its timeout, the connections are force-closed, but a handler task still
+  running is not stopped, and it can reach the resource after `on_stopped` released it.
+- The port is released when the drain *starts*, so a `serve()` of the same app called while a
+  `terminate()` is still draining is admitted, and this run's `on_stopped` then runs while the
+  next run is already serving. Wait for `terminate()` to return before serving again when a
+  hook releases something the next run will use.
+
+Like `on_shutdown`, it runs only when `terminate()` does: not on a hard kill, and not when Ctrl-C
+ends a script run as `julia app.jl` (see the Ctrl-C note on `serve`). Its time adds to the exit
+time, after `shutdown_timeout`.
+
+The struct is parameterized on the four fields' types, `LifecycleMiddleware{M,S,D,P}`, so each
 value has a concrete type. `LifecycleMiddleware` without parameters is still the type to test
 against and to collect in (`x isa LifecycleMiddleware`, `LifecycleMiddleware[]`).
 
@@ -1141,7 +1168,8 @@ Startup runs route-owned entries (declared via `path`/`urlpatterns`) before serv
 (declared via `serve(middleware = ...)`), each in registration order. Teardown is the exact
 reverse — **LIFO**, matching Spring's `SmartLifecycle`, OTP supervisors and `defer`/`atexit`.
 So a middleware may rely on anything registered before it still being up during its own
-`on_shutdown`.
+`on_shutdown`. The `on_stopped` broadcast visits the entries in that same LIFO order, and it begins
+only after every `on_shutdown` has returned.
 
 The one exception is **promotion**: hand the *same* object to both `serve(middleware = ...)`
 and a route, and route ownership wins — it moves to the end of the route-owned half. Since
@@ -1160,26 +1188,35 @@ each activation its own state and have `on_shutdown` retire it — see `_janitor
 or `AccessLog` for the per-activation run struct.
 
 A hook that throws is logged and swallowed, and the rest of the sequence still runs — see
-[`startup`](@ref) and [`shutdown`](@ref). Ctrl-C is the one throw that is not discarded: the
+[`startup`](@ref), [`shutdown`](@ref) and [`stopped`](@ref). Ctrl-C is the one throw that is not discarded: the
 sequence still runs to completion, and `serve()`/`terminate()` then re-raise the interrupt
 once (#185).
 """
-struct LifecycleMiddleware{M<:Function, S<:Union{Function,Nothing}, D<:Union{Function,Nothing}}
+struct LifecycleMiddleware{M<:Function, S<:Union{Function,Nothing}, D<:Union{Function,Nothing},
+                           P<:Union{Function,Nothing}}
     # The middleware function itself (handles incoming requests)
     middleware :: M
     # A hook that's called when the server starts up (optional)
     on_startup :: S
-    # A hook that's called when the server is shutdown (optional)
+    # A hook that's called when the server is shutdown, before the drain (optional)
     on_shutdown :: D
+    # A hook that's called after the listener has closed and the drain is over (optional, #161)
+    on_stopped :: P
 end
 
-# Parameterized on the three functions' types (#719), so a `serve(middleware = (…))` tuple holding
+# Parameterized on the four functions' types (#719), so a `serve(middleware = (…))` tuple holding
 # one is concrete: the global fold reaches `.middleware` without a dynamic call, and `serve` can take
 # the hooks' pointers in a trimmed build (`serve_lifecycle_entry`, src/routeendpoint.jl). The bare
 # name is still the type every `isa` and `Vector{LifecycleMiddleware}` means.
 LifecycleMiddleware(; middleware::Function, on_startup::Union{Function,Nothing} = nothing,
-                    on_shutdown::Union{Function,Nothing} = nothing) =
-    LifecycleMiddleware(middleware, on_startup, on_shutdown)
+                    on_shutdown::Union{Function,Nothing} = nothing,
+                    on_stopped::Union{Function,Nothing} = nothing) =
+    LifecycleMiddleware(middleware, on_startup, on_shutdown, on_stopped)
+# The three-field positional form the struct had before `on_stopped` (#161), so adding the hook
+# changes no existing constructor call.
+LifecycleMiddleware(middleware::Function, on_startup::Union{Function,Nothing},
+                    on_shutdown::Union{Function,Nothing}) =
+    LifecycleMiddleware(middleware, on_startup, on_shutdown, nothing)
 
 # SECURITY (#307): the default `show` prints each closure WITH its captures -- `repr` of a closure
 # is `var"#3#4"{String}("the-key")` -- and every `LifecycleMiddleware` Nitro builds closes over a
@@ -1187,7 +1224,8 @@ LifecycleMiddleware(; middleware::Function, on_startup::Union{Function,Nothing} 
 # (`dump` still walks raw fields; that is explicit introspection, not accidental disclosure.)
 function Base.show(io::IO, lm::LifecycleMiddleware)
     print(io, "LifecycleMiddleware(on_startup = ", lm.on_startup === nothing ? "nothing" : "<hook>",
-          ", on_shutdown = ", lm.on_shutdown === nothing ? "nothing" : "<hook>", ")")
+          ", on_shutdown = ", lm.on_shutdown === nothing ? "nothing" : "<hook>",
+          ", on_stopped = ", lm.on_stopped === nothing ? "nothing" : "<hook>", ")")
 end
 Base.show(io::IO, ::MIME"text/plain", lm::LifecycleMiddleware) = show(io, lm)
 
@@ -1260,7 +1298,7 @@ value is discarded.
 `InterruptException` is **deferred** the same way [`startup`](@ref) defers it: `shutdown` logs it
 and returns it, and `terminate()` completes **both** shutdown broadcasts, clears the serve-owned
 lifecycle list, closes the listener — escalating an interrupted drain to
-a force-close — and only then re-raises it. If more than one hook is interrupted, each is logged
+a force-close — runs the [`stopped`](@ref) broadcast, and only then re-raises it. If more than one hook is interrupted, each is logged
 and the first is re-raised; the rest are dropped, since an `InterruptException` carries nothing to
 tell them apart (#185).
 """
@@ -1271,6 +1309,28 @@ function shutdown(lf::LifecycleMiddleware)::Union{Nothing,InterruptException}
     catch error
         error isa InterruptException && return _report_interrupt(error, "on_shutdown")
         @error "Error in LifecycleMiddleware.on_shutdown: " exception=(loggable(error), catch_backtrace())
+    end
+    return nothing  # not the hook's value — see `startup`
+end
+
+"""
+    stopped(lf::LifecycleMiddleware) -> Union{Nothing, InterruptException}
+
+Run `lf.on_stopped` if it has one. Called by `terminate()` for every registered
+[`LifecycleMiddleware`](@ref), in the same LIFO order as [`shutdown`](@ref), **after** the
+listener has closed and the drain is over (#161); apps do not normally call it.
+
+The contract is `shutdown`'s: a `nothing` hook is a no-op, a throwing hook is logged and
+swallowed, the hook's value is discarded, and an `InterruptException` is logged and *returned*,
+so `terminate()` finishes the broadcast before re-raising it.
+"""
+function stopped(lf::LifecycleMiddleware)::Union{Nothing,InterruptException}
+    isnothing(lf.on_stopped) && return nothing
+    try
+        lf.on_stopped()
+    catch error
+        error isa InterruptException && return _report_interrupt(error, "on_stopped")
+        @error "Error in LifecycleMiddleware.on_stopped: " exception=(loggable(error), catch_backtrace())
     end
     return nothing  # not the hook's value — see `startup`
 end

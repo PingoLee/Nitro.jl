@@ -325,6 +325,20 @@ serve(app; port = parse(Int, get(ENV, "PORT", "8000")),
       secret_key = SecretString(ENV["API_SECRET_KEY"]))
 ```
 
+### Closing the database pools on `terminate`
+
+PormG closes every pool when the process exits. To close them when the *server* stops — a test
+that serves and terminates, or an app that re-serves in the same process — add
+[`pormg_nitro_pools`](@ref Nitro.pormg_nitro_pools) with the keys this app loaded:
+
+```julia
+serve(app; middleware = [pormg_nitro_pools(keys = ["db"]), workers], …)
+```
+
+It closes them after `terminate` has stopped accepting and the requests still in flight have
+finished, not while they run, and in the reverse of the order given. A key that is not loaded
+is an error when the middleware is built, before `serve`. The next query reopens a closed pool.
+
 ## The entry point `newapp` writes
 
 `main.jl` is the program. `julia --project main.jl` runs it, and it is the file a JuliaC build

@@ -212,6 +212,7 @@ const RH = Nitro.Core.RouterHOF
     end
     @test only(serve_lf).mw === lm
     @test T.startup(only(serve_lf)) === nothing && up[] == 1
+    @test T.stopped(only(serve_lf)) === nothing && up[] == 1     # no `on_stopped`: a no-op
 end
 
 # The trimmed branches, in a child with `_trimmed()` redefined to `true` (see the server handle's
@@ -221,11 +222,11 @@ end
     import Nitro
     const T = Nitro.Core.Types
     const RH = Nitro.Core.RouterHOF
-    using Nitro.Core: LifecycleMiddleware, App, startup, shutdown
+    using Nitro.Core: LifecycleMiddleware, App, startup, shutdown, stopped
     Core.eval(T, :(_trimmed() = true))
-    up, down = Ref(0), Ref(0)
+    up, down, gone = Ref(0), Ref(0), Ref(0)
     lm = LifecycleMiddleware(middleware = h -> h, on_startup = () -> (up[] += 1),
-                             on_shutdown = () -> (down[] += 1))
+                             on_shutdown = () -> (down[] += 1), on_stopped = () -> (gone[] += 1))
     boom = LifecycleMiddleware(middleware = h -> h, on_startup = () -> error("hook failed"))
     intr = LifecycleMiddleware(middleware = h -> h, on_startup = () -> throw(InterruptException()))
     app = App()
@@ -238,6 +239,8 @@ end
     # An interrupt comes back as a value, as it does from a direct call (#185).
     println("INTERRUPT=", startup(s[3]) isa InterruptException)
     println("DOWN=", shutdown(s[1]) === nothing, " ", down[])
+    # The post-drain phase is the third code through the same `Cint` (#161), and only it runs.
+    println("STOPPED=", stopped(s[1]) === nothing, " ", gone[], " ", up[], " ", down[])
     # A `Vector` member has no compiled hooks in an image, so it is refused.
     vec = try RH.register_serve_lifecycle!(App(), Any[lm]); "accepted" catch e; e isa ArgumentError ? "refused" : "other" end
     println("VECTOR=", vec)
@@ -247,12 +250,12 @@ end
     route = try RH.register_route_lifecycle!(app2, Any[lm]); "registered" catch e; e isa ArgumentError ? "refused" : "other" end
     println("ROUTE=", route, " ", isempty(RH.lifecycle_snapshot(app2)[1]))
     # End to end: `serve` registers the tuple and starts it, `terminate` stops it, both by `ccall`.
-    up[] = 0; down[] = 0
+    up[] = 0; down[] = 0; gone[] = 0
     app3 = App()
     Nitro.serve(app3; middleware = (lm,), host = "127.0.0.1", port = $(get_free_port()), async = true,
                 show_banner = false, access_log = false)
     Nitro.Core.terminate(app3)
-    println("SERVE=", up[], " ", down[])
+    println("SERVE=", up[], " ", down[], " ", gone[])
     # Revise is refused, before anything starts: a trimmed image cannot make its `invokelatest`.
     # The refusal leaves `serve` as the value-free `LoggedException` a trimmed image gets (#749),
     # which keeps an `ArgumentError`'s message.
@@ -272,7 +275,8 @@ end
     out, err = String(take!(out)), String(take!(err))
     @test (p.exitcode, p.termsignal) == (0, 0) || (out, last(err, 2000))
     for line in ("PTRS=true", "UP=true 1", "BOOM=true", "INTERRUPT=true", "DOWN=true 1",
-                 "VECTOR=refused", "ROUTE=refused true", "SERVE=1 1", "REVISE=refused")
+                 "STOPPED=true 1 1 1", "VECTOR=refused", "ROUTE=refused true", "SERVE=1 1 1",
+                 "REVISE=refused")
         @test occursin(line, out) || (line, out)
     end
 end

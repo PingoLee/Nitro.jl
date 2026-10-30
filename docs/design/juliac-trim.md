@@ -451,11 +451,14 @@ the tree covers both:
 **Done in [#719](https://github.com/PingoLee/Nitro.jl/issues/719): both, one per half, behind one
 concrete entry.**
 
-- `LifecycleMiddleware{M,S,D}` is parameterized on its three functions. The keyword constructor
+- `LifecycleMiddleware{M,S,D}` was parameterized on its three functions. The keyword constructor
   is unchanged, and the bare name still serves for `isa` and `LifecycleMiddleware[]`. A
   `serve(middleware = (…))` tuple holding one is concrete, which also types the global fold
   through `.middleware` (§3.8). Code that compares two of their types, or reads the registry,
   changes; `upgrading/2026-10-24-719-lifecycle-registry-entries.md` has the edits.
+  [#161](https://github.com/PingoLee/Nitro.jl/issues/161) added a fourth, the post-drain
+  `on_stopped` (`LifecycleMiddleware{M,S,D,P}`); its hook goes through the same pointers, as
+  phase code `2` in the `Cint` that was the `up` flag.
 - The registry holds a `LifecycleEntry` per object (`src/routeendpoint.jl`): `mw`, which dedup and
   promotion compare by `===` (what `∈` on the bare middleware meant, since it defines no `==`), and
   the pointer a trimmed image calls the hooks through. `startup(e)`/`shutdown(e)` on the entry are

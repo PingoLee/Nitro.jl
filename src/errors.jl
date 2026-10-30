@@ -648,7 +648,10 @@ different reasons**, and conflating them is how this list rots:
    and the run task's `_run_claimed!`/`_hand_back!` catch-alls. They rethrow only the interrupt.
    The loops' outer handlers turn it into a drain request rather than a `@warn` and an exit,
    because the heartbeat must keep renewing while the drain runs. `_drain!`'s catch is
-   shutdown code and swallows everything (#427). `src/response.jl`'s `_run_sse_producer` (#160) is the same
+   shutdown code and swallows everything (#427). `pormg_nitro_pools`' per-key close
+   (`ext/NitroPormGExt.jl`, #161) runs after the drain, with no request left to fail: one key
+   that cannot be closed costs a logged error and never the keys after it, and the interrupt goes
+   on to `stopped`, which defers it like any hook's. `src/response.jl`'s `_run_sse_producer` (#160) is the same
    discipline one level down: the producer task nothing waits on, where the expected failure is
    the client disconnecting. `AccessLog`'s writer (`_run`/`_flush!` in
    `src/middleware/access_log.jl`, #649) is this group too: the app's sink failing with an

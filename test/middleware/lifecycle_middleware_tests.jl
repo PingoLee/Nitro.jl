@@ -1022,3 +1022,218 @@ end # @testitem
 # Reviewed by eye, the same call `janitor_tests.jl` makes about `errormonitor`. What the items
 # above DO pin is the half that is reachable in-process: an interrupt inside a startup or
 # shutdown hook.
+
+
+# ── #161: the post-drain phase ───────────────────────────────────────────────────────────────
+#
+# `on_shutdown` runs BEFORE the HTTP drain, while the listener still accepts, so it cannot release
+# what a request may still be using — a pool closed there is cut from under the drain and reopened
+# by the next request served. `on_stopped` runs after `close(service)`, over the same snapshot, in
+# the same LIFO order.
+
+@testitem "Lifecycle middleware — on_stopped, the hook runner (#161)" tags=[:middleware] setup=[NitroCommon] begin
+using Test
+using HTTP
+using Nitro
+using Nitro.Core: LifecycleMiddleware, startup, shutdown, stopped
+
+_pass(handler) = (req::HTTP.Request -> handler(req))
+_quiet(f) = Base.CoreLogging.with_logger(f, Base.CoreLogging.NullLogger())
+
+@testset "it is optional, and a three-hook middleware is unchanged" begin
+    lm = LifecycleMiddleware(middleware = _pass, on_startup = () -> 1, on_shutdown = () -> 2)
+    @test lm.on_stopped === nothing
+    @test stopped(lm) === nothing
+    @test lm isa LifecycleMiddleware{<:Function, <:Function, <:Function, Nothing}
+    # Both positional forms: the four-field one, and the three-field one it had before #161.
+    @test LifecycleMiddleware(_pass, nothing, nothing, nothing).on_stopped === nothing
+    @test LifecycleMiddleware(_pass, nothing, nothing).on_stopped === nothing
+end
+
+@testset "it runs the hook and discards its value" begin
+    ran = Ref(0)
+    lm = LifecycleMiddleware(middleware = _pass, on_stopped = () -> (ran[] += 1; :value))
+    @test stopped(lm) === nothing
+    @test ran[] == 1
+    # The other two phases do not run it.
+    @test startup(lm) === nothing && shutdown(lm) === nothing
+    @test ran[] == 1
+end
+
+@testset "a throw is logged and swallowed; an interrupt is returned" begin
+    boom = LifecycleMiddleware(middleware = _pass, on_stopped = () -> error("hook failed"))
+    logger = Test.TestLogger(min_level = Base.CoreLogging.Warn)
+    @test Base.CoreLogging.with_logger(() -> stopped(boom), logger) === nothing
+    @test any(r -> occursin("LifecycleMiddleware.on_stopped", r.message), logger.logs)
+
+    intr = LifecycleMiddleware(middleware = _pass, on_stopped = () -> throw(InterruptException()))
+    @test _quiet(() -> stopped(intr)) isa InterruptException
+end
+
+@testset "show stays value-free (#307)" begin
+    secret = "s3cr3t-hook-capture"
+    lm = LifecycleMiddleware(middleware = _pass, on_stopped = () -> length(secret))
+    shown = sprint(show, lm)
+    @test !occursin(secret, shown)
+    @test occursin("on_stopped = <hook>", shown)
+    @test occursin("on_stopped = nothing", sprint(show, LifecycleMiddleware(middleware = _pass)))
+end
+
+@testset "a registry entry runs it, under the JIT a direct call" begin
+    ran = Ref(0)
+    lm = LifecycleMiddleware(middleware = _pass, on_stopped = () -> (ran[] += 1))
+    app = Nitro.Core.App()
+    Nitro.Core.RouterHOF.register_serve_lifecycle!(app, (lm,))
+    _, serve_lf = Nitro.Core.RouterHOF.lifecycle_snapshot(app)
+    @test stopped(only(serve_lf)) === nothing
+    @test ran[] == 1
+end
+end # @testitem
+
+
+@testitem "Lifecycle middleware — on_stopped runs after the drain (#161)" tags=[:middleware, :network] setup=[NitroCommon] begin
+using Test
+using HTTP
+using Nitro
+using Nitro.Core: LifecycleMiddleware
+import Nitro: App, path
+
+_pass(handler) = (req::HTTP.Request -> handler(req))
+# A failed `@test` does not stop a testset, but a throw does: never let one leave a listener up for
+# the items after this one.
+_ensure_down(ctx) = Base.isopen(ctx.service) &&
+    Base.CoreLogging.with_logger(Base.CoreLogging.NullLogger()) do
+        try Nitro.Core.terminate(ctx) catch end
+    end
+_serve(ctx, mw; port = get_free_port()) =
+    Nitro.Core.serve(ctx; middleware = mw, host = HOST, port = port, async = true,
+                     show_banner = false, show_errors = false, access_log = nothing)
+
+@testset "after every on_shutdown, in the same LIFO order, with the listener closed" begin
+    order = String[]
+    open_at = Dict{String,Bool}()
+    ctx = App()
+    mk(name) = LifecycleMiddleware(
+        middleware  = _pass,
+        on_startup  = () -> push!(order, "up:$name"),
+        on_shutdown = () -> (push!(order, "down:$name"); open_at["down:$name"] = Base.isopen(ctx.service)),
+        on_stopped  = () -> (push!(order, "stopped:$name"); open_at["stopped:$name"] = Base.isopen(ctx.service)))
+    route_lf, serve_lf = mk("route"), mk("serve")
+    Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
+        path("/o", (req::HTTP.Request) -> Res.send("ok"), middleware = [route_lf])
+    ])
+    try
+        _serve(ctx, [serve_lf])
+        @test timedwait(() -> Base.isopen(ctx.service), 10.0) === :ok
+        Nitro.Core.terminate(ctx)
+    finally
+        _ensure_down(ctx)
+    end
+    @test order == ["up:route", "up:serve", "down:serve", "down:route",
+                    "stopped:serve", "stopped:route"]
+    @test open_at["down:serve"] && open_at["down:route"]          # before the drain
+    @test !open_at["stopped:serve"] && !open_at["stopped:route"]  # after it
+end
+
+@testset "a request in flight at terminate finishes before on_stopped runs" begin
+    # The property #161 exists for. `on_shutdown` RELEASES the handler, so "down" before
+    # "handler-done" is causal, not timed; what is asserted is that the drain waited for the
+    # handler and `on_stopped` came after it.
+    order = String[]
+    lk = ReentrantLock()
+    note(s) = lock(() -> push!(order, s), lk)
+    entered, release = Base.Event(), Base.Event()
+    lm = LifecycleMiddleware(middleware = _pass,
+                             on_shutdown = () -> (note("down"); notify(release)),
+                             on_stopped  = () -> note("stopped"))
+    ctx = App()
+    Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
+        path("/slow", (req::HTTP.Request) -> (notify(entered); wait(release); note("handler-done");
+                                              Res.send("ok")))
+    ])
+    port = get_free_port()
+    try
+        _serve(ctx, [lm]; port)
+        @test timedwait(() -> Base.isopen(ctx.service), 10.0) === :ok
+        client = Threads.@spawn HTTP.get("http://$HOST:$port/slow"; retry = false, readtimeout = 30)
+        @test timedwait(() -> entered.set, 10.0) === :ok
+        Nitro.Core.terminate(ctx; timeout = 20)
+        @test fetch(client).status == 200
+    finally
+        notify(release)     # never leave the handler parked if an assertion above threw
+        _ensure_down(ctx)
+    end
+    @test order == ["down", "handler-done", "stopped"]
+end
+
+@testset "a throwing on_stopped is logged and the rest still run" begin
+    ran = Ref(0)
+    fine = LifecycleMiddleware(middleware = _pass, on_stopped = () -> (ran[] += 1))
+    boom = LifecycleMiddleware(middleware = _pass, on_stopped = () -> error("hook failed"))
+    ctx = App()
+    logger = Test.TestLogger(min_level = Base.CoreLogging.Warn)
+    try
+        # Serve-owned order [fine, boom]: LIFO stops `boom` first, then `fine`, which must still run.
+        _serve(ctx, [fine, boom])
+        @test timedwait(() -> Base.isopen(ctx.service), 10.0) === :ok
+        Base.CoreLogging.with_logger(() -> Nitro.Core.terminate(ctx), logger)
+    finally
+        _ensure_down(ctx)
+    end
+    @test ran[] == 1
+    @test any(r -> occursin("LifecycleMiddleware.on_stopped", r.message), logger.logs)
+    @test !Base.isopen(ctx.service)
+end
+
+@testset "an interrupt from on_stopped is re-raised once, after the sequence" begin
+    a_ran = Ref(0)
+    a = LifecycleMiddleware(middleware = _pass, on_stopped = () -> (a_ran[] += 1))
+    b = LifecycleMiddleware(middleware = _pass, on_stopped = () -> throw(InterruptException()))
+    @test a != b
+    ctx = App()
+    Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
+        path("/health", (req::HTTP.Request) -> Res.send("ok"), middleware = [a])
+    ])
+    try
+        # `b` is serve-owned, so it is stopped BEFORE route-owned `a`, which must still run.
+        _serve(ctx, [b])
+        @test timedwait(() -> Base.isopen(ctx.service), 10.0) === :ok
+        Base.CoreLogging.with_logger(Base.CoreLogging.NullLogger()) do
+            @test_throws InterruptException Nitro.Core.terminate(ctx)
+        end
+        @test a_ran[] == 1
+        @test !Base.isopen(ctx.service)
+        @test ctx.service.server[] === nothing
+        # Not stranded.
+        _serve(ctx, [])
+        @test timedwait(() -> Base.isopen(ctx.service), 10.0) === :ok
+        Nitro.Core.terminate(ctx)
+    finally
+        _ensure_down(ctx)
+    end
+end
+
+@testset "an on_shutdown interrupt still lets every on_stopped run, then escapes once" begin
+    # The deferral now spans two phases: an interrupt collected while shutting down must be carried
+    # past the close AND the post-drain broadcast, and re-raised only after both.
+    stopped_ran = String[]
+    a = LifecycleMiddleware(middleware = _pass, on_stopped = () -> push!(stopped_ran, "a"))
+    b = LifecycleMiddleware(middleware = _pass,
+                            on_shutdown = () -> throw(InterruptException()),
+                            on_stopped  = () -> push!(stopped_ran, "b"))
+    ctx = App()
+    try
+        _serve(ctx, [a, b])
+        @test timedwait(() -> Base.isopen(ctx.service), 10.0) === :ok
+        logger = Test.TestLogger(min_level = Base.CoreLogging.Warn)
+        Base.CoreLogging.with_logger(logger) do
+            @test_throws InterruptException Nitro.Core.terminate(ctx)
+        end
+        @test stopped_ran == ["b", "a"]                 # both ran, in LIFO order
+        @test !Base.isopen(ctx.service)
+        @test count(r -> occursin("interrupt during LifecycleMiddleware", r.message), logger.logs) == 1
+    finally
+        _ensure_down(ctx)
+    end
+end
+end # @testitem

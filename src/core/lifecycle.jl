@@ -762,8 +762,26 @@ function terminate(context::App; timeout::Nullable{Real} = nothing)
         # next `serve()` builds a new pipeline and starts cold, while requests still in flight
         # here finish against the old one untouched.
         context.service.external_url[] = nothing
-        interrupt = _close_deferring_interrupt(context.service,
-            something(timeout, context.service.shutdown_timeout[]), interrupt)
+        # Post-drain (#161), in the `finally`: the listener is closed and no request is served any
+        # more, so this is where a hook releases what a request could still have been using — a
+        # pool closed in `on_shutdown` was cut from under the drain, and reopened by the next
+        # request it served. A `finally` so that a `close` that throws something other than an
+        # interrupt still releases them, and so no safepoint lies between the close and the hooks.
+        # Over the snapshot taken above, in the same LIFO order: `serve_lifecycle` is empty by
+        # now, and the snapshot is exactly the set this run started. The inner `try` is the
+        # shutdown broadcasts' own, for the same between-hooks interrupt.
+        try
+            interrupt = _close_deferring_interrupt(context.service,
+                something(timeout, context.service.shutdown_timeout[]), interrupt)
+        finally
+            try
+                interrupt = _broadcast_lifecycle(stopped, Iterators.reverse(serve_lf), interrupt)
+                interrupt = _broadcast_lifecycle(stopped, Iterators.reverse(route_lf), interrupt)
+            catch e
+                e isa InterruptException || rethrow()
+                interrupt = something(interrupt, e)
+            end
+        end
         # Re-raised only now: everything a later `serve()` depends on has already been done.
         isnothing(interrupt) || throw(interrupt)
     end
