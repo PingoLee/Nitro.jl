@@ -17,7 +17,7 @@ import UUIDs
 # The database half of the generated app — what differs between `pormg = true` and `false`.
 Base.@kwdef struct _NewappDB
     usings::String                              # the module's `using` line
-    module_note::Vector{String} = String[]      # module-body comment lines after the `App` const
+    module_body::Vector{String} = String[]      # module-body lines after the `App` const
     boot::Vector{String} = String[]             # `main()` lines before `worker_startup`
     store::String                               # the worker-store expression
     deps::Vector{Pair{String,String}} = Pair{String,String}[]      # name => uuid
@@ -70,10 +70,15 @@ Everything that connects or starts runs in `main(; kwargs...)`, which reads `POR
 there would be gone at runtime.
 
 With `pormg = true` (the default) `using PormG` must come first. The boot then loads `db/` with
-`PormG.Configuration.load_many` and stores worker tasks through
-[`pormg_nitro_worker`](@ref), and once Nitro's files are written PormG's own interactive
-`PormG.setup` asks for the database and writes `db/connection.yml`. Answer its questions in the
-REPL. PormG's database drivers are weak dependencies, so the adapter you choose decides which one
+`PormG.Configuration.load_many` in the environment a set `PORMG_ENV` names, else Nitro's
+([`current_env`](@ref): `NITRO_ENV`, else `GENIE_ENV`, else `"dev"`), binds the models to it once
+you include them, and stores worker tasks through
+[`pormg_nitro_worker`](@ref). The models are `include`d in the module body rather than
+`@import_models`ed: PormG registers models only against a folder already loaded, and loading in
+the module body would read `db/connection.yml` while the package precompiles.
+
+Once Nitro's files are written PormG's own interactive `PormG.setup` asks for the database and
+writes `db/connection.yml`. Answer its questions in the REPL. PormG's database drivers are weak dependencies, so the adapter you choose decides which one
 the app installs and loads: `SQLite` for SQLite, `LibPQ` for PostgreSQL. If you leave the prompt,
 the app is written without a driver; run `PormG.setup("db")` from the app directory and add the
 driver yourself. With `pormg = false` the boot uses an in-memory worker store and there is no
@@ -274,7 +279,7 @@ function _newapp_module(name::String, db::_NewappDB)
         "const app = App(mod = @__MODULE__)",
         "",
     ]
-    isempty(db.module_note) || append!(lines, db.module_note, [""])
+    isempty(db.module_body) || append!(lines, db.module_body, [""])
     append!(lines, [
         "include(\"Handlers/HealthHandlers.jl\")",
         "include(\"Routes.jl\")",

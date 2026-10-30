@@ -12,7 +12,8 @@ const E2E_DB_KEY = "nitro_consumer_e2e"
 e2e_is_postgres(spec::AbstractString) = occursin("dbname=", spec)
 
 function e2e_store(spec::AbstractString)
-    PormG.register_connection(E2E_DB_KEY, spec; adapter = e2e_is_postgres(spec) ? "PostgreSQL" : "SQLite")
+    PormG.register_connection(E2E_DB_KEY, spec; adapter = e2e_is_postgres(spec) ? "PostgreSQL" : "SQLite",
+                              env = "test")
     PormG.config[E2E_DB_KEY].change_data = true
     PormG.config[E2E_DB_KEY].change_db = true
     return Nitro.pormg_nitro_worker(db_key = E2E_DB_KEY)

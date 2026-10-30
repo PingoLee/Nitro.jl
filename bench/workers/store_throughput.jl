@@ -39,9 +39,9 @@ backend == "memory" || @eval using PormG, SQLite, LibPQ
 function pormg_store(n::Int)
     key = "store_throughput_$n"
     if backend == "sqlite"
-        PormG.register_connection(key, joinpath(mktempdir(), "bench.sqlite"); adapter = "SQLite")
+        PormG.register_connection(key, joinpath(mktempdir(), "bench.sqlite"); adapter = "SQLite", env = "bench")
     else
-        PormG.register_connection(key, ENV["NITRO_BENCH_POSTGRES"]; adapter = "PostgreSQL")
+        PormG.register_connection(key, ENV["NITRO_BENCH_POSTGRES"]; adapter = "PostgreSQL", env = "bench")
     end
     PormG.config[key].change_data = true
     PormG.config[key].change_db = true

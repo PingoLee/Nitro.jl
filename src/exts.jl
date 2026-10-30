@@ -80,7 +80,7 @@ below for the same arrangement.
 ## Example
 ```julia
 using Nitro, PormG
-PormG.Configuration.load("db")
+PormG.Configuration.load("db"; env = something(sync_pormg_env!(), current_env()))
 
 store = pormg_nitro_session()
 serve(middleware=[SessionMiddleware(store=store)])
@@ -98,26 +98,29 @@ is unset.
 
 **Only a set environment is published.** With neither variable set, `current_env()` reports its
 `"dev"` fallback, but nothing is written: that fallback is not a choice anyone made, and as
-`PORMG_ENV` it would outrank one someone did make, `default_env:` in `connection.yml`. PormG
-then resolves its own environment. A blank or whitespace-only `PORMG_ENV` counts as unset. It is
-overwritten when there is an environment to publish, and removed when there is not, so PormG
-never looks up a `""` section.
+`PORMG_ENV` it would answer for every PormG `load` in the process. PormG then resolves its own
+environment, and outside an interactive session it refuses a `load` or `register_connection`
+that names none. A blank or whitespace-only `PORMG_ENV` counts as unset. It is overwritten when
+there is an environment to publish, and removed when there is not.
 
 **A default, never a force.** With `force = false` (the default) an existing `PORMG_ENV` is
-left exactly as it is. PormG's documented precedence stays intact either way:
+left exactly as it is. PormG's precedence stays intact either way:
 
 ```
-env= kwarg  >  ENV["PORMG_ENV"]  >  `default_env:` in connection.yml  >  "dev"
+env= kwarg  >  ENV["PORMG_ENV"]  >  in a REPL only: `default_env:` in connection.yml, else "dev"
 ```
 
 so an explicit `env=` at a `load` call site always wins regardless of this function. Pass
 `force = true` only to deliberately overwrite a value already there. It still writes nothing
 when neither `NITRO_ENV` nor `GENIE_ENV` is set.
 
-`NitroPormGExt.__init__` calls this for you at `using PormG`, which is what lets an app write
-`PormG.Configuration.load_many(["db"])` with no `env=` and still get the environment it set.
-Call it by hand only if you set `NITRO_ENV` *after* loading PormG — see the load-order note in
-the environment docs.
+`NitroPormGExt.__init__` calls this for you at `using PormG`, which is what lets a `load` with
+no `env=` get the environment `NITRO_ENV` set. Its return value is what the boot `Nitro.newapp`
+writes passes to PormG, with Nitro's fallback behind it:
+`env = something(sync_pormg_env!(), current_env())` is a set `PORMG_ENV`, else `NITRO_ENV`
+(or `GENIE_ENV`), else `"dev"`, so the `load` names an environment even with neither variable
+set. Call it by hand, too, if you set `NITRO_ENV` *after* loading PormG — see the load-order
+note in the environment docs.
 
 Requires `using PormG`; without the extension loaded this is a `MethodError`, exactly like
 `pormg_nitro_worker`.
@@ -125,7 +128,9 @@ Requires `using PormG`; without the extension loaded this is a `MethodError`, ex
 ## Example
 ```julia
 using Nitro, PormG
-# ENV["PORMG_ENV"] is already seeded from NITRO_ENV here.
+# ENV["PORMG_ENV"] is already seeded from NITRO_ENV here, when NITRO_ENV is set. With neither
+# variable set, this `load` is refused outside a REPL; name the environment instead:
+#   PormG.Configuration.load_many(["db"]; env = something(sync_pormg_env!(), current_env()))
 PormG.Configuration.load_many(["db"])
 ```
 """
@@ -164,7 +169,7 @@ deliberately carries none.
 ## Example
 ```julia
 using Nitro, PormG
-PormG.Configuration.load("db")
+PormG.Configuration.load("db"; env = something(sync_pormg_env!(), current_env()))
 
 app = App(mod = @__MODULE__)
 store = pormg_nitro_worker(db_key="db")

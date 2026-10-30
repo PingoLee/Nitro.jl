@@ -1435,7 +1435,7 @@ using SQLite
 using Nitro.Types: get_session, set_session!, session_store_full
 
 key = "nitro_session_real_567"
-PormG.register_connection(key, joinpath(mktempdir(), "sessions.sqlite"); adapter = "SQLite")
+PormG.register_connection(key, joinpath(mktempdir(), "sessions.sqlite"); adapter = "SQLite", env = "test")
 try
     PormG.config[key].change_data = true
     PormG.config[key].change_db = true

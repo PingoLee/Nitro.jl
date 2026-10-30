@@ -10,12 +10,12 @@ PormG = "7d8d7541-4d3d-4580-80a2-17064efb0993"
 
 [sources]
 Nitro = {path = "../../.."}
-PormG = {url = "https://github.com/PingoLee/PormG.jl.git", rev = "6f558894c68046a948e30bad3018a791a5f9898e"}
+PormG = {url = "https://github.com/PingoLee/PormG.jl.git", rev = "5531c68cf482ca0723878bc6c593720a8cbf3502"}
 
 [compat]
 HTTP = "~2.13"
 Nitro = "0.6.0"
-PormG = "^0.8"
+PormG = "^0.9"
 Postgres = "2.4"
 julia = "^1.13"
 

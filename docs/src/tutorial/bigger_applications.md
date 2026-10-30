@@ -55,14 +55,21 @@ under *The boot `newapp` writes* below. As the app grows, add a handler module p
 
 ## Setting up PormG models
 
-PormG models live in `db/models.jl`, outside `src/`. Import them in the module body with
-`@import_models`, which creates a plain Julia module you can alias and pass down to handlers via
-`import`. Importing models only defines code, so it belongs in the module body.
+PormG models live in `db/models.jl`, outside `src/`, as a module named `models`. `include` that
+file in the module body: it creates a plain Julia module you can alias and pass down to handlers
+via `import`. Including only defines code, so it belongs in the module body.
 
-**Connecting does not.** `PormG.Configuration.load_many` opens the database connection. A
-package's module body runs once, when it is precompiled, and loading the cached package does not
-run it again, so a connection opened there does not exist at runtime. Keep `load_many` in
-`main()`, where `newapp` puts it.
+**Loading and binding do not.** `PormG.Configuration.load_many` reads `db/connection.yml`, password
+included, and `PormG.Models.set_models` binds the models to the connection it loaded. A package's
+module body runs once, when it is precompiled, and loading the cached package does not run it
+again: PormG's configuration set up there does not exist at runtime, and a JuliaC image would
+carry the file's contents. Keep both calls in `main()`, where `newapp` puts the first and shows
+the second.
+
+This is also why the module body does not use PormG's `@import_models`. It registers the models
+as it includes them, and PormG refuses to register models whose folder no `load` has loaded yet,
+outside a REPL. A precompile is never a REPL, so a package with `@import_models` in its module
+body and `load_many` in `main()` fails to precompile.
 
 ```julia
 # src/MyApp.jl
@@ -72,8 +79,8 @@ using Nitro, PormG, SQLite
 
 const app = App(mod = @__MODULE__)
 
-# Import the model file — creates a module named `models`
-PormG.@import_models "../db/models.jl" models
+# Include the model file: defines a module named `models`, bound to nothing yet
+include("../db/models.jl")
 
 # Alias for convenience: handlers do `import ..appM`
 const appM = models
@@ -82,7 +89,13 @@ include("Handlers/ProductHandlers.jl")
 include("Handlers/OrderHandlers.jl")
 include("Routes.jl")
 
-# main() as `newapp` wrote it: `load_many` connects here, at runtime.
+function main(; kwargs...)
+    # At runtime: load db/, then bind the models to it.
+    env = something(sync_pormg_env!(), current_env())
+    PormG.Configuration.load_many(["db"]; root = pkgdir(@__MODULE__), env)
+    PormG.Models.set_models(models, joinpath(pkgdir(@__MODULE__), "db"))
+    # ...the rest of main() as `newapp` wrote it
+end
 
 end # module
 ```
@@ -236,8 +249,9 @@ using Nitro, PormG, SQLite
 
 const app = App(mod = @__MODULE__)
 
-# Once db/models.jl defines models, import them here for the handlers (`import ..appM`):
-#   PormG.@import_models "../db/models.jl" models
+# Once db/models.jl defines models, include them here for the handlers (`import ..appM`).
+# Including only defines them: `main` binds them to the connection.
+#   include("../db/models.jl")
 #   const appM = models
 
 include("Handlers/HealthHandlers.jl")
@@ -250,9 +264,12 @@ Boot the app and serve it. Reads `PORT` (default 8000) and `API_SECRET_KEY` (at 
 32 bytes); keyword arguments go to `serve` (tests pass `async = true`).
 """
 function main(; kwargs...)
-    sync_pormg_env!()  # NITRO_ENV -> PORMG_ENV, only when NITRO_ENV is set
-    # PormG parses db/connection.yml, validates it and connects, from any working directory
-    PormG.Configuration.load_many(["db"]; root = pkgdir(@__MODULE__))
+    # PormG reads db/connection.yml, from any working directory, in the environment
+    # `PORMG_ENV` names, else `NITRO_ENV` (or `GENIE_ENV`), else "dev"
+    env = something(sync_pormg_env!(), current_env())
+    PormG.Configuration.load_many(["db"]; root = pkgdir(@__MODULE__), env)
+    # Once the models are included above, bind them to that connection:
+    #   PormG.Models.set_models(models, joinpath(pkgdir(@__MODULE__), "db"))
     workers = worker_startup(app; queues = ["reports"], store = pormg_nitro_worker(db_key = "db"))
     urlpatterns(app, "", Routes.urlpatterns())
     serve(app; port = parse(Int, get(ENV, "PORT", "8000")), middleware = [workers],
@@ -269,11 +286,18 @@ Line by line:
   PostgreSQL app loads `LibPQ` instead.
 - `const app = App(mod = @__MODULE__)`: the application handle that every routing and serving call
   takes. `mod = @__MODULE__` is what `serve(revise = …)` tracks.
-- `sync_pormg_env!()` copies `NITRO_ENV`, when it is set, to `PORMG_ENV`, so PormG reads the same
-  environment from `connection.yml`. Without `NITRO_ENV`, PormG uses `default_env:`.
-- `load_many(["db"]; root = pkgdir(@__MODULE__))`: PormG parses `db/connection.yml`, validates it
-  and connects. `root` finds `db/` next to the package rather than in the working directory, and
-  the connection key stays `"db"`.
+- `env = something(sync_pormg_env!(), current_env())` is the environment PormG reads
+  `connection.yml` in. [`sync_pormg_env!`](@ref) publishes `NITRO_ENV` (or `GENIE_ENV`) to
+  `PORMG_ENV` when one is set, and returns `PORMG_ENV`, so a `PORMG_ENV` the deployment set
+  still wins. With none of the three set, it is [`current_env`](@ref)'s `"dev"`. It has to be
+  named, because outside a REPL PormG refuses a `load` with no environment rather than guess one,
+  and with it named, `default_env:` in `connection.yml` is not read. Set `NITRO_ENV=prod` in
+  production and give `connection.yml` a `prod:` block.
+- `load_many(["db"]; root = pkgdir(@__MODULE__), env)`: PormG parses `db/connection.yml` and
+  validates it; the first query connects. `root` finds `db/` next to the package rather than in
+  the working directory, and the connection key stays `"db"`.
+- `set_models(models, …)` binds the models you included to that connection, once there are any.
+  Until then the line stays commented out.
 - `worker_startup(app; …, store = pormg_nitro_worker(db_key = "db"))`: background tasks are
   stored in the database, on the same connection. See [Workers](workers.md).
 - `urlpatterns(app, "", Routes.urlpatterns())` registers the routes. The prefix comes first, and

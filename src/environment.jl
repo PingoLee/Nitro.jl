@@ -40,9 +40,9 @@ end
 # and `_explicit_env` are the only callers that touch `ENV`.
 #
 # `nothing` when NEITHER variable is set: the environment someone actually chose, as opposed to
-# the `"dev"` Nitro falls back to. The PormG bridge needs that distinction (#331) -- publishing
-# the fallback as if it were a choice outranks a choice someone DID make, `default_env:` in
-# connection.yml.
+# the `"dev"` Nitro falls back to. The PormG bridge needs that distinction (#331) -- published as
+# `PORMG_ENV`, the fallback would answer for every PormG `load` in the process, as if someone had
+# chosen it.
 function _resolve_explicit(nitro::Nullable{String}, genie::Nullable{String})::Nullable{String}
     n = _present(nitro)
     if n !== nothing
@@ -91,9 +91,12 @@ calls it once at startup, and `NitroPormGExt` once at load.
 
 With `PormG` loaded, an environment set in `NITRO_ENV` or `GENIE_ENV` is published to
 `ENV["PORMG_ENV"]` as a **default** (see `sync_pormg_env!`), so
-`PormG.Configuration.load_many([...])` needs no `env=`. A pre-set `PORMG_ENV` and an explicit
-`env=` both still win. The `"dev"` fallback is **not** published: with neither variable set,
-PormG resolves its own environment, so `default_env:` in `connection.yml` still decides.
+`PormG.Configuration.load_many([...])` needs no `env=` when one is set. A pre-set `PORMG_ENV` and
+an explicit `env=` both still win. The `"dev"` fallback is **not** published: with neither
+variable set, PormG resolves its own environment, and outside an interactive session it refuses
+a `load` that names none. Pass `env = something(sync_pormg_env!(), current_env())` to give PormG
+a set `PORMG_ENV`, else this function's answer, its fallback included — the app `Nitro.newapp`
+writes does.
 
 # This function REPORTS; it must never GATE
 

@@ -13,7 +13,7 @@ using Nitro
 using PormG
 
 # 1. Configure PormG
-PormG.Configuration.load("db")
+PormG.Configuration.load("db"; env = something(sync_pormg_env!(), current_env()))
 PormG.@import_models "db/models.jl" models
 import .models as M
 
@@ -109,7 +109,7 @@ sets up the expiry index, and returns a ready-to-use store.
 ```julia
 using Nitro, PormG
 
-PormG.Configuration.load("db")
+PormG.Configuration.load("db"; env = something(sync_pormg_env!(), current_env()))
 
 store = pormg_nitro_session(db_key="db")
 

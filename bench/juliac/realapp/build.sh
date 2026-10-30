@@ -11,9 +11,10 @@
 #        (e.g. "generic;x86-64-v3").
 #      ENTRY (default `main`): the entry file in this directory.
 #      JULIA, JULIAC_BIN, OUT as in bench/juliac/build.sh. OUT defaults to ./out (gitignored).
-# Nothing secret is read while building: main.jl reads ENV when the executable starts. But the
-# build process loads RealApp, and `@import_models` loads db/connection.yml implicitly then --
-# check the executable for the database password before it leaves the machine (#744).
+# Nothing secret is read while building: main.jl reads ENV, and `main` loads db/connection.yml,
+# when the executable starts. RealApp includes its models rather than `@import_models`ing them
+# (#790), because that macro registered them by loading db/connection.yml implicitly in the build
+# process, which put the database password into the image (#744).
 # Output goes through `tee` to bench/results/juliac-<stamp>-realapp-<entry>-<mode>-<cpu>.log;
 # never JuliaC's --verbose (it prints the whole environment).
 set -uo pipefail

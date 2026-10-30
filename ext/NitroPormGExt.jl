@@ -1956,18 +1956,18 @@ end
 # ============================================================================
 
 function sync_pormg_env!(; force::Bool = false)::Union{String, Nothing}
-    # Blank counts as UNSET, matching how `current_env` treats `NITRO_ENV` -- and here it
-    # matters more, because PormG's `_effective_env` returns `""` on a bare `haskey` and then
-    # looks up a `""` section in connection.yml. Honouring an empty `PORMG_ENV` as if it were
-    # a deliberate choice would make the bridge worse than not existing.
+    # Blank counts as UNSET, matching how `current_env` treats `NITRO_ENV`. PormG 0.9 reads a
+    # blank `PORMG_ENV` as unset too (PormG #1228); before it, PormG looked up a `""` section in
+    # connection.yml, so the bridge removing the blank was what made it unset. It still does, so
+    # the variable says the same thing to every reader of the process environment.
     current = get(ENV, "PORMG_ENV", nothing)
     blank = current !== nothing && isempty(strip(current))
     if force || current === nothing || blank
         # Only an environment someone SET is published (#331). Nitro's `"dev"` fallback is not
-        # a choice, and published as one it outranked a choice someone did make: `default_env:`
-        # in connection.yml sits below `PORMG_ENV` in PormG's precedence, so a prod box relying
-        # on it silently connected to dev. With neither `NITRO_ENV` nor `GENIE_ENV` set, PormG
-        # resolves its own environment -- which is also why `force` then has nothing to write.
+        # a choice, and published as one it would answer for every `load` in the process. With
+        # neither `NITRO_ENV` nor `GENIE_ENV` set, PormG resolves its own environment -- in a
+        # REPL `default_env:`, else "dev"; anywhere else it refuses a `load` with no `env=`
+        # (PormG #1228) -- which is also why `force` then has nothing to write.
         #
         # Resolved only here, as before: a typo in `NITRO_ENV` does not throw while a set
         # `PORMG_ENV` means there is nothing to publish.
@@ -2010,11 +2010,12 @@ function __init__()
     # `task_model(db_key)` build a bound model per store instead, which is a handful of
     # allocations about twice per application.
 
-    # Bridge the environment set in `NITRO_ENV`/`GENIE_ENV` to PormG's, so an app can call
-    # `PormG.Configuration.load_many([...])` with no `env=` and get the environment Nitro
-    # resolved (#55). A DEFAULT, never a force: a pre-set `PORMG_ENV` and an explicit `env=`
-    # both still win -- and with neither variable set nothing is published, so PormG's own
-    # `default_env:` still decides (#331).
+    # Bridge the environment set in `NITRO_ENV`/`GENIE_ENV` to PormG's, so a `load_many([...])`
+    # with no `env=` gets the environment Nitro resolved (#55). A DEFAULT, never a force: a
+    # pre-set `PORMG_ENV` and an explicit `env=` both still win -- and with neither variable set
+    # nothing is published, so PormG resolves its own (#331), which outside a REPL is a refusal
+    # (PormG #1228). The generated app names one either way:
+    # `env = something(sync_pormg_env!(), current_env())`.
     #
     # Guarded, unlike the registration above, because this is the only side effect here that
     # ESCAPES THE MODULE: it mutates the OS process environment, which is inherited by any
@@ -2034,8 +2035,8 @@ function __init__()
             @warn "Nitro could not bridge its environment to PormG: " *
                   sprint(showerror, err) *
                   "\n`PORMG_ENV` is left as it was, so PormG falls back to its own " *
-                  "resolution (`env=` kwarg, then `PORMG_ENV`, then `default_env:` in " *
-                  "connection.yml, then \"dev\").\nFix the variable and call " *
+                  "resolution (`env=` kwarg, then `PORMG_ENV`; outside a REPL a `load` " *
+                  "with neither is refused).\nFix the variable and call " *
                   "`sync_pormg_env!()`, or pass `env=` explicitly."
         end
     end
@@ -2055,15 +2056,28 @@ function Nitro._newapp_pormg(write_app::Function, root::String)
                    "LibPQ" => ("194296ae-ab2e-5f79-8cd4-7183a0a5a0d1", "1"))
     db(names) = Nitro._NewappDB(
         usings = join(["using Nitro", "PormG", names...], ", "),
-        module_note = [
-            "# Once db/models.jl defines models, import them here for the handlers (`import ..appM`):",
-            "#   PormG.@import_models \"../db/models.jl\" models",
+        # The models are included, not `@import_models`ed: since PormG 0.9 (#1226) registering
+        # them needs their folder loaded first, outside a REPL, and a precompile worker is never
+        # a REPL. Loading in the module body would read db/connection.yml, password and all,
+        # while the package precompiles or a JuliaC image is built -- an image keeps every
+        # global, PormG's configuration included. So the module body only defines, and `main`
+        # loads, then binds. The environment is named outright (PormG #1228), in PormG 0.8's
+        # precedence minus its guesses: a set `PORMG_ENV` still wins, as it did when the bridge
+        # left it alone and `load` read it; else `NITRO_ENV` (the bridge publishes it, and
+        # returns `PORMG_ENV`); else `current_env()`'s "dev", in place of `default_env:`.
+        module_body = [
+            "# Once db/models.jl defines models, include them here for the handlers (`import ..appM`).",
+            "# Including only defines them: `main` binds them to the connection.",
+            "#   include(\"../db/models.jl\")",
             "#   const appM = models",
         ],
         boot = [
-            "sync_pormg_env!()  # NITRO_ENV -> PORMG_ENV, only when NITRO_ENV is set",
-            "# PormG parses db/connection.yml, validates it and connects, from any working directory",
-            "PormG.Configuration.load_many([\"db\"]; root = pkgdir(@__MODULE__))",
+            "# PormG reads db/connection.yml, from any working directory, in the environment",
+            "# `PORMG_ENV` names, else `NITRO_ENV` (or `GENIE_ENV`), else \"dev\"",
+            "env = something(sync_pormg_env!(), current_env())",
+            "PormG.Configuration.load_many([\"db\"]; root = pkgdir(@__MODULE__), env)",
+            "# Once the models are included above, bind them to that connection:",
+            "#   PormG.Models.set_models(models, joinpath(pkgdir(@__MODULE__), \"db\"))",
         ],
         store = "pormg_nitro_worker(db_key = \"db\")",
         deps = ["PormG" => string(Base.PkgId(PormG).uuid); [n => drivers[n][1] for n in names]],
