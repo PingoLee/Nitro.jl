@@ -76,8 +76,9 @@ using Test
 # `warmth:` (`grep 'warmth:'` over a CI job log):
 #
 #   warmth: start os=… julia=… threads=… mem_free=<fraction> …   <- before any measurement
-#   warmth: baseline dict_int_s=…                                 <- before its @test
-#   warmth: ratio shape=… ratio=… shape_s=… baseline_s=…          <- one per shape, before its @test
+#   warmth: baseline dict_int_s=… caller_s=…                       <- before its @test
+#   warmth: ratio shape=… ratio=… shape_s=… baseline_s=… limit=… caller_s=…
+#                                                                 <- one per shape, before its @test
 #   warmth: end mem_free=…                                        <- after them, even on a throw
 #
 # Those lines are for two things. Over a few CI runs they give the per-OS distribution of
@@ -150,6 +151,41 @@ using Test
 #
 # Move these with the `warmth:` lines from CI, not with a red on a loaded developer box.
 #
+# ── The probe's caller, timed apart (#710) ────────────────────────────────────────────────
+#
+# Every shape's first request starts by compiling the probe's own thunk, `go` in the probe: a
+# fresh closure that builds the request and calls `internalrequest`. That compile is the same
+# work for every shape, ~7–9 ms at CI's flags, and it sits inside every number above,
+# denominator included. Once, locally, it was not the same SIZE:
+#
+#   `cookie_ext`, CI's flags: 0.060 s against 0.024 s, on every child for a stretch of one
+#   session. `--trace-compile` put all of the excess in compiling the thunk (44 ms against
+#   8.6 ms for `dict_int`'s), while the shape's own compiles, its `FormattedLeaf` and the
+#   `get_cookie` keyword call, were normal. The same probe read 0.024 s later in the session,
+#   with nothing changed but the pkgimages other processes had since written to the depot.
+#
+# A step of the same size has turned the coverage leg red on every run since 2026-10-29:
+#
+#   `url`, ubuntu at 1 thread, from 2026-10-29 21:46 on: 0.053–0.061 s against 0.014–0.023 s
+#   before it and on every other leg, with no `src/` change between the two readings and the
+#   baseline unmoved. The test env had moved to HTTP 2.13.3 / URIs 1.7.3. The same step
+#   appeared twice on 2026-10-28 with the older versions.
+#
+# Whether that one is the thunk too is NOT established. `url`'s thunk has the same types as
+# `dict_int`'s, which did not move, so a thunk-only step there is hard to explain. The shape's
+# own path is the other suspect: `url()` escapes through `HTTP.escapeuri`, which is URIs code.
+# The coverage leg is also the one place the probe child loads an image that `Pkg.test` did not
+# build in that run: the parent precompiles only the coverage configuration, and the child runs
+# with `--code-coverage=none`.
+#
+# So the probe compiles `go` before the request and prints the two times. `shape_s` is still
+# their SUM, so every ratio and limit above means what it meant. `caller_s` on the `warmth:`
+# line says whether a slow reading's time went into the probe's own thunk or into the shape. A
+# red whose excess sits in `caller_s` is the probe; one whose excess sits in `shape_s - caller_s`
+# is a cold path in the workload. Taking the thunk out of the timed quantity would remove the
+# first kind, but it moves every ratio (it shrinks the baseline by about a third on ubuntu at 1
+# thread, 10–17% on the other legs), so it waits for the CI lines to recalibrate against.
+#
 # This is a `:slow` item — it spawns one Julia process per measurement. `--skip-tags slow`
 # drops it.
 
@@ -172,12 +208,16 @@ const SHAPES = ["dict_any" => MAX_RATIO, "query_ext" => MAX_RATIO, "json_ext" =>
 probe = joinpath(@__DIR__, ".helpers", "precompile_warmth_probe.jl")
 @test isfile(probe)
 
+# One sample: the first request's `total`, and the share of it that compiled the probe's own
+# thunk, `caller` (see "The probe's caller, timed apart" above).
 function measure(shape)
     cmd = `$(Base.julia_cmd()) --code-coverage=none --project=$(Base.active_project()) $probe $shape`
-    parse(Float64, strip(read(cmd, String)))
+    total, caller = parse.(Float64, split(read(cmd, String)))
+    (; total, caller)
 end
 
-best_of(shape, n) = minimum(measure(shape) for _ in 1:n)
+# The sample with the smallest total, kept whole so its split is logged with it.
+best_of(shape, n) = argmin(s -> s.total, [measure(shape) for _ in 1:n])
 
 # See "Why it logs on every run" above for why this is not the item's own logger.
 runner = isdefined(Main, :NitroTestRunner) ? getfield(Main, :NitroTestRunner) : nothing
@@ -197,17 +237,19 @@ end
 
 warmth("start os=$(Sys.KERNEL) arch=$(Sys.ARCH) julia=$VERSION threads=$(Threads.nthreads()) $(memory())")
 try
-    baseline = best_of("dict_int", 3)
-    warmth("baseline dict_int_s=$(fmt(baseline)) limit_s=$MAX_BASELINE_SECONDS")
+    base = best_of("dict_int", 3)
+    baseline = base.total
+    warmth("baseline dict_int_s=$(fmt(baseline)) caller_s=$(fmt(base.caller)) " *
+           "limit_s=$MAX_BASELINE_SECONDS")
     @test 0 < baseline < MAX_BASELINE_SECONDS
 
     # Two samples per numerator, not one: the test runner never retries an item, so a single
     # sample makes one GC pause or one moment of CPU steal on a shared runner a hard red.
     @testset "$shape stays warm" for (shape, limit) in SHAPES
-        shape_s = best_of(shape, 2)
-        ratio = shape_s / baseline
-        warmth("ratio shape=$shape ratio=$(round(ratio; digits = 2)) shape_s=$(fmt(shape_s)) " *
-               "baseline_s=$(fmt(baseline)) limit=$limit")
+        s = best_of(shape, 2)
+        ratio = s.total / baseline
+        warmth("ratio shape=$shape ratio=$(round(ratio; digits = 2)) shape_s=$(fmt(s.total)) " *
+               "baseline_s=$(fmt(baseline)) limit=$limit caller_s=$(fmt(s.caller))")
         @test ratio < limit
     end
 finally
