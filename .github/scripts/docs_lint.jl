@@ -174,6 +174,14 @@ function collect_docs()
 end
 
 """
+A file's text with CRLF line endings read as LF. Every check below reads through this, so a
+Windows checkout under `core.autocrlf=true` lints like CI's LF checkout. A `\\r` left in the
+text defeats each `(?m)…\$` anchor without saying so: `block_scalar` stopped recognising
+`description: >-\\r`, and four folded descriptions read as unquoted plain scalars (#820).
+"""
+readtext(path) = replace(read(path, String), "\r\n" => "\n")
+
+"""
 Parse the leading `---` front-matter block into a Dict{String,String}.
 Handles plain `key: value` and folded `key: >-` blocks (subsequent indented
 lines are joined with spaces). Returns an empty Dict when there is no block.
@@ -296,7 +304,7 @@ function symbol_defined(sym)
         isdir(base) || continue
         for (dir, _, files) in walkdir(base), f in files
             endswith(f, ".jl") || continue
-            occursin(pat, read(joinpath(dir, f), String)) && return true
+            occursin(pat, readtext(joinpath(dir, f))) && return true
         end
     end
     return false
@@ -305,7 +313,7 @@ end
 # G: does `file` contain a `## <n>.` heading?
 function has_section(path, n)
     isfile(path) || return false
-    return occursin(Regex("(?m)^#{2,3}\\s+" * string(n) * "\\."), read(path, String))
+    return occursin(Regex("(?m)^#{2,3}\\s+" * string(n) * "\\."), readtext(path))
 end
 
 function lint_sections(file, text, errors)
@@ -341,7 +349,7 @@ function lint_skill_frontmatter(errors)
             push!(errors, ".github/skills/$(name)/: no SKILL.md")
             continue
         end
-        fm = front_matter(read(skill, String))
+        fm = front_matter(readtext(skill))
         got = get(fm, "name", "")
         got == name ||
             push!(errors, ".github/skills/$(name)/SKILL.md: front-matter name `$(got)` != directory `$(name)`")
@@ -354,7 +362,7 @@ function lint_instruction_frontmatter(errors)
     isdir(INSTRUCTIONS_DIR) || return
     for f in sort(readdir(INSTRUCTIONS_DIR))
         endswith(f, ".md") || continue
-        fm = front_matter(read(joinpath(INSTRUCTIONS_DIR, f), String))
+        fm = front_matter(readtext(joinpath(INSTRUCTIONS_DIR, f)))
         isempty(get(fm, "description", "")) &&
             push!(errors, ".github/instructions/$(f): empty or missing `description`")
     end
@@ -367,7 +375,7 @@ function lint_registry(errors)
         push!(errors, "$(HUB): canonical hub is missing")
         return
     end
-    text = read(hub, String)
+    text = readtext(hub)
 
     actual_skills = tracked_subdirs(SKILLS_DIR)
     actual_skills == PUBLIC_SKILLS ||
@@ -416,8 +424,8 @@ function lint_skill_stubs(errors)
         stub_path  = joinpath(CLAUDE_SKILLS_DIR, n, "SKILL.md")
         (isfile(canon_path) && isfile(stub_path) && !islink(stub_path)) || continue   # reported above
 
-        canon = read(canon_path, String)
-        stub  = read(stub_path, String)
+        canon = readtext(canon_path)
+        stub  = readtext(stub_path)
         canon_fm = front_matter_block(canon)
         stub_fm  = front_matter_block(stub)
         canon_fm === nothing &&
@@ -458,7 +466,7 @@ function main()
     isempty(docs) && (println(stderr, "docs_lint: no docs found — check DOC_GLOBS/DOC_DIRS"); exit(2))
 
     for file in docs
-        text = read(file, String)
+        text = readtext(file)
         lint_paths(file, text, errors)
         lint_links(file, text, errors)
         lint_sections(file, text, errors)

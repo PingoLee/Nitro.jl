@@ -63,6 +63,7 @@ const TEST_FILES = [
     "newapp_tests.jl",
     "examples_tests.jl",
     "docs_deploy_tests.jl",
+    "docs_lint_tests.jl",
     "cookies_tests.jl",
     "session_tests.jl",
     "sessionstores_tests.jl",
