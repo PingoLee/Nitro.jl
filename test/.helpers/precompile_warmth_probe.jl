@@ -7,7 +7,9 @@
 # Lives under `test/.helpers/` so test discovery prunes it (dot-directory) —
 # it is named `*_probe.jl` rather than `*_tests.jl` for the same reason, belt and braces.
 #
-# Usage: julia --project=<env> precompile_warmth_probe.jl <shape>   # prints e.g. "0.183"
+# Usage: julia --project=<env> precompile_warmth_probe.jl <shape>
+# prints "<total s> <caller s>", e.g. "0.183 0.009": the first request including the compile of
+# the probe's own thunk, then that compile alone (#710; see the end of this file).
 
 using Nitro, HTTP
 using Nitro: Res, RouteDefinition, path, Query, Json
@@ -96,8 +98,16 @@ else
     error("unknown shape: $SHAPE")
 end
 
-elapsed = @elapsed resp = go()
+# `go` is the probe's own caller, not part of the shape, so it is compiled first and timed apart
+# from the request (#710). The test still divides the SUM, so the ratios mean what they meant
+# before; the split is there to show where a slow reading's time went. `caller` is `go`, `hit`,
+# the `HTTP.Request` constructor and the inference of `internalrequest`, the same work for every
+# shape. The shape's own compiles stay in `request`: `internalrequest` hands the request to
+# `setupmiddleware(...)`, which is typed `::Function`, and inference stops there, so the router,
+# the route endpoint and the handler compile only when the request reaches them.
+caller = @elapsed precompile(go, ())
+request = @elapsed resp = go()
 resp.status == 200 || error("shape $SHAPE returned $(resp.status), expected 200")
 body = Nitro.text(resp)
 occursin(expected, body) || error("shape $SHAPE body $(repr(body)) lacks $(repr(expected))")
-println(elapsed)
+println(caller + request, " ", caller)
