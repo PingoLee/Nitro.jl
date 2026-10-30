@@ -1270,7 +1270,7 @@ using Nitro
 using Nitro.Core: internalrequest
 using Nitro.Core.RouterHOF: router
 using Nitro.Core.Routing: urlpatterns
-import Nitro: App, path, text
+import Nitro: App, path, include_routes, text
 
 # REGRESSION for #291, an authorization bypass. `compose` chose the middleware chain from the
 # request as it arrived, and global middleware ran inside that chain. A layer that rewrote
@@ -1280,7 +1280,7 @@ import Nitro: App, path, text
 # route's 200. The 404/405 cases are the ones the issue itself thought were safe.
 #
 # Global middleware now wraps route selection, so its rewrites pick up the new route's guards.
-# A router- or route-level layer runs after selection; rerouting from there onto a route with
+# A group-, router- or route-level layer runs after selection; rerouting from there onto a route with
 # different middleware is refused with a 500.
 
 deleted = Ref(false)
@@ -1428,6 +1428,34 @@ end
         hit(app, "GET", "/r/x", OVERRIDE_DELETE)
     end
     @test r.status == 500
+end
+
+@testset "a group-level override between two routes of one include_routes group is refused (#705)" begin
+    # Unlike `router(...; middleware)`, `include_routes` gives every route of the group its own
+    # copy of the group's list, so no two of them share an entry. The rewritten leaf's entry is
+    # not the one the running chain was built from, and the reroute is refused like any other.
+    app = App()
+    group_deleted = Ref(false)
+    urlpatterns(app, "", include_routes("/g", [
+        path("/x", (req::HTTP.Request) -> Res.send("get"); method = "GET"),
+        path("/x", (req::HTTP.Request) -> (group_deleted[] = true; Res.send("delete")); method = "DELETE"),
+    ]; middleware = [override]))
+    logger = Test.TestLogger(min_level = Base.CoreLogging.Error)
+    r = Base.CoreLogging.with_logger(logger) do
+        hit(app, "GET", "/g/x", OVERRIDE_DELETE)
+    end
+    @test r.status == 500
+    @test !group_deleted[]
+    # The refusal is the reroute check's, not some other 500: one error, naming both routes.
+    entry = only(logger.logs)
+    @test entry.kwargs[:from] == "GET /g/x"
+    @test entry.kwargs[:to] == "DELETE /g/x"
+
+    # Without the rewrite each route is served under its own copy of the group's layers.
+    r = hit(app, "GET", "/g/x")
+    @test r.status == 200 && text(r) == "get"
+    r = hit(app, "DELETE", "/g/x")
+    @test r.status == 200 && text(r) == "delete"
 end
 
 @testset "a reroute onto a declared-method leaf keys on its declared method" begin
