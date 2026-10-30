@@ -405,3 +405,76 @@ pin_probe(req::HTTP.Request) = paced_probe("/events/pin"; status = 204, n = 3000
 end
 
 end
+
+# #777: a producer still parked in `sleep` when the process exits must end it quietly. Exit runs
+# every finalizer, reachable objects' included, and a `Timer`'s wakes its waiter with `EOFError`
+# (#772). `_run_sse_producer` used to log that as `the event producer failed`, compiling and
+# printing during teardown, the hazard that crashed CI's child in #772. It now reads
+# `Errors.process_exiting()` first and returns, and its `finally` still closes the stream.
+#
+# A child process, because only an exit can show it, shaped like #773's janitor exit item
+# (test/middleware/janitor_tests.jl): a default thread kept awake to run whatever the finalizers
+# wake, and a finalizer created last that holds the exit open while the woken producers run.
+# Exit runs finalizers newest first, list by list, and a producer's `Timer` is on a default
+# thread's list where this one is on thread 1's, so the `Timer`s are finalized by the time it
+# reports. That finalizer must wait GC-SAFE. `Libc.systemsleep` is a
+# GC-unsafe ccall, so a woken producer's first collection waited at the safepoint for the whole
+# hold and the unpatched path printed nothing -- the issue's own repro hid the bug it reported.
+# With `gc_safe = true` the unpatched path printed the `@error` from every producer.
+#
+# What the item asserts is what the bug produces (#774): the child exits `(0, 0)` and its stderr
+# carries no producer error, no `EOFError` and no `Unhandled Task`. The report line comes from a
+# finalizer during exit, which Julia does not promise to run, so it is optional; when it is there
+# every stream must be closed.
+@testitem "SSE — a producer parked at exit ends quietly and closes its stream (#777)" tags=[:handler, :slow] setup=[NitroCommon] begin
+    using Test
+    using Nitro
+
+    # The flag `process_exiting` reads is Base-internal; this is the contract that keeps a rename
+    # a red test rather than an `UndefVarError` inside the producer's `catch`.
+    @test isdefined(Base, :_atexit_hooks_finished)
+    @test Base._atexit_hooks_finished isa Bool
+    @test Base._atexit_hooks_finished === false
+    @test Nitro.Core.Errors.process_exiting() === false
+
+    code = """
+    using Nitro
+    const PARKED = Threads.Atomic{Int}(0)
+    const STREAMS = map(1:5) do _
+        Nitro.Res.sse() do events
+            Threads.atomic_add!(PARKED, 1)
+            sleep(3600)
+        end.body
+    end
+    timedwait(() -> PARKED[] == 5, 10.0) === :ok || error("a producer never started")
+    sleep(0.2)
+    Threads.@spawn while true
+        yield()
+    end
+    const CHECK = finalizer(Ref(0)) do _
+        # `Libc.systemsleep`'s own split: `Sleep` on Windows, which has no `usleep` to load.
+        if Sys.iswindows()
+            @ccall gc_safe=true Sleep(2000::UInt32)::Cvoid
+        else
+            @ccall gc_safe=true usleep(2_000_000::Cuint)::Cint
+        end
+        Core.println("SSE AT EXIT: open=", count(isopen, STREAMS))
+    end
+    println("exiting")
+    """
+    cmd = `$(Base.julia_cmd()) --code-coverage=none --startup-file=no --threads=2
+           --project=$(Base.active_project()) -e $code`
+    out, err = IOBuffer(), IOBuffer()
+    p = run(pipeline(ignorestatus(cmd); stdout = out, stderr = err))
+    stdout_text, stderr_text = String(take!(out)), String(take!(err))
+    failure = (p.exitcode, p.termsignal) == (0, 0) ? nothing :
+        "child exit $(p.exitcode), signal $(p.termsignal); stderr: $(stderr_text)"
+    @test failure === nothing
+    # The script ran to its end: the producers were parked when the exit began.
+    @test occursin("exiting", stdout_text)
+    @test !occursin("the event producer failed", stderr_text)
+    @test !occursin("EOFError", stderr_text)
+    @test !occursin("Unhandled Task", stderr_text)
+    report = match(r"SSE AT EXIT: open=(\d+)", stdout_text)
+    @test report === nothing || report[1] == "0"
+end
