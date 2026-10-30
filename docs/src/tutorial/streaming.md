@@ -145,9 +145,40 @@ See [Behind a Reverse Proxy](@ref) for the nginx and Caddy configuration — in 
 A handler that holds its connection for its whole lifetime is **always cut at**
 `serve(shutdown_timeout = …)`: the graceful drain has nothing to wait out, so it reaches its
 timeout and force-closes. A producer parked in `write` unwinds the moment the socket is torn down.
-One parked on a `sleep`, a `Channel` or an `Event` does not — if it must finish cleanly, give it a
-shutdown signal of its own from a `LifecycleMiddleware`'s `on_shutdown`, which runs *before* the
-drain begins. See [`terminate`](@ref).
+One parked on a `sleep`, a `Channel` or an `Event` does not, and outlives `terminate` until it next
+wakes. Give it a shutdown signal of its own from a `LifecycleMiddleware`'s `on_shutdown`, which
+runs *before* the drain begins, and check it every tick:
+
+```julia
+const STOPPING = Threads.Atomic{Bool}(false)
+
+# Owns the flag and no request work: `identity` passes every request through untouched.
+stop_streams = Nitro.LifecycleMiddleware(
+    middleware  = identity,
+    on_startup  = () -> (STOPPING[] = false),
+    on_shutdown = () -> (STOPPING[] = true))
+
+function pings(req)
+    return Res.sse() do events
+        while isopen(events) && !STOPPING[]
+            write(events, SSEEvent(""; event = "ping"))
+            sleep(15)
+        end
+    end
+end
+
+app = App(mod = @__MODULE__)
+urlpatterns(app, "", [path("/pings", pings)])
+serve(app, middleware = [stop_streams])
+```
+
+The producer then stops within one tick of `terminate`. Polling `cancel_requested(req)` from the
+producer is not a substitute: the producer runs on a task of its own, and that accessor reads
+`req.context`, which only the handler's task may do.
+
+A producer still parked in `sleep` when the process *exits* is woken by the exit itself. Julia
+finalizes every `Timer`, and the `sleep` then throws `EOFError`. Nitro treats that as the end of the stream,
+not as a failed producer: it closes the stream and logs nothing. See [`terminate`](@ref).
 
 ## Why not a `STREAM` route?
 

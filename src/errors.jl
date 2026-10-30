@@ -650,7 +650,9 @@ different reasons**, and conflating them is how this list rots:
    because the heartbeat must keep renewing while the drain runs. `_drain!`'s catch is
    shutdown code and swallows everything (#427). `src/response.jl`'s `_run_sse_producer` (#160) is the same
    discipline one level down: the producer task nothing waits on, where the expected failure is
-   the client disconnecting. `AccessLog`'s writer (`_run`/`_flush!` in
+   the client disconnecting. After the interrupt rethrow it ends quietly when
+   `process_exiting()` says the failure is the exit's own wake (#777), before it classifies
+   anything. `AccessLog`'s writer (`_run`/`_flush!` in
    `src/middleware/access_log.jl`, #649) is this group too: the app's sink failing with an
    overflow costs one dropped batch, and an interrupt ends the drain with a `@warn`, the janitor's
    shape. Do not "fix" these to match the table above.
@@ -726,5 +728,32 @@ Deliberately **not exported**: this is internal vocabulary, imported explicitly 
 """
 @inline is_unrecoverable(e) =
     e isa InterruptException || e isa StackOverflowError || e isa OutOfMemoryError
+
+"""
+    process_exiting() -> Bool
+
+`true` once the process has run its last `atexit` hook and is about to run its finalizers: the
+window in which a failure in a background task is the exit's doing, not the task's (#777).
+
+Exit runs **every** finalizer, reachable objects' included, and a `Timer`'s wakes whatever waits on
+it with `EOFError` (#772). So a task parked in `sleep` at exit wakes, on another thread, with an
+exception it did nothing to earn, while thread 1 tears the process down. A catch-all that logs
+that is noise at best, and at worst it compiles and prints code during teardown, which is what
+crashed CI's test child in #772. A catch site in a background task that runs application code
+checks this first and ends quietly. The janitors do not need it: they park on a `Base.Event`, which
+no finalizer wakes (`src/middleware/janitor.jl`). A Workers callback is application code with the
+same exposure, and does not check it yet.
+
+It reads `Base._atexit_hooks_finished`, which `Base._atexit` sets after the last hook and before
+it returns to the runtime that runs the finalizers: Base's documented order, *atexit hooks run
+before object finalizers*. That global is internal, so `test/sse_tests.jl` pins that it exists and
+is a `Bool`. A Julia that renames it fails that test, not this read inside a catch. A Nitro-owned
+`atexit` hook setting a flag of its own would carry the same meaning, but it needs an `__init__`
+and makes a dynamic call into Nitro at exit, which a `juliac --trim` executable would have to be
+shown to survive. Reading Base's flag needs neither.
+
+Call sites: `_run_sse_producer` (`src/response.jl`). Deliberately **not exported**.
+"""
+process_exiting()::Bool = Base._atexit_hooks_finished
 
 end

@@ -40,7 +40,7 @@ using SHA: sha256
 import JSON
 # The SSE producer is application code, so its failure is logged as `loggable(err)`, never the
 # live exception (#648, the #613 rule).
-using ..Errors: loggable
+using ..Errors: loggable, process_exiting
 using ..Constants: FILE_STREAM_THRESHOLD
 
 function apply_headers!(target::Union{HTTP.Response,HTTP.Headers}, headers)
@@ -509,6 +509,15 @@ function _run_sse_producer(producer::Function, events::HTTP.SSEStream)
         producer(events)
     catch err
         err isa InterruptException && rethrow()
+        # A producer woken by the process's exit is not a failing producer (#777). Exit runs every
+        # finalizer, live `Timer`s included, and a `Timer`'s wakes a producer parked in `sleep`
+        # with `EOFError` -- the docstring's own example parks there. Logging that would compile
+        # and print an error during teardown, the hazard that crashed CI in #772, and say nothing
+        # the operator can act on. Checked FIRST and alone: whatever the producer threw now is the
+        # exit's consequence, and nothing else here (`_is_closed_stream_error`, `loggable`) needs to
+        # be dispatched for it. Keying on `EOFError` instead would hide a real upstream end of
+        # file while the process runs normally. The `finally` still closes the stream.
+        process_exiting() && return nothing
         # A write that failed BECAUSE the stream was closed is the expected end, not a fault. The
         # transport closes the body when the client disconnects — and `terminate` force-closes the
         # socket on a long-lived handler by design (src/core/lifecycle.jl) — after which the
@@ -601,8 +610,38 @@ responses by default, which `X-Accel-Buffering: no` asks it not to do for this r
 
 A long-lived stream is **always cut at `serve(shutdown_timeout = …)`** — the graceful drain cannot
 wait out a handler that holds its connection for its whole lifetime. A producer parked in `write`
-unwinds as soon as the socket is torn down; one parked on a `sleep` or a `Channel` does not, so give
-it a shutdown signal of its own from a `LifecycleMiddleware`'s `on_shutdown`. See
+unwinds as soon as the socket is torn down; one parked on a `sleep` or a `Channel` does not, and
+outlives `terminate` until it next wakes. Give it a shutdown signal of its own from a
+`LifecycleMiddleware`'s `on_shutdown`, and check it every tick:
+
+```julia
+const STOPPING = Threads.Atomic{Bool}(false)
+
+# Owns the flag and no request work: `identity` passes every request through untouched.
+stop_streams = Nitro.LifecycleMiddleware(
+    middleware  = identity,
+    on_startup  = () -> (STOPPING[] = false),
+    on_shutdown = () -> (STOPPING[] = true))
+
+function pings(req)
+    return Res.sse() do events
+        while isopen(events) && !STOPPING[]
+            write(events, SSEEvent(""; event = "ping"))
+            sleep(15)
+        end
+    end
+end
+
+serve(app, middleware = [stop_streams])
+```
+
+The producer then stops within one tick of `terminate`. Do not poll `cancel_requested(req)` from
+the producer instead: it runs on a task of its own, and that accessor reads `req.context`, which
+only the handler's task may do.
+
+A producer still parked in `sleep` when the process **exits** is woken by the exit itself: Julia
+finalizes every `Timer`, and the `sleep` then throws `EOFError`. Nitro treats that as the end of the stream, not
+as a failed producer: it closes the stream and logs nothing. See
 [`terminate`](@ref Nitro.terminate).
 
 Caller-supplied `headers` are applied last, so they override the defaults above — a
