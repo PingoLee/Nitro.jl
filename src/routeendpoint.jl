@@ -302,7 +302,8 @@ end
 # ── Lifecycle hooks (#719; docs/design/juliac-trim.md §3.4) ─────────────────────────────────────
 #
 # The registry holds lifecycle middleware of as many types as an app installs, so the call from
-# `startserver`/`terminate` into each one's `startup`/`shutdown` cannot be resolved statically.
+# `startserver`/`terminate` into each one's `startup`/`shutdown`/`stopped` cannot be resolved
+# statically.
 # `LifecycleEntry` is that call's erasure point, as `RouteEndpoint` is a route's. The two halves of
 # the registry are registered at different times, so each gets the pointer it can get then:
 # route-owned entries at top level, which under `juliac` is build time, through an exported thunk;
@@ -314,8 +315,8 @@ end
 
 One registered [`LifecycleMiddleware`](@ref), behind one concrete type, for
 `Service.route_lifecycle` and `Service.serve_lifecycle` (#719). `mw` is the object itself, which
-dedup and promotion compare by `===`; [`startup`](@ref) and [`shutdown`](@ref) on the entry run
-that object's hooks.
+dedup and promotion compare by `===`; [`startup`](@ref), [`shutdown`](@ref) and [`stopped`](@ref)
+on the entry run that object's hooks.
 
 **Under the JIT it is a direct call**, `startup(e.mw)`: one dynamic call per hook per server, as
 before. **In a trimmed image it is a `ccall`**: through the thunk a `--trim` build exported for a
@@ -330,12 +331,18 @@ mutable struct LifecycleEntry
     @atomic thunk :: Ptr{Cvoid} # `sym`, looked up on first use
 end
 
-# What both kinds of pointer call: the hook, at `L`. `startup`/`shutdown` already catch what a hook
-# throws; this catch is for anything else, which must not unwind through the foreign frame
-# (`EndpointFailure`, above).
-function _lifecycle_call(lf::L, up::Cint)::Any where {L<:LifecycleMiddleware}
+# The hook a foreign call asks for, as the `Cint` both kinds of pointer carry. `0`/`1` keep the
+# meaning of the `up` flag this replaced; `2` is the post-drain hook (#161).
+const _PHASE_SHUTDOWN = Cint(0)
+const _PHASE_STARTUP  = Cint(1)
+const _PHASE_STOPPED  = Cint(2)
+
+# What both kinds of pointer call: the hook, at `L`. `startup`/`shutdown`/`stopped` already catch
+# what a hook throws; this catch is for anything else, which must not unwind through the foreign
+# frame (`EndpointFailure`, above).
+function _lifecycle_call(lf::L, phase::Cint)::Any where {L<:LifecycleMiddleware}
     try
-        return up != 0 ? startup(lf) : shutdown(lf)
+        return _lifecycle_direct(lf, phase)
     catch err
         return EndpointFailure(err)
     end
@@ -344,16 +351,16 @@ end
 # The exported entry for a route-owned type `L`, in `RouteEndpoint`'s calling convention.
 struct LifecycleThunk{L} end
 
-function _lifecycle_thunk(::Type{L}, lf::Ptr{Cvoid}, up::Cint, out::Ptr{Cvoid}) where {L}
+function _lifecycle_thunk(::Type{L}, lf::Ptr{Cvoid}, phase::Cint, out::Ptr{Cvoid}) where {L}
     cell = unsafe_pointer_to_objref(out)::Base.RefValue{Any}
-    cell[] = _lifecycle_call(unsafe_pointer_to_objref(lf)::L, up)
+    cell[] = _lifecycle_call(unsafe_pointer_to_objref(lf)::L, phase)
     return nothing
 end
 
 function _export_lifecycle_thunk(::Type{L}, sym::String) where {L}
     # The exact signature, for `jl_extern_c` (see `_export_thunk`).
-    Core.eval(@__MODULE__, :((::LifecycleThunk{$L})(lf::Ptr{Cvoid}, up::Cint, out::Ptr{Cvoid}) =
-                                 _lifecycle_thunk($L, lf, up, out)))
+    Core.eval(@__MODULE__, :((::LifecycleThunk{$L})(lf::Ptr{Cvoid}, phase::Cint, out::Ptr{Cvoid}) =
+                                 _lifecycle_thunk($L, lf, phase, out)))
     Base.Experimental.entrypoint(LifecycleThunk{L}(), (Ptr{Cvoid}, Cint, Ptr{Cvoid}))
     Base._ccallable(sym, Cvoid, Tuple{LifecycleThunk{L}, Ptr{Cvoid}, Cint, Ptr{Cvoid}})
     return nothing
@@ -404,18 +411,25 @@ function _lifecycle_fptr!(e::LifecycleEntry)::Ptr{Cvoid}
     return p
 end
 
-function _run_lifecycle(e::LifecycleEntry, up::Bool)::Union{Nothing,InterruptException}
-    _trimmed() || return up ? startup(e.mw) : shutdown(e.mw)
+function _run_lifecycle(e::LifecycleEntry, phase::Cint)::Union{Nothing,InterruptException}
+    _trimmed() || return _lifecycle_direct(e.mw, phase)
     result = if e.shim != C_NULL
-        ccall(e.shim, Any, (Any, Cint), e.mw, Cint(up))
+        ccall(e.shim, Any, (Any, Cint), e.mw, phase)
     else
         out = Ref{Any}()
-        ccall(_lifecycle_fptr!(e), Cvoid, (Any, Cint, Any), e.mw, Cint(up), out)
+        ccall(_lifecycle_fptr!(e), Cvoid, (Any, Cint, Any), e.mw, phase, out)
         out[]
     end
     result isa EndpointFailure && throw(result.err)
     return result::Union{Nothing,InterruptException}
 end
 
-startup(e::LifecycleEntry) = _run_lifecycle(e, true)
-shutdown(e::LifecycleEntry) = _run_lifecycle(e, false)
+# The hook runner for a phase, called directly: the JIT's whole path, and the far side of a trimmed
+# build's foreign call.
+_lifecycle_direct(mw::LifecycleMiddleware, phase::Cint) =
+    phase == _PHASE_STARTUP ? startup(mw) :
+    phase == _PHASE_STOPPED ? stopped(mw) : shutdown(mw)
+
+startup(e::LifecycleEntry) = _run_lifecycle(e, _PHASE_STARTUP)
+shutdown(e::LifecycleEntry) = _run_lifecycle(e, _PHASE_SHUTDOWN)
+stopped(e::LifecycleEntry) = _run_lifecycle(e, _PHASE_STOPPED)

@@ -1,9 +1,9 @@
 # Middleware API
 
 A middleware is a function `handle -> req -> resp`, and a middleware list accepts one directly.
-Several of the factories below instead return a [`LifecycleMiddleware`](@ref Nitro.Core.Types.LifecycleMiddleware) — a request function bundled with `on_startup`/`on_shutdown` hooks
-that `serve()` and `terminate()` run, so the middleware can own a background task for as long as
-the server is up. `serve()`, `path()` and `urlpatterns()` take either form; only code composing
+Several of the factories below instead return a [`LifecycleMiddleware`](@ref Nitro.Core.Types.LifecycleMiddleware) — a request function bundled with `on_startup`/`on_shutdown`/`on_stopped` hooks
+that `serve()` and `terminate()` run, so the middleware can own a background task or a connection
+pool for as long as the server is up. `serve()`, `path()` and `urlpatterns()` take either form; only code composing
 a chain by hand needs the `.middleware` field. The type is not exported, so construct one as
 `Nitro.LifecycleMiddleware(...)`.
 
@@ -108,4 +108,5 @@ route_missed
 Nitro.Core.Types.LifecycleMiddleware
 Nitro.Core.Types.startup
 Nitro.Core.Types.shutdown
+Nitro.Core.Types.stopped
 ```

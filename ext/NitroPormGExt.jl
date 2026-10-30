@@ -34,7 +34,7 @@ import Nitro.Workers: AbstractWorkerStore, TaskInfo, TaskStatus, TaskOptions,
     get_error_redactor, set_error_redactor!,
     get_watch_authorizer, set_watch_authorizer!,
     TaskLocks, task_locks
-import Nitro: pormg_nitro_worker
+import Nitro: pormg_nitro_worker, pormg_nitro_pools
 
 export PormGWorkerStore, pormg_nitro_worker
 
@@ -1949,6 +1949,51 @@ function pormg_nitro_worker(; db_key::String="db")
     conn = PormG.connection(key=db_key)
     _ensure_task_table!(conn, model)
     return PormGWorkerStore(model=model, db_key=db_key)
+end
+
+# ============================================================================
+# SECTION 8b: Pool teardown (#161)
+# ============================================================================
+
+# Deliberately no docstring -- `src/exts.jl` owns it.
+function pormg_nitro_pools(; keys::AbstractVector{<:AbstractString}, drain_seconds::Real = 5.0)
+    isempty(keys) && throw(ArgumentError(
+        "pormg_nitro_pools: `keys` is empty. Name the PormG keys this app owns."))
+    (isfinite(drain_seconds) && drain_seconds >= 0) || throw(ArgumentError(
+        "pormg_nitro_pools: `drain_seconds` must be finite and non-negative, got $drain_seconds."))
+    # Copied to concrete values once, so the hook captures neither the caller's vector (which it
+    # could mutate after the fact) nor an abstract element type.
+    owned = String[String(k) for k in keys]
+    drain = Float64(drain_seconds)
+    # The lookup `close_pool!(key)` itself does, so a key accepted here is one it can close. Here
+    # rather than in `on_startup`, whose throw would be logged and swallowed and never stop `serve`.
+    for key in owned
+        try
+            PormG.Configuration.get_settings(key)
+        catch e
+            e isa PormG.InvalidConfigurationError || rethrow()
+            throw(ArgumentError(
+                "pormg_nitro_pools: no PormG configuration is loaded for key \"$key\". Load it " *
+                "(`load_many`, `load` or `register_connection`) before building the middleware."))
+        end
+    end
+    passthrough = handle -> (req -> handle(req))
+    # `on_stopped`, not `on_shutdown`: after the listener has closed and the drain is over, so no
+    # request is using a pool or can reopen one. Reverse order, the LIFO the lifecycle uses.
+    # A `try` per key: closing a pool never throws, but the key form looks the key up first, and a
+    # key unregistered since construction throws there. One such key must not keep the rest open.
+    on_stopped = () -> begin
+        for key in Iterators.reverse(owned)
+            try
+                PormG.Configuration.close_pool!(key; drain_seconds = drain)
+            catch e
+                e isa InterruptException && rethrow()
+                @error "pormg_nitro_pools: could not close the pool" key exception=(loggable(e), catch_backtrace())
+            end
+        end
+        return nothing
+    end
+    return Nitro.Core.Types.LifecycleMiddleware(; middleware = passthrough, on_stopped)
 end
 
 # ============================================================================

@@ -12,8 +12,9 @@
 call per hook, and one `juliac --trim=safe` rejects. To give each hook a concrete call
 (docs/design/juliac-trim.md §3.4):
 
-- **`LifecycleMiddleware` is `LifecycleMiddleware{M,S,D}`**, parameterized on its `middleware`,
-  `on_startup` and `on_shutdown` functions. The keyword constructor is unchanged, and the bare name
+- **`LifecycleMiddleware` is `LifecycleMiddleware{M,S,D,P}`**, parameterized on its `middleware`,
+  `on_startup`, `on_shutdown` and `on_stopped` functions (`on_stopped`, the post-drain hook, is
+  #161's, before this entry was released). The keyword constructor is unchanged, and the bare name
   still serves for `x isa LifecycleMiddleware` and `LifecycleMiddleware[]`. What changes: two of
   them no longer share one concrete type (`typeof(a) === typeof(b)` is `false` when their functions
   differ), and a struct field declared `::LifecycleMiddleware` is now an abstract type.

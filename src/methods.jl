@@ -227,23 +227,24 @@ not-serving and `serve` can simply be retried. An interrupt out of the blocking 
 returning rather than leaving the listener up.
 
 **That holds in a REPL; outside one, Julia decides what Ctrl-C does (#426).** In an interactive
-REPL, a press stops an idle blocking `serve` cleanly, `on_shutdown` hooks included, after any
-number of served requests, over closed or kept-alive connections. Under load the press can still
-abort, because Julia hands it to the REPL only when no other task is runnable. With no interactive
-thread (`--threads=N,0`) handlers and background tasks share thread 1, and a press under load is
-less predictable still: in measured runs it sometimes ended the REPL session (#491).
+REPL, a press stops an idle blocking `serve` cleanly, `on_shutdown` and `on_stopped` hooks
+included, after any number of served requests, over closed or kept-alive connections. Under load
+the press can still abort, because Julia hands it to the REPL only when no other task is
+runnable. With no interactive thread (`--threads=N,0`) handlers and background tasks share thread
+1, and a press under load is less predictable still: in measured runs it sometimes ended the REPL session (#491).
 
 Outside a REPL:
 
 - A script run as `julia app.jl` is ended by the first press. Julia runs `atexit` hooks, but not
-  Nitro's `on_shutdown`.
+  Nitro's `on_shutdown` or `on_stopped`.
 - Under `julia -e`, the press can reach no task at all.
 - Code that calls `Base.exit_on_sigint(false)` can see `fatal: error thrown and no exception
   handler available` once a request has been served. A finished connection task is the last to
   have parked on thread 1, and Julia hands the press on only to a REPL.
 
-When `on_shutdown` hooks must run, stop the server with `terminate` rather than Ctrl-C: serve with
-`async = true`, keep the main task alive yourself, and call `terminate(app)` from your own code.
+When `on_shutdown` and `on_stopped` hooks must run, stop the server with `terminate` rather than
+Ctrl-C: serve with `async = true`, keep the main task alive yourself, and call `terminate(app)`
+from your own code.
 
 **What the socket path costs (#453).** HTTP.jl runs every connection on Julia's `:interactive`
 thread pool, which `julia -t N` sizes at one thread, so anything a request does on its connection
@@ -855,8 +856,10 @@ that polls it can wind down within the drain instead of being cut at its end.
 
 **This budget is not the whole exit time.** Every `LifecycleMiddleware` shutdown hook runs *before*
 the drain begins, and a hook may block: `worker_startup`'s drains in-flight background tasks for up
-to `WORKER_DRAIN_TIMEOUT_SECONDS` (5 seconds) of its own. The two are consecutive, so size them
-together against a container's stop grace period.
+to `WORKER_DRAIN_TIMEOUT_SECONDS` (5 seconds) of its own. Every `on_stopped` hook runs *after* the
+drain, once the listener is closed (#161) — `pormg_nitro_pools`' waits up to its `drain_seconds`
+per pool for leased connections. All three are consecutive, so size them together against a
+container's stop grace period.
 
 **Long-lived connections are always cut at the timeout.** A WebSocket, SSE, or STREAM handler
 holds its connection for its whole lifetime, so the drain can never wait it out. If such a

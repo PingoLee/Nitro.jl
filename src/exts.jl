@@ -5,7 +5,7 @@ This module holds all the partial function & struct definitions for all package 
 export ProtoBuffer, protobuf
 export mustache, otera
 export png, svg, pdf
-export pormg_nitro_session, pormg_nitro_worker, sync_pormg_env!
+export pormg_nitro_session, pormg_nitro_worker, pormg_nitro_pools, sync_pormg_env!
 
 # Serialization extension definitions
 function protobuf end
@@ -178,6 +178,51 @@ serve(app; middleware=[worker_startup(app; queues=["reports"], store=store)])
 ```
 """
 function pormg_nitro_worker end
+
+"""
+    pormg_nitro_pools(; keys, drain_seconds = 5.0) -> LifecycleMiddleware
+
+Close the named PormG connection pools when the server stops (#161): pass it in
+`serve(app; middleware = [...])`, and `terminate(app)` calls `PormG.Configuration.close_pool!`
+on each key, in the **reverse** of the order given.
+
+The close runs in the `on_stopped` phase of [`LifecycleMiddleware`](@ref Nitro.Core.Types.LifecycleMiddleware)
+— after the listener has closed and the HTTP drain is over — not in `on_shutdown`, which runs
+while requests are still being served. A pool closed there would cut off the queries the drain
+is waiting for, and a request served during the drain would reopen it.
+
+- `keys` is required and must be non-empty. Name the keys **this** app owns: several `App`s in
+  one process share PormG's registry, so closing every loaded pool would cut another app's
+  queries off. Each key must already be loaded (`load_many`, `load` or `register_connection`)
+  when this is called, and a key that is not is an `ArgumentError` here, before `serve` starts.
+  This is the fail-fast check: a throwing `on_startup` hook is logged and swallowed, so it could
+  not stop `serve`. To check that a database is *reachable* at boot, call
+  `PormG.Configuration.ping(key)` in `main()` yourself.
+- `drain_seconds` is passed to each `close_pool!`: how long it waits for a leased connection to
+  be returned before closing it anyway. After the HTTP drain, only work outside a request (a
+  background task, a handler cut off by a forced close) can still hold one.
+
+A closed pool is not a dead one: PormG reopens it on the next query, so
+`serve(); terminate(); serve()` needs nothing more, and code that queries after `terminate`
+reconnects. Let `terminate` return before serving again, though: the port is free once the drain
+begins, so a `serve` that starts during it is running when these pools are closed, and a
+connection it still holds `drain_seconds` later is closed under it. PormG's own `atexit` hook still closes every pool when the process exits; this is
+for closing them at `terminate`, which is earlier, or not the end of the process at all.
+
+Requires `using PormG`; without the extension loaded this is a `MethodError`, exactly like
+`pormg_nitro_worker`. This docstring is the only one for this function.
+
+## Example
+```julia
+using Nitro, PormG
+PormG.Configuration.load_many(["db", "db_audit"]; root, env)
+
+app = App(mod = @__MODULE__)
+serve(app; middleware = [pormg_nitro_pools(keys = ["db", "db_audit"])])
+# terminate(app) -> close_pool!("db_audit"), then close_pool!("db")
+```
+"""
+function pormg_nitro_pools end
 
 # `Nitro.newapp(name; pormg = true)`'s PormG half (#417), documented on `newapp` in
 # `src/newapp.jl`. `NitroPormGExt` gives it its one method: it writes the app through the callback

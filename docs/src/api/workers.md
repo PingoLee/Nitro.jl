@@ -23,6 +23,7 @@ Nitro.Workers.DEFAULT_QUEUE_NAME
 Nitro.Errors.WorkerUnavailableError
 Nitro.Errors.WorkerCapacityError
 Nitro.pormg_nitro_worker
+Nitro.pormg_nitro_pools
 ```
 
 ## Submitting Tasks
