@@ -212,20 +212,31 @@ using Test
 #   baseline unmoved. The test env had moved to HTTP 2.13.3 / URIs 1.7.3. The same step
 #   appeared twice on 2026-10-28 with the older versions.
 #
-# Whether that one is the thunk too is NOT established. `url`'s thunk has the same types as
-# `dict_int`'s, which did not move, so a thunk-only step there is hard to explain. The shape's
-# own path is the other suspect: `url()` escapes through `HTTP.escapeuri`, which is URIs code.
-# The coverage leg is also the one place the probe child loads an image that `Pkg.test` did not
-# build in that run: the parent precompiles only the coverage configuration, and the child runs
-# with `--code-coverage=none`.
+# So the probe compiles `go` before the request and prints the two times, and the CI lines
+# settled it: the step is the thunk. In both `url` reds on ubuntu at 1 thread, `caller_s` was
+# 0.045–0.046 s against the baseline's 0.009 s, and the request itself, `url()` included, took
+# 7–8 ms. `multipart` went red the same way on windows at 1 thread, with `formdata` and
+# `files_ext` beside it under their limits: `caller_s` 0.057–0.059 s against 0.013 s, and
+# ~6 ms of request. The thunks have the baseline's types and the probe's setup logs no
+# invalidations, so the extra compile is the depot's pkgimage state, not a path an
+# application pays. It reproduced locally and went away with no source change.
 #
-# So the probe compiles `go` before the request and prints the two times. `shape_s` is still
-# their SUM, so every ratio and limit above means what it meant. `caller_s` on the `warmth:`
-# line says whether a slow reading's time went into the probe's own thunk or into the shape. A
-# red whose excess sits in `caller_s` is the probe; one whose excess sits in `shape_s - caller_s`
-# is a cold path in the workload. Taking the thunk out of the timed quantity would remove the
-# first kind, but it moves every ratio (it shrinks the baseline by about a third on ubuntu at 1
-# thread, 10–17% on the other legs), so it waits for the CI lines to recalibrate against.
+# ── Every shape is charged the baseline's caller (#710) ───────────────────────────────────
+#
+# A shape's ratio is `(shape_s - caller_s + baseline caller_s) / baseline_s`: its own request,
+# plus the thunk compile the baseline paid. Where the two thunk compiles are the same size,
+# which is nearly always, the ratio is the old sum's, so the limits keep their calibration. A thunk-compile step no longer reaches the ratio. A cold shape still does,
+# because its compiles are in the request half (`internalrequest` is inferred only as far as
+# `setupmiddleware(...)`, typed `::Function`; see the probe).
+#
+# Dividing own time by own time was the other option, and it is wrong for this test.
+# Subtracting a constant from both sides inflates every ratio above 1. On the 306 shape
+# readings the CI legs logged on 2026-10-30, `json_ext` would read up to 9.6x and `query_ext`
+# 8.1x against 8. The charged form reads them at 6.7x and 5.7x. Wherever a shape's caller is
+# within 3 ms of the baseline's, the charged form is within 0.07 of the sum. All four sum
+# reds that day read 0.4–0.9x charged.
+# `ratio_sum` on the `warmth:` line keeps the old quantity visible, and `caller_s` keeps a
+# thunk step visible, even though neither can fail the test any more.
 #
 # This is a `:slow` item — it spawns one Julia process per measurement. `--skip-tags slow`
 # drops it.
@@ -306,9 +317,12 @@ try
 
     @testset "$shape stays warm" for ((shape, limit), s) in zip(SHAPES, samples)
         s isa CapturedException && throw(s)
-        ratio = s.total / baseline
+        # Charged the baseline's thunk compile, not its own (see "Every shape is charged the
+        # baseline's caller" above).
+        ratio = (s.total - s.caller + base.caller) / baseline
         warmth("ratio shape=$shape ratio=$(round(ratio; digits = 2)) shape_s=$(fmt(s.total)) " *
-               "baseline_s=$(fmt(baseline)) limit=$limit caller_s=$(fmt(s.caller))")
+               "baseline_s=$(fmt(baseline)) limit=$limit caller_s=$(fmt(s.caller)) " *
+               "ratio_sum=$(round(s.total / baseline; digits = 2))")
         @test ratio < limit
     end
 finally
