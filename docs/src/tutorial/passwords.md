@@ -158,6 +158,8 @@ password_needs_upgrade(old_hash; min_iterations=720_000)  # true
 A typical pattern in a login handler:
 
 ```julia
+const app = App(mod = @__MODULE__)
+
 jwt_secret = get(ENV, "JWT_SECRET", nothing)
 isnothing(jwt_secret) && error("JWT_SECRET must be set")
 
@@ -180,7 +182,7 @@ function login(req::HTTP.Request)
     return Res.json(Dict("token" => token))
 end
 
-urlpatterns("",
+urlpatterns(app, "",
     path("/api/login", login, method="POST"),
 )
 ```

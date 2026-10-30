@@ -292,12 +292,14 @@ The rules:
 using Nitro
 using Nitro.Auth
 
+const app = App(mod = @__MODULE__)
+
 jwt_secret = get(ENV, "JWT_SECRET", nothing)
 isnothing(jwt_secret) && error("JWT_SECRET must be set")
 
 validator = jwt_validator(jwt_secret)
 
-urlpatterns("",
+urlpatterns(app, "",
     path("/profile", profile, method="GET", middleware=[BearerAuth(validator)]),
 )
 ```
@@ -626,7 +628,7 @@ access  = encode_jwt(Dict("sub" => user.id, "token_use" => "access"),  secret; e
 refresh = encode_jwt(Dict("sub" => user.id, "token_use" => "refresh"), secret; expires_in=60*60*24*14)
 
 # The refresh endpoint accepts ONLY the refresh token — a stolen access token cannot mint more.
-urlpatterns("",
+urlpatterns(app, "",
     path("/auth/refresh", refresh_handler, method="POST", middleware=[
         BearerAuth(validator),
         GuardMiddleware(claim_required("token_use", "refresh")),
@@ -661,7 +663,7 @@ scope) claim and often no `sub`. Authentication works unchanged; authorization i
 guard:
 
 ```julia
-urlpatterns("",
+urlpatterns(app, "",
     path("/reports/generate", generate_report, method="POST", middleware=[
         BearerAuth(jwt_validator(jwt_secret)),
         GuardMiddleware(claim_required("action", "reports:generate")),
@@ -676,7 +678,7 @@ allowed key, for that route, *is* the authorization (the same per-route pattern 
 ```julia
 validator = jwt_validator(keyset; identity_from=:kid)
 
-urlpatterns("",
+urlpatterns(app, "",
     # only tokens verified against these key ids may reach this route
     path("/sync", sync_handler, method="POST", middleware=[
         BearerAuth(validator),

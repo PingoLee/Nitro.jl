@@ -71,17 +71,17 @@ using HTTP
 using Nitro
 using UUIDs
 
+const app = App(mod = @__MODULE__)
+
 function get_user(req::HTTP.Request, id::Int)
     return Res.json(Dict("id" => id))
 end
 
-function urlpatterns()
-    return [
-        path("/users/<int:id>", get_user, method="GET", name="user-detail"),
-    ]
-end
+urlpatterns(app, "",
+    path("/users/<int:id>", get_user, method="GET", name="user-detail"),
+)
 
-user_path = url("user-detail"; id=42)
+user_path = url(app, "user-detail"; id=42)
 # "/users/42"
 ```
 
@@ -90,10 +90,10 @@ Nitro substitutes the `{param}` placeholders from the registered route pattern, 
 It also raises one for a value the route itself would not accept, the way Django's `reverse()` does:
 
 - `""`, `"."` or `".."` for any parameter. None of these is a path segment. An empty value at the start of `/{org}/{page}` would build `//evil.example`, which browsers read as a link to another host, so an open redirect once it reaches `Res.redirect`.
-- For a converter parameter, a value that does not parse as the converter's type: `url("user-detail"; id="abc")` throws, and `id=42` and `id="42"` both build `/users/42`.
+- For a converter parameter, a value that does not parse as the converter's type: `url(app, "user-detail"; id="abc")` throws, and `id=42` and `id="42"` both build `/users/42`.
 
 ```julia
-url("user-detail"; id="abc")   # ArgumentError: ... does not match its Int converter
+url(app, "user-detail"; id="abc")   # ArgumentError: ... does not match its Int converter
 ```
 
 ## Using brackets `{name}`
@@ -450,13 +450,15 @@ In the application entry point, pass the routes and config to Nitro:
 
 ```julia
 # src/BI.jl / main.jl
+const app = App(mod = @__MODULE__)
+
 function start_server(env::String = "development")
     config = load_config(env)
 
     # Register all routes
-    Nitro.urlpatterns("", Routes.urlpatterns(config))
+    Nitro.urlpatterns(app, "", Routes.urlpatterns(config))
 
-    serve(
+    serve(app;
         host       = config.server[:host],
         port       = config.server[:port],
         context    = config,          # read it with getcontext(req) in middleware

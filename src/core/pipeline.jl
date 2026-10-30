@@ -80,10 +80,10 @@ The guard is `(router, method, target)` — every input `gethandler` reads — a
   `(r::Router)(req)` plus the `Allow` header (#281). Correct because no route middleware of
   *this* router was chosen for the request: the table was empty, the lookup missed, or the stash
   belongs to another `App`.
-- **Same router, but `method` or `target` changed** — router- or route-level middleware rerouted
-  the request after `compose` chose its chain. [`_route_rerouted`](@ref) decides whether the new
-  leaf may run under the chain that already ran (#291). This used to take the fallback above,
-  which ran the new leaf's handler without its guards.
+- **Same router, but `method` or `target` changed** — group-, router- or route-level middleware
+  rerouted the request after `compose` chose its chain. [`_route_rerouted`](@ref) decides
+  whether the new leaf may run under the chain that already ran (#291). This used to take the
+  fallback above, which ran the new leaf's handler without its guards.
 
 `r` doubles as the identity the stash is checked against, so this function needs nothing else
 to know which application it belongs to. `misses` is that application's `not_found` and
@@ -110,16 +110,21 @@ end
 """
     _route_rerouted(r, misses, req, res) -> response
 
-The terminal for a request that router- or route-level middleware rewrote (`req.method` or
-`req.target`) after `compose` chose its chain from `res` (#291).
+The terminal for a request that group-, router- or route-level middleware rewrote
+(`req.method` or `req.target`) after `compose` chose its chain from `res` (#291).
 
 The chain that already ran is the stashed route's. The rewritten request is resolved again, and
-its leaf is served only if that chain covers the leaf's router and route middleware:
+its leaf is served only if that chain covers the leaf's group, router and route middleware:
 
 - the leaf's `custommiddleware` entry is the very entry the running chain was built from — the
-  same route, a `HEAD` rewritten onto its own `GET`, or two routes under one
-  `router(...; middleware)` when neither adds route middleware of its own; or
-- the leaf has no entry at all: no router or route middleware to skip.
+  same route, or a `HEAD` rewritten onto its own `GET`; or
+- the leaf has no entry at all: no group, router or route middleware to skip.
+
+Two routes of one `include_routes(...; middleware)` group do **not** share an entry: each route
+gets its own copy of the group's list (`_group_middleware`, src/routing.jl), so a rewrite from
+one onto the other is refused like any other. Only the HOF layer, two routes under one
+`router(...; middleware)` (src/routerhof.jl) with no route middleware of their own, shares one
+entry and is served.
 
 A miss or a method mismatch is answered exactly as [`_route_unresolved`](@ref) answers it; no
 handler runs. Anything else is refused with a `500` and an `@error`. Serving it would run a
@@ -149,7 +154,7 @@ function _route_rerouted(r::HTTP.Router, misses::Types.MissResponses, req::HTTP.
     needs = get(Types.snapshot(res.pipeline.source), RouterHOF.genkey(mw_method, route), nothing)
     (needs === nothing || needs === ran) && return _route_call(req, handler, route, params, fmt)
 
-    @error "A router- or route-level middleware rerouted the request to a route with different middleware; refusing it. Rewrite req.method/req.target in global middleware (serve(middleware = [...])) instead, so the route is chosen after the rewrite." from = "$(res.mw_method) $(res.route)" to = "$(mw_method) $(route)"
+    @error "A group-, router- or route-level middleware rerouted the request to a route with different middleware; refusing it. Rewrite req.method/req.target in global middleware (serve(app; middleware = [...])) instead, so the route is chosen after the rewrite." from = "$(res.mw_method) $(res.route)" to = "$(mw_method) $(route)"
     return Res.json(("message" => "500: Internal Server Error"), status = 500)
 end
 

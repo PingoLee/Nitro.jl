@@ -7,29 +7,31 @@ Cookies are fundamental for maintaining state in web applications. Nitro provide
 ```julia
 using Nitro
 
+const app = App(mod = @__MODULE__)
+
 # The key comes from the environment, never from source, and must be at least 32 random
 # bytes. Generate one once: julia -e 'using Nitro; println(bytes2hex(Nitro.Crypto.secure_random_bytes(32)))'
-configcookies(secret_key = SecretString(ENV["COOKIE_SECRET"]))
+configcookies(app; secret_key = SecretString(ENV["COOKIE_SECRET"]))
 
 # 1. Set a cookie — encrypted, because a key is configured
 function save_theme(req)
     res = Res.send("Theme saved")
-    set_cookie!(res, "theme", get(getquery(req), "theme", "light"), maxage=30 * 24 * 3600)
+    set_cookie!(app, res, "theme", get(getquery(req), "theme", "light"), maxage=30 * 24 * 3600)
     return res
 end
 
 # 2. Read it back — decrypted. A cookie that does not open reads as the default.
 function preferences(req)
-    theme = get_cookie(req, "theme", "light")
+    theme = get_cookie(app, req, "theme", "light")
     return Res.json(Dict("theme" => theme))
 end
 
-urlpatterns("",
+urlpatterns(app, "",
     path("/theme", save_theme, method="POST"),
     path("/preferences", preferences, method="GET"),
 )
 
-serve()
+serve(app)
 ```
 
 !!! warning "Do not keep who the user is in a cookie"
@@ -48,11 +50,12 @@ serve()
 To set a cookie, use the `set_cookie!` function on an `HTTP.Response` object.
 
 ```julia
-set_cookie!(response, name, value; kwargs...)
+set_cookie!(app, response, name, value; kwargs...)
 ```
 
 | Argument | Description | Default |
 |---|---|---|
+| `app` | The application whose cookie defaults apply | Required |
 | `response` | The `HTTP.Response` object to modify | Required |
 | `name` | Name of the cookie (String) | Required |
 | `value` | Value to store (String, Int, Bool) | Required |
@@ -65,10 +68,10 @@ set_cookie!(response, name, value; kwargs...)
 res = Res.send("Cookie set")
 
 # Simple value, readable by JavaScript
-set_cookie!(res, "theme", "dark", httponly=false, encrypted=false)
+set_cookie!(app, res, "theme", "dark", httponly=false, encrypted=false)
 
 # Encrypted value
-set_cookie!(res, "cart", "item-17,item-42", encrypted=true, maxage=86400)
+set_cookie!(app, res, "cart", "item-17,item-42", encrypted=true, maxage=86400)
 ```
 
 ### Reading Cookies
@@ -76,7 +79,7 @@ set_cookie!(res, "cart", "item-17,item-42", encrypted=true, maxage=86400)
 To read a cookie, use `get_cookie` with the `HTTP.Request`.
 
 ```julia
-value = get_cookie(request, name, default=nothing; encrypted)
+value = get_cookie(app, request, name, default=nothing; encrypted)
 ```
 
 `encrypted` defaults to whether a `secret_key` is configured. An encrypted value is bound to the
@@ -87,13 +90,13 @@ sealed under another key or for another cookie) reads as `default`. See
 **Examples:**
 ```julia
 # Get raw string
-theme = get_cookie(req, "theme", "light"; encrypted=false)
+theme = get_cookie(app, req, "theme", "light"; encrypted=false)
 
 # Get encrypted value (automatically decrypts)
-cart = get_cookie(req, "cart"; encrypted=true)
+cart = get_cookie(app, req, "cart"; encrypted=true)
 
 # Get with type conversion
-count = get_cookie(req, "counter", 0) # returns Int
+count = get_cookie(app, req, "counter", 0) # returns Int
 ```
 
 ### Removing Cookies (Logout)
@@ -105,12 +108,12 @@ function clear_cart(req)
     res = Res.send("Cart cleared")
 
     # Overwrite the cookie with empty data and immediate expiration
-    set_cookie!(res, "cart", "", maxage=0)
+    set_cookie!(app, res, "cart", "", maxage=0)
 
     return res
 end
 
-urlpatterns("",
+urlpatterns(app, "",
     path("/cart/clear", clear_cart, method="POST"),
 )
 ```

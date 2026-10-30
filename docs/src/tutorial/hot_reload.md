@@ -24,15 +24,17 @@ using Revise
 using Nitro
 using HTTP
 
+const app = App(mod = @__MODULE__)
+
 function health(req::HTTP.Request)
     return Res.json(Dict("ok" => true))
 end
 
-urlpatterns("",
+urlpatterns(app, "",
     path("/health", health, method="GET"),
 )
 
-serve(revise=:lazy)
+serve(app; revise=:lazy)
 ```
 
 This does two things:
@@ -49,7 +51,7 @@ Nitro supports three values for the `revise` keyword.
 Disables hot reload.
 
 ```julia
-serve(revise=:none)
+serve(app; revise=:none)
 ```
 
 This is the default behavior.
@@ -59,7 +61,7 @@ This is the default behavior.
 Checks for revisions before handling each request.
 
 ```julia
-serve(revise=:lazy)
+serve(app; revise=:lazy)
 ```
 
 This is usually the easiest development mode to reason about.
@@ -69,7 +71,7 @@ This is usually the easiest development mode to reason about.
 Waits for revision notifications and applies them in the background.
 
 ```julia
-serve(revise=:eager)
+serve(app; revise=:eager)
 ```
 
 Use this if you prefer code changes to be revised as soon as they are detected.
@@ -83,8 +85,8 @@ server. That relies on the REPL: in a REPL, Julia hands a press that lands nowhe
 task running `serve`. Outside a REPL there is no such handoff, so see the note on Ctrl-C in the
 `serve` docstring.
 
-`terminate()` also stops the watcher, so after a `serve(revise = :eager)` is restarted in the same
-session, the next save reaches the new watcher instead of the stopped one.
+`terminate(app)` also stops the watcher, so after a `serve(app; revise = :eager)` is restarted in
+the same session, the next save reaches the new watcher instead of the stopped one.
 
 ## Production Setup
 
@@ -93,7 +95,9 @@ Production should not load `Revise`.
 ```julia
 using Nitro
 
-serve()
+const app = App(mod = @__MODULE__)
+
+serve(app)
 ```
 
 That keeps the production process simpler and avoids loading any hot-reload machinery.
@@ -102,7 +106,7 @@ That keeps the production process simpler and avoids loading any hot-reload mach
 
 Many Nitro applications are packaged as a Julia module instead of a single script. Your `BI.jl` layout is a good example of that pattern.
 
-In that setup, the end user usually does not call `serve(...)` directly. They call a package function such as `start_server(...)`.
+In that setup, the end user usually does not call `serve(app; ...)` directly. They call a package function such as `start_server(...)`.
 
 For hot reload to be usable there, the package wrapper should expose a `revise` keyword and pass it through to Nitro.
 
@@ -113,9 +117,11 @@ module MyApp
 
 using Nitro
 
+const app = App(mod = @__MODULE__)
+
 function start_server(; revise=:none, async=false)
     # app bootstrap here
-    serve(; revise=revise, async=async)
+    serve(app; revise=revise, async=async)
 end
 
 end
@@ -147,8 +153,10 @@ If your app module contains:
 ```julia
 using Nitro
 
+const app = App(mod = @__MODULE__)
+
 function start_server(...)
-    serve(...)
+    serve(app; ...)
 end
 ```
 
@@ -158,7 +166,7 @@ For example, change:
 
 ```julia
 function start_server(env::String=current_env(); async=false)
-    serve(; async=async)
+    serve(app; async=async)
 end
 ```
 
@@ -169,7 +177,7 @@ to:
 
 ```julia
 function start_server(env::String=current_env(); async=false, revise=:none)
-    serve(; async=async, revise=revise)
+    serve(app; async=async, revise=revise)
 end
 ```
 
@@ -212,7 +220,7 @@ Check the following:
 
 1. `Revise` is installed in the active Julia environment.
 2. You loaded `Revise` before `Nitro` or your Nitro-based application package.
-3. Your app wrapper passes `revise=:lazy` or `revise=:eager` through to `serve(...)`.
+3. Your app wrapper passes `revise=:lazy` or `revise=:eager` through to `serve(app; ...)`.
 
 ### My package starts Nitro, but hot reload never turns on
 
@@ -227,4 +235,4 @@ No. Production should just start the app without loading `Revise`.
 - `Revise` is optional
 - development loads `Revise` first
 - production does not load `Revise`
-- package-based apps should forward `revise` from their own startup function to `Nitro.serve(...)`
+- package-based apps should forward `revise` from their own startup function to `Nitro.serve(app; ...)`

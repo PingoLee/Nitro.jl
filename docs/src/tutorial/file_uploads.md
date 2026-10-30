@@ -219,14 +219,14 @@ complex validation/import steps, **never process the file directly in the reques
 This blocks the thread and causes client timeouts.
 
 !!! warning "Raise `max_body_bytes` first"
-    `serve()` refuses a request body over **64 MiB** with a `413` before your handler runs, so a
-    100 MB upload is rejected by default and the pattern below never gets a chance to stage it.
-    Raise the ceiling to at least the largest file you accept — `serve(max_body_bytes = 200 *
-    1024 * 1024)` — or pass `max_body_bytes = nothing` when a reverse proxy already caps bodies
-    upstream. Note the whole body is still buffered in memory before staging, so the ceiling you
-    choose is also the memory a single upload can claim.
+    `serve(app)` refuses a request body over **64 MiB** with a `413` before your handler runs, so
+    a 100 MB upload is rejected by default and the pattern below never gets a chance to stage it.
+    Raise the ceiling to at least the largest file you accept — `serve(app; max_body_bytes =
+    200 * 1024 * 1024)` — or pass `max_body_bytes = nothing` when a reverse proxy already caps
+    bodies upstream. Note the whole body is still buffered in memory before staging, so the
+    ceiling you choose is also the memory a single upload can claim.
 
-    The number of *parts* is capped separately: more than `serve(max_fields = …)` parts
+    The number of *parts* is capped separately: more than `serve(app; max_fields = …)` parts
     (default 1000) is a `400`. Raise it for a form that uploads more files than that at once.
 
 Instead, follow this **Stage & Work** pattern:
@@ -242,6 +242,7 @@ module ImportHandlers
 
 using Nitro
 using UUIDs
+import ..app   # the handle your app module defines before it includes the handlers
 
 export submit_import
 
@@ -273,7 +274,7 @@ function submit_import(req, upload::Files{FormFile})
     # Returns the STORED id ("<user_id>::import_<uuid>"), not task_key — stage the
     # file under task_key, but hand the client back what the submit returned.
     task_id = Nitro.Workers.submit_queued_task(
-        Nitro.CONTEXT[],
+        app,
         "import_queue",
         task_key,
         (task) -> MyImportModule.process(staged_path),
@@ -298,16 +299,15 @@ path("/api/import", ImportHandlers.submit_import, method="POST",
      middleware=[GuardMiddleware(login_required())]),
 ```
 
-**Server** — the submit above names `Nitro.CONTEXT[]`, so the worker runtime must be installed
-there, with `import_queue` in its `queues`. The argument-less `worker_startup` does both:
+**Server** — the submit above names `app`, so the worker runtime must be installed there, with
+`import_queue` in its `queues`. `worker_startup(app; …)` does both:
 
 ```julia
-serve(middleware=[worker_startup(queues=["import_queue"])])
+serve(app; middleware = [worker_startup(app; queues = ["import_queue"])])
 ```
 
 Without it the submit is refused with `WorkerUnavailableError`, a `503`: a task call never falls
-back to a runtime the app did not install. With an explicit `App`, pass it in both places instead
-(`worker_startup(app; …)` and `submit_queued_task(app, …)`).
+back to a runtime the app did not install.
 
 ## Sending multipart requests (client side)
 

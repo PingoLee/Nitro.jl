@@ -2179,19 +2179,19 @@ test; the note at that testset says why.)
 **`method`** and **`target`** — `gethandler` matches on both, and both are mutable fields. Since
 #291 `compose` resolves the route *after* global middleware, so a global
 `X-HTTP-Method-Override` or path-alias layer has already run by the time this is written and
-never trips the guard. Only **router-level and route-level** middleware sit between `compose`'s
-lookup and the terminal, so a mismatch here means one of those rewrote the request after its
-chain was chosen. (`PrefixStripMiddleware` and `OriginFormMiddleware` fold outside `compose` too,
-src/core/pipeline.jl.)
+never trips the guard. Only **group-, router- and route-level** middleware sit between
+`compose`'s lookup and the terminal, so a mismatch here means one of those rewrote the request
+after its chain was chosen. (`PrefixStripMiddleware` and `OriginFormMiddleware` fold outside
+`compose` too, src/core/pipeline.jl.)
 
 A mismatch is **not** simply re-resolved, and that is the #291 fix. The chain that already ran
 was chosen for the stashed route; the rewritten request may reach a different leaf whose own
 guards never ran. So the terminal re-resolves and serves the new leaf only when the entry the
 running chain was built from — `genkey(mw_method, route)` in `table` — is exactly what that leaf
-requires, or the leaf has no router or route middleware. Otherwise it refuses with a `500`. See
-`_route_rerouted` (src/core/pipeline.jl). The entry itself is not stashed: that would cost a
-`genkey` string on every matched request, which #250 removed from the cache-hit path, to serve
-a case that is rare by construction.
+requires, or the leaf has no group, router or route middleware. Otherwise it refuses with a
+`500`. See `_route_rerouted` (src/core/pipeline.jl). The entry itself is not stashed: that would
+cost a `genkey` string on every matched request, which #250 removed from the cache-hit path, to
+serve a case that is rare by construction.
 
 What the new leaf requires is read from a **fresh** snapshot of `pipeline.source`, the live
 table, not from `table`. The

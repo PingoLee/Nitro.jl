@@ -4,16 +4,20 @@ Nitro is a Julia web framework built on HTTP.jl.
 
 The public API documented here is:
 
-- `serve()` for starting the server
-- `terminate()` for graceful shutdown — a bounded drain of in-flight requests, tuned with
-  `serve(shutdown_timeout=…)` or `terminate(timeout=…)`
-- `serve(revise=:lazy)` and `serve(revise=:eager)` for optional development hot reload with `Revise.jl`
-- `path()`, `urlpatterns()`, and `include_routes()` for route registration
+- `App(mod = @__MODULE__)` for the application handle, which `urlpatterns`, `serve`, `terminate`,
+  the static mounts and the cookie calls take as their first argument (`path()` and
+  `include_routes()` build values and take none)
+- `serve(app)` for starting the server
+- `terminate(app)` for graceful shutdown — a bounded drain of in-flight requests, tuned with
+  `serve(app; shutdown_timeout=…)` or `terminate(app; timeout=…)`
+- `serve(app; revise=:lazy)` and `serve(app; revise=:eager)` for optional development hot reload
+  with `Revise.jl`
+- `path()`, `urlpatterns(app, …)`, and `include_routes()` for route registration
 - `getparams(req)`, `getquery(req)`, `getjson(req)`, `getform(req)`, `getfiles(req)`,
   `getpost(req)`, `payload(req)`, `getsession(req)`, `getuser(req)`, and `getip(req)` for
   reading the request
-- `serve(context=...)` for typed application configuration
-- `worker_startup(...)` and `Nitro.Workers` for in-process task execution
+- `serve(app; context=...)` for typed application configuration
+- `worker_startup(app; …)` and `Nitro.Workers` for in-process task execution
 - `Nitro.Auth` for JWT, auth cookies, password hashing, and auth validator helpers
 
 ## Minimal Example
@@ -22,15 +26,17 @@ The public API documented here is:
 using HTTP
 using Nitro
 
+const app = App(mod = @__MODULE__)
+
 function greet(req::HTTP.Request)
     return Res.json(Dict("message" => "hello world"))
 end
 
-urlpatterns("",
+urlpatterns(app, "",
     path("/greet", greet, method="GET"),
 )
 
-serve()
+serve(app)
 ```
 
 ## Centralized Routing
@@ -39,6 +45,8 @@ serve()
 using HTTP
 using Nitro
 using UUIDs
+
+const app = App(mod = @__MODULE__)
 
 function list_users(req::HTTP.Request)
     return Res.json(Dict("users" => ["alice", "bob"]))
@@ -58,8 +66,8 @@ api_routes = [
     path("/keys/<uuid:key>", get_key, method="GET"),
 ]
 
-urlpatterns("/api", api_routes)
-serve()
+urlpatterns(app, "/api", api_routes)
+serve(app)
 ```
 
 Supported converters are `<int:name>`, `<str:name>`, `<float:name>`, `<bool:name>`, and `<uuid:name>`.
@@ -68,6 +76,8 @@ Supported converters are `<int:name>`, `<str:name>`, `<float:name>`, `<bool:name
 
 ```julia
 using Nitro
+
+const app = App(mod = @__MODULE__)
 
 function dashboard(req)
     return Res.send("dashboard")
@@ -82,11 +92,11 @@ admin_routes = [
     path("/admin", admin, method="GET"),
 ]
 
-urlpatterns("",
+urlpatterns(app, "",
     include_routes("/panel", admin_routes)...,
 )
 
-serve()
+serve(app)
 ```
 
 ## Request Accessors
@@ -97,6 +107,8 @@ and caches the result, so calling one twice is free and both calls return the sa
 ```julia
 using HTTP
 using Nitro
+
+const app = App(mod = @__MODULE__)
 
 function inspect_request(req::HTTP.Request, id::Int)
     return Res.json(Dict(
@@ -111,11 +123,11 @@ function inspect_request(req::HTTP.Request, id::Int)
     ))
 end
 
-urlpatterns("",
+urlpatterns(app, "",
     path("/items/<int:id>", inspect_request, method="GET"),
 )
 
-serve()
+serve(app)
 ```
 
 For direct handler access, use `getjson(req)`, `getform(req)`, and `payload(req)`. `LazyRequest` remains useful for extractors, but ordinary handlers should usually stay on plain `HTTP.Request`.
@@ -138,6 +150,8 @@ Keep config in the application layer and pass it into Nitro at startup.
 using HTTP
 using Nitro
 
+const app = App(mod = @__MODULE__)
+
 struct AppConfig
     app_name::String
     environment::String
@@ -150,12 +164,12 @@ function config_handler(req::HTTP.Request, ctx::Context{AppConfig})
     ))
 end
 
-urlpatterns("",
+urlpatterns(app, "",
     path("/config", config_handler, method="GET"),
 )
 
 config = AppConfig("nitro-docs", "dev")
-serve(context=config)
+serve(app; context=config)
 ```
 
 Recommended bootstrap pattern:
@@ -163,13 +177,15 @@ Recommended bootstrap pattern:
 1. Load config in the app layer.
 2. Resolve environment variables and secrets.
 3. Build routes and middleware.
-4. Start Nitro with `serve(context=...)`.
+4. Start Nitro with `serve(app; context=...)`.
 
 ## Session Middleware
 
 ```julia
 using HTTP
 using Nitro
+
+const app = App(mod = @__MODULE__)
 
 function login(req::HTTP.Request)
     getsession(req)["user_id"] = 42
@@ -185,14 +201,14 @@ function profile(req::HTTP.Request)
     return Res.json(Dict("user_id" => user_id))
 end
 
-urlpatterns("",
+urlpatterns(app, "",
     path("/login", login, method="POST"),
     path("/profile", profile, method="GET"),
 )
 
 store = MemoryStore()          # in-process sessions; `store` is required
 
-serve(middleware=[
+serve(app; middleware=[
     SessionMiddleware(
         store=store,
         max_age=3600,
