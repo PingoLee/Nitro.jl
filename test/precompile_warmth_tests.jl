@@ -67,6 +67,35 @@ using Test
 # less. `min` throughout rather than the mean: a timing sample is noise ABOVE a floor, never
 # below it, so the minimum is the least-contaminated estimate of each.
 #
+# ── Why the baseline is read twice, and the larger read divides (#766) ────────────────────
+#
+# The floor itself moves, though. #766 is a run on a developer box whose `dict_int` read 0.048 s
+# against 0.080–0.088 s in eleven others on the same box: `multipart` took its usual time and
+# still read 1.37x against 1.2. A
+# minimum guards the denominator from above only, and `MAX_BASELINE_SECONDS` below is from above
+# too. Nothing guarded it from below, and one fast read became the denominator of every ratio in
+# the run, the tightest limits (`multipart` 1.2, `url` 1.8) first. (The `url` reds on ubuntu at
+# 1 thread from 2026-10-29 on look like this and are not: their baseline sat inside its usual
+# 0.021–0.038 s there, and `url`'s own time had moved. That is #710, below.)
+#
+# So `dict_int` is read before the shapes and again after them, best of three each time, and
+# the LARGER of the two minima divides. One fast read at either end can no longer set every
+# ratio; both would have to be fast, and then the runner really was fast. When the two agree,
+# the ratios the `warmth:` lines have recorded do not move. A floor was the other option, and
+# it needs a number no host gives: CI's `dict_int` is not a developer box's, and "1 s is cold"
+# works as a ceiling on every host while no "too fast" does.
+#
+# The price is on the other side, and it is the side the paragraph above calls dangerous: a
+# denominator read HIGH pulls every ratio down. One slow block, at either end, now sets the
+# denominator where before only the single block could. Say the runner slows late in a run,
+# `before` 0.040 s and `after` 0.055 s, and `multipart` regresses to 0.060 s: it reads 1.09
+# against 1.2 and passes, where `before` alone would have read 1.5. That trade was taken on
+# purpose (#766): fast reads have caused false reds, while a false pass from a slow block has
+# not been observed, though it would be silent if it happened. Both reads go on the `warmth:`
+# line, so a run where they disagree is
+# visible either way, and if they are seen to disagree by much, a guard on `after / before`
+# with the ceiling's meaning, "the measurement is untrustworthy", is the next step.
+#
 # ── Why it logs on every run, pass or fail (#610) ─────────────────────────────────────────
 #
 # A pass used to print nothing, so the MARGIN was invisible: nobody knew how close a given
@@ -76,7 +105,9 @@ using Test
 # `warmth:` (`grep 'warmth:'` over a CI job log):
 #
 #   warmth: start os=… julia=… threads=… mem_free=<fraction> …   <- before any measurement
-#   warmth: baseline dict_int_s=… caller_s=…                       <- before its @test
+#   warmth: baseline_before dict_int_s=… caller_s=…              <- the first read, as it lands
+#   warmth: baseline dict_int_s=… caller_s=… limit_s=… dict_int_before_s=… dict_int_after_s=…
+#                                                          <- after both reads, before its @test
 #   warmth: ratio shape=… ratio=… shape_s=… baseline_s=… limit=… caller_s=…
 #                                                                 <- one per shape, before its @test
 #   warmth: end mem_free=…                                        <- after them, even on a throw
@@ -237,16 +268,34 @@ end
 
 warmth("start os=$(Sys.KERNEL) arch=$(Sys.ARCH) julia=$VERSION threads=$(Threads.nthreads()) $(memory())")
 try
-    base = best_of("dict_int", 3)
-    baseline = base.total
-    warmth("baseline dict_int_s=$(fmt(baseline)) caller_s=$(fmt(base.caller)) " *
-           "limit_s=$MAX_BASELINE_SECONDS")
-    @test 0 < baseline < MAX_BASELINE_SECONDS
-
+    # The baseline is read on both sides of the shapes and the LARGER read divides (#766; see
+    # "Why the baseline is read twice" above), so every shape is timed before any ratio exists.
     # Two samples per numerator, not one: the test runner never retries an item, so a single
     # sample makes one GC pause or one moment of CPU steal on a shared runner a hard red.
-    @testset "$shape stays warm" for (shape, limit) in SHAPES
-        s = best_of(shape, 2)
+    before = best_of("dict_int", 3)
+    # Logged at once, so a run the watchdog stops part-way still says what the first read was.
+    warmth("baseline_before dict_int_s=$(fmt(before.total)) caller_s=$(fmt(before.caller))")
+    # A probe that fails (a crash, or its body check catching a broken parser) is kept and
+    # thrown inside its own shape's testset below: it reds that shape, and the others still
+    # run and log.
+    samples = map(SHAPES) do (shape, _)
+        try
+            best_of(shape, 2)
+        catch e
+            e isa InterruptException && rethrow()
+            CapturedException(e, catch_backtrace())
+        end
+    end
+    after = best_of("dict_int", 3)
+    base = before.total >= after.total ? before : after
+    baseline = base.total
+    warmth("baseline dict_int_s=$(fmt(baseline)) caller_s=$(fmt(base.caller)) " *
+           "limit_s=$MAX_BASELINE_SECONDS " *
+           "dict_int_before_s=$(fmt(before.total)) dict_int_after_s=$(fmt(after.total))")
+    @test 0 < baseline < MAX_BASELINE_SECONDS
+
+    @testset "$shape stays warm" for ((shape, limit), s) in zip(SHAPES, samples)
+        s isa CapturedException && throw(s)
         ratio = s.total / baseline
         warmth("ratio shape=$shape ratio=$(round(ratio; digits = 2)) shape_s=$(fmt(s.total)) " *
                "baseline_s=$(fmt(baseline)) limit=$limit caller_s=$(fmt(s.caller))")
