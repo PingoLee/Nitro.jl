@@ -90,12 +90,18 @@ Always type the `req` parameter as `HTTP.Request` and path parameters with their
 
 ## 8. `serve()` and Entry-Point
 
-- **`serve()` is keyword-only.** It takes no positional argument — not a port, and *not* the routes.
-  Route registration is a separate, earlier step:
+- **Examples use the explicit `App` form.** Build the handle once and pass it first to
+  `urlpatterns`, `serve`/`terminate`, `staticfiles`/`spafiles`/`dynamicfiles`, `worker_startup`,
+  `url`, `configcookies` and `set_cookie!`/`get_cookie`. `path()` and `include_routes()` build
+  values and take no app. The argument-less global layer is a convenience CONTRIBUTING asks new
+  code to avoid, so the docs do not teach it, and a page never mixes the two forms.
+- **`serve(app; …)` takes the app as its only positional argument** — never a port, and *not* the
+  routes. Everything else is a keyword. Route registration is a separate, earlier step:
 
 ```julia
-urlpatterns("", routes)   # register (prefix first; "" is root)
-serve()                   # then start — add host=/port=/middleware=/context= as needed
+const app = App(mod = @__MODULE__)
+urlpatterns(app, "", routes)   # register (app first, then the prefix; "" is root)
+serve(app)                     # then start — add host=/port=/middleware=/context= as needed
 ```
 
 - Never write `serve(urlpatterns)` or `serve(routes)`; there is no such method and the example will
