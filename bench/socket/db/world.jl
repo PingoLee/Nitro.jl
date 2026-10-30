@@ -36,10 +36,10 @@ db_sqlite_path() = get(ENV, "DB_SQLITE", joinpath(@__DIR__, "world.sqlite"))
 # its own models (`connect_key`, no `set_models`).
 function db_connect!()
     if DB_BACKEND == "postgres"
-        PormG.Configuration.register_connection(DB_KEY, db_conninfo(); pool_size = DB_POOL)
+        PormG.Configuration.register_connection(DB_KEY, db_conninfo(); pool_size = DB_POOL, env = "bench")
     else
         PormG.Configuration.register_connection(DB_KEY, db_sqlite_path(); adapter = "SQLite",
-                                                pool_size = DB_POOL)
+                                                pool_size = DB_POOL, env = "bench")
     end
     PormG.config[DB_KEY].change_data = true
     model = PormG.Models.Model("world",

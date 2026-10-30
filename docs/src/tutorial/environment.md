@@ -71,9 +71,26 @@ Starting server at http://127.0.0.1:8080
 
 ## Bridging to PormG
 
-With `PormG` loaded, Nitro publishes the environment you set in `NITRO_ENV` (or `GENIE_ENV`) to
-`ENV["PORMG_ENV"]`, which is the variable PormG's own configuration loader consults. That means
-a PormG app needs **no** `env=`:
+**Name the environment at the `load` call.** Outside an interactive session PormG refuses a
+`load`, `load_many` or `register_connection` that names no environment, rather than guess one: a
+service, a script, a test run and a precompile worker are all outside one. Name it as the app
+`Nitro.newapp` writes does:
+
+```julia
+# In your package's main(), as Nitro.newapp writes it
+env = something(sync_pormg_env!(), current_env())
+PormG.Configuration.load_many(["db"]; root = pkgdir(@__MODULE__), env)
+```
+
+That is a `PORMG_ENV` the deployment set, else `NITRO_ENV` (or `GENIE_ENV`), which
+[`sync_pormg_env!`](@ref) publishes as `PORMG_ENV` and returns, else `current_env()`'s `"dev"`.
+So `connection.yml` needs a block for every environment you run in, a `prod:` block for
+`NITRO_ENV=prod`, and its `default_env:` is not read. Without a `PORMG_ENV` of its own, PormG
+then uses the environment the startup banner reports.
+
+With `PormG` loaded, Nitro also publishes the environment you set in `NITRO_ENV` (or
+`GENIE_ENV`) to `ENV["PORMG_ENV"]`, the variable PormG's loader consults, so a `load` with no
+`env=` gets it too, when it is set:
 
 ```julia
 using Nitro, PormG
@@ -85,7 +102,7 @@ PormG.Configuration.load_many(["db"])
 It is a **default, never a force**. PormG's precedence is unchanged:
 
 ```
-env= kwarg  >  ENV["PORMG_ENV"]  >  default_env: in connection.yml  >  "dev"
+env= kwarg  >  ENV["PORMG_ENV"]  >  in a REPL only: default_env: in connection.yml, else "dev"
 ```
 
 so both of these still win over the bridge:
@@ -97,20 +114,14 @@ PormG.Configuration.load("db"; env = "test")   # explicit kwarg -- always wins
 
 **Only an environment you set is published.** With neither `NITRO_ENV` nor `GENIE_ENV` set,
 `current_env()` reports `"dev"`, but that is Nitro's fallback, not a choice, so the bridge
-writes nothing. PormG then resolves its own environment, and a `default_env:` in
-`connection.yml` decides. Publishing the fallback would put `"dev"` at the `PORMG_ENV` level,
-above `default_env:`, and a server relying on `default_env: prod` would silently connect to its
-dev database.
+writes nothing, and a `load` with no `env=` is left to PormG. The `current_env()` behind
+`something(sync_pormg_env!(), …)` is how you choose that fallback for PormG too.
 
-| `NITRO_ENV` / `GENIE_ENV` | `PORMG_ENV` before `using PormG` | PormG connects with |
+| `NITRO_ENV` / `GENIE_ENV` | `PORMG_ENV` before `using PormG` | a `load` with no `env=` uses |
 |---|---|---|
 | set, e.g. `prod` | unset or blank | `prod`, published by the bridge |
 | set | set, e.g. `test` | `test`: yours survives |
-| neither set | unset or blank | `default_env:` from `connection.yml`, else `"dev"` |
-
-In that last row the banner still says `Environment: dev` while PormG may be on `prod`.
-`current_env()` never gates anything, so nothing behaves differently because of it. Set
-`NITRO_ENV` wherever the process is launched, and both will agree.
+| neither set | unset or blank | in a REPL, `default_env:` from `connection.yml`, else `"dev"`; anywhere else PormG refuses it |
 
 !!! warning "Set `NITRO_ENV` before `using`"
     Nitro seeds `ENV["PORMG_ENV"]` once, when the PormG extension loads — that is, at
@@ -118,10 +129,9 @@ In that last row the banner still says `Environment: dev` while PormG may be on 
     returns, but `PORMG_ENV` keeps the value it was seeded with, or stays unset.
 
     The seed is also skipped during **precompilation**, deliberately: a compile worker must
-    not mutate the process environment. So a package that calls `PormG.Configuration.load*`
-    from a module body or a `@compile_workload` resolves its environment through PormG's own
-    chain at precompile time, and through the bridge at run time. Load configuration from
-    `__init__` or later, not from a module body.
+    not mutate the process environment. Load configuration at run time, from `main()` as the
+    generated app does, not from a module body: a module body runs only at precompile time,
+    where PormG's configuration does not survive into the session.
 
     This is the same rule as `RAILS_ENV`, `MIX_ENV` and `NODE_ENV`: the environment is a
     property of the process, decided before it starts, not during. If you must change it

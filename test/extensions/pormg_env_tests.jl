@@ -158,12 +158,49 @@ end
         # ...but an explicit `env=` at the call site still wins over everything.
         @test PormG.Configuration._effective_env("test", nothing) == "test"
     end
-    # With no environment set, a file-level `default_env:` decides again (#331) -- the case
-    # the bridge used to override with Nitro's "dev" fallback.
+    # With no environment set the bridge publishes nothing (#331), so PormG's own rule applies.
+    # In a REPL (`fallback = true`) that is the file's `default_env:`, else "dev" -- the case the
+    # bridge used to override with Nitro's "dev" fallback. Everywhere else, which is what `load`
+    # passes outside an interactive session since PormG 0.9 (PormG #1228), it is a refusal
+    # naming the `env=` to add: why the generated boot names one, with
+    # `env = something(sync_pormg_env!(), current_env())` (#790).
     withenv("NITRO_ENV" => nothing, "GENIE_ENV" => nothing, "PORMG_ENV" => nothing) do
         Nitro.sync_pormg_env!()
         @test PormG.Configuration._effective_env(nothing, "prod") == "prod"
         @test PormG.Configuration._effective_env(nothing, nothing) == "dev"
+        @test_throws PormG.InvalidConfigurationError PormG.Configuration._effective_env(
+            nothing, "prod"; fallback = false)
+        @test PormG.Configuration._effective_env(Nitro.current_env(), "prod"; fallback = false) ==
+              "dev"
+    end
+    # With `NITRO_ENV` set, the bridged value satisfies the service rule as well.
+    withenv("NITRO_ENV" => "prod", "GENIE_ENV" => nothing, "PORMG_ENV" => nothing) do
+        Nitro.sync_pormg_env!()
+        @test PormG.Configuration._effective_env(nothing, "dev"; fallback = false) == "prod"
+    end
+end
+
+@testset "the generated boot's environment keeps a deployment's PORMG_ENV (#790)" begin
+    # `Nitro.newapp` passes `env = something(sync_pormg_env!(), current_env())`. A bare
+    # `current_env()` would outrank a `PORMG_ENV` the deployment exported -- with `NITRO_ENV`
+    # unset, a box on `PORMG_ENV=prod` would load `dev`, the wrong-database class #331 fixed --
+    # and would make a block Nitro has no name for (`staging:`) unreachable.
+    boot_env() = something(Nitro.sync_pormg_env!(), Nitro.current_env())
+    cases = [
+        (nitro = nothing, pormg = nothing,   want = "dev"),      # nothing chosen: Nitro's fallback
+        (nitro = "prod",  pormg = nothing,   want = "prod"),     # NITRO_ENV, published by the bridge
+        (nitro = nothing, pormg = "prod",    want = "prod"),     # the deployment's PORMG_ENV survives
+        (nitro = nothing, pormg = "staging", want = "staging"),  # ...including one Nitro cannot name
+        (nitro = "prod",  pormg = "test",    want = "test"),     # a default, never a force
+        (nitro = "prod",  pormg = "  ",      want = "prod"),     # blank is unset
+        (nitro = nothing, pormg = "",        want = "dev"),
+    ]
+    for c in cases
+        withenv("NITRO_ENV" => c.nitro, "GENIE_ENV" => nothing, "PORMG_ENV" => c.pormg) do
+            @test boot_env() == c.want
+            # ...and PormG's service rule (no REPL fallback) resolves the named value as is.
+            @test PormG.Configuration._effective_env(boot_env(), "dev"; fallback = false) == c.want
+        end
     end
 end
 

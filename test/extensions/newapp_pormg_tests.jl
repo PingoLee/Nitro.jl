@@ -35,13 +35,20 @@ end
 
 src = read(joinpath(root, "src", "MyApp.jl"), String)
 
-@testset "the boot connects in main(), never in the module body" begin
+@testset "the boot loads and binds in main(), never in the module body" begin
     body, main = split(src, "\"\"\"\n    main"; limit = 2)
     @test occursin("using Nitro, PormG, SQLite", body)
+    # PormG refuses `@import_models` against a folder no `load` has loaded, outside a REPL
+    # (PormG #1226), and a precompile is never one: the models are included, and bound in main.
     @test !occursin("load_many", body)
-    @test occursin("PormG.Configuration.load_many([\"db\"]; root = pkgdir(@__MODULE__))", main)
+    @test !occursin("@import_models", src)
+    @test occursin("#   include(\"../db/models.jl\")", body)
+    # The environment is named, because PormG refuses a `load` with none outside a REPL (#790):
+    # a set `PORMG_ENV` first, as PormG 0.8 read it, then Nitro's.
+    @test occursin("env = something(sync_pormg_env!(), current_env())", main)
+    @test occursin("PormG.Configuration.load_many([\"db\"]; root = pkgdir(@__MODULE__), env)", main)
+    @test occursin("#   PormG.Models.set_models(models, joinpath(pkgdir(@__MODULE__), \"db\"))", main)
     @test occursin("store = pormg_nitro_worker(db_key = \"db\")", main)
-    @test occursin("sync_pormg_env!()", main)
 end
 
 @testset "Project.toml installs PormG by URL and the driver the adapter needs" begin
@@ -89,4 +96,102 @@ end
     @test m !== nothing
     m === nothing || @test m[1] == src
 end
+end
+
+@testitem "newapp -- a PormG app with models precompiles, binds and serves (#790)" tags=[:extension, :pormg, :slow, :network] setup=[NitroCommon] begin
+using Test
+using Nitro
+
+@eval using PormG
+
+# The rot guard for the PormG half, as `test/newapp_tests.jl` is for the in-memory one. It runs
+# what a user does next: define a model, uncomment the lines the template says to, and load the
+# package -- which precompiles it in a worker that is never a REPL. That is where PormG 0.9
+# refuses `@import_models` against a folder no `load` has loaded (PormG #1226), and where a `load`
+# with no environment is refused (PormG #1228). `NITRO_ENV` and `PORMG_ENV` are unset in the
+# child, so the environment is `current_env()`'s "dev", the one block a SQLite `PormG.setup` writes.
+root = joinpath(mktempdir(), "shop")
+answers = joinpath(mktempdir(), "answers.txt")
+write(answers, "2\n\n\n\nn\n")
+open(answers) do io
+    redirect_stdin(io) do
+        redirect_stdout(devnull) do
+            Nitro.newapp("ShopApp"; path = root)
+        end
+    end
+end
+
+# The model goes INTO the file `PormG.setup` wrote, before its closing `end`, rather than over
+# it: whatever PormG's generator puts there (a registration line, a module name) is loaded too.
+models_file = joinpath(root, "db", "models.jl")
+models_src = read(models_file, String)
+@test occursin(r"^module models$"m, models_src)
+ends = collect(eachmatch(r"^end\b"m, models_src))
+@test !isempty(ends)
+close_at = last(ends).offset
+models_src = models_src[1:prevind(models_src, close_at)] *
+    "Item = Models.Model(\"item\", id = Models.IDField(), " *
+    "name = Models.CharField(max_length = 50))\n\n" * models_src[close_at:end]
+write(models_file, models_src)
+modfile = joinpath(root, "src", "ShopApp.jl")
+src = read(modfile, String)
+for line in ("include(\"../db/models.jl\")", "const appM = models",
+             "PormG.Models.set_models(models, joinpath(pkgdir(@__MODULE__), \"db\"))")
+    @test occursin("#   " * line, src)
+    src = replace(src, "#   " * line => line)
+end
+write(modfile, src)
+
+checkout = pkgdir(Nitro)
+logfile = joinpath(mktempdir(), "child.log")
+# Both children fit inside the runner's 600 s per-item watchdog, so a slow leg fails here, with
+# the child's log, instead of the watchdog killing the whole run.
+function run_child(script; timeout = 280)
+    cmd = addenv(Cmd(`$(Base.julia_cmd()) --project=$root -e $script`; dir = root),
+                 "JULIA_LOAD_PATH" => join(["@", "@stdlib"], Sys.iswindows() ? ';' : ':'),
+                 "JULIA_PROJECT" => nothing, "NITRO_ENV" => nothing, "GENIE_ENV" => nothing,
+                 "PORMG_ENV" => nothing)
+    proc = open(logfile, "a") do log
+        run(pipeline(cmd; stdout = log, stderr = log); wait = false)
+    end
+    if timedwait(() -> process_exited(proc), timeout) === :timed_out
+        kill(proc)
+        wait(proc)
+    end
+    ok = success(proc)
+    ok || println(read(logfile, String))
+    return ok
+end
+
+# As in `test/newapp_tests.jl`: Pkg refuses to `develop` over a `url` source, so drop Nitro's.
+# PormG stays on the `[sources]` commit the template copied from Nitro's own Project.toml.
+@test run_child("""
+    using Pkg
+    p = Pkg.TOML.parsefile("Project.toml")
+    delete!(p["sources"], "Nitro")
+    open(io -> Pkg.TOML.print(io, p), "Project.toml", "w")
+    Pkg.develop(path = $(repr(checkout)))
+    Pkg.instantiate()
+    """)
+
+@test run_child("""
+    using ShopApp, HTTP, Nitro, Sockets
+
+    server = Sockets.listen(Sockets.localhost, 0)
+    port = Int(Sockets.getsockname(server)[2])
+    close(server)
+    ENV["PORT"] = string(port)
+    ENV["API_SECRET_KEY"] = "x"^32    # a placeholder: the boot requires 32 bytes
+    ShopApp.main(; host = "127.0.0.1", async = true, show_banner = false, access_log = nothing)
+    try
+        ShopApp.appM.Item.connect_key == "db" ||
+            error("the models are bound to \$(repr(ShopApp.appM.Item.connect_key)), not \\"db\\"")
+        r = HTTP.get("http://127.0.0.1:\$port/health"; retry = false, status_exception = false)
+        r.status == 200 || error("GET /health answered \$(r.status)")
+    finally
+        terminate(ShopApp.app)
+    end
+    println("bound and served")
+    """)
+@test occursin("bound and served", read(logfile, String))
 end

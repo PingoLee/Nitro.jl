@@ -11,7 +11,10 @@ const app = App(mod = @__MODULE__)
 # from, which is gone at run time. REALAPP_ROOT names the real one; `pkgdir` is the fallback.
 const ROOT = Ref{String}("")
 
-PormG.@import_models "../db/models.jl" models
+# Included, not `@import_models`ed, as the scaffold says: PormG registers models only against a
+# loaded folder (PormG #1226), and loading here would read db/connection.yml into the image.
+# `main` binds them.
+include("../db/models.jl")
 const appM = models
 
 include("Handlers/HealthHandlers.jl")
@@ -26,10 +29,12 @@ Boot the app and serve it. Reads `PORT` (default 8000), `API_SECRET_KEY` and `JW
 at least 32 bytes); keyword arguments go to `serve` (tests pass `async = true`).
 """
 function main(; kwargs...)
-    sync_pormg_env!()  # NITRO_ENV -> PORMG_ENV, only when NITRO_ENV is set
-    # PormG parses db/connection.yml, validates it and connects, from any working directory
+    # PormG reads db/connection.yml, from any working directory, in the environment
+    # `PORMG_ENV` names, else `NITRO_ENV` (or `GENIE_ENV`), else "dev"
     ROOT[] = get(ENV, "REALAPP_ROOT", pkgdir(@__MODULE__))
-    PormG.Configuration.load_many(["db"]; root = ROOT[])
+    env = something(sync_pormg_env!(), current_env())
+    PormG.Configuration.load_many(["db"]; root = ROOT[], env)
+    PormG.Models.set_models(models, joinpath(ROOT[], "db"))
     workers = worker_startup(app; queues = ["reports"], store = pormg_nitro_worker(db_key = "db"))
     session = SessionMiddleware(store = pormg_nitro_session(db_key = "db"), secure = false)
     bearer = BearerAuth(Auth.jwt_validator(SecretString(ENV["JWT_SECRET"])))

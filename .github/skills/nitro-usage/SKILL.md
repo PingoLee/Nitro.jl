@@ -517,11 +517,22 @@ unrecognised value throws at `serve()`. Do not write your own `get(ENV, "APP_ENV
 config = load_config(current_env())      # Nitro resolves the NAME; the app decides what it means
 ```
 
-With PormG loaded, an environment set in `NITRO_ENV`/`GENIE_ENV` is published to
-`ENV["PORMG_ENV"]` as a default, so `PormG.Configuration.load_many(["db"])` needs no `env=`. A
-pre-set `PORMG_ENV` and an explicit `env=` both still win. With neither variable set, the `"dev"`
-fallback is **not** published, so `default_env:` in `connection.yml` decides. Set `NITRO_ENV`
-**before** `using`, as with `RAILS_ENV`/`MIX_ENV`.
+With PormG, **name the environment at the `load` call**: outside a REPL PormG refuses a
+`load`/`load_many`/`register_connection` with none, rather than guess. Name it as the boot
+`Nitro.newapp` writes does — `env = something(sync_pormg_env!(), current_env())`: a set
+`PORMG_ENV`, else `NITRO_ENV`/`GENIE_ENV`, else `"dev"` — and keep a `connection.yml` block for
+each environment you run in (`prod:` for `NITRO_ENV=prod`); `default_env:` is not read. A bare
+`env = current_env()` would silently override a `PORMG_ENV` the deployment set. An environment set in `NITRO_ENV`/`GENIE_ENV` is
+also published to `ENV["PORMG_ENV"]` as a default, so a `load` with no `env=` gets it when it is
+set; the `"dev"` fallback is **not** published. Set `NITRO_ENV` **before** `using`, as with
+`RAILS_ENV`/`MIX_ENV`.
+
+**Load and bind PormG in `main()`, include models in the module body.** `include("../db/models.jl")`
+defines the `models` module; `main()` calls `load_many` and then
+`PormG.Models.set_models(models, joinpath(pkgdir(@__MODULE__), "db"))`. Do not put
+`@import_models` in a package's module body with `load_many` in `main()`: it registers the models
+as it includes them, PormG refuses that before their folder is loaded, and a precompile is never a
+REPL — the package does not precompile.
 
 `current_env()` **reports**; it must never **gate**. Selecting a config file, log verbosity, seed
 data: fine. Deciding whether a cookie gets `Secure`, whether CSRF is enforced, or whether error

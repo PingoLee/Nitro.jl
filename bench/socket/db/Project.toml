@@ -10,4 +10,4 @@ SQLite = "0aa819cd-b072-5ff4-a722-6bc24af294d9"
 
 [sources]
 Nitro = {path = "../../.."}
-PormG = {url = "https://github.com/PingoLee/PormG.jl.git", rev = "6f558894c68046a948e30bad3018a791a5f9898e"}
+PormG = {url = "https://github.com/PingoLee/PormG.jl.git", rev = "5531c68cf482ca0723878bc6c593720a8cbf3502"}

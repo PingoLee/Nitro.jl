@@ -36,7 +36,7 @@ backend == "sqlite" && @eval using PormG, SQLite
 function sqlite_store()
     key = "heartbeat_bench"
     path = joinpath(mktempdir(), "bench.sqlite")
-    PormG.register_connection(key, path; adapter = "SQLite")
+    PormG.register_connection(key, path; adapter = "SQLite", env = "bench")
     PormG.config[key].change_data = true
     PormG.config[key].change_db = true
     return Nitro.pormg_nitro_worker(db_key = key)

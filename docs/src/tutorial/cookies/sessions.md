@@ -293,7 +293,7 @@ For persistent sessions in production:
 using Nitro
 using PormG
 
-PormG.Configuration.load("db")
+PormG.Configuration.load("db"; env = something(sync_pormg_env!(), current_env()))
 
 store = pormg_nitro_session(db_key="db")
 

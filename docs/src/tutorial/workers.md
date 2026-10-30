@@ -1106,7 +1106,7 @@ Configure PormG with the connection key you want workers to use:
 using Nitro
 using PormG
 
-PormG.Configuration.load("workers")
+PormG.Configuration.load("workers"; env = something(sync_pormg_env!(), current_env()))
 ```
 
 The default key is `"db"`. Use a different `db_key` when your worker database uses another PormG connection, for example `db_key="db_bs"`.
