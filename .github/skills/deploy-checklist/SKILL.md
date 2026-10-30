@@ -30,7 +30,13 @@ Read `nitro-config.instructions.md` for config ownership rules before recommendi
       in an executable is printed field by field, secrets included. `serve` sanitizes its own
       errors there, but not the app's start-up code before it. The line keeps an
       `ErrorException`/`ArgumentError` message verbatim, so no secret is interpolated into one.
-      The recipe is in the deployment guide, under *Compiling with juliac*.
+      The recipe is in the deployment guide, under *Compiling with juliac*; an app from
+      `Nitro.newapp` already has it, as `main.jl`.
+- [ ] **A JuliaC executable finds `db/` from `APP_ROOT`** (or is started in the folder that
+      holds it): the generated `main.jl` passes `root = get(ENV, "APP_ROOT", pwd())`, because
+      in an executable `pkgdir` names the temporary build copy, which is gone. Set it in the
+      unit file / Dockerfile, and confirm the image does not carry `db/connection.yml`: the
+      models are included in the module body and loaded only in `main()`.
 - [ ] **`NITRO_ENV` is set on the target box**, to one of `dev` / `prod` / `test`. Unset
       resolves to `dev`, and `serve()` now *rejects* anything outside that set — so a
       `staging` value that used to boot no longer does. Confirm it from the unit file /
@@ -59,8 +65,9 @@ Report missing env vars by name; do not invent secret values.
 
 ## 3. Nitro runtime pipeline
 
-- [ ] Routes registered with `urlpatterns(prefix, routes)` **before** `serve()`; `serve(middleware=[...])`
-      is keyword-only. Pipeline order: global middleware → defaults → router (`nitro-core.instructions.md`).
+- [ ] Routes registered with `urlpatterns(app, prefix, routes)` **before** `serve(app; …)`; the app
+      is `serve`'s only positional argument, everything else (`middleware=[...]`) is a keyword.
+      Pipeline order: global middleware → defaults → router (`nitro-core.instructions.md`).
 - [ ] `SessionMiddleware` / `CSRFMiddleware` present for stateful cookie apps.
 - [ ] `spafiles` or static config matches how the frontend is served in production.
 - [ ] Access logging is privacy-safe. `serve(...; access_log=true)` (default on) logs the

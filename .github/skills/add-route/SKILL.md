@@ -14,7 +14,7 @@ Implementation workflow (not a review). Follow `nitro-core.instructions.md` and 
 
 | Target | Handler location | Route registration |
 |--------|------------------|-------------------|
-| **Nitro.jl package** | `src/` or existing handler modules; often inline in `test/` for behavior tests | `urlpatterns` in the relevant test file or example |
+| **Nitro.jl package** | `src/` or existing handler modules; often inline in `test/` for behavior tests | `urlpatterns(app, …)` on the test's own `App`, in the relevant test file or example |
 | **Application using Nitro** | `src/Handlers/<Domain>Handlers.jl` | `src/Routes.jl` (or `src/Routes/*.jl`) via `path()` / `include_routes()` |
 
 Follow routing and response rules from `nitro-core.instructions.md`.
@@ -35,7 +35,7 @@ path("/api/items/<int:id>", ItemHandlers.get_item, method="GET")
 
 - Use Django converters — the registry has exactly five: `<int:…>`, `<str:…>`, `<float:…>`, `<bool:…>`, `<uuid:…>`.
 - Compose groups with `include_routes("api/", api_routes)` when appropriate.
-- Register with `urlpatterns(prefix, routes)` (prefix required, `""` for root) **before** calling `serve()`.
+- Register with `urlpatterns(app, prefix, routes)` (the app first, then the prefix, `""` for root) **before** calling `serve(app; …)`. `app` is the handle the app's module builds once, `const app = App(mod = @__MODULE__)`; a test builds its own.
 
 ### 3. Guards and middleware
 
@@ -71,7 +71,7 @@ Fix failures before finishing. Report what files were added or changed.
 
 ## Checklist before done
 
-- [ ] `path()` + `urlpatterns(prefix, routes)` only — no macro/function registrars
+- [ ] `path()` + `urlpatterns(app, prefix, routes)` only — no macro/function registrars, no argument-less global form
 - [ ] Handler takes a typed `req` and returns via `Res.*` (raw returns are safe, just less explicit)
 - [ ] Guards applied where needed, via `middleware=[GuardMiddleware(...)]` — not a `guards=` keyword
 - [ ] Tests added and `Pkg.test()` passes

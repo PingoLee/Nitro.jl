@@ -23,12 +23,15 @@ path("/api/products/<int:id>", ProductHandlers.get_product, method="GET")
 Every multi-file example must use the Django-style separation:
 
 ```
+main.jl                # the program: `(@main)` calls MyApp.main() (see bigger_applications.md)
 src/
-├── main.jl            # entry-point: loads routes, calls serve()
+├── MyApp.jl           # the module: `const app = App(mod = @__MODULE__)`, main() registers and serves
 ├── Routes.jl          # all path() declarations
 └── Handlers/
     └── DomainHandlers.jl
 ```
+
+This is the layout `Nitro.newapp` writes; show it, not a variant.
 
 - Handler logic belongs in `src/Handlers/<Domain>Handlers.jl` modules.
 - Route declarations belong exclusively in `src/Routes.jl` (or sub-files under `src/Routes/`).
@@ -49,24 +52,35 @@ Good generic domains: Products, Orders, Users, Drivers, Stores, Items.
 
 ## 4. PormG Model Setup
 
-When showing how to wire PormG into an app, use the `@import_models` + alias pattern:
+When showing how to wire PormG into an app, `include` the models in the module body and load and
+bind them in `main()`, as `Nitro.newapp` writes it:
 
 ```julia
 # src/MyApp.jl — module body: defines code, connects nothing
-PormG.@import_models "../db/automatic_models.jl" automatic_models
-const appM = automatic_models   # handlers import this alias
+include("../db/models.jl")   # defines the `models` module, bound to nothing yet
+const appM = models          # handlers import this alias
 
-function main(; kwargs...)
-    PormG.Configuration.load_many(["db"]; root = pkgdir(@__MODULE__))   # connects at runtime
+function main(; root::AbstractString = pkgdir(@__MODULE__), kwargs...)
+    env = something(sync_pormg_env!(), current_env())
+    PormG.Configuration.load_many(["db"]; root, env)        # reads db/connection.yml at runtime
+    PormG.Models.set_models(models, joinpath(root, "db"))   # binds the models to it
     # … worker_startup, urlpatterns(app, …), serve(app; …)
 end
 ```
 
 - **Never call `load_many`/`load` in a module body.** A package's module body runs at precompile
-  time and never again, so the connection would not exist at runtime. It goes in `main()`, as
-  `Nitro.newapp` writes it — the boot in `bigger_applications.md` is that generated file.
+  time and never again, so the connection would not exist at runtime, and a JuliaC image would
+  carry `connection.yml`'s password. It goes in `main()` — the boot in `bigger_applications.md` is
+  the generated file, pinned by a test.
+- **Never show `@import_models` in a package's module body.** It registers the models as it
+  includes them, PormG 0.9 refuses that before their folder is loaded, and a precompile is never a
+  REPL: the package does not precompile.
+- **Name the environment at the `load`** (`env = something(sync_pormg_env!(), current_env())`):
+  outside a REPL PormG refuses a `load` with none.
+- **`db/` is found from `main`'s `root`.** `main.jl` passes `APP_ROOT`, else the working
+  directory, because a JuliaC executable's `pkgdir` names the folder it was built from.
 - The `db/` directory lives **outside** `src/` alongside the project root.
-- `@import_models` creates a plain Julia module; the `const appM = ...` alias is what handlers use.
+- `include` creates a plain Julia module; the `const appM = ...` alias is what handlers use.
 - Handlers include `import ..appM` and query with `appM.Product |> object`.
 - Never import `PormG` in `src/` of the Nitro **core** itself — only in application code and `ext/NitroPormGExt.jl`.
 
