@@ -24,8 +24,11 @@ yet, or must be an empty directory.
 $ cd myapp
 $ julia --project -e 'using Pkg; Pkg.instantiate()'
 $ export API_SECRET_KEY=$(openssl rand -hex 32)   # at least 32 bytes
-$ julia --project -e 'using MyApp; MyApp.main()'
+$ julia --project main.jl
 ```
+
+`main.jl` is the program: it calls `MyApp.main()` and catches a failed start-up, and it is the
+file a JuliaC build compiles (see *The entry point `newapp` writes* below).
 
 ## Recommended project layout
 
@@ -34,6 +37,7 @@ myapp/
 ├── Project.toml            # Nitro and PormG by URL, plus HTTP and the database driver
 ├── Manifest.toml           # written by the first Pkg.instantiate()
 ├── .gitignore              # excludes db/connection.yml: it holds the database password
+├── main.jl                 # the entry point: `julia --project main.jl`, or a JuliaC build
 ├── db/
 │   ├── connection.yml      # written by PormG.setup
 │   └── models.jl           # your PormG models
@@ -89,11 +93,11 @@ include("Handlers/ProductHandlers.jl")
 include("Handlers/OrderHandlers.jl")
 include("Routes.jl")
 
-function main(; kwargs...)
+function main(; root::AbstractString = pkgdir(@__MODULE__), kwargs...)
     # At runtime: load db/, then bind the models to it.
     env = something(sync_pormg_env!(), current_env())
-    PormG.Configuration.load_many(["db"]; root = pkgdir(@__MODULE__), env)
-    PormG.Models.set_models(models, joinpath(pkgdir(@__MODULE__), "db"))
+    PormG.Configuration.load_many(["db"]; root, env)
+    PormG.Models.set_models(models, joinpath(root, "db"))
     # ...the rest of main() as `newapp` wrote it
 end
 
@@ -258,18 +262,21 @@ include("Handlers/HealthHandlers.jl")
 include("Routes.jl")
 
 """
-    main(; kwargs...)
+    main(; root::AbstractString = pkgdir(@__MODULE__), kwargs...)
 
 Boot the app and serve it. Reads `PORT` (default 8000) and `API_SECRET_KEY` (at least
 32 bytes); keyword arguments go to `serve` (tests pass `async = true`).
+
+`root` is the folder that holds `db/`. `main.jl` passes `APP_ROOT`, else the working
+directory: in a JuliaC executable `pkgdir` names the folder it was built from.
 """
-function main(; kwargs...)
-    # PormG reads db/connection.yml, from any working directory, in the environment
-    # `PORMG_ENV` names, else `NITRO_ENV` (or `GENIE_ENV`), else "dev"
+function main(; root::AbstractString = pkgdir(@__MODULE__), kwargs...)
+    # PormG reads `root`/db/connection.yml in the environment `PORMG_ENV` names,
+    # else `NITRO_ENV` (or `GENIE_ENV`), else "dev"
     env = something(sync_pormg_env!(), current_env())
-    PormG.Configuration.load_many(["db"]; root = pkgdir(@__MODULE__), env)
+    PormG.Configuration.load_many(["db"]; root, env)
     # Once the models are included above, bind them to that connection:
-    #   PormG.Models.set_models(models, joinpath(pkgdir(@__MODULE__), "db"))
+    #   PormG.Models.set_models(models, joinpath(root, "db"))
     workers = worker_startup(app; queues = ["reports"], store = pormg_nitro_worker(db_key = "db"))
     urlpatterns(app, "", Routes.urlpatterns())
     serve(app; port = parse(Int, get(ENV, "PORT", "8000")), middleware = [workers],
@@ -293,11 +300,14 @@ Line by line:
   named, because outside a REPL PormG refuses a `load` with no environment rather than guess one,
   and with it named, `default_env:` in `connection.yml` is not read. Set `NITRO_ENV=prod` in
   production and give `connection.yml` a `prod:` block.
-- `load_many(["db"]; root = pkgdir(@__MODULE__), env)`: PormG parses `db/connection.yml` and
-  validates it; the first query connects. `root` finds `db/` next to the package rather than in
-  the working directory, and the connection key stays `"db"`.
-- `set_models(models, …)` binds the models you included to that connection, once there are any.
-  Until then the line stays commented out.
+- `main(; root = pkgdir(@__MODULE__), …)`: `root` is the folder that holds `db/`. Called from the
+  REPL, it defaults to the package's own directory, so `MyApp.main()` works from any working
+  directory. `main.jl` passes another one, for the reason given under *The entry point `newapp`
+  writes* below.
+- `load_many(["db"]; root, env)`: PormG parses `root/db/connection.yml` and validates it; the
+  first query connects. The connection key stays `"db"`.
+- `set_models(models, joinpath(root, "db"))` binds the models you included to that connection,
+  once there are any. Until then the line stays commented out.
 - `worker_startup(app; …, store = pormg_nitro_worker(db_key = "db"))`: background tasks are
   stored in the database, on the same connection. See [Workers](workers.md).
 - `urlpatterns(app, "", Routes.urlpatterns())` registers the routes. The prefix comes first, and
@@ -314,6 +324,52 @@ serve(app; port = parse(Int, get(ENV, "PORT", "8000")),
       middleware = [workers, SessionMiddleware(store = MemoryStore()), RateLimiter()],
       secret_key = SecretString(ENV["API_SECRET_KEY"]))
 ```
+
+## The entry point `newapp` writes
+
+`main.jl` is the program. `julia --project main.jl` runs it, and it is the file a JuliaC build
+compiles into an executable. The same test pins it to this page:
+
+<!-- newapp:main.jl -->
+```julia
+# The program: `julia --project main.jl` runs it, and a JuliaC build compiles it into an
+# executable. In an executable an exception that escapes `@main` is printed field by field,
+# secrets included, so a failed start-up is caught here and reported without its values.
+using MyApp, Nitro
+
+function (@main)(args::Vector{String})::Cint
+    try
+        # The folder that holds db/. Not `pkgdir`: in a JuliaC executable that is the
+        # temporary copy of the project it was built from, gone by the time it runs.
+        MyApp.main(; root = get(ENV, "APP_ROOT", pwd()))
+    catch e
+        e isa InterruptException && rethrow()
+        # Not `@error "…" exception = e`: a trimmed image cannot show an arbitrary
+        # exception, and an untrimmed one would print its values.
+        println(Core.stderr, "start-up failed: ", Nitro.startup_failure_text(e))
+        return Cint(1)
+    end
+    return Cint(0)
+end
+```
+<!-- /newapp -->
+
+- `(@main)` is what Julia runs after the file is loaded, as a script or as an executable's entry.
+  It returns the exit code.
+- `root = get(ENV, "APP_ROOT", pwd())`: an executable cannot use `pkgdir`. JuliaC builds from a
+  temporary copy of the project and deletes it afterwards, and `pkgdir` (like `@__DIR__`) still
+  names that copy when the executable runs. So the program takes the folder that holds `db/` from
+  `APP_ROOT`, else from the working directory: start it from the app's directory, or set
+  `APP_ROOT`.
+- The `try` covers the whole life of the server, and the `catch` prints one line and exits with
+  `1`. In a compiled executable an exception that escapes `main` is printed field by field, so a
+  password or a key it holds would reach the log.
+  [`Nitro.startup_failure_text`](@ref Nitro.Core.Errors.startup_failure_text) names the exception
+  without its values. `serve` already does this for its own errors, but what `main` runs before it
+  (`load_many`, `worker_startup`, `urlpatterns`) is outside `serve`. Never put a secret into the
+  message of an `error(...)` or an `ArgumentError` you throw at start-up: those messages are
+  printed verbatim. The *Compiling with juliac* section of [Deployment](deployment.md) has the
+  details.
 
 ---
 

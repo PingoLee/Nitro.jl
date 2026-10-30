@@ -51,7 +51,7 @@ end
     root = Nitro.newapp("DemoApp"; path = joinpath(mktempdir(), "demo"), pormg = false)
     files = sort!([replace(relpath(joinpath(d, f), root), '\\' => '/')
                    for (d, _, fs) in walkdir(root) for f in fs])
-    @test files == sort!(["Project.toml", "src/DemoApp.jl", "src/Routes.jl",
+    @test files == sort!(["Project.toml", "main.jl", "src/DemoApp.jl", "src/Routes.jl",
                           "src/Handlers/HealthHandlers.jl", "test/runtests.jl"])
     @test !isdir(joinpath(root, "db"))
 
@@ -66,7 +66,22 @@ end
         @test !occursin(call, body)
     end
     @test occursin("serve(app; port = parse(Int, get(ENV, \"PORT\", \"8000\"))", src)
+    @test occursin("function main(; kwargs...)", src)   # no `root`: there is no db/ to find
     @test Meta.parseall(src) isa Expr   # it is Julia
+
+    # The program (#798): the boot runs inside a `try` whose `catch` prints a value-free line,
+    # because a compiled executable prints an escaping exception field by field.
+    entry = read(joinpath(root, "main.jl"), String)
+    @test occursin("using DemoApp, Nitro", entry)
+    @test occursin("function (@main)(args::Vector{String})::Cint", entry)
+    @test occursin("        DemoApp.main()\n    catch e\n", entry)
+    @test occursin("e isa InterruptException && rethrow()", entry)
+    @test occursin("println(Core.stderr, \"start-up failed: \", Nitro.startup_failure_text(e))",
+                   entry)
+    @test occursin("return Cint(1)", entry)
+    @test !occursin("APP_ROOT", entry)
+    @test !occursin(r"^\s*@error"m, entry) && !occursin("showerror", entry)
+    @test Meta.parseall(entry) isa Expr
 
     project = TOML.parsefile(joinpath(root, "Project.toml"))
     nitro_project = TOML.parsefile(joinpath(pkgdir(Nitro), "Project.toml"))
@@ -183,4 +198,25 @@ end
     println("served")
     """)
 @test occursin("served", read(logfile, String))
+
+# The program (#798). With `API_SECRET_KEY` unset, `main` fails before `serve` is called. The entry
+# prints one value-free line and exits with 1: no fatal dump, no backtrace, and not the
+# `KeyError`'s key, which is what a compiled executable's fatal printer would have written.
+errfile = joinpath(mktempdir(), "entry.err")
+entry = addenv(Cmd(`$(Base.julia_cmd()) --project=$root main.jl`; dir = root),
+               "JULIA_LOAD_PATH" => join(["@", "@stdlib"], Sys.iswindows() ? ';' : ':'),
+               "JULIA_PROJECT" => nothing, "API_SECRET_KEY" => nothing)
+proc = open(errfile, "w") do err
+    run(pipeline(entry; stdout = devnull, stderr = err); wait = false)
+end
+if timedwait(() -> process_exited(proc), 300) === :timed_out
+    kill(proc)
+    wait(proc)
+end
+err = read(errfile, String)
+proc.exitcode == 1 || println(err)
+@test proc.exitcode == 1
+@test occursin(r"^start-up failed: KeyError \(its contents are withheld"m, err)
+@test !occursin("API_SECRET_KEY", err)
+@test !occursin("Stacktrace", err) && !occursin("fatal:", err)
 end

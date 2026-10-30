@@ -19,6 +19,10 @@ Base.@kwdef struct _NewappDB
     usings::String                              # the module's `using` line
     module_body::Vector{String} = String[]      # module-body lines after the `App` const
     boot::Vector{String} = String[]             # `main()` lines before `worker_startup`
+    main_kwargs::String = ""                    # `main`'s keywords before `kwargs...`
+    main_doc::Vector{String} = String[]         # `main`'s docstring lines on those keywords
+    entry_kwargs::String = ""                   # what `main.jl` passes to `main`
+    entry_comment::Vector{String} = String[]    # `main.jl`'s comment lines on those
     store::String                               # the worker-store expression
     deps::Vector{Pair{String,String}} = Pair{String,String}[]      # name => uuid
     sources::Vector{Pair{String,String}} = Pair{String,String}[]   # name => inline table
@@ -55,6 +59,7 @@ not exported: call it qualified, `Nitro.newapp("MyApp")`.
 path/
 ├── Project.toml                 # Nitro and HTTP (and PormG) — installed by URL
 ├── .gitignore                   # pormg = true: excludes db/connection.yml (it holds the password)
+├── main.jl                      # the entry point: `julia --project main.jl`, or a JuliaC build
 ├── db/                          # pormg = true only — written by PormG.setup
 ├── src/
 │   ├── MyApp.jl                 # the module and its main() boot
@@ -75,7 +80,16 @@ With `pormg = true` (the default) `using PormG` must come first. The boot then l
 you include them, and stores worker tasks through
 [`pormg_nitro_worker`](@ref). The models are `include`d in the module body rather than
 `@import_models`ed: PormG registers models only against a folder already loaded, and loading in
-the module body would read `db/connection.yml` while the package precompiles.
+the module body would read `db/connection.yml` while the package precompiles. The folder holding
+`db/` is `main`'s `root` keyword, by default the package's own directory, `pkgdir`.
+
+`main.jl` is the program: `(@main)` calls `main` inside a `try` and, when start-up fails, prints
+one line built by [`Nitro.startup_failure_text`](@ref Nitro.Core.Errors.startup_failure_text) on
+`Core.stderr` and exits with `1`. In a compiled executable an exception that escapes `main` is
+printed field by field, secrets included, so nothing is let out raw. With `pormg = true` it passes
+`root = get(ENV, "APP_ROOT", pwd())`: a JuliaC executable's `pkgdir` names the temporary copy of
+the project it was built from, which is gone at run time, so set `APP_ROOT` to the folder that
+holds `db/`, or start the executable there.
 
 Once Nitro's files are written PormG's own interactive `PormG.setup` asks for the database and
 writes `db/connection.yml`. Answer its questions in the REPL. PormG's database drivers are weak dependencies, so the adapter you choose decides which one
@@ -162,6 +176,7 @@ end
 function _newapp_files(name::String, db::_NewappDB, nitro_rev::String)::Vector{Pair{String,String}}
     files = [
         "Project.toml" => _newapp_project(name, db, nitro_rev),
+        "main.jl" => _newapp_entry(name, db),
         "src/$name.jl" => _newapp_module(name, db),
         "src/Routes.jl" => _NEWAPP_ROUTES,
         "src/Handlers/HealthHandlers.jl" => _NEWAPP_HEALTH,
@@ -285,12 +300,15 @@ function _newapp_module(name::String, db::_NewappDB)
         "include(\"Routes.jl\")",
         "",
         "\"\"\"",
-        "    main(; kwargs...)",
+        "    main(; $(db.main_kwargs)kwargs...)",
         "",
         "Boot the app and serve it. Reads `PORT` (default 8000) and `API_SECRET_KEY` (at least",
         "32 bytes); keyword arguments go to `serve` (tests pass `async = true`).",
+    ])
+    isempty(db.main_doc) || append!(lines, db.main_doc)
+    append!(lines, [
         "\"\"\"",
-        "function main(; kwargs...)",
+        "function main(; $(db.main_kwargs)kwargs...)",
     ])
     append!(lines, ("    " * l for l in db.boot))
     append!(lines, [
@@ -301,6 +319,34 @@ function _newapp_module(name::String, db::_NewappDB)
         "end",
         "",
         "end # module",
+    ])
+    return join(lines, "\n") * "\n"
+end
+
+# `main.jl`, the program. The catch is #798's: before `serve`'s own swap starts (#749, #752), an
+# exception from the boot would reach the runtime's fatal printer, which writes its fields.
+function _newapp_entry(name::String, db::_NewappDB)
+    lines = String[
+        "# The program: `julia --project main.jl` runs it, and a JuliaC build compiles it into an",
+        "# executable. In an executable an exception that escapes `@main` is printed field by field,",
+        "# secrets included, so a failed start-up is caught here and reported without its values.",
+        "using $name, Nitro",
+        "",
+        "function (@main)(args::Vector{String})::Cint",
+        "    try",
+    ]
+    append!(lines, ("        " * l for l in db.entry_comment))
+    append!(lines, [
+        "        $name.main($(isempty(db.entry_kwargs) ? "" : "; " * db.entry_kwargs))",
+        "    catch e",
+        "        e isa InterruptException && rethrow()",
+        "        # Not `@error \"…\" exception = e`: a trimmed image cannot show an arbitrary",
+        "        # exception, and an untrimmed one would print its values.",
+        "        println(Core.stderr, \"start-up failed: \", Nitro.startup_failure_text(e))",
+        "        return Cint(1)",
+        "    end",
+        "    return Cint(0)",
+        "end",
     ])
     return join(lines, "\n") * "\n"
 end

@@ -46,9 +46,28 @@ src = read(joinpath(root, "src", "MyApp.jl"), String)
     # The environment is named, because PormG refuses a `load` with none outside a REPL (#790):
     # a set `PORMG_ENV` first, as PormG 0.8 read it, then Nitro's.
     @test occursin("env = something(sync_pormg_env!(), current_env())", main)
-    @test occursin("PormG.Configuration.load_many([\"db\"]; root = pkgdir(@__MODULE__), env)", main)
-    @test occursin("#   PormG.Models.set_models(models, joinpath(pkgdir(@__MODULE__), \"db\"))", main)
+    # `db/` is found from `root` (#798), which defaults to `pkgdir` only when nothing passes one:
+    # a JuliaC executable's `pkgdir` is the temporary copy it was built from.
+    @test occursin("function main(; root::AbstractString = pkgdir(@__MODULE__), kwargs...)", main)
+    @test occursin("PormG.Configuration.load_many([\"db\"]; root, env)", main)
+    @test occursin("#   PormG.Models.set_models(models, joinpath(root, \"db\"))", main)
+    # The default in the signature (written twice: docstring and definition) and the docstring's
+    # note on JuliaC. Nothing in the body: `load_many` and `set_models` take `root`.
+    @test count("pkgdir", main) == 3
     @test occursin("store = pormg_nitro_worker(db_key = \"db\")", main)
+end
+
+entry = read(joinpath(root, "main.jl"), String)
+
+@testset "main.jl passes APP_ROOT, else the working directory, inside the value-free catch (#798)" begin
+    @test occursin("using MyApp, Nitro", entry)
+    @test occursin("        MyApp.main(; root = get(ENV, \"APP_ROOT\", pwd()))\n    catch e\n", entry)
+    @test occursin("e isa InterruptException && rethrow()", entry)
+    @test occursin("println(Core.stderr, \"start-up failed: \", Nitro.startup_failure_text(e))",
+                   entry)
+    @test !occursin("pkgdir(", entry) && !occursin("@__DIR__", entry)
+    @test !occursin(r"^\s*@error"m, entry) && !occursin("showerror", entry)
+    @test Meta.parseall(entry) isa Expr
 end
 
 @testset "Project.toml installs PormG by URL and the driver the adapter needs" begin
@@ -86,21 +105,26 @@ end
     @test project["deps"]["LibPQ"] == pormg_project["weakdeps"]["LibPQ"]
 end
 
-# The single source for the tutorial's boot (#417): `bigger_applications.md` carries this exact
-# file between the markers. Regenerate it with `Nitro.newapp("MyApp")` (SQLite) and paste.
+# The single source for the tutorial's boot (#417) and entry (#798): `bigger_applications.md`
+# carries these exact files between the markers. Regenerate them with `Nitro.newapp("MyApp")`
+# (SQLite) and paste.
 @testset "bigger_applications.md shows exactly what newapp writes" begin
     # A Windows checkout may give the page CRLF line endings; the generated file has LF.
     md = replace(read(joinpath(pkgdir(Nitro), "docs", "src", "tutorial", "bigger_applications.md"),
                       String), "\r\n" => "\n")
-    m = match(r"<!-- newapp:src/MyApp\.jl -->\n```julia\n(.*?)```\n<!-- /newapp -->"s, md)
-    @test m !== nothing
-    m === nothing || @test m[1] == src
+    for (file, content) in ("src/MyApp.jl" => src, "main.jl" => entry)
+        # `String * Regex` quotes the string, so the file name's `.` is literal.
+        m = match("<!-- newapp:$file -->\n```julia\n" * r"(.*?)```\n<!-- /newapp -->"s, md)
+        @test m !== nothing
+        m === nothing || @test m[1] == content
+    end
 end
 end
 
 @testitem "newapp -- a PormG app with models precompiles, binds and serves (#790)" tags=[:extension, :pormg, :slow, :network] setup=[NitroCommon] begin
 using Test
 using Nitro
+using HTTP, Sockets
 
 @eval using PormG
 
@@ -136,7 +160,7 @@ write(models_file, models_src)
 modfile = joinpath(root, "src", "ShopApp.jl")
 src = read(modfile, String)
 for line in ("include(\"../db/models.jl\")", "const appM = models",
-             "PormG.Models.set_models(models, joinpath(pkgdir(@__MODULE__), \"db\"))")
+             "PormG.Models.set_models(models, joinpath(root, \"db\"))")
     @test occursin("#   " * line, src)
     src = replace(src, "#   " * line => line)
 end
@@ -144,8 +168,9 @@ write(modfile, src)
 
 checkout = pkgdir(Nitro)
 logfile = joinpath(mktempdir(), "child.log")
-# Both children fit inside the runner's 600 s per-item watchdog, so a slow leg fails here, with
-# the child's log, instead of the watchdog killing the whole run.
+# Each child has its own timeout, so a slow leg usually fails here, with the child's log, instead
+# of the runner's 600 s per-item watchdog killing the whole run. The legs after the first only
+# load what it precompiled, so their timeouts are shorter.
 function run_child(script; timeout = 280)
     cmd = addenv(Cmd(`$(Base.julia_cmd()) --project=$root -e $script`; dir = root),
                  "JULIA_LOAD_PATH" => join(["@", "@stdlib"], Sys.iswindows() ? ';' : ':'),
@@ -174,6 +199,13 @@ end
     Pkg.instantiate()
     """)
 
+# `root` (#798): `db/` moves to another folder and the package's own loses its connection.yml,
+# as a JuliaC executable's `pkgdir` names a folder that no longer holds one. Only a boot that
+# takes `db/` from `root` connects. (models.jl stays: the package includes it as it precompiles.)
+alt = mktempdir()
+cp(joinpath(root, "db"), joinpath(alt, "db"))
+mv(joinpath(root, "db", "connection.yml"), joinpath(root, "db", "connection.yml.moved"))
+
 @test run_child("""
     using ShopApp, HTTP, Nitro, Sockets
 
@@ -182,7 +214,8 @@ end
     close(server)
     ENV["PORT"] = string(port)
     ENV["API_SECRET_KEY"] = "x"^32    # a placeholder: the boot requires 32 bytes
-    ShopApp.main(; host = "127.0.0.1", async = true, show_banner = false, access_log = nothing)
+    ShopApp.main(; root = $(repr(alt)), host = "127.0.0.1", async = true, show_banner = false,
+                 access_log = nothing)
     try
         ShopApp.appM.Item.connect_key == "db" ||
             error("the models are bound to \$(repr(ShopApp.appM.Item.connect_key)), not \\"db\\"")
@@ -192,6 +225,34 @@ end
         terminate(ShopApp.app)
     end
     println("bound and served")
-    """)
+    """; timeout = 180)
 @test occursin("bound and served", read(logfile, String))
+
+# The program itself, run the way an executable runs it: `main.jl` from the app's directory,
+# whose db/ no longer has a connection.yml, with `APP_ROOT` naming the folder that does.
+server = Sockets.listen(Sockets.localhost, 0)
+port = Int(Sockets.getsockname(server)[2])
+close(server)
+entry = addenv(Cmd(`$(Base.julia_cmd()) --project=$root main.jl`; dir = root),
+               "JULIA_LOAD_PATH" => join(["@", "@stdlib"], Sys.iswindows() ? ';' : ':'),
+               "JULIA_PROJECT" => nothing, "NITRO_ENV" => nothing, "GENIE_ENV" => nothing,
+               "PORMG_ENV" => nothing, "APP_ROOT" => alt, "PORT" => string(port),
+               "API_SECRET_KEY" => "x"^32)
+proc = open(logfile, "a") do log
+    run(pipeline(entry; stdout = log, stderr = log); wait = false)
+end
+health() = try
+    HTTP.get("http://127.0.0.1:$port/health"; retry = false, status_exception = false,
+             connect_timeout = 2, readtimeout = 5).status == 200
+catch
+    false
+end
+served = try
+    timedwait(() -> process_exited(proc) || health(), 120; pollint = 1) === :ok && health()
+finally
+    kill(proc)
+    wait(proc)
+end
+served || println(read(logfile, String))
+@test served
 end
