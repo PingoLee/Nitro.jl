@@ -1,6 +1,6 @@
 ## `AccessRecord.ts` and the `AccessLog` prune cutoff are UTC, no longer local time (#561)
 
-- **Version**: Unreleased
+- **Version**: 0.7.0
 - **Nitro ref**: [#561](https://github.com/PingoLee/Nitro.jl/issues/561) ; `src/middleware/access_log.jl`
 - **Recorded**: 2026-10-21
 - **Severity**: behavior change (record contents, retention cutoff)

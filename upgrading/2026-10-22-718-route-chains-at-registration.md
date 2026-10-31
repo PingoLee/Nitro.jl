@@ -1,6 +1,6 @@
 ## Route middleware is folded once, at registration; a leaf not registered through Nitro is refused (#718)
 
-- **Version**: Unreleased
+- **Version**: 0.7.0
 - **Nitro ref**: [#718](https://github.com/PingoLee/Nitro.jl/issues/718) ; `src/routeendpoint.jl`, `src/routerhof.jl`, `src/core/pipeline.jl`, `src/core/registration.jl`
 - **Recorded**: 2026-10-22
 - **Severity**: breaking (a route put on the app's router with `HTTP.register!`); behavior (when a route middleware factory runs)

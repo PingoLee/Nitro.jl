@@ -1,6 +1,6 @@
 ## `App(not_found = …, method_not_allowed = …)` — the custom 404/405 move off the router, and `Service` accepts only Nitro's own router
 
-- **Version**: Unreleased
+- **Version**: 0.7.0
 - **Nitro ref**: [#625](https://github.com/PingoLee/Nitro.jl/issues/625) ; `src/types.jl`, `src/context.jl`, `src/core/pipeline.jl`, `src/core/staticfiles.jl`, `src/core/registration.jl`, `src/core/framework_middleware.jl`
 - **Recorded**: 2026-10-17
 - **Severity**: breaking. An app that passed its own `HTTP.Router` to `Service` fails at

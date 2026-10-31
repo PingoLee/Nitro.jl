@@ -1,6 +1,6 @@
 ## `Nitro.newapp` — the generated boot finds `db/` from a `root` keyword, and a `main.jl` entry catches a failed start-up
 
-- **Version**: Unreleased
+- **Version**: 0.7.0
 - **Nitro ref**: #798 ; `src/newapp.jl`, `ext/NitroPormGExt.jl` (`_newapp_pormg`);
   `docs/src/tutorial/bigger_applications.md`, `docs/src/tutorial/deployment.md`,
   `docs/src/tutorial/environment.md`

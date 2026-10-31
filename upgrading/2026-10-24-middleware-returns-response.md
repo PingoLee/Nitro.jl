@@ -1,6 +1,6 @@
 ## A middleware that returns anything but an `HTTP.Response` gets a `500`
 
-- **Version**: Unreleased
+- **Version**: 0.7.0
 - **Nitro ref**: `src/routerhof.jl` (`ResponseBoundary`), `src/core/transport.jl`, `src/middleware/security_headers.jl`, `src/middleware/cors_middleware.jl`, `src/middleware/rate_limiter.jl`, `src/middleware/session_middleware.jl`, `src/middleware/csrf_middleware.jl`
 - **Recorded**: 2026-10-24
 - **Severity**: behavior (a middleware, or a handler under `serialize = false`, whose value reaches the outside of the global middleware chain without being an `HTTP.Response`)

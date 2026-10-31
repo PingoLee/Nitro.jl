@@ -1,6 +1,6 @@
 ## A session store's exception reaches the caller as a value-free `SessionStoreFault` (#612)
 
-- **Version**: Unreleased
+- **Version**: 0.7.0
 - **Nitro ref**: [#612](https://github.com/PingoLee/Nitro.jl/issues/612) ; `src/types.jl`, `src/cookies.jl`, `src/middleware/session_middleware.jl`, `src/errors.jl`
 - **Recorded**: 2026-10-19
 - **Severity**: behavior change. Nothing about status codes changes. Code that catches a session

@@ -1,6 +1,6 @@
 ## `consume!` holds thread 1 outside the scheduler, so tasks tied to thread 1 wait for it (#677)
 
-- **Version**: Unreleased
+- **Version**: 0.7.0
 - **Nitro ref**: [#677](https://github.com/PingoLee/Nitro.jl/issues/677) ; `src/Workers/consumer.jl`
 - **Recorded**: 2026-10-20
 - **Severity**: behavior change, in a consumer process outside Windows only. Nothing changes in a

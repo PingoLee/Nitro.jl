@@ -1,6 +1,6 @@
 ## The lifecycle registry holds `LifecycleEntry` values, and `LifecycleMiddleware` is parameterized (#719)
 
-- **Version**: Unreleased
+- **Version**: 0.7.0
 - **Nitro ref**: #719; `src/types.jl`, `src/routeendpoint.jl`, `src/context.jl`, `src/routerhof.jl`
 - **Recorded**: 2026-10-24
 - **Severity**: breaking (two `Service` fields change element type; `LifecycleMiddleware` gains type parameters) — only for code that reads the registry or compares `LifecycleMiddleware` types

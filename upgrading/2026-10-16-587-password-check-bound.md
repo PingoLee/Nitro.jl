@@ -1,6 +1,6 @@
 ## `check_password` / `make_password` wait for a permit: at most `nthreads(:default) - 2` hash at once (#587)
 
-- **Version**: Unreleased
+- **Version**: 0.7.0
 - **Nitro ref**: [#587](https://github.com/PingoLee/Nitro.jl/issues/587) ; `src/Auth/passwords.jl`
 - **Recorded**: 2026-10-16
 - **Severity**: **behavior change (availability default).** Under a burst of logins, the checks
