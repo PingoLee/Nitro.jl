@@ -99,10 +99,10 @@ else
 end
 
 # `go` is the probe's own caller, not part of the shape, so it is compiled first and timed apart
-# from the request (#710). The test still divides the SUM, so the ratios mean what they meant
-# before; the split is there to show where a slow reading's time went. `caller` is `go`, `hit`,
-# the `HTTP.Request` constructor and the inference of `internalrequest`, the same work for every
-# shape. The shape's own compiles stay in `request`: `internalrequest` hands the request to
+# from the request (#710). The test charges every shape the BASELINE's `caller`, not its own, so
+# a step in this compile cannot fail a shape while a cold path in the request still can.
+# `caller` is `go`, `hit`, the `HTTP.Request` constructor and the inference of
+# `internalrequest`, the same work for every shape. The shape's own compiles stay in `request`: `internalrequest` hands the request to
 # `setupmiddleware(...)`, which is typed `::Function`, and inference stops there, so the router,
 # the route endpoint and the handler compile only when the request reaches them.
 caller = @elapsed precompile(go, ())
