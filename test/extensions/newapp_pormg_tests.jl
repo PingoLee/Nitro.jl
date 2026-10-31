@@ -122,6 +122,16 @@ end
 end
 
 @testitem "newapp -- a PormG app with models precompiles, binds and serves (#790)" tags=[:extension, :pormg, :slow, :network] setup=[NitroCommon] begin
+# Every child below takes its time from this one clock (#817). The runner stops the whole run at
+# 600 s per item, from before this line: a filtered or shuffled run evaluates `NitroCommon` cold
+# first. So the children share 500 s, a child shutdown adds at most 45 s (`stop!`), and a
+# `health()` poll in flight at the deadline at most 7 s. A slow leg then fails in a child, with
+# that child's log, never by the watchdog.
+T0 = time()
+DEADLINE = T0 + 500
+left_for(cap) = min(cap, DEADLINE - time())
+elapsed() = round(time() - T0; digits = 1)
+
 using Test
 using Nitro
 using HTTP, Sockets
@@ -168,22 +178,63 @@ write(modfile, src)
 
 checkout = pkgdir(Nitro)
 logfile = joinpath(mktempdir(), "child.log")
-# Each child has its own timeout, so a slow leg usually fails here, with the child's log, instead
-# of the runner's 600 s per-item watchdog killing the whole run. The legs after the first only
-# load what it precompiled, so their timeouts are shorter.
-function run_child(script; timeout = 280)
-    cmd = addenv(Cmd(`$(Base.julia_cmd()) --project=$root -e $script`; dir = root),
-                 "JULIA_LOAD_PATH" => join(["@", "@stdlib"], Sys.iswindows() ? ';' : ':'),
-                 "JULIA_PROJECT" => nothing, "NITRO_ENV" => nothing, "GENIE_ENV" => nothing,
-                 "PORMG_ENV" => nothing)
-    proc = open(logfile, "a") do log
-        run(pipeline(cmd; stdout = log, stderr = log); wait = false)
+
+# SIGTERM, then a bounded wait, never a bare `wait(proc)` (#816): a served child once ignored the
+# SIGTERM, and the unbounded wait parked the item until the runner stopped the run. A child that
+# outlives `grace` gets a SIGQUIT, which makes Julia print every task's backtrace into its log,
+# then a SIGKILL. Returns whether the SIGTERM alone ended it. On Windows `kill` is
+# `TerminateProcess`, so there it always does.
+#
+# A SIGTERM never reaches `terminate()` or its drains: a script ends through its `atexit` hooks
+# only (`serve`'s docstring, src/methods.jl), and the one this app has is PormG's, which closes the
+# pools with no drain. A healthy exit takes seconds, so a child alive after `grace` is stuck.
+function stop!(proc; grace = 30, dump_grace = 15)
+    kill(proc)
+    timedwait(() -> process_exited(proc), grace) === :ok && return true
+    println("── the child outlived its SIGTERM by $grace s (#816); on Linux, its task dump is in the log")
+    if !Sys.iswindows()
+        kill(proc, Base.SIGQUIT)
+        timedwait(() -> process_exited(proc), dump_grace)
     end
-    if timedwait(() -> process_exited(proc), timeout) === :timed_out
-        kill(proc)
-        wait(proc)
+    process_exited(proc) || kill(proc, Base.SIGKILL)
+    wait(proc)
+    return false
+end
+
+# The escalation runs only when #816 fires, so it is exercised here against a child that ignores
+# SIGTERM and SIGQUIT both, and that only the SIGKILL can end. POSIX only: see above.
+if !Sys.iswindows()
+    deaf = run(`sh -c 'trap "" TERM QUIT; exec sleep 300'`; wait = false)
+    @test stop!(deaf; grace = 1, dump_grace = 1) == false
+    @test process_exited(deaf) && deaf.termsignal == Base.SIGKILL
+end
+
+# `--code-coverage=none`, as every other child in the suite runs: on the coverage leg an inherited
+# flag would precompile and run the generated app, and everything it loads, instrumented (#817),
+# and no child's coverage is collected anyway.
+child_cmd(args...; env...) =
+    addenv(Cmd(`$(Base.julia_cmd()) --code-coverage=none --project=$root $args`; dir = root),
+           "JULIA_LOAD_PATH" => join(["@", "@stdlib"], Sys.iswindows() ? ';' : ':'),
+           "JULIA_PROJECT" => nothing, "NITRO_ENV" => nothing, "GENIE_ENV" => nothing,
+           "PORMG_ENV" => nothing, (string(k) => v for (k, v) in env)...)
+
+# Each child gets `timeout`, or what is left of the item's clock if that is less. The legs after
+# the first only load what it precompiled, so their caps are shorter.
+function run_child(script; timeout = 280)
+    t = left_for(timeout)
+    if t <= 0
+        println("── no time left on the item's clock at $(elapsed()) s; the child was not started")
+        return false
+    end
+    proc = open(logfile, "a") do log
+        run(pipeline(child_cmd("-e", script); stdout = log, stderr = log); wait = false)
+    end
+    if timedwait(() -> process_exited(proc), t) === :timed_out
+        println("── the child ran past its $(round(t; digits = 1)) s")
+        stop!(proc)
     end
     ok = success(proc)
+    println("── child done at $(elapsed()) s, ok = $ok")
     ok || println(read(logfile, String))
     return ok
 end
@@ -233,26 +284,38 @@ mv(joinpath(root, "db", "connection.yml"), joinpath(root, "db", "connection.yml.
 server = Sockets.listen(Sockets.localhost, 0)
 port = Int(Sockets.getsockname(server)[2])
 close(server)
-entry = addenv(Cmd(`$(Base.julia_cmd()) --project=$root main.jl`; dir = root),
-               "JULIA_LOAD_PATH" => join(["@", "@stdlib"], Sys.iswindows() ? ';' : ':'),
-               "JULIA_PROJECT" => nothing, "NITRO_ENV" => nothing, "GENIE_ENV" => nothing,
-               "PORMG_ENV" => nothing, "APP_ROOT" => alt, "PORT" => string(port),
-               "API_SECRET_KEY" => "x"^32)
-proc = open(logfile, "a") do log
-    run(pipeline(entry; stdout = log, stderr = log); wait = false)
-end
 health() = try
     HTTP.get("http://127.0.0.1:$port/health"; retry = false, status_exception = false,
              connect_timeout = 2, readtimeout = 5).status == 200
 catch
     false
 end
-served = try
-    timedwait(() -> process_exited(proc) || health(), 120; pollint = 1) === :ok && health()
-finally
-    kill(proc)
-    wait(proc)
+# Returns (served, stopped): whether `/health` answered, and whether the SIGTERM alone ended it.
+function run_entry(; timeout = 120)
+    t = left_for(timeout)
+    if t <= 0
+        println("── no time left on the item's clock at $(elapsed()) s; main.jl was not started")
+        return (false, true)
+    end
+    entry = child_cmd("main.jl"; APP_ROOT = alt, PORT = string(port), API_SECRET_KEY = "x"^32)
+    proc = open(logfile, "a") do log
+        run(pipeline(entry; stdout = log, stderr = log); wait = false)
+    end
+    # The poll records its own answer: a second `health()` after it could add another 7 s.
+    up = Ref(false)
+    stopped = false
+    try
+        timedwait(() -> process_exited(proc) || (up[] = health()), t; pollint = 1)
+    finally
+        stopped = stop!(proc)
+    end
+    served = up[]
+    println("── main.jl done at $(elapsed()) s, served = $served, stopped = $stopped")
+    return (served, stopped)
 end
-served || println(read(logfile, String))
+served, stopped = run_entry()
+served && stopped || println(read(logfile, String))
 @test served
+# A served program ends on SIGTERM. #816 is the case where it did not.
+@test stopped
 end
