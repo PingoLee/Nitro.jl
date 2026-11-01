@@ -3,6 +3,7 @@
 #
 #   bench/juliac/realapp/measure.sh check <jit|exe>            # every route, status and body
 #   bench/juliac/realapp/measure.sh first <jit|exe> [label]    # one fresh process PER ROUTE
+#   bench/juliac/realapp/measure.sh first_after_ready <jit|exe> [label]   # the same, after READY
 #   bench/juliac/realapp/measure.sh rss   <jit|exe> [label]    # RSS at rest, and after every route
 #
 # `jit` runs main.jl under the real julia binary of JULIA (not the juliaup launcher, so the pid,
@@ -10,6 +11,9 @@
 # Readiness is the listening socket (`ss`), never a connection, as bench/socket/first_request.sh
 # does, so nothing warms the request path before the measured request. `listen` is launch to
 # listening socket. `warm` is the median of WARM_N requests after the first.
+# `first_after_ready` waits instead for the app's `READY` line on fd 2, written by the lifecycle
+# hook RealApp registers after `worker_startup`'s, so the start-up hooks have returned before the
+# first request (#744, #799); `ready` is launch to that line. Still no request before it.
 #
 # REALAPP_ROOT is set to this directory for both: see src/RealApp.jl.
 # Env: SECRETS (required) a file of `API_SECRET_KEY=…` / `JWT_SECRET=…` lines, AUTH_HEADER
@@ -21,8 +25,8 @@
 set -uo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/../../.." && pwd)
-MODE=${1:?usage: measure.sh <check|first|rss> <jit|exe> [label]}
-TARGET=${2:?usage: measure.sh <check|first|rss> <jit|exe> [label]}
+MODE=${1:?usage: measure.sh <check|first|first_after_ready|rss> <jit|exe> [label]}
+TARGET=${2:?usage: measure.sh <check|first|first_after_ready|rss> <jit|exe> [label]}
 LABEL=${3:-$(basename "$TARGET")}
 PORT=${PORT:-18744}
 THREADS=${THREADS:-8,1}
@@ -73,7 +77,7 @@ start() {
     echo "measure.sh: port $PORT already in use" >&2; exit 1
   fi
   local t0
-  t0=$(date +%s.%N)
+  t0=$(date +%s.%N); T0=$t0
   if [ "$TARGET" = jit ]; then
     ( set -a; . "$SECRETS"; set +a; cd "$LOGS" && PORT=$PORT REALAPP_ROOT="$HERE" PORMG_POSTGRES_DRIVER=Postgres \
       exec "$JULIA_BIN" --startup-file=no --project="$HERE" --threads="$THREADS" "$HERE/main.jl" ) >"$1" 2>&1 &
@@ -88,6 +92,17 @@ start() {
     sleep 0.05
   done
   echo "measure.sh: $LABEL never listened; log $1" >&2; stop; return 1
+}
+
+# Wait for the app's READY line in log $1, at most READY_TIMEOUT_S (default 300) seconds after the
+# launch; sets READY (seconds since launch). The launch time is start()'s t0, kept in T0.
+wait_ready() {
+  for _ in $(seq 1 $(( ${READY_TIMEOUT_S:-300} * 20 ))); do
+    grep -q '^READY$' "$1" && { READY=$(echo "$(date +%s.%N) - $T0" | bc -l); return 0; }
+    kill -0 "$pid" 2>/dev/null || { echo "measure.sh: $LABEL exited before READY; log $1" >&2; pid=""; return 1; }
+    sleep 0.05
+  done
+  echo "measure.sh: $LABEL never wrote READY; log $1" >&2; stop; return 1
 }
 
 # request <method> <path> <body> -> "status seconds"; the body lands in $BODY_FILE.
@@ -128,6 +143,20 @@ first)
     [ "$code1" = "$status" ] || echo "measure.sh: $LABEL $name first answered $code1, want $status" >&2
     printf 'first\t%s\t%s\tlisten=%.3f\tfirst_ms=%.1f\tstatus=%s\twarm_ms=%.2f\n' "$LABEL" "$name" "$LISTEN" \
       "$(echo "$t1 * 1000" | bc -l)" "$code1" "$(echo "$warm * 1000" | bc -l)"
+    stop
+  done
+  ;;
+first_after_ready)
+  for r in "${ROUTES[@]}"; do
+    IFS='|' read -r name method path body status _ <<<"$r"
+    log="$LOGS/$LABEL-ready-$name.log"
+    start "$log" || exit 1
+    wait_ready "$log" || exit 1
+    read -r code1 t1 < <(request "$method" "$path" "$body")
+    warm=$(for _ in $(seq 1 "$WARM_N"); do request "$method" "$path" "$body" | cut -d' ' -f2; done | median)
+    [ "$code1" = "$status" ] || echo "measure.sh: $LABEL $name first answered $code1, want $status" >&2
+    printf 'first_after_ready\t%s\t%s\tlisten=%.3f\tready=%.3f\tfirst_ms=%.1f\tstatus=%s\twarm_ms=%.2f\n' "$LABEL" "$name" \
+      "$LISTEN" "$READY" "$(echo "$t1 * 1000" | bc -l)" "$code1" "$(echo "$warm * 1000" | bc -l)"
     stop
   done
   ;;

@@ -6,13 +6,15 @@
 #
 #   bench/juliac/realapp/rounds.sh jit=jit native=out/realapp-main-no-native default=out/realapp-main-no-default
 #
-# Env: STARTS (default 3), RESULTS (default bench/results/realapp-rounds-<stamp>.tsv), plus
+# Env: STARTS (default 3), FIRST_MODE (default `first`; `first_after_ready` times the first
+#      request after the app's READY line instead of after the socket, #744), RESULTS (default bench/results/realapp-rounds-<stamp>.tsv), plus
 #      measure.sh's (SECRETS and AUTH_HEADER are required). The quiet gate's summaries go to
 #      stdout with the readings.
 set -uo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/../../.." && pwd)
 STARTS=${STARTS:-3}
+FIRST_MODE=${FIRST_MODE:-first}
 RESULTS=${RESULTS:-"$ROOT/bench/results/realapp-rounds-$(date +%Y%m%d-%H%M%S).tsv"}
 [ $# -gt 0 ] || { echo "usage: rounds.sh label=target..."; exit 2; }
 BUILDS=("$@")
@@ -27,8 +29,8 @@ for s in $(seq 1 "$STARTS"); do
     label=${b%%=*}; target=${b#*=}
     echo "== start $s: $label"
     "$ROOT/bench/socket/quiet.sh" "realapp-$label-s$s" bash -c '
-      "$1/measure.sh" rss "$2" "$3" && "$1/measure.sh" first "$2" "$3"' _ "$HERE" "$target" "$label" |
-      tee /dev/stderr | awk -v s="$s" -F'\t' '$1 == "rss" || $1 == "first" { print s "\t" $0 }' >> "$RESULTS"
+      "$1/measure.sh" rss "$2" "$3" && "$1/measure.sh" "$4" "$2" "$3"' _ "$HERE" "$target" "$label" "$FIRST_MODE" |
+      tee /dev/stderr | awk -v s="$s" -F'\t' '$1 == "rss" || $1 ~ /^first/ { print s "\t" $0 }' >> "$RESULTS"
     [ "${PIPESTATUS[0]}" = 0 ] || { echo "rounds.sh: block $label start $s failed"; exit 1; }
   done
 done
