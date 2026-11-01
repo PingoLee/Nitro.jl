@@ -1171,6 +1171,17 @@ So a middleware may rely on anything registered before it still being up during 
 `on_shutdown`. The `on_stopped` broadcast visits the entries in that same LIFO order, and it begins
 only after every `on_shutdown` has returned.
 
+**Which task runs `on_startup`.** Outside a REPL, when thread 1 is the interactive thread (the
+default `julia -t N` layout), `serve` runs the startup broadcast on one task of the default pool
+and waits for it, so a supervisor's `SIGTERM` never finds thread 1 compiling a hook (#824). In a
+REPL, and when every thread is a default one (`--threads=1`, `--threads=N,0`), the hooks run on
+the task that called `serve`. Either way they run one after another, in the order above. Outside a
+REPL a hook therefore does not run on the calling task. It cannot read that task's task-local
+storage. An `@async` it starts, or a `Timer(cb)`, stays on a default-pool thread rather than on
+thread 1. A lock that the caller of `serve` holds deadlocks the hook if the hook takes it. In a
+script that calls `Base.exit_on_sigint(false)`, Ctrl-C during start-up waits for the hooks to return
+instead of interrupting one that hangs.
+
 The one exception is **promotion**: hand the *same* object to both `serve(middleware = ...)`
 and a route, and route ownership wins — it moves to the end of the route-owned half. Since
 `terminate()` unwinds the serve-owned half first and the route-owned half second, a promoted
