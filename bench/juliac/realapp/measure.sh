@@ -4,6 +4,7 @@
 #   bench/juliac/realapp/measure.sh check <jit|exe>            # every route, status and body
 #   bench/juliac/realapp/measure.sh first <jit|exe> [label]    # one fresh process PER ROUTE
 #   bench/juliac/realapp/measure.sh first_after_ready <jit|exe> [label]   # the same, after READY
+#   bench/juliac/realapp/measure.sh sequence <jit|exe> [label]   # ONE process: each route's first request, in order, after READY
 #   bench/juliac/realapp/measure.sh rss   <jit|exe> [label]    # RSS at rest, and after every route
 #
 # `jit` runs main.jl under the real julia binary of JULIA (not the juliaup launcher, so the pid,
@@ -25,8 +26,8 @@
 set -uo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/../../.." && pwd)
-MODE=${1:?usage: measure.sh <check|first|first_after_ready|rss> <jit|exe> [label]}
-TARGET=${2:?usage: measure.sh <check|first|first_after_ready|rss> <jit|exe> [label]}
+MODE=${1:?usage: measure.sh <check|first|first_after_ready|sequence|rss> <jit|exe> [label]}
+TARGET=${2:?usage: measure.sh <check|first|first_after_ready|sequence|rss> <jit|exe> [label]}
 LABEL=${3:-$(basename "$TARGET")}
 PORT=${PORT:-18744}
 THREADS=${THREADS:-8,1}
@@ -159,6 +160,24 @@ first_after_ready)
       "$LISTEN" "$READY" "$(echo "$t1 * 1000" | bc -l)" "$code1" "$(echo "$warm * 1000" | bc -l)"
     stop
   done
+  ;;
+sequence)
+  # One process: after READY, the first request of every route in ROUTES order. The first one
+  # pays what all routes share (the transport's closures, specialized on the middleware stack);
+  # each later one pays only what its own route adds.
+  log="$LOGS/$LABEL-sequence.log"
+  start "$log" || exit 1
+  wait_ready "$log" || exit 1
+  i=0
+  for r in "${ROUTES[@]}"; do
+    IFS='|' read -r name method path body status _ <<<"$r"
+    i=$((i + 1))
+    read -r code1 t1 < <(request "$method" "$path" "$body")
+    [ "$code1" = "$status" ] || echo "measure.sh: $LABEL $name answered $code1, want $status" >&2
+    printf 'sequence\t%s\t%s\tlisten=%.3f\tready=%.3f\tpos=%d\tfirst_ms=%.1f\tstatus=%s\n' "$LABEL" "$name" \
+      "$LISTEN" "$READY" "$i" "$(echo "$t1 * 1000" | bc -l)" "$code1"
+  done
+  stop
   ;;
 rss)
   start "$LOGS/$LABEL-rss.log" || exit 1
