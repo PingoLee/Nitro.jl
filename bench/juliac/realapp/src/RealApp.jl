@@ -21,6 +21,7 @@ include("Handlers/HealthHandlers.jl")
 include("Handlers/ItemHandlers.jl")
 include("Handlers/MiscHandlers.jl")
 include("Routes.jl")
+include("precompile.jl")
 
 # Bench only (#744): the listener opens before the `startup` hooks run, so the socket is not
 # readiness. This hook is registered after `worker_startup`'s, and hooks run in registration

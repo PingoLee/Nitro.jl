@@ -7,6 +7,7 @@ HTTP = "cd3eb016-35fb-5094-929b-558a96fad6f3"
 Postgres = "8f23287e-300e-4f50-bc2b-9f1dfe95da84"
 Nitro = "e5efdb2c-68ee-4494-894d-55bb80f0a340"
 PormG = "7d8d7541-4d3d-4580-80a2-17064efb0993"
+PrecompileTools = "aea7be01-6a6a-4083-8856-8a6e6704d82a"
 
 [sources]
 Nitro = {path = "../../.."}
@@ -17,6 +18,7 @@ HTTP = "~2.13"
 Nitro = "0.6.0"
 PormG = "^0.9"
 Postgres = "2.4"
+PrecompileTools = "1"
 julia = "^1.13"
 
 [extras]
