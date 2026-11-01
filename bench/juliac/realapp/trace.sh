@@ -9,7 +9,8 @@
 #   SECRETS=… AUTH_HEADER=… bench/juliac/realapp/trace.sh [route-name…]   # default: every route
 #
 # Writes bench/results/realapp-trace-<stamp>/<route>.jl (the statements of that request) and
-# prints one count per route. Same env as measure.sh.
+# prints one count per route. Same env as measure.sh, plus TRACE_TIMING=1, which adds
+# --trace-compile-timing: each statement then carries its compile time, and trace_counts.jl sums it.
 set -uo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/../../.." && pwd)
@@ -51,7 +52,7 @@ for name in "${NAMES[@]}"; do
   IFS='|' read -r method path body <<<"${REQ[$name]}"
   trace="$DIR/full-$name.jl"
   ( set -a; . "$SECRETS"; set +a; cd "$DIR" && PORT=$PORT REALAPP_ROOT="$HERE" PORMG_POSTGRES_DRIVER=Postgres \
-    exec "$JULIA_BIN" --startup-file=no --project="$HERE" --threads="$THREADS" --trace-compile="$trace" \
+    exec "$JULIA_BIN" --startup-file=no --project="$HERE" --threads="$THREADS" --trace-compile="$trace" ${TRACE_TIMING:+--trace-compile-timing} \
     "$HERE/main.jl" ) >"$DIR/server-$name.log" 2>&1 &
   pid=$!
   for _ in $(seq 1 6000); do
@@ -59,10 +60,17 @@ for name in "${NAMES[@]}"; do
     kill -0 "$pid" 2>/dev/null || { echo "trace.sh: server exited ($name)" >&2; exit 1; }
     sleep 0.05
   done
-  # Let start-up compilation settle. The socket opens BEFORE the lifecycle `startup` hooks run,
-  # and 3 s was not enough in the one run: the worker hook's PormG query was still compiling, so
-  # the window held start-up statements, not the route's.
-  sleep "${SETTLE_S:-3}"
+  # The socket opens BEFORE the lifecycle `startup` hooks run, and 3 s after it was not enough in
+  # the first run: the worker hook's PormG query was still compiling, so the window held start-up
+  # statements, not the route's. Wait for RealApp's READY line (its last start-up hook) at most
+  # READY_TIMEOUT_S, then SETTLE_S (default 2 s) for whatever start-up left running.
+  for _ in $(seq 1 $(( ${READY_TIMEOUT_S:-300} * 20 ))); do
+    grep -q '^READY$' "$DIR/server-$name.log" && break
+    kill -0 "$pid" 2>/dev/null || { echo "trace.sh: server exited before READY ($name)" >&2; exit 1; }
+    sleep 0.05
+  done
+  grep -q '^READY$' "$DIR/server-$name.log" || { echo "trace.sh: no READY ($name)" >&2; exit 1; }
+  sleep "${SETTLE_S:-2}"
   before=$(wc -l <"$trace")
   args=(-s -o /dev/null -w '%{http_code} %{time_total}' -X "$method")
   [ -n "$body" ] && args+=(-H 'Content-Type: application/json' --data "$body")

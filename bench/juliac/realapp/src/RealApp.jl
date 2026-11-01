@@ -21,6 +21,14 @@ include("Handlers/HealthHandlers.jl")
 include("Handlers/ItemHandlers.jl")
 include("Handlers/MiscHandlers.jl")
 include("Routes.jl")
+include("precompile.jl")
+
+# Bench only (#744): the listener opens before the `startup` hooks run, so the socket is not
+# readiness. This hook is registered after `worker_startup`'s, and hooks run in registration
+# order, so `READY` on fd 2 means every start-up hook before it has returned. Straight to fd 2:
+# a trimmed executable's `Base.stdout` is stale, and a buffered stream would print late.
+_mark_ready() = (m = "READY\n"; ccall(:write, Cssize_t, (Cint, Ptr{UInt8}, Csize_t), 2, m, sizeof(m)); nothing)
+const ready = Nitro.LifecycleMiddleware(middleware = identity, on_startup = _mark_ready)
 
 """
     main(; kwargs...)
@@ -39,7 +47,7 @@ function main(; kwargs...)
     session = SessionMiddleware(store = pormg_nitro_session(db_key = "db"), secure = false)
     bearer = BearerAuth(Auth.jwt_validator(SecretString(ENV["JWT_SECRET"])))
     urlpatterns(app, "", Routes.urlpatterns(; session, bearer))
-    serve(app; port = parse(Int, get(ENV, "PORT", "8000")), middleware = [workers],
+    serve(app; port = parse(Int, get(ENV, "PORT", "8000")), middleware = [workers, ready],
           secret_key = SecretString(ENV["API_SECRET_KEY"]), kwargs...)
 end
 
