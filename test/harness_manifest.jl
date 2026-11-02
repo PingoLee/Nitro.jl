@@ -71,6 +71,7 @@ const TEST_FILES = [
     "workers_tests.jl",
     "workers_consumer_e2e_tests.jl",
     "workers_thread1_hijack_tests.jl",
+    "serve_startup_sigterm_tests.jl",
     "reexports_tests.jl",
     "http_internals_contract_tests.jl",
     "juliac_internals_contract_tests.jl",

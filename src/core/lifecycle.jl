@@ -669,6 +669,62 @@ function _broadcast_lifecycle(hook::Function, entries,
     return interrupt
 end
 
+# `startserver`'s startup broadcast: route-owned hooks first, then serve-owned (#82).
+_startup_hooks(route_lf, serve_lf)::Nullable{InterruptException} =
+    _broadcast_lifecycle(startup, serve_lf, _broadcast_lifecycle(startup, route_lf))
+
+# Outside a REPL, the startup broadcast runs on a `:default` task, not on thread 1 (#824). A
+# SIGTERM ends a script by running the `atexit` hooks on thread 1, on top of whatever thread 1 was
+# running (`jl_exit_thread0`), and that frame never resumes. Startup hooks compile a great deal the
+# first time they run: the Workers boot sweep, a store's first queries, the log records they write.
+# A signal that lands mid-compile leaves the exit path behind the JIT state the frozen frame holds,
+# and the process never exits: a served PormG app hung that way on every SIGTERM sent while its
+# boot sweep ran. On a `:default` thread the compile goes on to the end and thread 1 waits in the
+# scheduler, where the same signal exits at once.
+#
+# Two conditions. Thread 1 is in the interactive pool, so a `:default` task can never land on it:
+# under `-t 1` (`1,0`) or an `N,0` layout every thread is a default one, and the broadcast stays
+# where it is. And not in a REPL, where Ctrl-C is how an operator aborts a hook that hangs, and the
+# press reaches the task parked on thread 1, which would be the wait below and not the hook.
+# Outside one a press ends the process the way a SIGTERM does, unless the script has turned that
+# off with `Base.exit_on_sigint(false)`. Then the press reaches the wait below, which defers it
+# until the hooks return, so it no longer aborts a hook that hangs; a SIGTERM still ends the process.
+#
+# The hooks are not stopped by the exit. While thread 1 runs the `atexit` hooks (PormG's closes
+# its pools), the broadcast goes on running on its own thread, and a hook mid-query can log the
+# error the closed pool gives it before the process ends.
+_startup_off_thread1() = !isinteractive() && Threads.threadpool(1) === :interactive
+
+function _startup_broadcast(route_lf, serve_lf)::Nullable{InterruptException}
+    _startup_off_thread1() || return _startup_hooks(route_lf, serve_lf)
+    # Whatever escapes the broadcast is handed back rather than thrown (`startup` itself catches a
+    # hook's own exception, so this is something structural, see `startserver`), so the wait below
+    # raises only an interrupt of its own. The caller gets the exception itself, its type and value,
+    # not wrapped in a `TaskFailedException`; its backtrace starts here, not in the broadcast.
+    task = Threads.@spawn :default try
+        _startup_hooks(route_lf, serve_lf)
+    catch e
+        e
+    end
+    interrupt = nothing
+    while true
+        try
+            wait(task)
+            break
+        catch e
+            # A Ctrl-C reaches this wait only under `exit_on_sigint(false)` (see above). The hooks
+            # run on to the end, as the broadcast always does, and the interrupt is deferred with
+            # theirs (#185).
+            e isa InterruptException || rethrow()
+            interrupt = something(interrupt, e)
+        end
+    end
+    result = fetch(task)
+    result isa InterruptException && return something(interrupt, result)
+    isnothing(result) || throw(result)
+    return interrupt
+end
+
 # The same deferral for the LAST step of the teardown, which is not a broadcast but is just as
 # abandonable: `close(::Service)` blocks the calling task in `timedwait` for up to
 # `shutdown_timeout` (`_shutdown_server`, src/context.jl), and an interrupt there escapes before
@@ -808,8 +864,7 @@ function startserver(ctx::App; host, port, show_banner=false, async=false, kwarg
     # otherwise skip the unwind below and strand the listener `start(...)` just opened.
     interrupt = nothing
     try
-        interrupt = _broadcast_lifecycle(startup, route_lf)
-        interrupt = _broadcast_lifecycle(startup, serve_lf, interrupt)
+        interrupt = _startup_broadcast(route_lf, serve_lf)
     catch e
         # A non-interrupt escaping here strands the listener, because the unwind below is gated
         # on `!isnothing(interrupt)`. Deliberate: `startup` catches everything from the hook
