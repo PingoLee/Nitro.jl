@@ -65,12 +65,16 @@ wall was cleared in [#571](https://github.com/PingoLee/Nitro.jl/issues/571), and
 > changed. The minimal app goes from 10 to 4, and all 6 body-read rows are gone. The trimmed app
 > now answers a request with a body as the JIT does (`405`, `404`), where it answered `500`. The 4
 > left are Base's `ScopedValue` HAMT and two upstream sites. The probe does not move on HTTP: it
-> calls the pipeline directly. It reads 231 on a fresh resolve, but 110 of those come from
-> JSON.jl 1.13.0 ([JuliaIO/JSON.jl#543](https://github.com/JuliaIO/JSON.jl/pull/543)), under
-> which a typed parse with a custom read style no longer verifies: Nitro's is
+> calls the pipeline directly. It read 231 on a fresh resolve while JSON.jl 1.13.0–1.13.3 were
+> current, 110 of them from [JuliaIO/JSON.jl#543](https://github.com/JuliaIO/JSON.jl/pull/543),
+> under which a typed parse with a custom read style no longer verified: Nitro's is
 > `_parseparam_fallback`'s `JSON.parse(str, Int64; style = NITRO_READ_STYLE)`, the JSON
-> fall-through of a scalar parameter. On JSON 1.12.2 the probe reads 121 (§3.9, and the hermetic
-> repro on [#801](https://github.com/PingoLee/Nitro.jl/issues/801)).
+> fall-through of a scalar parameter. **Cleared upstream in JSON.jl 1.13.4** (reported as
+> [JuliaIO/JSON.jl#553](https://github.com/JuliaIO/JSON.jl/issues/553), fixed by #555, released
+> 2026-10-30): re-measured on 2026-11-02 the probe reads 121 on 1.13.4, row for row what it reads
+> on 1.12.2 ([#801](https://github.com/PingoLee/Nitro.jl/issues/801#issuecomment-6567855388)).
+> Nitro floors `JSON` at 1.13.4 so the count no longer depends on the resolve date; no Nitro code
+> changed.
 
 ## 1. How to measure
 
@@ -954,12 +958,13 @@ the CSRF one prints masked. That is #751.
   want the same closed dispatch over JSON values that the session's values do.
 - The `@with` HAMT (unchanged). The request body read inside HTTP.jl is cleared on HTTP 2.13
   (§3.9).
-- **New since this count:** JSON.jl 1.13.0 (JuliaIO/JSON.jl#543), under which a typed parse with
-  a custom `StructStyle` is no longer trim-verifiable. Nitro's is `_parseparam_fallback`'s
-  `_parse_json_bounded(str, T; style = NITRO_READ_STYLE)` (`src/utilities/misc.jl`), reached from
-  every scalar path or query parameter. On the probe it is 106 rows at `_parse_json_bounded`,
-  plus 4 inside StructUtils.jl (§3.9). The JWT claims read's `dicttype` keyword is a separate,
-  version-independent 2-row wall (§3.9, #747).
+- **New since this count, and cleared since:** JSON.jl 1.13.0 (JuliaIO/JSON.jl#543), under which
+  a typed parse with a custom `StructStyle` was no longer trim-verifiable. Nitro's is
+  `_parseparam_fallback`'s `_parse_json_bounded(str, T; style = NITRO_READ_STYLE)`
+  (`src/utilities/misc.jl`), reached from every scalar path or query parameter. On the probe it
+  was 106 rows at `_parse_json_bounded`, plus 4 inside StructUtils.jl (§3.9). **JSON.jl 1.13.4
+  fixed it** (JuliaIO/JSON.jl#553 / #555), and Nitro floors `JSON` there. The JWT claims read's
+  `dicttype` keyword is a separate, version-independent 2-row wall (§3.9, #747).
 
 ### 3.9 The recount on HTTP 2.13
 
@@ -1026,9 +1031,18 @@ version this record's earlier counts were built with, the after tree's probe rea
   style now goes through `StructUtils.make(style, Any, x)`, whose recursion infers `Any` (26 rows)
   and whose `cannot parse` message interpolates a `LazyValue` (90 rows). The rows are real at run
   time: on `[1]` the trimmed 1.13.0 image fails with a different `MethodError` from the JIT's.
-- **Who clears it.** Upstream, with the report drafted on #801. On Nitro's side, the fall-through
-  can parse a number target under JSON.jl's default style, since nothing is lifted into a string
-  for one and #306's reason for the custom style does not apply; proposed on #801, not measured.
+- **Who cleared it: upstream.** Reported as [JuliaIO/JSON.jl#553](https://github.com/JuliaIO/JSON.jl/issues/553),
+  fixed by #555 ("Let typed parses with a custom read style compile under juliac --trim"),
+  released in JSON.jl 1.13.4 on 2026-10-30. Re-measured on 2026-11-02 on `main` at `702ad510`
+  (Julia 1.13.2, JuliaC 0.3.12, three bench environments with JSON pinned exactly, everything
+  else resolving the same): 1.13.0 still reads 231, with the same 108 + 4 + 1 + 1 rows as this
+  table; 1.13.4 reads **121**, and `frames.jl`'s output is identical to 1.12.2's
+  ([#801](https://github.com/PingoLee/Nitro.jl/issues/801#issuecomment-6567855388)). The three
+  images behave the same (the probe sends no parameter that reaches the parse, so this shows the
+  fix changes nothing at run time; it does not exercise the fixed path). Nitro's `[compat]` floor
+  moved from `JSON = "1.12.1"` to `"1.13.4"`, so a fresh resolve cannot land on 1.13.0–1.13.3; no
+  Nitro code changed, and the Nitro-side dispatch once proposed on #801 (a number target under
+  the default style) is not needed.
 - **The `dicttype` keyword** of the JWT claims read is the 2 rows that stay on both versions: a
   type passed as a keyword reaches `parse`'s body as a `DataType`, and the trimmed image dies at
   that call with a `MethodError`. JSON.jl cannot resolve it from inside `parse`; typing the claims
@@ -1102,8 +1116,9 @@ The order:
    app with a frame in `src/` is Base's `ScopedValue` HAMT, behind `_app_context_seed`'s `@with`
    (§3.5).
 7. **The extended probe's walls, largest first** (§3.9):
-   - JSON.jl 1.13.0's typed parse under a custom style (JuliaIO/JSON.jl#543), 110 rows, reached
-     from `_parseparam_fallback` (#801; the `dicttype` keyword's 2 rows belong to #747);
+   - ~~JSON.jl 1.13.0's typed parse under a custom style (JuliaIO/JSON.jl#543), 110 rows, reached
+     from `_parseparam_fallback`~~ **cleared** in JSON.jl 1.13.4 (JuliaIO/JSON.jl#553 / #555;
+     #801, re-measured 2026-11-02: 231 → 121). The `dicttype` keyword's 2 rows belong to #747;
    - Auth's claims, 60 with the guards' claim compare ([#747](https://github.com/PingoLee/Nitro.jl/issues/747));
    - the session store's internals, 37 with `set_cookie!` and LRUCache.jl
      ([#748](https://github.com/PingoLee/Nitro.jl/issues/748)).
