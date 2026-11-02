@@ -8,8 +8,9 @@
 # it is named `*_probe.jl` rather than `*_tests.jl` for the same reason, belt and braces.
 #
 # Usage: julia --project=<env> precompile_warmth_probe.jl <shape>
-# prints "<total s> <caller s>", e.g. "0.183 0.009": the first request including the compile of
-# the probe's own thunk, then that compile alone (#710; see the end of this file).
+# prints "<total s> <caller s> <gc s>", e.g. "0.183 0.009 0.0": the first request including the
+# compile of the probe's own thunk, that compile alone, and the collection time inside both
+# (#710; see the end of this file).
 
 using Nitro, HTTP
 using Nitro: Res, RouteDefinition, path, Query, Json
@@ -105,9 +106,20 @@ end
 # `internalrequest`, the same work for every shape. The shape's own compiles stay in `request`: `internalrequest` hands the request to
 # `setupmiddleware(...)`, which is typed `::Function`, and inference stops there, so the router,
 # the route endpoint and the handler compile only when the request reaches them.
+#
+# A full collection first (#710). Loading Nitro and registering the routes allocate enough that
+# the process's first collection is due about now, and wherever it lands it costs ~35-45 ms at
+# CI's flags, the size of a warm request. Without this it fell in one window or another by
+# allocation count alone: in `dict_int` on one leg, in `url` or in the thunk's compile on others,
+# and it moved when a dependency changed what loading allocates. After it, a collection in the
+# windows below is one the shape's own work triggered, which a cold shape's compile still does.
+# `gc` is the collection time inside the two windows, printed so a step there stays visible.
+GC.gc()
+gc0 = Base.gc_time_ns()
 caller = @elapsed precompile(go, ())
 request = @elapsed resp = go()
+gc = (Base.gc_time_ns() - gc0) / 1e9
 resp.status == 200 || error("shape $SHAPE returned $(resp.status), expected 200")
 body = Nitro.text(resp)
 occursin(expected, body) || error("shape $SHAPE body $(repr(body)) lacks $(repr(expected))")
-println(caller + request, " ", caller)
+println(caller + request, " ", caller, " ", gc)

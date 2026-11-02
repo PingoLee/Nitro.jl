@@ -105,10 +105,10 @@ using Test
 # `warmth:` (`grep 'warmth:'` over a CI job log):
 #
 #   warmth: start os=… julia=… threads=… mem_free=<fraction> …   <- before any measurement
-#   warmth: baseline_before dict_int_s=… caller_s=…              <- the first read, as it lands
-#   warmth: baseline dict_int_s=… caller_s=… limit_s=… dict_int_before_s=… dict_int_after_s=…
+#   warmth: baseline_before dict_int_s=… caller_s=… gc_s=…       <- the first read, as it lands
+#   warmth: baseline dict_int_s=… caller_s=… gc_s=… limit_s=… dict_int_before_s=… dict_int_after_s=…
 #                                                          <- after both reads, before its @test
-#   warmth: ratio shape=… ratio=… shape_s=… baseline_s=… limit=… caller_s=…
+#   warmth: ratio shape=… ratio=… shape_s=… baseline_s=… limit=… caller_s=… gc_s=… ratio_sum=…
 #                                                                 <- one per shape, before its @test
 #   warmth: end mem_free=…                                        <- after them, even on a throw
 #
@@ -127,7 +127,9 @@ using Test
 # What #610's data did show is the leg running closest to the line: ubuntu at 1 thread reads
 # `json_ext` at up to ~7.4x against 8.0. That is not noise. Its `dict_int` is systematically
 # lower there (0.021–0.038 s against 0.047–0.076 s on the other legs), while `json_ext` takes
-# about the same time everywhere. It is #710's to settle, with the `caller_s` field below.
+# about the same time everywhere. #710 found why: on the other legs the process's first
+# collection often landed in `dict_int`, and on that leg it seldom did. With the collection
+# taken out (below), every leg's `dict_int` reads like that one's.
 #
 # Compare the memory fraction WITHIN one OS only. On macOS `Sys.free_memory()` counts only
 # pages that are completely free, not cached or inactive ones. The first CI run with this
@@ -212,14 +214,32 @@ using Test
 #   baseline unmoved. The test env had moved to HTTP 2.13.3 / URIs 1.7.3. The same step
 #   appeared twice on 2026-10-28 with the older versions.
 #
-# So the probe compiles `go` before the request and prints the two times, and the CI lines
-# settled it: the step is the thunk. In both `url` reds on ubuntu at 1 thread, `caller_s` was
-# 0.045–0.046 s against the baseline's 0.009 s, and the request itself, `url()` included, took
-# 7–8 ms. `multipart` went red the same way on windows at 1 thread, with `formdata` and
-# `files_ext` beside it under their limits: `caller_s` 0.057–0.059 s against 0.013 s, and
-# ~6 ms of request. The thunks have the baseline's types and the probe's setup logs no
-# invalidations, so the extra compile is the depot's pkgimage state, not a path an
-# application pays. It reproduced locally and went away with no source change.
+# So the probe compiles `go` before the request and prints the two times. The CI lines then put
+# the step in the thunk on some runs (`url` `caller_s` 0.045 s against 0.009 s) and in the request
+# on others (`url` 0.042 s of request, `caller_s` 0.008 s), and a run on 2026-11-01 had it in a
+# different shape on each leg: `url` on ubuntu at 1 thread, `dict_int`, `dict_any` and
+# `cookie_ext` on ubuntu at 2, the thunk of five shapes on windows at 1.
+#
+# ── The step was a collection, so the probe collects first (#710) ────────────────────────
+#
+# It is the process's first garbage collection. `@timed` around the request, CI's flags,
+# Julia 1.13.2, Linux, same depot, four children per shape:
+#
+#               request, as the probe was              after a `GC.gc()` before the windows
+#   dict_int    0.051-0.055 s, of it gc 0.033-0.035 s  0.017-0.018 s, gc 0
+#   url         0.007 s, gc 0                          0.007 s, gc 0
+#
+# Loading Nitro and registering the routes allocate enough that the first collection falls due
+# around the first request. Where it lands follows the allocation count, which is why it moved
+# between shapes, legs, depots and dependency versions with no Nitro change, and why every
+# instrument added to find it moved it again. Nothing about it is precompile coverage, which is
+# what this file guards. The probe now runs a full collection before its two windows, so a
+# collection inside them is one the shape's own work triggered: a cold shape's compile allocates
+# tens of MB and still pays its own (cold `json_ext`, 178 MB, 0.063 s of gc). The collection time
+# in the windows is printed as `gc_s`, so a step there is still visible.
+#
+# The thunk compile is otherwise the same size for every shape, so charging the baseline's
+# (below) is kept but no longer does any work a run has needed.
 #
 # ── Every shape is charged the baseline's caller (#710) ───────────────────────────────────
 #
@@ -260,12 +280,12 @@ const SHAPES = ["dict_any" => MAX_RATIO, "query_ext" => MAX_RATIO, "json_ext" =>
 probe = joinpath(@__DIR__, ".helpers", "precompile_warmth_probe.jl")
 @test isfile(probe)
 
-# One sample: the first request's `total`, and the share of it that compiled the probe's own
-# thunk, `caller` (see "The probe's caller, timed apart" above).
+# One sample: the first request's `total`, the share of it that compiled the probe's own thunk,
+# `caller` (see "The probe's caller, timed apart" above), and the collection time inside it, `gc`.
 function measure(shape)
     cmd = `$(Base.julia_cmd()) --code-coverage=none --project=$(Base.active_project()) $probe $shape`
-    total, caller = parse.(Float64, split(read(cmd, String)))
-    (; total, caller)
+    total, caller, gc = parse.(Float64, split(read(cmd, String)))
+    (; total, caller, gc)
 end
 
 # The sample with the smallest total, kept whole so its split is logged with it.
@@ -295,7 +315,8 @@ try
     # sample makes one GC pause or one moment of CPU steal on a shared runner a hard red.
     before = best_of("dict_int", 3)
     # Logged at once, so a run the watchdog stops part-way still says what the first read was.
-    warmth("baseline_before dict_int_s=$(fmt(before.total)) caller_s=$(fmt(before.caller))")
+    warmth("baseline_before dict_int_s=$(fmt(before.total)) caller_s=$(fmt(before.caller)) " *
+           "gc_s=$(fmt(before.gc))")
     # A probe that fails (a crash, or its body check catching a broken parser) is kept and
     # thrown inside its own shape's testset below: it reds that shape, and the others still
     # run and log.
@@ -310,7 +331,7 @@ try
     after = best_of("dict_int", 3)
     base = before.total >= after.total ? before : after
     baseline = base.total
-    warmth("baseline dict_int_s=$(fmt(baseline)) caller_s=$(fmt(base.caller)) " *
+    warmth("baseline dict_int_s=$(fmt(baseline)) caller_s=$(fmt(base.caller)) gc_s=$(fmt(base.gc)) " *
            "limit_s=$MAX_BASELINE_SECONDS " *
            "dict_int_before_s=$(fmt(before.total)) dict_int_after_s=$(fmt(after.total))")
     @test 0 < baseline < MAX_BASELINE_SECONDS
@@ -321,7 +342,7 @@ try
         # baseline's caller" above).
         ratio = (s.total - s.caller + base.caller) / baseline
         warmth("ratio shape=$shape ratio=$(round(ratio; digits = 2)) shape_s=$(fmt(s.total)) " *
-               "baseline_s=$(fmt(baseline)) limit=$limit caller_s=$(fmt(s.caller)) " *
+               "baseline_s=$(fmt(baseline)) limit=$limit caller_s=$(fmt(s.caller)) gc_s=$(fmt(s.gc)) " *
                "ratio_sum=$(round(s.total / baseline; digits = 2))")
         @test ratio < limit
     end
