@@ -990,6 +990,25 @@ end
 # The extension module itself, for the private `task_model` accessor the #202 guard drives.
 const PormGExt = Base.get_extension(Nitro, :NitroPormGExt)
 
+# `_bind_model!` goes through `PormG.Models.bind!`, which refuses a key no configuration is loaded
+# under (#791). A test that only BUILDS a model or store registers the key offline for the build:
+# SQL renders, nothing connects, and the binding outlives the entry. A key something else already
+# loaded is left alone, and only the keys registered here are removed -- `PormG.config` is global,
+# and a leaked entry would become PormG's sole-connection fallback for every later item.
+function with_offline_keys(f, keys::String...)
+    added = String[]
+    try
+        for k in keys
+            haskey(PormG.config, k) && continue
+            PormG.Configuration.register_offline(k; adapter = :sqlite)
+            push!(added, k)
+        end
+        return f()
+    finally
+        foreach(PormG.Configuration.unregister_connection, added)
+    end
+end
+
 # `claim_next!` runs in a transaction (#514), through a seam on the store's model. The mocks have
 # no transactions, so their method runs the body directly -- and marks the database as inside one
 # for its duration, which is what `MockDB.locks` records against each `FOR UPDATE` read.
@@ -3451,12 +3470,14 @@ else
             #
             # Mirrors the session-side guard in `pormg_session_tests.jl`; the two stores had the
             # identical gap and #202 closes both.
-            @test getproperty(PormGExt, :task_model)().connect_key == "db"
-            @test getproperty(PormGExt, :task_model)("tasks").connect_key == "tasks"
+            with_offline_keys("db", "tasks") do
+                @test getproperty(PormGExt, :task_model)().connect_key == "db"
+                @test getproperty(PormGExt, :task_model)("tasks").connect_key == "tasks"
 
-            # One model per store, never a shared singleton -- `connect_key` names exactly one
-            # connection, so two stores on different keys could not share an object.
-            @test getproperty(PormGExt, :task_model)() !== getproperty(PormGExt, :task_model)()
+                # One model per store, never a shared singleton -- `connect_key` names exactly
+                # one connection, so two stores on different keys could not share an object.
+                @test getproperty(PormGExt, :task_model)() !== getproperty(PormGExt, :task_model)()
+            end
 
             key = "nitro-test-task-tx"
             haskey(PormG.config, key) &&
@@ -3512,9 +3533,20 @@ else
             # too, so without this the `isnothing(model)` arm of `PormGWorkerStore` has no
             # coverage at all -- regressing it to `task_model()` would leave a store at
             # `db_key="tasks"` carrying a model bound to `"db"` and the suite would stay green.
-            # Neither constructor touches `PormG.config`, so no fixture is needed.
-            @test RealPormGWorkerStore(db_key="tasks").model.connect_key == "tasks"
-            @test RealPormGWorkerStore().model.connect_key == "db"
+            # The binding needs the key loaded (#791), and nothing here queries, so an offline
+            # entry is enough.
+            with_offline_keys("db", "tasks") do
+                @test RealPormGWorkerStore(db_key="tasks").model.connect_key == "tasks"
+                @test RealPormGWorkerStore().model.connect_key == "db"
+            end
+
+            # A key nothing loaded is refused when the store builds its model, with PormG's own
+            # error naming the key, before any SQL runs (#791).
+            unloaded = "nitro-791-task-unloaded"
+            @test !haskey(PormG.config, unloaded)
+            err = try RealPormGWorkerStore(db_key=unloaded); nothing catch e; e end
+            @test err isa PormG.InvalidConfigurationError
+            @test occursin(unloaded, sprint(showerror, err))
         end
 
         @testset "the run_id migration probes before it alters (#366)" begin
@@ -3534,7 +3566,7 @@ else
             # database the column. That premise is asserted, not assumed: a model that stopped
             # emitting `run_id` would put every boot back on the migration path, logging on each.
             booted = FakeSchemaPool(true)
-            getproperty(PormGExt, :_ensure_task_table!)(booted, getproperty(PormGExt, :task_model)())
+            getproperty(PormGExt, :_ensure_task_table!)(booted, with_offline_keys(getproperty(PormGExt, :task_model), "db"))
             @test occursin("CREATE TABLE", first(booted.sql))
             @test occursin("\"run_id\"", first(booted.sql))
             @test !any(is_alter, booted.sql)
@@ -4051,7 +4083,7 @@ else
         @testset "the claim columns are added on boot, each probed first (#514)" begin
             is_alter(s) = startswith(s, "ALTER TABLE")
             pre = FakeSchemaPool(true; claim_columns = Set{String}())
-            getproperty(PormGExt, :_ensure_task_table!)(pre, getproperty(PormGExt, :task_model)())
+            getproperty(PormGExt, :_ensure_task_table!)(pre, with_offline_keys(getproperty(PormGExt, :task_model), "db"))
             @test pre.claim_columns == Set(ADDED_COLUMNS)
             alters = filter(is_alter, pre.sql)
             @test length(alters) == 6
@@ -4071,7 +4103,7 @@ else
 
             # A fresh database gets them from CREATE TABLE, so its boot alters nothing.
             fresh = FakeSchemaPool(true)
-            getproperty(PormGExt, :_ensure_task_table!)(fresh, getproperty(PormGExt, :task_model)())
+            getproperty(PormGExt, :_ensure_task_table!)(fresh, with_offline_keys(getproperty(PormGExt, :task_model), "db"))
             @test all(c -> occursin("\"$c\"", first(fresh.sql)), ADDED_COLUMNS)
             @test !any(is_alter, fresh.sql)
 
@@ -4092,7 +4124,7 @@ else
             is_alter(s) = startswith(s, "ALTER TABLE")
             # A table from step 1: the claim columns, not the job columns. Exactly two ALTERs.
             step1 = FakeSchemaPool(true; claim_columns = Set(CLAIM_COLUMNS))
-            getproperty(PormGExt, :_ensure_task_table!)(step1, getproperty(PormGExt, :task_model)())
+            getproperty(PormGExt, :_ensure_task_table!)(step1, with_offline_keys(getproperty(PormGExt, :task_model), "db"))
             @test step1.claim_columns == Set(ADDED_COLUMNS)
             @test filter(is_alter, step1.sql) == ["ALTER TABLE \"nitro_task\" ADD COLUMN \"job_name\" VARCHAR(255)",
                                                   "ALTER TABLE \"nitro_task\" ADD COLUMN \"job_args\" TEXT"]

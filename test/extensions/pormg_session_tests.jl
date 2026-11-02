@@ -429,6 +429,25 @@ end
 
 const PormGExt = Base.get_extension(Nitro, :NitroPormGExt)
 
+# `_bind_model!` goes through `PormG.Models.bind!`, which refuses a key no configuration is loaded
+# under (#791). A test that only BUILDS a model or store registers the key offline for the build:
+# SQL renders, nothing connects, and the binding outlives the entry. A key something else already
+# loaded is left alone, and only the keys registered here are removed -- `PormG.config` is global,
+# and a leaked entry would become PormG's sole-connection fallback for every later item.
+function with_offline_keys(f, keys::String...)
+    added = String[]
+    try
+        for k in keys
+            haskey(PormG.config, k) && continue
+            PormG.Configuration.register_offline(k; adapter = :sqlite)
+            push!(added, k)
+        end
+        return f()
+    finally
+        foreach(PormG.Configuration.unregister_connection, added)
+    end
+end
+
 # -- A stand-in PormG connection, for `pormg_nitro_session` ---------------
 #
 # `PormG.connection(key=k)` is just `config[k].connections` (`PormG/src/Configuration.jl`),
@@ -1172,13 +1191,15 @@ end
     # on, and the half below pins that premise. The binding is kept for a different reason,
     # pinned below too: `model.objects` resolves by the model before `.db()` is reached (#532,
     # see `_bind_model!`).
-    @test getproperty(PormGExt, :session_model)().connect_key == "db"
-    @test getproperty(PormGExt, :session_model)("sessions").connect_key == "sessions"
+    with_offline_keys("db", "sessions") do
+        @test getproperty(PormGExt, :session_model)().connect_key == "db"
+        @test getproperty(PormGExt, :session_model)("sessions").connect_key == "sessions"
 
-    # One model per store, never a shared singleton: `connect_key` names exactly one
-    # connection, so two stores on different keys sharing an object would overwrite each
-    # other's binding.
-    @test getproperty(PormGExt, :session_model)() !== getproperty(PormGExt, :session_model)()
+        # One model per store, never a shared singleton: `connect_key` names exactly one
+        # connection, so two stores on different keys sharing an object would overwrite each
+        # other's binding.
+        @test getproperty(PormGExt, :session_model)() !== getproperty(PormGExt, :session_model)()
+    end
 
     key = "nitro-test-session-tx"
     (haskey(PormG.config, key)) &&
@@ -1239,10 +1260,21 @@ end
     # `model=`, and `pormg_nitro_session` builds the model itself and passes it in too, so
     # without this the `isnothing(model)` arm of `PormGSessionStore` has no coverage --
     # regressing it to `session_model()` would leave a store at `db_key="sessions"` carrying a
-    # model bound to `"db"` and the suite would stay green. The constructor touches no
-    # `PormG.config` entry, so no fixture is needed.
-    @test RealPormGSessionStore(db_key="sessions").model.connect_key == "sessions"
-    @test RealPormGSessionStore().model.connect_key == "db"
+    # model bound to `"db"` and the suite would stay green. The binding needs the key loaded
+    # (#791), and nothing here queries, so an offline entry is enough.
+    with_offline_keys("db", "sessions") do
+        @test RealPormGSessionStore(db_key="sessions").model.connect_key == "sessions"
+        @test RealPormGSessionStore().model.connect_key == "db"
+    end
+
+    # A key nothing loaded is refused when the store builds its model, with PormG's own error
+    # naming the key, before any SQL runs (#791). It used to be bound blindly, and the factory's
+    # connection lookup that followed failed with a bare `KeyError`.
+    unloaded = "nitro-791-session-unloaded"
+    @test !haskey(PormG.config, unloaded)
+    err = try RealPormGSessionStore(db_key=unloaded); nothing catch e; e end
+    @test err isa PormG.InvalidConfigurationError
+    @test occursin(unloaded, sprint(showerror, err))
 end
 
 @testset "every `.objects` in the extension is routed through `.db(` (#532)" begin
@@ -1363,7 +1395,8 @@ struct FakePostgresPool <: PormG.PormGPostgres end
     # That premise is asserted, not assumed: through the whole bootstrap, CREATE TABLE carries
     # the column, so a new database never takes the migration path.
     booted = FakeSessionSchemaPool(true)
-    getproperty(PormGExt, :_ensure_session_table!)(booted, getproperty(PormGExt, :session_model)())
+    getproperty(PormGExt, :_ensure_session_table!)(
+        booted, with_offline_keys(getproperty(PormGExt, :session_model), "db"))
     @test occursin("CREATE TABLE", first(booted.sql))
     @test occursin("\"created_at\"", first(booted.sql))
     @test !any(is_alter, booted.sql)
@@ -1465,6 +1498,53 @@ finally
     # PormG falls back to the sole loaded connection for an unbound model, so a leaked entry could
     # be picked up by a later test item -- the reason every other item here removes its key.
     delete!(PormG.config, key)
+end
+
+end
+
+# A key a connection resolver serves boots both stores with no `load` of its own (#791). The
+# factories bind the model (`PormG.Models.bind!`, which asks the resolver) before they look the
+# connection up, and `PormG.connection(key = …)` does not ask it: with the binding after the
+# lookup, or with Nitro's own binding back, the factory raises a `KeyError` here. Real SQLite
+# files, because each factory creates its table on the connection it resolved.
+@testitem "PormG store factories on a resolver-served key (#791)" tags=[:extension, :pormg] setup=[NitroCommon] begin
+
+using Test
+using Nitro
+using PormG
+using SQLite
+using Nitro.Types: get_session, set_session!
+
+session_key, task_key = "nitro_session_resolver_791", "nitro_task_resolver_791"
+for k in (session_key, task_key)
+    haskey(PormG.config, k) && error("test-only PormG connection key is already registered: $k")
+end
+folder = mktempdir()
+asked = String[]
+previous = PormG.Configuration._CONNECTION_RESOLVER[]
+PormG.set_connection_resolver(function (k)
+    push!(asked, k)
+    k in (session_key, task_key) || return nothing
+    return Dict("url" => joinpath(folder, "$k.sqlite"), "adapter" => "SQLite", "env" => "test")
+end)
+try
+    store = Nitro.pormg_nitro_session(db_key = session_key)
+    @test session_key in asked
+    @test haskey(PormG.config, session_key)
+    @test store.db_key == session_key
+    # The store queries the key it resolved: a write and a read through it round-trip.
+    PormG.config[session_key].change_data = true
+    set_session!(store, "resolved-1", Dict{String,Any}("v" => 1); ttl = 60)
+    @test get_session(store, "resolved-1") == Dict{String,Any}("v" => 1)
+
+    workers = Nitro.pormg_nitro_worker(db_key = task_key)
+    @test task_key in asked
+    @test haskey(PormG.config, task_key)
+    @test workers.db_key == task_key
+finally
+    PormG.Configuration._CONNECTION_RESOLVER[] = previous
+    # Both keys, whatever failed: a leaked entry is PormG's sole-connection fallback for later items.
+    foreach(PormG.Configuration.unregister_connection, (session_key, task_key))
 end
 
 end
