@@ -2139,6 +2139,13 @@ function Nitro._newapp_pormg(write_app::Function, root::String)
             "# temporary copy of the project it was built from, gone by the time it runs.",
         ],
         store = "pormg_nitro_worker(db_key = \"db\")",
+        # The pools close after `terminate` has drained (#810), in `on_stopped`. That runs after
+        # every `on_shutdown`, the worker runtime's drain included, so the workers are stopped
+        # first wherever the pools are listed. First in the list because `terminate` runs the
+        # serve-level `on_stopped` hooks in reverse, so the pools also close after any such hook
+        # an app adds to the list. Built after `load_many`, which it needs: a key that is not
+        # loaded is refused when the middleware is built.
+        middleware = ["pormg_nitro_pools(keys = [\"db\"])"],
         deps = ["PormG" => string(Base.PkgId(PormG).uuid); [n => drivers[n][1] for n in names]],
         sources = ["PormG" => "{url = \"$(pin.url)\", rev = \"$(pin.rev)\"}"],
         compat = ["PormG" => pin.compat; [n => drivers[n][2] for n in names]],

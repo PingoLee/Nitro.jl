@@ -279,7 +279,8 @@ function main(; root::AbstractString = pkgdir(@__MODULE__), kwargs...)
     #   PormG.Models.set_models(models, joinpath(root, "db"))
     workers = worker_startup(app; queues = ["reports"], store = pormg_nitro_worker(db_key = "db"))
     urlpatterns(app, "", Routes.urlpatterns())
-    serve(app; port = parse(Int, get(ENV, "PORT", "8000")), middleware = [workers],
+    serve(app; port = parse(Int, get(ENV, "PORT", "8000")),
+          middleware = [pormg_nitro_pools(keys = ["db"]), workers],
           secret_key = SecretString(ENV["API_SECRET_KEY"]), kwargs...)
 end
 
@@ -315,29 +316,38 @@ Line by line:
 - `serve(app; …)` is keyword-only. `PORT` defaults to `8000`, and `API_SECRET_KEY` must hold at
   least 32 bytes. Keyword arguments to `main` go through to `serve`, which is how a test starts the
   server with `async = true`.
+- `pormg_nitro_pools(keys = ["db"])` closes the database pools when the server stops. See
+  *Closing the database pools on `terminate`* below.
 
-Global middleware goes in `serve`'s `middleware` list, next to `workers`, and runs before every
-route, whichever handler it targets:
+Global middleware goes in `serve`'s `middleware` list, after `pormg_nitro_pools` and next to
+`workers`, and runs before every route, whichever handler it targets:
 
 ```julia
 serve(app; port = parse(Int, get(ENV, "PORT", "8000")),
-      middleware = [workers, SessionMiddleware(store = MemoryStore()), RateLimiter()],
+      middleware = [pormg_nitro_pools(keys = ["db"]), workers,
+                    SessionMiddleware(store = MemoryStore()), RateLimiter()],
       secret_key = SecretString(ENV["API_SECRET_KEY"]))
 ```
 
 ### Closing the database pools on `terminate`
 
-PormG closes every pool when the process exits. To close them when the *server* stops — a test
-that serves and terminates, or an app that re-serves in the same process — add
-[`pormg_nitro_pools`](@ref Nitro.pormg_nitro_pools) with the keys this app loaded:
+PormG closes every pool when the process exits. The boot above also closes them when the *server*
+stops (a test that serves and terminates, or an app that re-serves in the same process), through
+[`pormg_nitro_pools`](@ref Nitro.pormg_nitro_pools). It closes them after `terminate` has stopped
+accepting and the requests still in flight have finished, not while they run, and in the reverse
+of the order given. The next query reopens a closed pool.
+
+The worker runtime stops first wherever the pools are listed: it drains in `terminate`'s
+shutdown phase, before the server stops accepting, and the pools close only after that. They are
+first in the list so that they also close after any other listed layer that releases something
+when the server stops, because `terminate` runs those in the reverse of the list order. An app
+that loads more keys names them all, and a key that is not loaded is an error when the
+middleware is built, before `serve`. So build it after `load_many`, as `main` does:
 
 ```julia
-serve(app; middleware = [pormg_nitro_pools(keys = ["db"]), workers], …)
+PormG.Configuration.load_many(["db", "db_audit"]; root, env)
+serve(app; middleware = [pormg_nitro_pools(keys = ["db", "db_audit"]), workers], …)
 ```
-
-It closes them after `terminate` has stopped accepting and the requests still in flight have
-finished, not while they run, and in the reverse of the order given. A key that is not loaded
-is an error when the middleware is built, before `serve`. The next query reopens a closed pool.
 
 ## The entry point `newapp` writes
 
