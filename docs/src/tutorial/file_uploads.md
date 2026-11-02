@@ -212,7 +212,7 @@ end
 end # module Routes
 ```
 
-## Best Practices for Large Systems (e.g. BI/Enterprise)
+## Best Practices for Large Systems
 
 If your system processes very large files (e.g. 100MB+ `.dbf` or `.xlsx` files) or requires
 complex validation/import steps, **never process the file directly in the request handler.**

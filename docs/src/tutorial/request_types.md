@@ -13,7 +13,7 @@ For Nitro.jl-style applications, two methods cover virtually all real-world need
 | `GET`  | Fetch / query data | Reading records, dashboards, status checks |
 | `POST` | Submit data / trigger an action | Creating records, imports, syncs, complex lookups |
 
-> `PUT`, `PATCH`, and `DELETE` are supported, but action-oriented backends (like BI data pipelines)
+> `PUT`, `PATCH`, and `DELETE` are supported, but action-oriented backends
 > naturally favor `POST` for any operation that involves a payload or a side-effect.
 
 ## Anatomy of a URL
