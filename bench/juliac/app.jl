@@ -31,9 +31,32 @@ const SERVE_LIFECYCLE = Nitro.LifecycleMiddleware(middleware = handler -> handle
 LIFECYCLE && urlpatterns(app, "", path("/lifecycle", req -> Res.send("lifecycle"); method = "GET",
                                        middleware = [ROUTE_LIFECYCLE]))
 
+# The listener-closure ladder (#744): each knob moves the served shape one step toward what
+# bench/juliac/realapp passes to `serve`, so a first request's `--trace-compile` window says which
+# serve-level layer HTTP.jl's `_serve_listener!` closure is specialized on. Read at top level, as
+# `LIFECYCLE` is: under `juliac` that is build time, so with all three off (the default) the
+# branches below are dead and the app is the minimal one above. What they build is built in
+# `main`: `WORKERS_MW` installs a worker runtime, which must not happen at build time.
+#   ACCESS_LOG=1  `serve`'s default `access_log` and `show_banner` (the shape Nitro's workload warms)
+#   SECRET_KEY=1  a `secret_key`, 32 random bytes generated in `main` and never printed
+#   WORKERS_MW=1  the Workers middleware over an in-memory store, ahead of the serve-owned
+#                 lifecycle layer: the realapp's `[workers, ready]`, passed as a `Tuple`
+const ACCESS_LOG = get(ENV, "ACCESS_LOG", "0") == "1"
+const SECRET_KEY = get(ENV, "SECRET_KEY", "0") == "1"
+const WORKERS_MW = get(ENV, "WORKERS_MW", "0") == "1"
+
 function (@main)(args::Vector{String})::Cint
     port = parse(Int, get(ENV, "PORT", "8080"))
-    serve(app; host = "127.0.0.1", port, async = false, show_banner = false, access_log = false,
-          middleware = LIFECYCLE ? (SERVE_LIFECYCLE,) : ())
+    secret_key = SECRET_KEY ? SecretString(bytes2hex(Nitro.Crypto.secure_random_bytes(32))) : nothing
+    middleware = if WORKERS_MW
+        (worker_startup(app; queues = ["reports"], store = Nitro.Workers.InMemoryWorkerStore()),
+         SERVE_LIFECYCLE)
+    elseif LIFECYCLE
+        (SERVE_LIFECYCLE,)
+    else
+        ()
+    end
+    serve(app; host = "127.0.0.1", port, async = false, show_banner = ACCESS_LOG,
+          access_log = ACCESS_LOG, secret_key, middleware)
     return Cint(0)
 end
