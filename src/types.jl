@@ -1101,12 +1101,16 @@ This is a **return type users meet**, not something most apps construct: `RateLi
 
 - `middleware::Function` — the request function, `handle -> req -> resp`. This is the part the
   chain actually runs.
-- `on_startup::Union{Function,Nothing}` — called once by `serve()`, with no arguments. Its
-  return value is discarded.
+- `on_startup::Union{Function,Nothing}` — called once by `serve()`, with no arguments,
+  **before** the listener opens (#799). Its return value is discarded.
 - `on_shutdown::Union{Function,Nothing}` — called once by `terminate()`, with no arguments,
   **before** the HTTP drain: the listener is still accepting, and requests are still running.
 - `on_stopped::Union{Function,Nothing}` — called once by `terminate()`, with no arguments,
   **after** the listener has closed and the drain has finished or been forced (#161).
+
+A `serve()` whose start fails after its startup hooks ran (a startup interrupt, or a listener
+that will not bind) calls each hook's `on_shutdown` and then `on_stopped` too, with no listener
+ever opened and no request served.
 
 All three hooks are optional; `nothing` means "nothing to do", which is why a middleware with no
 resource to own can still be one of these rather than a bare function (`RateLimiter`'s
@@ -1122,14 +1126,13 @@ drain may re-acquire it. This is Spring's phased shutdown: the web server stops,
 it served from are destroyed; and Go's `db.Close()` after `srv.Shutdown()` returns.
 [`pormg_nitro_pools`](@ref Nitro.pormg_nitro_pools) is the in-tree user.
 
-`on_stopped` is best effort in two cases:
+`on_stopped` is best effort in one case: when the drain hits its timeout, the connections are
+force-closed, but a handler task still running is not stopped, and it can reach the resource
+after `on_stopped` released it.
 
-- When the drain hits its timeout, the connections are force-closed, but a handler task still
-  running is not stopped, and it can reach the resource after `on_stopped` released it.
-- The port is released when the drain *starts*, so a `serve()` of the same app called while a
-  `terminate()` is still draining is admitted, and this run's `on_stopped` then runs while the
-  next run is already serving. Wait for `terminate()` to return before serving again when a
-  hook releases something the next run will use.
+It never runs against the next run of the same app. The port is released when the drain
+*starts*, but `serve()` refuses that app with an `ArgumentError` until `terminate()` has returned,
+its last `on_stopped` included (#812).
 
 Like `on_shutdown`, it runs only when `terminate()` does: not on a hard kill, and not when Ctrl-C
 ends a script run as `julia app.jl` (see the Ctrl-C note on `serve`). Its time adds to the exit
@@ -1265,9 +1268,9 @@ without their paired `on_shutdown`. The hook's own return value is discarded —
 
 `InterruptException` is the one exception that is neither swallowed nor rethrown here: it is
 **deferred**. `startup` logs it and *returns* it, and `startserver` (`src/core/lifecycle.jl`)
-finishes broadcasting over the remaining hooks, unwinds through `terminate` — so the listener it
-just opened does not stay open — and re-raises the interrupt once. Ctrl-C during startup is
-honored without stranding the sequence (#185).
+finishes broadcasting over the remaining hooks, unwinds them (each hook's `on_shutdown` and
+`on_stopped`; the listener has not opened yet, #799), and re-raises the interrupt once. Ctrl-C
+during startup is honored without stranding the sequence (#185).
 
 !!! note "Why not `e isa InterruptException && rethrow()`"
     That idiom (`src/utilities/misc.jl`, `src/middleware/janitor.jl`) is for *leaf* catch-alls,

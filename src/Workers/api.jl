@@ -1,11 +1,11 @@
 # No fallback (#322). This used to answer `default_runtime()` whenever `ctx` had nothing
 # installed, and that runtime carries none of the app's policy: no queue authorizer, no error
 # redactor, no retention. It was reachable in three ordinary ways -- a request in the window
-# between `serve()` opening its listener and the startup hook installing the runtime, the
-# tutorial's bare `worker_startup` paired with App-first calls, and a `start!` that threw before
-# installing -- and in each one a submission silently skipped the app's authorization. An App
-# with no runtime is now refused; `worker_startup(app)` installs one when it is BUILT, so the
-# startup window no longer exists for it.
+# between `serve()` opening its listener and the startup hook installing the runtime (a window
+# #799 closed too: the hooks now run before the listener opens), the tutorial's bare
+# `worker_startup` paired with App-first calls, and a `start!` that threw before installing --
+# and in each one a submission silently skipped the app's authorization. An App with no runtime
+# is now refused; `worker_startup(app)` installs one when it is BUILT.
 function _resolve_runtime(ctx::App; key::Symbol=DEFAULT_EXTENSION_KEY, runtime::Union{Nothing, WorkerRuntime}=nothing)
     if !isnothing(runtime)
         return runtime
@@ -592,16 +592,18 @@ function startup(ctx::App;
     # built, before the install below, not from `on_startup`, whose exception is only logged.
     queue_specs, external = _checked_queue_specs(ctx, key, store, runtime, queues)
 
-    # Installed NOW, when the middleware is built, not in `on_startup` (#322). `serve()` opens its
-    # listener before it runs the startup hooks, so a runtime installed by the hook left a window
-    # in which App-first calls found nothing installed -- and they used to fall back to the
-    # process-wide runtime, skipping the app's queue authorizer. `_start_runtime_for!` also refuses
-    # `store` + `runtime` together here, at boot, instead of from a hook whose exception is only
-    # logged. Only the INSTALL moves: the zombie sweep, the queue processors and the scheduler
-    # still start in `on_startup`.
+    # Installed NOW, when the middleware is built, not in `on_startup` (#322), so App-first calls
+    # made before `serve()` -- installing a queue authorizer on `worker_store(app)`, above all --
+    # find it. They used to find nothing and fall back to the process-wide runtime, skipping the
+    # app's queue authorizer. (`serve()` used to open its listener before the startup hooks,
+    # which left a request the same window; since #799 the hooks run first.)
+    # `_start_runtime_for!` also refuses `store` + `runtime` together here, at boot, instead of
+    # from a hook whose exception is only logged. Only the INSTALL moves: the zombie sweep, the
+    # queue processors and the scheduler still start in `on_startup`.
     installed = _start_runtime_for!(ctx, key, store, runtime, drain_timeout)
-    # Declared now too, not only by `start!` in the hook (#324): a submit in the startup window
-    # would otherwise be refused as an undeclared queue.
+    # Declared now too, not only by `start!` in the hook (#324): a submit made before the hook
+    # runs -- from an earlier startup hook, or before `serve()` -- would otherwise be refused as an
+    # undeclared queue.
     # A new name, not `queue_specs` reassigned: `on_startup` below captures it, and a captured
     # variable that is assigned twice is a `Core.Box` (#364).
     declared_specs, _ = _declare_with_app!(ctx, installed, queue_specs, external)

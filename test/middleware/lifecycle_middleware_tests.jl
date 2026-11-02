@@ -889,8 +889,10 @@ end
 @test boom_stopped[] == 1
 @test later_stopped[] == 1
 
-# The listener `start(...)` had already opened is closed, not stranded.
+# No listener is left behind. Since #799 none is opened before the hooks return; before that,
+# the one `start(...)` had already opened had to be closed by the unwind.
 @test !Base.isopen(ctx.service)
+@test Nitro.Core.AppContext._idle(ctx.service)
 @test ctx.service.server[] === nothing
 @test isempty(ctx.service.serve_lifecycle)
 @test ctx.service.external_url[] === nothing

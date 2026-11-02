@@ -295,7 +295,7 @@ end
 # `SessionMiddleware`'s prune and `FixedRateLimiter`'s sweep. It is EVENT-driven, not
 # interval-driven: it parks on `take!` rather than `sleep(interval)`, is stopped by `close`ing
 # the channel rather than by a stop token, and because closing takes effect immediately its
-# `on_shutdown` can bound-WAIT for the drain (`timedwait(..., 5.0)`) where those two can only
+# `on_stopped` can bound-WAIT for the drain (`timedwait(..., 5.0)`) where those two can only
 # signal and let the task finish its nap. Widening `_janitor` to cover a blocking-wait loop with
 # a bounded shutdown would put a second shape back into the helper, which is exactly what
 # extracting it removed. This divergence is by design; the three that collapsed were not.
@@ -312,7 +312,7 @@ end
 # with one `@warn`. Rethrowing it only killed the writer with an `errormonitor` "Unhandled Task
 # ERROR", and swallowing it and draining on would park this task again as the one every later
 # Ctrl-C lands in. Records are then buffered up to `capacity` and dropped, never blocking a
-# request, until the server restarts: `on_shutdown` closes this activation and `on_startup` spawns
+# request, until the server restarts: `on_stopped` closes this activation and `on_startup` spawns
 # a fresh one, so no state needs resetting here.
 function _run(sink, r::_Run, max_batch::Int)
     try
@@ -380,6 +380,10 @@ end
 Build a `LifecycleMiddleware` that asynchronously records every handled request and
 delivers batches to `sink(::Vector{AccessRecord})`. Add it to `serve(middleware=[…])`;
 its background writer starts and stops with the server.
+
+The writer stops in the `on_stopped` phase, after `terminate`'s HTTP drain, so the requests the
+drain finishes are recorded too. Stopping it waits up to 5 seconds for the buffered records to
+reach `sink`, and that wait adds to the exit time after the drain.
 
 - `sink`      — `Vector{AccessRecord} -> Any`, called on the writer task (may block/do I/O)
 - `capacity`  — max buffered records before new ones are dropped (protects the hot path)
@@ -561,21 +565,30 @@ function AccessLog(sink::Function; capacity::Integer=10_000,
     end
 
     # Two independent resources, each idempotent on its own, so neither guard may short-circuit
-    # the other: an early `return` in the writer half must not skip the pruner. The pruner stops
-    # FIRST so the drain wait below is not spent with a prune still being scheduled.
+    # the other: an early `return` in the writer half must not skip the pruner.
     on_startup = function ()
         start_writer()
         pruner === nothing || pruner[1]()
         return nothing
     end
 
+    # Split across `terminate`'s two teardown phases (#811). The pruner stops in `on_shutdown`,
+    # before the HTTP drain: a prune is not something the drain needs. The writer stops in
+    # `on_stopped`, once the listener is closed and the drain is over, because the drain exists to
+    # finish requests, and each one it finishes has a record to write. Stopped in `on_shutdown`,
+    # as it was, a request still in flight met a closed channel and one admitted while the
+    # shutdown hooks ran was never captured, and neither was counted in a drop warning.
     on_shutdown = function ()
         pruner === nothing || pruner[2]()
+        return nothing
+    end
+
+    on_stopped = function ()
         stop_writer()
         return nothing
     end
 
-    return LifecycleMiddleware(; middleware, on_startup, on_shutdown)
+    return LifecycleMiddleware(; middleware, on_startup, on_shutdown, on_stopped)
 end
 
 end # module StructuredAccessLogMiddleware

@@ -236,10 +236,11 @@ try
         @test asked[] === :none
     end
 
-    # The port is free as soon as the drain begins, so a `serve` admitted mid-drain must start
-    # clean while the run being stopped keeps its flag set. One flag cleared at either end of
-    # `terminate` would fail one of the two.
-    @testset "a serve admitted during a drain starts clean; the draining run stays :shutdown" begin
+    # The port is free as soon as the drain begins, but a `serve` of the same app is refused
+    # until `terminate` returns (#812), and the run after it starts clean. The draining run keeps
+    # its own flag set throughout: one flag cleared at either end of `terminate` would fail one
+    # of the two halves.
+    @testset "a serve during a drain is refused; the next run starts clean (#812)" begin
         port2 = get_free_port()
         serve(app; host = HOST, port = port2, async = true, show_banner = false,
               access_log = nothing, shutdown_timeout = 30)
@@ -252,18 +253,22 @@ try
             reason, _ = take_within(reported, 10.0, NO_REPORT)
             @test reason === :shutdown                       # the draining run's handler
             @test timedwait(() -> !isopen(app.service), 10.0) === :ok
-            port3 = get_free_port()
-            serve(app; host = HOST, port = port3, async = true, show_banner = false,
-                  access_log = nothing)
-            @test timedwait(() -> isopen(app.service), 10.0) === :ok
-            asked[] = nothing
-            @test HTTP.get("http://$HOST:$port3/ask"; status_exception = false).status == 200
-            @test asked[] === :none                          # the new run's handler
+            @test_throws ArgumentError serve(app; host = HOST, port = get_free_port(),
+                                             async = true, show_banner = false,
+                                             access_log = nothing)
+            @test !istaskdone(stopping)                      # still inside the drain
         finally
             isready(release) || put!(release, nothing)
             stopping === nothing || wait(stopping)
             close(sock)
         end
+        port3 = get_free_port()
+        serve(app; host = HOST, port = port3, async = true, show_banner = false,
+              access_log = nothing)
+        @test timedwait(() -> isopen(app.service), 10.0) === :ok
+        asked[] = nothing
+        @test HTTP.get("http://$HOST:$port3/ask"; status_exception = false).status == 200
+        @test asked[] === :none                              # the new run's handler
     end
 finally
     terminate(app)

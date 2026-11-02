@@ -42,11 +42,18 @@ function _rethrow_value_free(@nospecialize(e))
     rethrow()
 end
 
+# Whether a blocking `serve` on `app` may tear down what it finds in its `finally`: only when the
+# App had no server run in any phase before the call (#812). One that is starting, serving or
+# stopping belongs to another call, which the refusal leaves alone.
+_serve_owns_cleanup(app::App)::Bool =
+    Nitro.Core.AppContext._idle(app.service) && !isopen(app.service)
+
 """
     serve(; middleware=(), host="127.0.0.1", port=8080, kwargs...) -> Union{Server, Nothing}
 
 Start the Nitro HTTP server with the registered routes. Runs until `terminate()`
-(or `Ctrl-C`); pass `async=true` to return immediately and serve in the background.
+(or `Ctrl-C`); pass `async=true` to return as soon as the server is listening, its startup
+hooks done, and serve in the background.
 
 Returns the running `Server` in `async=true` mode; in blocking mode it returns
 `nothing`, since the server has already shut down by the time control returns and a
@@ -218,11 +225,22 @@ is explicit introspection, not accidental disclosure.)
 
 Calling `serve` on an app that is **already serving** throws an `ArgumentError`: the second
 call would overwrite the running server's handle and strand its port. Terminate that app
-first, or give the second listener its own `App`.
+first, or give the second listener its own `App`. The same refusal holds while the app is still
+**starting** under another `serve` call, and while it is **stopping**: `terminate` frees the
+port as soon as its drain begins, but a `serve` of the same app is refused until `terminate` has
+returned, so the old run's last teardown hooks can never release what the new run is using
+(#812). Another `App` in the same process is not affected.
+
+**The port opens only once every startup hook has returned (#799).** `serve` runs each
+`LifecycleMiddleware`'s `on_startup` first and then starts the listener, so a connection that
+succeeds reaches an app whose hooks are done: a worker runtime running, a janitor started,
+whatever the hooks compile already compiled. A hook that blocks keeps the port closed until it
+returns. If the listener then fails to start (the address is in use, say), every hook that ran
+gets its `on_shutdown` and `on_stopped` before `serve` throws, and the app can be served again.
 
 **Ctrl-C is honored at both points it can land (#185).** An interrupt inside a startup hook lets
-the remaining hooks finish, then unwinds through `terminate` and rethrows — so the app is left
-not-serving and `serve` can simply be retried. An interrupt out of the blocking wait
+the remaining hooks finish, then runs every hook's `on_shutdown` and `on_stopped` and rethrows,
+with no listener ever opened — so the app is left not-serving and `serve` can simply be retried. An interrupt out of the blocking wait
 (`async = false`) is the documented way to stop the server, and now tears it down before
 returning rather than leaving the listener up.
 
@@ -279,7 +297,7 @@ function serve(; async::Bool = false, kwargs...)
     # deliberately, making a refused `serve()` lethal to a healthy one. Reading the context up
     # front also still cleans up when a throw lands *after* the handle was installed, which a
     # post-hoc `started = true` would miss.
-    ours = !isopen(CONTEXT[].service)
+    ours = _serve_owns_cleanup(CONTEXT[])
     try
         try
             # Returns the running `HTTP.Server` when async; `nothing` in blocking mode (the
@@ -839,13 +857,17 @@ end
     terminate(; timeout = nothing)
 
 Stop the running server: run every `LifecycleMiddleware` shutdown hook and close the listener.
-A no-op when nothing is serving. (There is no middleware cache to drop: each pipeline owns its
-own, so the next `serve()` starts cold.)
+A no-op when nothing is serving, while another `terminate` of the same app is already running,
+and while a `serve` of it is still starting. (There is no middleware cache to drop: each
+pipeline owns its own, so the next `serve()` starts cold.)
 
-Shutdown is a **bounded graceful drain**, modeled on Go's `http.Server.Shutdown(ctx)`. The
-listening socket is released immediately — the port is free as soon as `terminate` is entered
-— then Nitro waits up to `timeout` seconds for in-flight requests to finish and force-closes
-whatever remains.
+Until `terminate` returns, a `serve` of the same app is refused with an `ArgumentError`, though
+the port is already free (#812). Call `serve` again once it has returned.
+
+Shutdown is a **bounded graceful drain**, modeled on Go's `http.Server.Shutdown(ctx)`. Once the
+`on_shutdown` hooks have run, the listening socket is released — the port is free from the
+moment the drain begins — then Nitro waits up to `timeout` seconds for in-flight requests to
+finish and force-closes whatever remains.
 
 Nothing can stop a running handler, so from the moment `terminate` is entered, before any
 shutdown hook runs, every in-flight request reads `cancel_reason(req) === :shutdown`. A handler
@@ -858,8 +880,9 @@ that polls it can wind down within the drain instead of being cut at its end.
 the drain begins, and a hook may block: `worker_startup`'s drains in-flight background tasks for up
 to `WORKER_DRAIN_TIMEOUT_SECONDS` (5 seconds) of its own. Every `on_stopped` hook runs *after* the
 drain, once the listener is closed (#161) — `pormg_nitro_pools`' waits up to its `drain_seconds`
-per pool for leased connections. All three are consecutive, so size them together against a
-container's stop grace period.
+per pool for leased connections, and `AccessLog`'s up to 5 seconds for its writer to hand the
+buffered records, the drain's included, to its sink. All three are consecutive, so size them
+together against a container's stop grace period.
 
 **Long-lived connections are always cut at the timeout.** A WebSocket, SSE, or STREAM handler
 holds its connection for its whole lifetime, so the drain can never wait it out. If such a
@@ -931,7 +954,7 @@ function serve(app::App; async::Bool = false, secret_key = nothing, kwargs...)
     _warn_shadowed_cookie_key(app, secret_key)
     # Same reasoning as the singleton form above: decide ownership BEFORE the call, so a
     # rejected `serve` never tears down the healthy server that caused the rejection.
-    ours = !isopen(app.service)
+    ours = _serve_owns_cleanup(app)
     try
         try
             return Nitro.Core.serve(app; async, secret_key, kwargs...)
@@ -962,10 +985,10 @@ The App-first form: a lifecycle middleware for `serve(app; middleware = [...])` 
 worker runtime. Pass `store = …` to choose a backend, or `runtime = …` to adopt one you built.
 
 **The runtime is installed when this is called, not when the server starts**
-([#322](https://github.com/PingoLee/Nitro.jl/issues/322)). `serve()` opens its listener before it
-runs startup hooks, so a runtime installed by the hook left a window in which App-first calls
-found nothing installed. So `worker_store(app)` is available straight after building the
-middleware, which is the moment to install policy on it:
+([#322](https://github.com/PingoLee/Nitro.jl/issues/322)). So `worker_store(app)` is available
+straight after building the middleware, before `serve()` runs any hook, which is the moment to
+install policy on it. (`serve()` runs its startup hooks before it opens the listener (#799), so
+no request can reach the app before the hook has started the runtime either.)
 
 ```julia
 app = App(mod = @__MODULE__)

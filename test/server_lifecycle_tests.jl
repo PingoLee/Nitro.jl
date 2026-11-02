@@ -157,12 +157,11 @@ end
     end
 end
 
-@testset "a serve() during the drain window is not stranded by the finishing terminate()" begin
+@testset "a serve() during the drain window is refused until terminate() returns (#812)" begin
     # `HTTP.close` releases the listener up front, so `isopen(service)` goes false while the
-    # drain is still running and a concurrent `serve()` is admitted. If the finishing
-    # `close(::Service)` then cleared `server[]` unconditionally it would strand that new
-    # server: live, listening, and unreachable from `terminate()` — the exact leak this
-    # change exists to remove, just through a narrower window.
+    # drain is still running. A `serve()` used to be admitted there, and the old run's
+    # `on_stopped` hooks then ran against the new run. The phase keeps it refused until the
+    # whole teardown is over, and the refusal must leave the draining run untouched.
     entered, release = Base.Event(), Base.Event()
     ctx  = _pinning_context(entered, release)
     p1   = get_free_port()
@@ -179,25 +178,145 @@ end
         # Wait for the listener to be released — that is the window's opening edge.
         @test timedwait(() -> !isopen(ctx.service), 10.0; pollint = 0.05) === :ok
 
-        srvB = _serve(ctx, get_free_port())
-        @test ctx.service.server[].server === srvB
+        refusal = try
+            _serve(ctx, get_free_port())
+            nothing
+        catch e
+            e
+        end
+        @test refusal isa ArgumentError
+        @test occursin("still stopping", sprint(showerror, refusal))
         # Self-verifying: assert we really are inside the window. Without this, a pathological
         # runner where the drain finished first would silently degrade to green-without-testing.
+        @test !istaskdone(stopping)
+        # A second `terminate` while the first is running is a no-op, not a second teardown.
+        @test Nitro.Core.terminate(ctx; timeout = 2.0) === nothing
         @test !istaskdone(stopping)
 
         @test timedwait(() -> istaskdone(stopping), 20.0; pollint = 0.1) === :ok
         @test !istaskfailed(stopping)
+        @test isnothing(ctx.service.server[])
 
-        # The decisive assertion: B's handle survived A's shutdown, so B is still reachable
-        # from terminate() rather than being a permanently-bound orphan.
+        # Once `terminate` has returned, the same App serves again.
+        srvB = _serve(ctx, get_free_port())
         @test ctx.service.server[].server === srvB
         @test isopen(ctx.service)
     finally
         notify(release)
         isnothing(sock) || close(sock)
-        isnothing(srvB) || HTTP.forceclose(srvB)
+        isnothing(srvB) || Nitro.Core.terminate(ctx; timeout = 2.0)
         isnothing(srvA) || HTTP.forceclose(srvA)
-        ctx.service.server[] = nothing
+    end
+end
+
+@testset "concurrent terminate() calls run each teardown hook once (#812)" begin
+    # The first `terminate` is held INSIDE its `on_shutdown`, where the listener is still open, so
+    # the others run while it is mid-teardown. Under a guard on `isopen` they all got in and ran
+    # every hook again; the phase claim makes them return at once.
+    ctx = Nitro.Core.App()
+    Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
+        path("/ok", (req) -> Res.send("ok"), method = "GET"),
+    ])
+    in_shutdown, hold = Base.Event(), Base.Event()
+    shutdowns, stoppeds = Threads.Atomic{Int}(0), Threads.Atomic{Int}(0)
+    lifecycle = Nitro.LifecycleMiddleware(middleware = identity,
+        on_shutdown = () -> (Threads.atomic_add!(shutdowns, 1); notify(in_shutdown); wait(hold)),
+        on_stopped  = () -> Threads.atomic_add!(stoppeds, 1))
+    srv = _serve(ctx, get_free_port(); middleware = [lifecycle])
+    first_stop = nothing
+    try
+        first_stop = Threads.@spawn Nitro.Core.terminate(ctx; timeout = 1.0)
+        wait(in_shutdown)
+        @test isopen(ctx.service)                 # the window an `isopen` guard admitted
+        others = [Threads.@spawn Nitro.Core.terminate(ctx; timeout = 1.0) for _ in 1:3]
+        @test timedwait(() -> all(istaskdone, others), 10.0; pollint = 0.05) === :ok
+        @test !any(istaskfailed, others)
+        @test !istaskdone(first_stop)             # they returned while the first was held
+        @test shutdowns[] == 1
+        notify(hold)
+        @test timedwait(() -> istaskdone(first_stop), 20.0; pollint = 0.05) === :ok
+        @test !istaskfailed(first_stop)
+        @test (shutdowns[], stoppeds[]) == (1, 1)
+        @test Nitro.Core.AppContext._idle(ctx.service)
+    finally
+        notify(hold)
+        isnothing(first_stop) || wait(first_stop)
+        isnothing(srv) || HTTP.forceclose(srv)
+    end
+end
+
+@testset "a serve() that fails to bind unwinds its hooks and leaves the App idle (#812, #799)" begin
+    # The startup hooks run before the listener opens (#799), so by the time the bind fails each
+    # has started, and each must get its `on_shutdown` and `on_stopped`. The App is then idle,
+    # its serve-owned lifecycle unregistered, and a retry starts the list exactly once.
+    ctx = Nitro.Core.App()
+    started, shut, stopped_ = Threads.Atomic{Int}(0), Threads.Atomic{Int}(0), Threads.Atomic{Int}(0)
+    lifecycle = Nitro.LifecycleMiddleware(middleware = identity,
+        on_startup  = () -> Threads.atomic_add!(started, 1),
+        on_shutdown = () -> Threads.atomic_add!(shut, 1),
+        on_stopped  = () -> Threads.atomic_add!(stopped_, 1))
+    held = Sockets.listen(Sockets.localhost, 0)
+    port = Int(Sockets.getsockname(held)[2])
+    try
+        # `reuseaddr = false`, so the held port refuses the bind on every platform.
+        @test_throws Exception _serve(ctx, port; middleware = [lifecycle], reuseaddr = false)
+    finally
+        close(held)
+    end
+    @test (started[], shut[], stopped_[]) == (1, 1, 1)
+    @test Nitro.Core.AppContext._idle(ctx.service)
+    @test !isopen(ctx.service)
+    @test isempty(ctx.service.serve_lifecycle)
+    @test ctx.service.external_url[] === nothing
+    srv = _serve(ctx, get_free_port(); middleware = [lifecycle])
+    try
+        @test started[] == 2
+    finally
+        Nitro.Core.terminate(ctx)
+    end
+    @test (shut[], stopped_[]) == (2, 2)
+end
+
+@testset "the port stays closed until every startup hook has returned (#799)" begin
+    # A hook that blocks keeps the listener from opening: a connection is refused, the App is not
+    # serving yet, and a second `serve` is refused as still starting. Once the hook returns, the
+    # same port answers.
+    entered, release = Base.Event(), Base.Event()
+    ctx = Nitro.Core.App()
+    Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
+        path("/ok", (req) -> Res.send("ok"), method = "GET"),
+    ])
+    hook = Nitro.LifecycleMiddleware(middleware = identity,
+        on_startup = () -> (notify(entered); wait(release)))
+    port = get_free_port()
+    # `async = true` still returns only once the listener is up, so the call runs on a task.
+    starting = Threads.@spawn _serve(ctx, port; middleware = [hook])
+    try
+        wait(entered)
+        @test !isopen(ctx.service)
+        @test isnothing(ctx.service.server[])
+        @test_throws Base.IOError Sockets.connect(Sockets.localhost, port)
+        refusal = try
+            _serve(ctx, get_free_port())
+            nothing
+        catch e
+            e
+        end
+        @test refusal isa ArgumentError
+        @test occursin("already starting", sprint(showerror, refusal))
+        # A `terminate` has nothing to stop yet; it leaves the start alone.
+        @test Nitro.Core.terminate(ctx) === nothing
+        @test !istaskdone(starting)
+
+        notify(release)
+        @test timedwait(() -> istaskdone(starting), 20.0; pollint = 0.05) === :ok
+        @test !istaskfailed(starting)
+        @test isopen(ctx.service)
+        @test HTTP.get("http://$HOST:$port/ok"; retry = false).status == 200
+    finally
+        notify(release)
+        wait(starting)
+        Nitro.Core.terminate(ctx)
     end
 end
 

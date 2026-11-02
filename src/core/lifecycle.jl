@@ -278,6 +278,39 @@ _default_serve_listener(ctx::App) =
                                     security_headers = nothing),
                     stream_handler, DEFAULT_MAX_BODY_BYTES, zero(Int64), zero(Int64), nothing)
 
+# The refusal `serve` throws when `ctx` is not idle, worded for the phase it is in (#812).
+function _not_idle_error(ctx::App)::ArgumentError
+    phase = ctx.service.phase[]
+    if phase === AppContext.PHASE_STOPPING
+        return ArgumentError(
+            "This App is still stopping: `terminate` is draining its previous run and has " *
+            "teardown hooks still to run, which would release what a new run starts using. Wait " *
+            "for `terminate` to return, then call `serve` again.")
+    elseif phase === AppContext.PHASE_STARTING
+        return ArgumentError(
+            "This App is already starting: another `serve()` call is bringing it up. Wait for " *
+            "that call, and `terminate` it before serving again, or give the second listener " *
+            "its own: `app = App(mod = @__MODULE__); serve(app; …)`.")
+    end
+    return ArgumentError(
+        "This App is already serving on " *
+        "$(something(ctx.service.external_url[], "an open listener")). A second `serve()` " *
+        "would overwrite the running server's handle, leaving it unreachable and its port " *
+        "bound until the process exits. Terminate THIS app first, or give the second " *
+        "listener its own: `app = App(mod = @__MODULE__); serve(app; …)`.")
+end
+
+# Undo a `serve` that failed while it still owned `PHASE_STARTING` (#812): no startup hook has
+# run and no listener is open, so the `serve(middleware = …)` lifecycle this call registered
+# belongs to a run that never existed. Cleared, or the next `serve` would start it alongside its
+# own. Then the phase goes back to `IDLE`, last, so a retry finds the App as it was.
+function _abandon_start!(ctx::App)
+    lock(() -> empty!(ctx.service.serve_lifecycle), ctx.service.lifecycle_lock)
+    ctx.service.external_url[] = nothing
+    ctx.service.phase[] = AppContext.PHASE_IDLE
+    return nothing
+end
+
 # Documented on the public `Nitro.serve` (src/methods.jl), which is the binding users call and
 # the one `docs/` renders. A docstring here is a second copy Documenter counts as missing (#186).
 function serve(ctx::App;
@@ -317,14 +350,12 @@ function serve(ctx::App;
     # leaving it unreachable and its port bound for the life of the process, with nothing left
     # to close it. That is a programming error, not something to paper over by silently killing
     # the first server's in-flight requests.
-    if isopen(ctx.service)
-        throw(ArgumentError(
-            "This App is already serving on " *
-            "$(something(ctx.service.external_url[], "an open listener")). A second `serve()` " *
-            "would overwrite the running server's handle, leaving it unreachable and its port " *
-            "bound until the process exits. Terminate THIS app first, or give the second " *
-            "listener its own: `app = App(mod = @__MODULE__); serve(app; …)`."))
-    end
+    #
+    # On the PHASE, not on `isopen` alone (#812): `terminate` closes the listener when its drain
+    # starts, and a `serve` admitted from then on ran while the old run's `on_stopped` hooks were
+    # still to come, so they released what the new run had just started using. This is the
+    # read-only half; the claim itself is the compare-and-swap below, after validation.
+    AppContext._idle(ctx.service) && !isopen(ctx.service) || throw(_not_idle_error(ctx))
 
     # Before any mutation (#401): the hook runs on every logged request, so a wrong shape -- a
     # non-function, or the old pre-handler `req -> Bool` -- is refused at the call that has it.
@@ -470,71 +501,87 @@ function serve(ctx::App;
         max_cookie_size=current.max_cookie_size,
     )
 
-    if !ismissing(context)
-        ctx.app_context[] = Context(context)
-    end
-    ctx.service.cookies[] = cookies
-
-    ctx.service.external_url[] = external_url isa String ? external_url : "http://$host:$port"
-    ctx.service.prefix[] = global_prefix
-    # Stored rather than passed through, because the *blocking* `serve()` calls `terminate()`
-    # from its own `finally` (the Ctrl-C path) with no way to hand it a keyword.
-    ctx.service.shutdown_timeout[] = Float64(shutdown_timeout)
-    ctx.service.max_fields[] = Int64(max_fields)
-
-    if revise == :lazy || revise == :eager
-        if Threads.nthreads() > 1
-            @warn "You are attempting to use Revise with multiple threads. Please note that Revise 3.5.18 and earlier are not threadsafe."
+    # The claim (#812). Here, after every refusal above and before the first mutation below, so a
+    # refused call leaves the App untouched and a call that loses the race to another `serve` is
+    # refused the same way. From here on every failure before the server is up hands the phase
+    # back to `PHASE_IDLE` (`_abandon_start!`), or the App could never serve again.
+    AppContext._claim_phase!(ctx.service, AppContext.PHASE_IDLE, AppContext.PHASE_STARTING) ||
+        throw(_not_idle_error(ctx))
+    # Whether THIS call still owns `PHASE_STARTING`. `startserver` clears it at the moment it moves
+    # the phase on (to `SERVING`, or back to `IDLE` through its own unwind), and from then on the
+    # `catch` below must leave the phase alone: once it is `IDLE` again another `serve` may already
+    # have claimed it, and resetting that claim would admit a third.
+    claim = Ref(true)
+    try
+        if !ismissing(context)
+            ctx.app_context[] = Context(context)
         end
-        if !has_revise_hooks()
-            error("Revise support is unavailable. Load Revise.jl in your development session before using the `revise` option")
+        ctx.service.cookies[] = cookies
+
+        ctx.service.external_url[] = external_url isa String ? external_url : "http://$host:$port"
+        ctx.service.prefix[] = global_prefix
+        # Stored rather than passed through, because the *blocking* `serve()` calls `terminate()`
+        # from its own `finally` (the Ctrl-C path) with no way to hand it a keyword.
+        ctx.service.shutdown_timeout[] = Float64(shutdown_timeout)
+        ctx.service.max_fields[] = Int64(max_fields)
+
+        if revise == :lazy || revise == :eager
+            if Threads.nthreads() > 1
+                @warn "You are attempting to use Revise with multiple threads. Please note that Revise 3.5.18 and earlier are not threadsafe."
+            end
+            if !has_revise_hooks()
+                error("Revise support is unavailable. Load Revise.jl in your development session before using the `revise` option")
+            end
+            if ctx.mod === nothing
+                @warn "`revise` was requested but this App tracks no module, so code in `Main` may not be revised. Construct it as `App(mod = @__MODULE__)` from the module you want tracked."
+            end
         end
-        if ctx.mod === nothing
-            @warn "`revise` was requested but this App tracks no module, so code in `Main` may not be revised. Construct it as `App(mod = @__MODULE__)` from the module you want tracked."
+
+        # Lifecycle registration lives HERE — once per server — not in `setupmiddleware`, which
+        # `internalrequest` also calls, per request (#68). `startup.` runs only in `startserver`,
+        # so a middleware registered from the request path got an `on_shutdown` at `terminate`
+        # with no paired `on_startup` — deterministic, needing no race at all — and additionally
+        # wrote to an unsynchronized `Set` that `startup.`/`shutdown.` broadcast over, which a
+        # concurrent `internalrequest` could overlap.
+        #
+        # SERVE-owned (#82): this list belongs to this server run, so `terminate` clears it. Route
+        # middleware registers itself as route-owned at `urlpatterns()` time instead, and survives.
+        #
+        # The user's list only: `ReviseHandler()`, prepended below, is a plain closure, not a
+        # `LifecycleMiddleware`, so it has nothing to register.
+        register_serve_lifecycle!(ctx, middleware)
+
+        # No warning for running on one thread (#149): single-threaded is a valid deployment, not a
+        # misconfiguration, and the banner already reports the thread count. `preprocesskwargs` drops
+        # `queuesize` unconditionally, so the warning that it is ignored is unconditional too.
+        if haskey(kwargs, :queuesize)
+            @warn "Deprecated: serve() ignores `queuesize`; remove the argument."
         end
-    end
 
-    # Lifecycle registration lives HERE — once per server — not in `setupmiddleware`, which
-    # `internalrequest` also calls, per request (#68). `startup.` runs only in `startserver`,
-    # so a middleware registered from the request path got an `on_shutdown` at `terminate`
-    # with no paired `on_startup` — deterministic, needing no race at all — and additionally
-    # wrote to an unsynchronized `Set` that `startup.`/`shutdown.` broadcast over, which a
-    # concurrent `internalrequest` could overlap.
-    #
-    # SERVE-owned (#82): this list belongs to this server run, so `terminate` clears it. Route
-    # middleware registers itself as route-owned at `urlpatterns()` time instead, and survives.
-    #
-    # The user's list only: `ReviseHandler()`, prepended below, is a plain closure, not a
-    # `LifecycleMiddleware`, so it has nothing to register.
-    register_serve_lifecycle!(ctx, middleware)
-
-    # No warning for running on one thread (#149): single-threaded is a valid deployment, not a
-    # misconfiguration, and the banner already reports the thread count. `preprocesskwargs` drops
-    # `queuesize` unconditionally, so the warning that it is ignored is unconditional too.
-    if haskey(kwargs, :queuesize)
-        @warn "Deprecated: serve() ignores `queuesize`; remove the argument."
-    end
-
-    # One `setupmiddleware` call per branch, each handing its pipeline to `_serve_pipeline`
-    # (#572). Prepending `ReviseHandler()` to `middleware` and building once made the list's type
-    # a `Union` of the two, and a keyword call over a `Union` is one `juliac --trim` cannot
-    # resolve, so the production path lost its typed pipeline to a dev-only option. Split like
-    # this, the `revise = :none` branch is concrete all the way to `HTTP.listen!`.
-    pipeline_kwargs = (; serialize, catch_errors, show_errors, access_log, access_log_query,
-                       access_log_skip, security_headers)
-    # `Types._trimmed()` first: Revise was refused above in a trimmed image, so the branch below is
-    # dead there.
-    if Types._trimmed() || revise == :none
-        return _serve_pipeline(ctx, setupmiddleware(ctx; middleware, pipeline_kwargs...),
+        # One `setupmiddleware` call per branch, each handing its pipeline to `_serve_pipeline`
+        # (#572). Prepending `ReviseHandler()` to `middleware` and building once made the list's type
+        # a `Union` of the two, and a keyword call over a `Union` is one `juliac --trim` cannot
+        # resolve, so the production path lost its typed pipeline to a dev-only option. Split like
+        # this, the `revise = :none` branch is concrete all the way to `HTTP.listen!`.
+        pipeline_kwargs = (; serialize, catch_errors, show_errors, access_log, access_log_query,
+                           access_log_skip, security_headers)
+        # `Types._trimmed()` first: Revise was refused above in a trimmed image, so the branch below is
+        # dead there.
+        if Types._trimmed() || revise == :none
+            return _serve_pipeline(ctx, setupmiddleware(ctx; middleware, pipeline_kwargs...),
+                                   handler, body_limit, request_limit, upgraded_limit, security_headers,
+                                   revise, host, port, show_banner, async, kwargs, claim)
+        end
+        # Prepended without `insert!`, so the `Tuple` form works too. Dev-only, and dynamic on
+        # purpose: `ReviseHandler` reaches the revised world through `invokelatest`.
+        return _serve_pipeline(ctx, setupmiddleware(ctx; middleware = (ReviseHandler(), middleware...),
+                                                    pipeline_kwargs...),
                                handler, body_limit, request_limit, upgraded_limit, security_headers,
-                               revise, host, port, show_banner, async, kwargs)
+                               revise, host, port, show_banner, async, kwargs, claim)
+    catch
+        claim[] && _abandon_start!(ctx)
+        rethrow()
     end
-    # Prepended without `insert!`, so the `Tuple` form works too. Dev-only, and dynamic on
-    # purpose: `ReviseHandler` reaches the revised world through `invokelatest`.
-    return _serve_pipeline(ctx, setupmiddleware(ctx; middleware = (ReviseHandler(), middleware...),
-                                                pipeline_kwargs...),
-                           handler, body_limit, request_limit, upgraded_limit, security_headers,
-                           revise, host, port, show_banner, async, kwargs)
 end
 
 # The rest of `serve`, once the pipeline exists: a function barrier, so everything below is
@@ -547,7 +594,7 @@ end
 function _serve_pipeline(ctx::App, configured_middelware::P, handler::H, body_limit::Int64,
                          request_limit::Int64, upgraded_limit::Int64, security_headers,
                          revise::Symbol, host, port, show_banner, async,
-                         kwargs) where {P<:Function, H}
+                         kwargs, claim::Base.RefValue{Bool}) where {P<:Function, H}
     # Once-assigned, because the `start` closure below captures it: a name reassigned before
     # capture is boxed (#364).
     listener = first(_serve_listener(configured_middelware, handler, body_limit, request_limit,
@@ -567,7 +614,7 @@ function _serve_pipeline(ctx::App, configured_middelware::P, handler::H, body_li
     _warn_if_no_gc_target(current_env(), _gc_target_bytes())
 
     try
-        return startserver(ctx; host, port, show_banner, async, kwargs, start=(kwargs) ->
+        return startserver(ctx; host, port, show_banner, async, kwargs, claim, start=(kwargs) ->
             HTTP.listen!(listener, host, port; kwargs...))
     catch
         # A `serve(async = true)` that never got its listener up (an address in use, say) returns
@@ -762,9 +809,90 @@ function _close_deferring_interrupt(service, timeout::Real,
     return interrupt
 end
 
+# The teardown both ends of a run share: `terminate` stopping a run that is serving, and
+# `_unwind_start!` undoing one whose startup hooks ran but which never got its listener (#799).
+# Every hook in the snapshot gets its `on_shutdown`, then its `on_stopped`, LIFO, with the
+# listener closed between the two when there is one. Returns the first interrupt any of it raised
+# (#185), for the caller to re-raise once everything else is done; it never throws one itself.
+#
+# LIFO (#74): the exact reverse of `startserver`'s startup sequence, which ran route-owned then
+# serve-owned, each in registration order. So: serve-owned reversed, then route-owned reversed.
+# Teardown order is a specified contract, not hash order — see `Service` (src/context.jl) for why
+# LIFO and not something else.
+function _teardown!(context::App, route_lf, serve_lf,
+                    interrupt::Nullable{InterruptException};
+                    listener::Bool, timeout::Real)::Nullable{InterruptException}
+    # Deferred, not broadcast-and-pray (#185): an interrupt from any hook is carried past the
+    # rest of the sequence and handed back, so the clears and the `close` below are
+    # unconditional.
+    #
+    # The `try` is around the broadcasts, not inside them, because `startup`/`shutdown` can
+    # only catch an interrupt that lands INSIDE a hook frame. SIGINT is delivered at
+    # safepoints, and the loop itself has several — so a press between two hooks would
+    # otherwise escape bare and skip everything below. Catching here costs the remaining hooks
+    # (they are unreachable once the stack has unwound) but never the teardown *below*.
+    #
+    # The clears below stay bare, deliberately. No user code runs in them, so the window is
+    # bounded by `lifecycle_lock` contention rather than by a hook, and extending the `try` over
+    # them would be protecting statements that are themselves partial-state transitions — a
+    # half-run clear is worse than a skipped one.
+    try
+        interrupt = _broadcast_lifecycle(shutdown, Iterators.reverse(serve_lf), interrupt)
+        interrupt = _broadcast_lifecycle(shutdown, Iterators.reverse(route_lf), interrupt)
+    catch e
+        e isa InterruptException || rethrow()
+        interrupt = something(interrupt, e)
+    end
+    # Only the SERVE-owned half is cleared (#82). These came from this run's
+    # `serve(middleware = ...)` list and `serve` re-registers them on the next call, so
+    # keeping them would start a previous run's middleware alongside the new one.
+    #
+    # `route_lifecycle` is deliberately NOT emptied. Those entries were declared once, at
+    # `urlpatterns()` time, and nothing re-adds them — routes are not re-registered on a
+    # second `serve()`. Emptying them is what made every route-level `on_startup` silently
+    # skipped for the rest of the process's life, which for a route-level `RateLimiter`
+    # meant its bucket-pruning task never restarted while the store kept growing. They are
+    # cleared only by replacing the context (`resetstate()`, src/methods.jl).
+    lock(() -> empty!(context.service.serve_lifecycle), context.service.lifecycle_lock)
+    # Do NOT "symmetrize" this by also emptying `custommiddleware`: that table is route
+    # *registration* state, not cache state. test/original_tests.jl re-serves after a
+    # `terminate()` and expects the registered routes and their middleware to survive.
+    # There is no chain cache to clear either: each pipeline owns its own (#255), so the
+    # next `serve()` builds a new pipeline and starts cold, while requests still in flight
+    # here finish against the old one untouched.
+    context.service.external_url[] = nothing
+    # Post-drain (#161), in the `finally`: the listener is closed and no request is served any
+    # more, so this is where a hook releases what a request could still have been using — a
+    # pool closed in `on_shutdown` was cut from under the drain, and reopened by the next
+    # request it served. A `finally` so that a `close` that throws something other than an
+    # interrupt still releases them, and so no safepoint lies between the close and the hooks.
+    # Over the caller's snapshot, in the same LIFO order: `serve_lifecycle` is empty by now, and
+    # the snapshot is exactly the set this run started. The inner `try` is the shutdown
+    # broadcasts' own, for the same between-hooks interrupt.
+    try
+        listener && (interrupt = _close_deferring_interrupt(context.service, timeout, interrupt))
+    finally
+        try
+            interrupt = _broadcast_lifecycle(stopped, Iterators.reverse(serve_lf), interrupt)
+            interrupt = _broadcast_lifecycle(stopped, Iterators.reverse(route_lf), interrupt)
+        catch e
+            e isa InterruptException || rethrow()
+            interrupt = something(interrupt, e)
+        end
+    end
+    return interrupt
+end
+
 # Documented on the public `Nitro.terminate` (src/methods.jl); see the note on `serve` above.
 function terminate(context::App; timeout::Nullable{Real} = nothing)
-    if isopen(context.service)
+    # The phase, not `isopen` (#812): the claim makes a second, concurrent `terminate` a no-op
+    # rather than a second run of every hook, and it is what keeps `serve` refused until the very
+    # end of this function. A run that is still starting has no listener yet and is not stopped
+    # here; its `serve` unwinds it if its start fails (see `Nitro.terminate`).
+    AppContext._claim_phase!(context.service, AppContext.PHASE_SERVING,
+                             AppContext.PHASE_STOPPING) || return nothing
+    interrupt = nothing
+    try
         # First, before any hook can block: every in-flight request now reads `:shutdown` from
         # `cancel_reason(req)` (#466), so a handler that polls it winds down during the drain
         # below instead of being force-closed at its end. Swap, then set: the pipelines of this
@@ -772,86 +900,50 @@ function terminate(context::App; timeout::Nullable{Real} = nothing)
         stopping = context.service.shutting_down[]
         context.service.shutting_down[] = Threads.Atomic{Bool}(false)
         stopping[] = true
-        # LIFO (#74): the exact reverse of `startserver`'s startup sequence, which ran
-        # route-owned then serve-owned, each in registration order. So: serve-owned reversed,
-        # then route-owned reversed. Teardown order is a specified contract now, not hash
-        # order — see `Service` (src/context.jl) for why LIFO and not something else.
         route_lf, serve_lf = lifecycle_snapshot(context)
-        # Deferred, not broadcast-and-pray (#185): an interrupt from any hook is carried past the
-        # rest of the sequence and re-raised at the very bottom of this function, so the clears
-        # and the `close` below are unconditional exactly as they were before.
-        #
-        # The `try` is around the broadcasts, not inside them, because `startup`/`shutdown` can
-        # only catch an interrupt that lands INSIDE a hook frame. SIGINT is delivered at
-        # safepoints, and the loop itself has several — so a press between two hooks would
-        # otherwise escape bare and skip everything below, which is the exact failure this issue
-        # is about, reached by a different door. Catching here costs the remaining hooks (they
-        # are unreachable once the stack has unwound) but never the teardown *below*.
-        #
-        # The snapshot above and the clears below stay bare, deliberately. No user code runs in
-        # either, so the window is bounded by `lifecycle_lock` contention rather than by a hook,
-        # and extending the `try` over them would be protecting statements that are themselves
-        # partial-state transitions — a half-run clear is worse than a skipped one.
-        interrupt = nothing
-        try
-            interrupt = _broadcast_lifecycle(shutdown, Iterators.reverse(serve_lf))
-            interrupt = _broadcast_lifecycle(shutdown, Iterators.reverse(route_lf), interrupt)
-        catch e
-            e isa InterruptException || rethrow()
-            interrupt = something(interrupt, e)
-        end
-        # Only the SERVE-owned half is cleared (#82). These came from this run's
-        # `serve(middleware = ...)` list and `serve` re-registers them on the next call, so
-        # keeping them would start a previous run's middleware alongside the new one.
-        #
-        # `route_lifecycle` is deliberately NOT emptied. Those entries were declared once, at
-        # `urlpatterns()` time, and nothing re-adds them — routes are not re-registered on a
-        # second `serve()`. Emptying them is what made every route-level `on_startup` silently
-        # skipped for the rest of the process's life, which for a route-level `RateLimiter`
-        # meant its bucket-pruning task never restarted while the store kept growing. They are
-        # cleared only by replacing the context (`resetstate()`, src/methods.jl).
-        lock(() -> empty!(context.service.serve_lifecycle), context.service.lifecycle_lock)
-        # Do NOT "symmetrize" this by also emptying `custommiddleware`: that table is route
-        # *registration* state, not cache state. test/original_tests.jl re-serves after a
-        # `terminate()` and expects the registered routes and their middleware to survive.
-        # There is no chain cache to clear either: each pipeline owns its own (#255), so the
-        # next `serve()` builds a new pipeline and starts cold, while requests still in flight
-        # here finish against the old one untouched.
-        context.service.external_url[] = nothing
-        # Post-drain (#161), in the `finally`: the listener is closed and no request is served any
-        # more, so this is where a hook releases what a request could still have been using — a
-        # pool closed in `on_shutdown` was cut from under the drain, and reopened by the next
-        # request it served. A `finally` so that a `close` that throws something other than an
-        # interrupt still releases them, and so no safepoint lies between the close and the hooks.
-        # Over the snapshot taken above, in the same LIFO order: `serve_lifecycle` is empty by
-        # now, and the snapshot is exactly the set this run started. The inner `try` is the
-        # shutdown broadcasts' own, for the same between-hooks interrupt.
-        try
-            interrupt = _close_deferring_interrupt(context.service,
-                something(timeout, context.service.shutdown_timeout[]), interrupt)
-        finally
-            try
-                interrupt = _broadcast_lifecycle(stopped, Iterators.reverse(serve_lf), interrupt)
-                interrupt = _broadcast_lifecycle(stopped, Iterators.reverse(route_lf), interrupt)
-            catch e
-                e isa InterruptException || rethrow()
-                interrupt = something(interrupt, e)
-            end
-        end
-        # Re-raised only now: everything a later `serve()` depends on has already been done.
-        isnothing(interrupt) || throw(interrupt)
+        interrupt = _teardown!(context, route_lf, serve_lf, nothing; listener = true,
+                               timeout = something(timeout, context.service.shutdown_timeout[]))
+    finally
+        # After the last `on_stopped` hook, and in a `finally`: whatever escapes above, an App left
+        # in `PHASE_STOPPING` could never serve again.
+        context.service.phase[] = AppContext.PHASE_IDLE
     end
+    # Re-raised only now: everything a later `serve()` depends on has already been done.
+    isnothing(interrupt) || throw(interrupt)
     return nothing
 end
 
-function startserver(ctx::App; host, port, show_banner=false, async=false, kwargs, start)::Union{Server, Nothing}
-    show_banner && serverwelcome(ctx.service.external_url[], ctx.service.prefix[])
-    # Concrete here, so this is where a trimmed build takes the handle's pointers (src/context.jl).
-    server = start(preprocesskwargs(kwargs))
-    ctx.service.server[] = AppContext.ServerHandle(server)
-    # Before the hooks: every exit from here on goes through `terminate`, whose `close` releases
-    # it. A no-op outside the Julia versions JuliaLang/julia#63882 affects (src/context.jl).
-    AppContext._hold_wake_guard!(ctx.service)
+# Undo a start whose startup hooks ran but which never got as far as serving (#799): an interrupt
+# in a hook, something structural escaping the broadcast, or a listener that would not bind. No
+# request was ever served, so there is nothing to drain and no shutdown flag to set; every hook
+# in the snapshot still gets its `on_shutdown` and `on_stopped`, including an interrupted one,
+# whose `on_startup` only got part-way. That is what the idempotency contract on
+# `LifecycleMiddleware` (src/types.jl) exists to make safe — `_janitor` and `AccessLog` both no-op
+# on an inactive activation.
+#
+# The unwind hands the phase back to `IDLE` itself, last, and tells `serve` it no longer owns the
+# start first, so `serve`'s own reset cannot undo a later claim. Returns the first interrupt,
+# `interrupt` included, for the caller to raise.
+function _unwind_start!(ctx::App, claim::Base.RefValue{Bool}, route_lf, serve_lf,
+                        interrupt::Nullable{InterruptException})::Nullable{InterruptException}
+    claim[] = false
+    try
+        interrupt = _teardown!(ctx, route_lf, serve_lf, interrupt; listener = false, timeout = 0)
+    finally
+        ctx.service.phase[] = AppContext.PHASE_IDLE
+    end
+    return interrupt
+end
+
+function startserver(ctx::App; host, port, show_banner=false, async=false, kwargs,
+                     claim::Base.RefValue{Bool}, start)::Union{Server, Nothing}
+    # The startup hooks run FIRST, and the listener opens only once they have all returned
+    # (#799). A port that answers is then an app that is ready: its worker runtime installed, its
+    # janitors running, what its hooks compile compiled. Opening it first, as `serve` used to, let
+    # a TCP probe, a proxy's upstream check or a client in while the app was still initialising.
+    # The lineage agrees: Spring finishes bean initialisation before the embedded server accepts a
+    # connection, and Django runs every `AppConfig.ready()` before it serves.
+    #
     # Route-owned first, then serve-owned: that is declaration order — routes are registered at
     # `urlpatterns()` time, the `serve(middleware = ...)` list only at `serve()` time (#82).
     # Within each half, registration order. `terminate` unwinds the exact reverse (#74).
@@ -859,44 +951,51 @@ function startserver(ctx::App; host, port, show_banner=false, async=false, kwarg
     # Over a snapshot, not the live vectors: a `revise=:lazy` re-registration runs on a
     # request-handling task and could otherwise `push!` while this broadcast iterates.
     route_lf, serve_lf = lifecycle_snapshot(ctx)
-    # Around the broadcasts for the same reason `terminate` wraps its own: a hook frame is the
+    # Around the broadcasts for the same reason `_teardown!` wraps its own: a hook frame is the
     # only place `startup` can catch an interrupt, and a press landing between two hooks would
-    # otherwise skip the unwind below and strand the listener `start(...)` just opened.
+    # otherwise skip the unwind below.
     interrupt = nothing
     try
         interrupt = _startup_broadcast(route_lf, serve_lf)
     catch e
-        # A non-interrupt escaping here strands the listener, because the unwind below is gated
-        # on `!isnothing(interrupt)`. Deliberate: `startup` catches everything from the hook
-        # frame, so reaching this line at all means something structural is broken (a throwing
-        # logger, an async failure), and a loud strand is a more honest signal than a quiet
-        # cleanup that hides it. Pre-existing behavior; named here because the `catch` now makes
-        # unwinding look like it would be one line away.
-        e isa InterruptException || rethrow()
+        # Something structural (a throwing logger, an async failure): `startup` catches whatever a
+        # hook throws, so reaching this line means the broadcast itself broke. It used to strand
+        # the open listener, on purpose, as the loud signal; with no listener yet, the hooks that
+        # ran are unwound and the error is raised as it was.
+        if !(e isa InterruptException)
+            _unwind_start!(ctx, claim, route_lf, serve_lf, nothing)
+            rethrow()
+        end
         interrupt = something(interrupt, e)
     end
     if !isnothing(interrupt)
-        # `start(...)` above already opened the listener. Throwing bare here strands it: live,
-        # with half its middleware started, no `on_shutdown` ever run, and every later `serve()`
-        # rejected by the already-serving guard with nothing left able to close it. Unwind
-        # through the REAL teardown — it pairs every hook that just ran and closes the listener
-        # — then re-raise once (#185).
-        #
-        # "Pairs every hook" includes the INTERRUPTED one, whose `on_startup` only got part-way.
-        # Its `on_shutdown` is called against half-built state, which is exactly what the
-        # idempotency contract on `LifecycleMiddleware` (src/types.jl) exists to make safe —
-        # `_janitor` and `AccessLog` both no-op on an inactive activation.
-        try
-            terminate(ctx)
-        catch e
-            # A SECOND Ctrl-C during the unwind. `terminate` finishes its own sequence BEFORE it
-            # rethrows, so by the time this lands there is nothing left to clean up, and one
-            # `InterruptException` is indistinguishable from another. Anything else is a real
-            # teardown failure: it stays loud and supersedes the interrupt.
-            e isa InterruptException || rethrow()
-        end
-        throw(interrupt)
+        # Unwind the hooks that ran, then re-raise once (#185). A SECOND Ctrl-C during the unwind
+        # is folded into the first: one `InterruptException` is indistinguishable from another.
+        throw(something(_unwind_start!(ctx, claim, route_lf, serve_lf, interrupt), interrupt))
     end
+
+    # Concrete here, so this is where a trimmed build takes the handle's pointers (src/context.jl).
+    server = try
+        start(preprocesskwargs(kwargs))
+    catch
+        # An address in use, a refused bind, or a Ctrl-C landing here: the hooks above all ran, so
+        # each gets its teardown, and the bind's own error is what the caller sees.
+        _unwind_start!(ctx, claim, route_lf, serve_lf, nothing)
+        rethrow()
+    end
+    ctx.service.server[] = AppContext.ServerHandle(server)
+    # The run is `terminate`'s to stop from here on (#812), so `serve` no longer owns the start.
+    # In the statements right after the handle, with no call between them: an interrupt landing
+    # any later, at a safepoint in the wake guard below, would otherwise reach `serve`'s reset
+    # while it still owned the start, which hands the phase back to `IDLE` over an open listener
+    # that `terminate` then refuses to close.
+    ctx.service.phase[] = AppContext.PHASE_SERVING
+    claim[] = false
+    # Every exit from here on goes through `terminate`, whose `close` releases it. A no-op outside
+    # the Julia versions JuliaLang/julia#63882 affects (src/context.jl).
+    AppContext._hold_wake_guard!(ctx.service)
+    # Once the port answers, so the banner never announces a server that is not there yet.
+    show_banner && serverwelcome(ctx.service.external_url[], ctx.service.prefix[])
 
     if !async
         try
@@ -908,10 +1007,9 @@ function startserver(ctx::App; host, port, show_banner=false, async=false, kwarg
             _with_stdout(out -> println(out))
             # Ctrl-C out of the blocking wait is THE documented way to stop a blocking `serve` —
             # the banner says so. Without this the listener survives the interrupt and only a
-            # process restart clears it, which also made an interrupt one instant earlier (in the
-            # startup broadcast above, which unwinds) behave better than one an instant later.
-            # `terminate` is a no-op when nothing is serving, so this is safe on the normal exit
-            # path too, and idempotent against the `finally terminate()` in `src/methods.jl`.
+            # process restart clears it. `terminate` is a no-op when nothing is serving, so this
+            # is safe on the normal exit path too, and idempotent against the `finally
+            # terminate()` in `src/methods.jl`.
             try
                 terminate(ctx)
             catch e
