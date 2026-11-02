@@ -206,6 +206,20 @@ _as_db_row(row::Dict{Symbol,Any}) = MockRow(merge(row, Dict{Symbol,Any}(
     :created_at => ZonedDateTime(row[:created_at], tz"UTC"),
 )))
 
+# The mock's VALUE refusals are PormG's own (#791): every column a `create`, `update_or_create` or
+# `update` writes goes through `PormG.validate_value` (PingoLee/PormG.jl#1239), the write path's
+# per-field checks, against the real `nitro_session` model -- an unknown column, NULL in a NOT NULL
+# one, a wrong type, a key over `max_length`, a NUL in text. `MOCK_VALUE_MODEL` is bound to an
+# offline key below. The query-SHAPE refusals (no connection, an unmodelled filter, an unfiltered
+# update...) are the mock's own: `validate_value` checks values, not queries. One gap, where the
+# mock is laxer than PormG: `validate_value` applies `create`'s rules, which allow the primary key,
+# so the mock's `update` accepts a primary-key write a real `update` refuses.
+function _mock_validate_values(pairs)
+    for (k, v) in pairs
+        PormG.validate_value(MOCK_VALUE_MODEL, k, v)
+    end
+end
+
 function Base.getproperty(qs::MockQuerySet, name::Symbol)
     if name === :filter
         return function(pairs::Pair{String,<:Any}...)
@@ -238,6 +252,7 @@ function Base.getproperty(qs::MockQuerySet, name::Symbol)
         end
     elseif name === :create
         return function(pairs::Pair{String,<:Any}...)
+            _mock_validate_values(pairs)
             row = Dict{Symbol,Any}()
             for (k, v) in pairs
                 row[Symbol(k)] = v
@@ -258,6 +273,8 @@ function Base.getproperty(qs::MockQuerySet, name::Symbol)
         # hook: it reads nothing a concurrent statement could land between (#567).
         upsert_fn = function(lookup::Pair{String,<:Any}...; defaults)
             isempty(defaults) && error("MockSessionQuerySet: update_or_create() needs defaults, as PormG does.")
+            _mock_validate_values(lookup)
+            _mock_validate_values(defaults)
             return lock(_mock_lock(qs)) do
                 table = _selected_table(qs)
                 key = Dict{Symbol,Any}(Symbol(k) => v for (k, v) in lookup)[:session_key]
@@ -278,6 +295,7 @@ function Base.getproperty(qs::MockQuerySet, name::Symbol)
             isempty(getfield(qs, :filters)) &&
                 error("MockSessionQuerySet: update() requires a filter -- refusing to update " *
                       "every row, as PormG does.")
+            _mock_validate_values(pairs)
             # The compare and the set in ONE lock hold -- that is what an UPDATE ... WHERE is.
             return lock(_mock_lock(qs)) do
                 table = _selected_table(qs)
@@ -428,6 +446,19 @@ if RealPormGSessionStore === nothing
 end
 
 const PormGExt = Base.get_extension(Nitro, :NitroPormGExt)
+
+# The model the mock's values are validated against (`_mock_validate_values`, #791), bound to an
+# offline key for the whole item and removed at its end. Its own key, never "db": the item's
+# other fixtures register and remove "db" around single assertions. Held for the whole item
+# because `validate_value` reads the key's settings on every call, and not in a `finally` because
+# the item defines `const`s and types at top level, which a `try` block refuses. An error that
+# escapes a `@testset` therefore leaks it; the key is offline, so a later query that fell back to
+# it fails loudly rather than reaching a database.
+const MOCK_VALUE_KEY = "nitro-791-mock-values-session"
+haskey(PormG.config, MOCK_VALUE_KEY) &&
+    error("test-only PormG connection key is already registered: $MOCK_VALUE_KEY")
+PormG.Configuration.register_offline(MOCK_VALUE_KEY)
+const MOCK_VALUE_MODEL = PormGExt.session_model(MOCK_VALUE_KEY)
 
 # `_bind_model!` goes through `PormG.Models.bind!`, which refuses a key no configuration is loaded
 # under (#791). A test that only BUILDS a model or store registers the key offline for the build:
@@ -1451,6 +1482,25 @@ end
     @test hook(nothing) === nothing
     @test hook(42) == 42
 end
+
+@testset "the mock refuses a value PormG refuses, by PormG's rule (#791)" begin
+    qs() = MockModel().objects.db("db")
+    # The type, then PormG's reason: each case has one bad field, and the message pins which rule
+    # refused it.
+    @test_throws PormG.InvalidValueError qs().create("session_key" => "k", "session_data" => "a\0b")
+    @test_throws "contains a NUL character" qs().create("session_key" => "k", "session_data" => "a\0b")
+    @test_throws PormG.InvalidValueError qs().create("session_key" => "k"^41, "session_data" => "{}")
+    @test_throws "max_length is 40" qs().create("session_key" => "k"^41, "session_data" => "{}")
+    @test_throws PormG.UnknownFieldError qs().create("session_key" => "k", "nope" => "1")
+    @test_throws PormG.InvalidValueError qs().filter("session_key" => "k").update("expires_at" => nothing)
+    @test_throws "null values are not allowed" qs().filter("session_key" => "k").update("expires_at" => nothing)
+    @test_throws PormG.InvalidValueError qs().update_or_create("session_key" => "k";
+                                                               defaults = ["session_data" => "a\0b"])
+    @test_throws "contains a NUL character" qs().update_or_create("session_key" => "k";
+                                                                  defaults = ["session_data" => "a\0b"])
+end
+
+PormG.Configuration.unregister_connection(MOCK_VALUE_KEY)
 
 end
 

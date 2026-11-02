@@ -369,13 +369,17 @@ function _record_lock!(qs::MockTaskQuerySet)
     return nothing
 end
 
-# PormG refuses a NUL in any bound text value before a statement is sent (PormG#951, 0.8):
-# PostgreSQL text cannot hold one and SQLite cannot read a value back past it. Modelled on the
-# writes, the path where free text -- a task's error message -- reaches the store.
-function _mock_refuse_nul(pairs)
+# The mock's VALUE refusals are PormG's own (#791): every column a `create` or `update` writes
+# goes through `PormG.validate_value` (PingoLee/PormG.jl#1239), the write path's per-field checks,
+# against the real `nitro_task` model -- an unknown column, NULL in a NOT NULL one, a wrong type, a
+# string over `max_length`, a NUL in text (PormG#951). `MOCK_VALUE_MODEL` is bound to an offline key
+# below. The query-SHAPE refusals (no connection, an unmodelled filter, an unfiltered update...)
+# are the mock's own, above and below: `validate_value` checks values, not queries. One gap, where
+# the mock is laxer than PormG: `validate_value` applies `create`'s rules, which allow the primary
+# key, so the mock's `update` accepts a primary-key write a real `update` refuses.
+function _mock_validate_values(pairs)
     for (k, v) in pairs
-        v isa AbstractString && '\0' in v &&
-            error("MockTaskQuerySet: `$k` contains a NUL character, which PormG refuses (PormG#951).")
+        PormG.validate_value(MOCK_VALUE_MODEL, k, v)
     end
 end
 
@@ -465,7 +469,7 @@ function Base.getproperty(qs::MockTaskQuerySet, name::Symbol)
         end
     elseif name === :create
         return function(pairs::Pair{String,<:Any}...)
-            _mock_refuse_nul(pairs)
+            _mock_validate_values(pairs)
             row = Dict{String,Any}()
             for (k, v) in pairs
                 row[k] = v
@@ -485,7 +489,7 @@ function Base.getproperty(qs::MockTaskQuerySet, name::Symbol)
             isempty(getfield(qs, :filters)) &&
                 error("MockTaskQuerySet: update() requires a filter -- refusing to update " *
                       "every row, as PormG does.")
-            _mock_refuse_nul(pairs)
+            _mock_validate_values(pairs)
             # Return the affected-row count, matching PormG's Django-style `update`.
             # It used to return `nothing`, which would make every compare-and-set in
             # the store read as a failure — or, worse, as an untested success.
@@ -990,6 +994,20 @@ end
 # The extension module itself, for the private `task_model` accessor the #202 guard drives.
 const PormGExt = Base.get_extension(Nitro, :NitroPormGExt)
 
+# The model the mock's values are validated against (`_mock_validate_values`, #791), bound to an
+# offline key for the whole file and removed at its end. Its own key, never "db": the file's
+# other fixtures register and remove "db" around single assertions. Held for the whole item
+# because `validate_value` reads the key's settings on every call (a per-call registration would
+# race under the threaded fixtures), and not in a `finally` because the item defines `const`s and
+# types at top level, which a `try` block refuses. An error that escapes a `@testset` therefore
+# leaks it; the key is offline, so a later query that fell back to it fails loudly rather than
+# reaching a database.
+const MOCK_VALUE_KEY = "nitro-791-mock-values-task"
+haskey(PormG.config, MOCK_VALUE_KEY) &&
+    error("test-only PormG connection key is already registered: $MOCK_VALUE_KEY")
+PormG.Configuration.register_offline(MOCK_VALUE_KEY)
+const MOCK_VALUE_MODEL = PormGExt.task_model(MOCK_VALUE_KEY)
+
 # `_bind_model!` goes through `PormG.Models.bind!`, which refuses a key no configuration is loaded
 # under (#791). A test that only BUILDS a model or store registers the key offline for the build:
 # SQL renders, nothing connects, and the binding outlives the entry. A key something else already
@@ -1248,8 +1266,11 @@ else
                 # A task's error is its own exception message, which can quote request data.
                 # PormG 0.8 refuses a NUL in any bound text value, so storing it raw would make
                 # the terminal write raise and drop the failure record. The premise first: the
-                # mock refuses what PormG refuses, or the two asserts below prove nothing.
+                # mock refuses what PormG refuses -- by PormG's own rule, `validate_value` (#791)
+                # -- or the two asserts below prove nothing.
                 m = MockTaskModel()
+                @test_throws PormG.InvalidValueError m.objects.db("db").create(
+                    "id" => "x", "error" => "a\0b")
                 @test_throws "contains a NUL character" m.objects.db("db").create(
                     "id" => "x", "error" => "a\0b")
 
@@ -3050,7 +3071,7 @@ else
                             m.objects.db("db").create(
                                 "id" => id, "run_id" => "run-$t", "status" => "PENDING",
                                 "progress" => 0.0, "result" => "", "error" => "",
-                                "created_at" => nothing, "started_at" => nothing,
+                                "created_at" => DateTime(2026, 1, 1), "started_at" => nothing,
                                 "completed_at" => nothing, "watchers" => "[]",
                                 "queue_name" => "default")
                             m.objects.db("db").filter("id" => id).first()
@@ -4301,6 +4322,8 @@ end
             @test record.kwargs[:exception_type] === :ErrorException
         end
     end
+
+    PormG.Configuration.unregister_connection(MOCK_VALUE_KEY)
 end
 
 end
