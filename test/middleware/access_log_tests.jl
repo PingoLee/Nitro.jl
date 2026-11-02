@@ -1,4 +1,8 @@
 @testitem "AccessLog middleware" tags=[:middleware] setup=[NitroCommon] begin
+# `AccessLog`'s writer flushes in `on_stopped`, after the drain (#811), so a test that stands in
+# for `terminate` runs both teardown phases, in `terminate`'s order.
+full_stop!(lf) = (Nitro.Core.Types.shutdown(lf); Nitro.Core.Types.stopped(lf); nothing)
+
 using Nitro.Core
 using Nitro
 using Dates
@@ -21,7 +25,7 @@ end
     startup(lf)
     resp = handler(Request("POST", "/api/things?limit=5"))
     @test resp.status == 201                 # response passes through unchanged
-    shutdown(lf)                             # flushes buffered records, waits for the writer
+    full_stop!(lf)                             # flushes buffered records, waits for the writer
 
     @test length(records) == 1
     rec = records[1]
@@ -46,7 +50,7 @@ end
     handler(Request("GET", "http://alice:pa55w0rd@h.example/x?code=S3CRET-CODE"))
     handler(Request("GET", "//bob:pa55w0rd@evil.example/y?k=S3CRET"))
     handler(Request("GET", "/frag#part?k=S3CRET"))
-    shutdown(lf)
+    full_stop!(lf)
 
     @test [r.path for r in records] == ["/reset", "/x", "/y", "/frag"]
     for r in records
@@ -70,7 +74,7 @@ end
     handler(Request("GET", "/f#frag?a=1"))          # a '?' inside a fragment is no query
     handler(Request("GET", "/empty?"))              # an empty query is `nothing`, not ""
     handler(Request("GET", "/none"))
-    shutdown(lf)
+    full_stop!(lf)
 
     @test [r.query for r in records] == ["limit=5", "code=abc", "a=1", nothing, nothing, nothing]
     @test records[2].path == "/x"                   # opting into the query keeps the path reduced
@@ -84,7 +88,7 @@ end
 
     startup(lf)
     handler(Request("GET", "/health"))
-    shutdown(lf)
+    full_stop!(lf)
 
     @test length(records) == 1
     @test records[1].path == "/health"
@@ -110,7 +114,7 @@ end
     startup(lf)
     handler(Request("GET", "/static/app.js"))   # skipped
     handler(Request("GET", "/api/data"))        # logged
-    shutdown(lf)
+    full_stop!(lf)
 
     @test length(records) == 1
     @test records[1].path == "/api/data"
@@ -132,7 +136,7 @@ end
     handler(Request("GET", "/missing"))          # 404 -> skipped
     handler(Request("GET", "/found"))            # 200 -> logged
     @test_throws ErrorException handler(Request("GET", "/boom"))   # resp === nothing -> logged
-    shutdown(lf)
+    full_stop!(lf)
 
     @test seen == [404, 200, nothing]            # (unpatched: skip was never given a response)
     @test [r.path for r in records] == ["/found", "/boom"]
@@ -145,7 +149,7 @@ end
     handler = lf.middleware(req -> error("boom"))
     startup(lf)
     @test_throws ErrorException handler(Request("GET", "/x"))
-    shutdown(lf)
+    full_stop!(lf)
     @test isempty(records)
 end
 
@@ -165,7 +169,7 @@ end
 
     startup(lf)
     @test_throws ErrorException handler(Request("GET", "/api/fail"))
-    shutdown(lf)
+    full_stop!(lf)
 
     @test length(records) == 1
     @test records[1].status == 500
@@ -224,7 +228,7 @@ end
     end
 
     notify(s.release)                    # let the sink (and drain) proceed
-    shutdown(lf)                         # drains buffered records, waits for the writer
+    full_stop!(lf)                         # drains buffered records, waits for the writer
 
     # Delivered = 1 in-flight + `capacity` (2) buffered = 3; the other 3 were dropped.
     @test length(s.records) == 3
@@ -243,7 +247,7 @@ end
     end
 
     notify(s.release)
-    shutdown(lf)
+    full_stop!(lf)
 
     @test length(s.records) == 4
     @test 3 in s.batch_sizes             # rec 2..4 delivered together in a single batch
@@ -261,7 +265,7 @@ end
     startup(lf)
     resp = handler(Request("GET", "/api/data"))
     @test resp.status == 200             # request unaffected by the failing sink
-    shutdown(lf)                         # must not hang despite the sink throwing
+    full_stop!(lf)                         # must not hang despite the sink throwing
 
     @test calls[] >= 1                   # the sink really was invoked (and threw)
 end
@@ -273,11 +277,11 @@ end
 
     startup(lf)
     handler(Request("GET", "/api/first"))
-    shutdown(lf)                             # closes the first activation's channel
+    full_stop!(lf)                             # closes the first activation's channel
 
     startup(lf)                              # builds a fresh _Run; must not touch the old one
     handler(Request("GET", "/api/second"))
-    shutdown(lf)
+    full_stop!(lf)
 
     @test length(records) == 2
     @test records[1].path == "/api/first"
@@ -296,7 +300,7 @@ end
     # '/' then 2-byte 'é's: the 18-byte budget beside the marker ends mid-character.
     handler(Request("GET", "/" * "é"^50 * "?" * "q"^100, ["User-Agent" => "u"^5000]))
     handler(Request("X"^100, "/short", ["User-Agent" => "curl/8"]))
-    shutdown(lf)
+    full_stop!(lf)
 
     long, short = records
     for v in (long.path, long.query, long.user_agent, short.method)
@@ -330,7 +334,7 @@ end
     end
 
     notify(s.release)
-    shutdown(lf)
+    full_stop!(lf)
 
     matched = [r.path for r in s.records if r.matched]
     unmatched = [r.path for r in s.records if !r.matched]
@@ -351,7 +355,7 @@ end
         # Let the writer drain before the next one, so each lands in an empty budget.
         @test timedwait(() -> length(records) >= i, 10.0; pollint = 0.01) === :ok
     end
-    shutdown(lf)
+    full_stop!(lf)
     @test [r.path for r in records] == ["/.env$i" for i in 1:5]   # (leaky release: only "/.env1")
     @test all(r -> !r.matched, records)
 end
@@ -371,7 +375,7 @@ end
     end
     handler(Request("GET", "/no-ip"))
     after = now(UTC)
-    shutdown(lf)
+    full_stop!(lf)
     @test all(r -> before <= r.ts <= after, records)
     @test [r.ip for r in records] ==
           ["203.0.113.9", "0.0.0.0", "255.255.255.255", "10.0.1.100", "2001:db8::1", nothing]
@@ -393,6 +397,10 @@ end # @testitem
 # catch-all leaf that defers to the router's 404) is not either, and a request a guard or
 # middleware REFUSED on a real route is matched: it never reached a lookup that came up empty.
 @testitem "AccessLog matched marker through the pipeline" tags=[:middleware] setup=[NitroCommon] begin
+# `AccessLog`'s writer flushes in `on_stopped`, after the drain (#811), so a test that stands in
+# for `terminate` runs both teardown phases, in `terminate`'s order.
+full_stop!(lf) = (Nitro.Core.Types.shutdown(lf); Nitro.Core.Types.stopped(lf); nothing)
+
 using Nitro
 using HTTP
 # Not `using Nitro.Core`: its `urlpatterns` would collide with `Nitro`'s (src/methods.jl).
@@ -421,7 +429,7 @@ for (method, target) in [("GET", "/real"), ("GET", "/gone"), ("GET", "/.env"),
 end
 # A global middleware after AccessLog refusing before the router runs.
 internalrequest(app, HTTP.Request("PUT", "/real"); middleware = [lf, deny])
-shutdown(lf)
+full_stop!(lf)
 
 got = Dict((r.method, r.path) => (r.status, r.matched) for r in records)
 @test got[("GET", "/real")] == (200, true)
@@ -441,7 +449,7 @@ startup(lf2)
 for target in ["/real", "/gone", "/.env", "/wp-login.php", "/static/nope", "/admin"]
     internalrequest(app, HTTP.Request("GET", target); middleware = [lf2])
 end
-shutdown(lf2)
+full_stop!(lf2)
 @test sort([r.path for r in kept]) == ["/admin", "/gone", "/real"]
 end
 
@@ -544,6 +552,10 @@ end
 # #159: the retention pruner. `AccessLog(sink; prune, retention, prune_interval)` schedules the
 # app's `prune(cutoff)` through the shared `_janitor`, starting and stopping with the writer.
 @testitem "AccessLog retention pruner" tags=[:middleware, :slow] setup=[NitroCommon] begin
+# `AccessLog`'s writer flushes in `on_stopped`, after the drain (#811), so a test that stands in
+# for `terminate` runs both teardown phases, in `terminate`'s order.
+full_stop!(lf) = (Nitro.Core.Types.shutdown(lf); Nitro.Core.Types.stopped(lf); nothing)
+
 using Nitro.Core
 using Nitro
 using Dates
@@ -583,7 +595,7 @@ end
     before = now(UTC)
     @test wait_for(() -> count() >= 3)                # it keeps firing, not just once
     after = now(UTC)
-    shutdown(lf)
+    full_stop!(lf)
 
     # Each cutoff is 90 days behind the clock that stamps `AccessRecord.ts` (`now(UTC)`, #561).
     # Only the first three are bounded by `after`: on >1 thread a later tick can land between
@@ -600,7 +612,7 @@ end
     before = now(UTC)
     @test wait_for(() -> count() >= 1)
     after = now(UTC)
-    shutdown(lf)
+    full_stop!(lf)
     @test before - Month(3) - Second(5) <= cutoffs()[1] <= after - Month(3)   # first only, as above
 end
 
@@ -610,7 +622,7 @@ end
     startup(lf)
     sleep(0.2)
     @test count() == 0
-    shutdown(lf)
+    full_stop!(lf)
 end
 
 @testset "a throwing prune costs one tick, not the pruner or the writer" begin
@@ -629,7 +641,7 @@ end
     @test wait_for(() -> calls[] >= 3)                # still ticking after throwing
     resp = handler(Request("GET", "/api/data"))
     @test resp.status == 200
-    shutdown(lf)
+    full_stop!(lf)
     @test length(records) == 1                        # the writer was unaffected
 end
 
@@ -640,7 +652,7 @@ end
 
     startup(lf)
     @test wait_for(() -> count() >= 1)
-    shutdown(lf)
+    full_stop!(lf)
     sleep(0.2)                                        # let a stale tick, if any, land
     n = count()
     sleep(0.3)                                        # 6 intervals: a live pruner would tick
@@ -650,7 +662,7 @@ end
     startup(lf)                                       # idempotent: no second task
     t0 = count()
     @test wait_for(() -> count() >= t0 + 6)
-    shutdown(lf)
+    full_stop!(lf)
     # Identity, not a tick-rate bound: a leaked second pruner would interleave its own ticks
     # with the first's, and a rate bound goes red whenever a loaded runner oversleeps.
     @test length(unique(objectid.(tasks_since(t0)))) == 1
@@ -792,6 +804,10 @@ end
 # #649: AccessLog's catches made no #254 carve-out, so Ctrl-C in a `skip` or `annotate` hook became
 # a warning and the request carried on, and an overflow in a hook was reported as a buggy hook.
 @testitem "AccessLog does not swallow an interrupt or an overflow (#649)" tags=[:middleware] setup=[NitroCommon] begin
+# `AccessLog`'s writer flushes in `on_stopped`, after the drain (#811), so a test that stands in
+# for `terminate` runs both teardown phases, in `terminate`'s order.
+full_stop!(lf) = (Nitro.Core.Types.shutdown(lf); Nitro.Core.Types.stopped(lf); nothing)
+
 using Nitro
 using HTTP
 using Nitro.Core: startup, shutdown
@@ -810,7 +826,7 @@ function outcome(lf)
             e
         end
     end
-    shutdown(lf)
+    full_stop!(lf)
     return got, logger.logs
 end
 hook_warned(logs) = any(l -> occursin("hook errored", string(l.message)), logs)
@@ -866,10 +882,10 @@ end
         handler(HTTP.Request("GET", "/first"))        # its batch meets the interrupt
         @test timedwait(() -> stopped(messages()) == 1, 10.0; pollint = 0.05) === :ok
         handler(HTTP.Request("GET", "/while-stopped"))
-        shutdown(lf)                                  # must not hang on the stopped writer
+        full_stop!(lf)                                  # must not hang on the stopped writer
         startup(lf)
         handler(HTTP.Request("GET", "/second"))
-        shutdown(lf)
+        full_stop!(lf)
     end
     ms = messages()
     @test stopped(ms) == 1
@@ -892,7 +908,7 @@ end
     h = lf.middleware(req -> HTTP.Response(200, "ok"))
     Nitro.Core.startup(lf)
     h(HTTP.Request("GET", "/"))
-    Nitro.Core.shutdown(lf)
+    Nitro.Core.Types.shutdown(lf); Nitro.Core.Types.stopped(lf)
     print(Dates.value(recs[1].ts - now(UTC)), " ", Dates.value(now() - now(UTC)))
     """
     # `--code-coverage=none` and captured streams: the child-process pattern of
@@ -915,4 +931,65 @@ end
         # its own grammar, so only a POSIX libc is held to it.
         Sys.iswindows() || @test local_offset > 13 * 3_600_000
     end
+end
+
+# #811: `AccessLog`'s writer used to stop in `on_shutdown`, which `terminate` runs BEFORE the drain,
+# so the two kinds of request the drain exists to finish lost their records, silently: one in
+# flight when the hook ran (its `put!` met a closed channel), and one admitted while the shutdown
+# hooks were still running (the middleware saw `active == false` and skipped it). The writer now
+# stops in `on_stopped`, after the drain, and both reach the sink.
+@testitem "AccessLog records the requests terminate's drain finishes (#811)" tags=[:middleware, :network] setup=[NitroCommon] begin
+using Nitro
+using HTTP
+
+records = AccessRecord[]
+lk = ReentrantLock()
+paths() = lock(() -> sort([r.path for r in records]), lk)
+alog = AccessLog(recs -> lock(() -> append!(records, recs), lk); batch = 1)
+
+@testset "both teardown phases are set" begin
+    @test alog.on_shutdown !== nothing
+    @test alog.on_stopped !== nothing
+end
+
+entered, gate = Channel{Nothing}(1), Channel{Nothing}(1)
+function slow(req)
+    put!(entered, nothing)
+    take!(gate)
+    return "slow"
+end
+
+app = App()
+urlpatterns(app, "", path("/slow", slow), path("/during", () -> "during"))
+port = get_free_port()
+during = Ref(0)
+# Listed BEFORE `alog`, so `terminate`'s LIFO teardown runs its `on_shutdown` AFTER `alog`'s: the
+# request it makes is admitted while the listener is still accepting and `alog` has already been
+# told the server is stopping.
+probe = Nitro.LifecycleMiddleware(middleware = identity, on_shutdown = () ->
+    (during[] = HTTP.get("http://$HOST:$port/during"; retry = false,
+                         status_exception = false).status))
+serve(app; host = HOST, port, async = true, show_banner = false, access_log = nothing,
+      shutdown_timeout = 30, middleware = [probe, alog])
+stopping = nothing
+inflight = nothing
+try
+    @test timedwait(() -> isopen(app.service), 10.0) === :ok
+    inflight = Threads.@spawn HTTP.get("http://$HOST:$port/slow"; retry = false,
+                                       status_exception = false)
+    take!(entered)                                    # `/slow` is inside its handler
+    stopping = Threads.@spawn terminate(app)
+    # The listener closes once the shutdown hooks are done, so the drain is now under way, with
+    # `/slow` still in flight.
+    @test timedwait(() -> !isopen(app.service), 20.0; pollint = 0.05) === :ok
+    @test during[] == 200
+    put!(gate, nothing)
+    @test fetch(inflight).status == 200
+    @test timedwait(() -> istaskdone(stopping), 30.0; pollint = 0.05) === :ok
+    @test !istaskfailed(stopping)
+    @test paths() == ["/during", "/slow"]
+finally
+    isready(gate) || put!(gate, nothing)
+    stopping === nothing ? terminate(app) : wait(stopping)
+end
 end

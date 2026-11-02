@@ -872,8 +872,9 @@ that polls it can wind down within the drain instead of being cut at its end.
 the drain begins, and a hook may block: `worker_startup`'s drains in-flight background tasks for up
 to `WORKER_DRAIN_TIMEOUT_SECONDS` (5 seconds) of its own. Every `on_stopped` hook runs *after* the
 drain, once the listener is closed (#161) — `pormg_nitro_pools`' waits up to its `drain_seconds`
-per pool for leased connections. All three are consecutive, so size them together against a
-container's stop grace period.
+per pool for leased connections, and `AccessLog`'s up to 5 seconds for its writer to hand the
+buffered records, the drain's included, to its sink. All three are consecutive, so size them
+together against a container's stop grace period.
 
 **Long-lived connections are always cut at the timeout.** A WebSocket, SSE, or STREAM handler
 holds its connection for its whole lifetime, so the drain can never wait it out. If such a

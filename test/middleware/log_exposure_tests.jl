@@ -9,6 +9,10 @@
 # body, a token. Those carry the sentinels below.
 
 @testitem "a callback or handler that throws over the request never logs its credentials (#613)" tags=[:middleware, :security] setup=[NitroCommon] begin
+# `AccessLog`'s writer flushes in `on_stopped`, after the drain (#811), so a test that stands in
+# for `terminate` runs both teardown phases, in `terminate`'s order.
+full_stop!(lf) = (Nitro.Core.Types.shutdown(lf); Nitro.Core.Types.stopped(lf); nothing)
+
 using Test
 using HTTP
 using Nitro
@@ -99,7 +103,7 @@ hook_cases = (
     logs = access_logs() do
         startup(lf)
         @test lf.middleware(req -> HTTP.Response(200, "ok"))(credentialed("/ok")).status == 200
-        shutdown(lf)                                    # drains the buffer, waits for the writer
+        full_stop!(lf)                                    # drains the buffer, waits for the writer
     end
     warned = [l for l in logs if occursin(message, string(l.message))]
     @test length(warned) == 1
