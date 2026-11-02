@@ -510,17 +510,74 @@ whatever JSON the token carried.
 
 ## Service and Capability Tokens
 
-Not every token identifies a *user*. A **service token** authorizes a *capability*: it
-carries an `action` (or scope) claim instead of a `sub`/`user_id`. This is the common
-shape for service-to-service calls — one backend calling your API on behalf of no
-particular person.
+Not every token identifies a *user*. A **service token** authenticates another backend — one
+service calling your API on behalf of no particular person — and usually authorizes a
+*capability*: it carries an `action` (or scope) claim instead of a `sub`/`user_id`.
+
+### One key per calling service
+
+Give each calling service **its own key**, and let the key that verified the token be the
+caller's identity:
 
 ```julia
 using Nitro.Auth
 
-# A caller mints a short-lived token that authorizes one action.
+required_env(name::String) = get(ENV, name, nothing) === nothing ? error("$name must be set") : ENV[name]
+
+# This service's own key signs; each caller's key only verifies, and may assert only its scope.
+keys = JWTKeyset(
+    "self" => required_env("JWT_SECRET");
+    verify = ["billing" => required_env("BILLING_JWT_SECRET"),
+              "reports" => required_env("REPORTS_JWT_SECRET")],
+    claims = Dict("billing" => ["action" => ["invoices:sync"]],
+                  "reports" => ["action" => ["reports:generate", "reports:read"]]),
+)
+service_auth = BearerAuth(jwt_validator(keys; identity_from = :kid))
+
+function sync_invoices(req::HTTP.Request)
+    # getuser(req).id == "billing": decided by the key that verified, not by a claim
+    return Res.json(Dict("status" => "queued", "caller" => getuser(req).id))
+end
+
+urlpatterns(app, "",
+    path("/invoices/sync", sync_invoices, method="POST", middleware=[
+        service_auth,
+        GuardMiddleware(kid_required(["billing"])),   # only this caller may enter
+    ]),
+)
+```
+
+The caller signs with a one-key keyset of its own, which stamps its `kid` into the token:
+
+```julia
+as_billing = JWTKeyset("billing" => required_env("BILLING_JWT_SECRET"))
+token = encode_jwt(Dict("action" => "invoices:sync"), as_billing; expires_in = 600)
+```
+
+Why this shape rather than one shared secret:
+
+- **The identity cannot be forged by another caller.** Under a shared secret, every service that
+  holds it can sign any claim, so a caller named in a claim (`"app" => "billing"`) is only what
+  the caller *said*. Here the reports service cannot produce a token that verifies as
+  `"billing"`, because it does not hold that key.
+- **Each caller is held to what it may claim.** The `claims` scope rejects with a `401` a token
+  from `billing` that asserts anything outside its scope — another `action`, or an extra claim
+  such as `"app"`. Without a scope, any key in a keyset may assert any claim; see
+  [Scoping what a key may claim](authentication.md#Scoping-what-a-key-may-claim).
+- **Revoking one caller is one line.** Drop its key from the keyset; the other callers are
+  untouched. Rotating a caller's key uses the same `verify = [...]` window as any rotation.
+- **`kid_required` keeps the service's own key out.** `"self"` verifies too, so a route that
+  only callers may reach names them.
+
+### Capability tokens under one shared secret
+
+When every caller is equally trusted, a single shared secret with a capability claim is the
+simpler shape. A caller mints a short-lived token that authorizes one action:
+
+```julia
+using Nitro.Auth
+
 token = encode_jwt(Dict(
-    "app"    => "analytics-service",
     "action" => "reports:generate",
     "iat"    => trunc(Int, time()),
     "exp"    => trunc(Int, time()) + 300,
@@ -544,7 +601,7 @@ To authorize the specific action, declare it with `claim_required`:
 authorize_generate = claim_required("action", "reports:generate")
 
 function generate_report(req::HTTP.Request)
-    return Res.json(Dict("status" => "queued", "requested_by" => getuser(req)["app"]))
+    return Res.json(Dict("status" => "queued"))
 end
 
 urlpatterns(app, "",
@@ -554,6 +611,10 @@ urlpatterns(app, "",
     ]),
 )
 ```
+
+Do not read *which* service called from a claim here: any holder of `jwt_secret` can write
+any value into it. When the answer matters — for an audit log, a per-caller limit, or a
+route only one caller may reach — use [one key per calling service](#One-key-per-calling-service).
 
 For list-shaped claims (permissions, scopes), use `kind=:contains`:
 
@@ -593,19 +654,10 @@ keys = JWTKeyset("current" => current_secret; verify = ["previous" => previous_s
 validator = jwt_validator(keys)
 ```
 
-With a keyset, the *verified* key id is exposed as `getprincipal(req).kid`, which unlocks two more
-patterns (both covered in depth in [Authentication](authentication.md)):
-
-```julia
-# Authorize by signer: only tokens signed by these keys may reach this route.
-GuardMiddleware(kid_required(["service-a", "service-b"]))
-
-# One key per caller? Make the signer the principal: getuser(req).id == verified kid.
-validator = jwt_validator(keys; identity_from=:kid)
-
-# In the handler, the token's verified key id -- with or without a user_validator:
-kid = getprincipal(req).kid
-```
+With a keyset, the *verified* key id is exposed as `getprincipal(req).kid` — with or without a
+`user_validator` — and `kid_required` authorizes by it, as in
+[one key per calling service](#One-key-per-calling-service). Both are covered in depth in
+[Authentication](authentication.md).
 
 A wrong-key token gets the guard's `403` by default; `kid_required(allowed; denied = f)` answers
 with whatever `f(req, reason)` builds instead — see
@@ -616,6 +668,85 @@ single string secret the header `kid` is an unchecked label, so `kid_required` d
 `identity_from=:kid` is a construction-time error. A `user_validator` that returns a
 `Principal` built with a `kid` of its own does not get around this: `kid_required` reads the
 token's `Principal` first, as `getprincipal` does (#517).
+
+### Cost at high request rates
+
+A recurring question for service traffic is whether moving it to sessions would save the JWT's
+CPU. It would not save anything that matters. These are medians from Nitro's own benchmark
+group (`bench/suite/jwt.jl`, run with `NITRO_BENCH_GROUPS="jwt session"`). They were measured
+in-process, on one thread pinned to one core of a Ryzen 5 5500, under Julia 1.13.2 on
+2026-10-28. There is no socket, HTTP parsing or TLS in them, so read them as relative costs, not
+as what one request costs in production.
+
+| What | Median | Allocations |
+|---|---:|---:|
+| `decode_jwt(token, secret)`, service claim set (`iss`, `aud`, `exp`, `iat`, one scope) | 3.9 µs | 44 |
+| `jwt_validator(secret)(token)` — `BearerAuth`'s per-request call | 4.0 µs | 44 |
+| `jwt_validator(keys; identity_from = :kid)`, 4-key keyset, token with `kid` | 4.2 µs | 49 |
+| the same, token **without** `kid` (every key tried; the worst case) | 5.1 µs | 48 |
+| `internalrequest` to a trivial route | 1.4 µs | 42 |
+| the same route behind `BearerAuth(jwt_validator(secret))` | 6.9 µs | 90 |
+| the same route behind `SessionMiddleware` on a `MemoryStore`, session loaded | 2.6 µs | 55 |
+
+The JWT check is the largest single cost in a trivial authenticated request, yet one core still
+verifies roughly 250,000 tokens a second. What usually costs more sits around it:
+
+- **The caller mints once per token lifetime, not once per request.** It caches the token and
+  re-mints shortly before `exp` — a lifetime of 5–15 minutes is typical. Verification stays per
+  request; signing stops being per request.
+
+  ```julia
+  const AS_BILLING = JWTKeyset("billing" => required_env("BILLING_JWT_SECRET"))
+  const TOKEN = Ref(("", 0.0))          # (token, expires_at)
+  const TOKEN_LOCK = ReentrantLock()
+
+  function service_token()
+      lock(TOKEN_LOCK) do
+          token, expires_at = TOKEN[]
+          if time() > expires_at - 60   # re-mint a minute before exp
+              token = encode_jwt(Dict("action" => "invoices:sync"), AS_BILLING; expires_in = 600)
+              TOKEN[] = (token, time() + 600)
+          end
+          return token
+      end
+  end
+  ```
+
+- **A `user_validator` that reads the database on every request costs more than the JWT.** A
+  database round trip is tens to hundreds of microseconds. A service principal needs no lookup:
+  with `identity_from = :kid` the verified key already says who called.
+- **Reuse connections on the caller.** A client that opens a new TLS connection per call pays a
+  handshake that costs orders of magnitude more than an HMAC. Keep the caller's connection pool
+  on, and make sure nothing between the two services closes it. Behind nginx, that means the
+  upstream `keepalive` plus `proxy_set_header Connection "";` pair in
+  [Reverse proxy](reverse_proxy.md#nginx).
+- **Why not sessions.** In the table a `MemoryStore` session request is about 4 µs cheaper.
+  That saving does not survive deployment:
+  - `MemoryStore` lives in one process, so a restart signs every caller out and a second
+    process cannot see the sessions.
+  - `PormGSessionStore` turns every request into a database query, which costs far more than
+    the 4 µs it was meant to save.
+  - The caller also has to log in and keep a cookie jar.
+
+  Revocation is the one thing a session gives that a token does not, and per-caller keys give it
+  too: drop that caller's key from the keyset, or rotate it through `verify = [...]` without
+  downtime.
+- **Static API keys are cheaper still, with a trade.** `BearerAuth` with a validator that looks
+  up the key's SHA-256 and returns the caller's *name* skips the HMAC and the claims parse:
+
+  ```julia
+  using SHA
+  # hex SHA-256 of each issued key => the caller it identifies; load it from your secret store
+  const API_KEYS = Dict(required_env("BILLING_API_KEY_SHA256") => "billing")
+  api_key_caller(key::AbstractString) = get(API_KEYS, bytes2hex(sha256(key)), nothing)
+
+  service_auth = BearerAuth(api_key_caller)   # getuser(req) == "billing"
+  ```
+
+  Return an identity, never a `Bool` — `true` is not a caller, and `BearerAuth` answers it with a `401`. The
+  trade: an API key has no `exp`, so a leaked key stays valid until you rotate it out. A token
+  leaked from a caller expires within minutes. Treat API keys as the alternative for when the
+  JWT cost really shows up in a profile, not as the default.
 
 ## Auth Cookies and CSRF
 
