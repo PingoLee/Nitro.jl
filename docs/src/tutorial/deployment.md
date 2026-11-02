@@ -141,9 +141,9 @@ a hook, which goes on running while the process ends and may log an error from a
 closed. At `--threads=N,0`
 and `--threads=1` every thread is a default one, and the hooks still run on thread 1. Give the
 supervisor a stop timeout that ends in `SIGKILL`; systemd's `TimeoutStopSec=` does, after 90 s by
-default. Two things this does not change: the listener opens before the hooks run, so an answered
-request does not mean start-up has finished (#799), and HTTP.jl's connection tasks still run on
-the interactive thread, where the first request compiles their loop (#827).
+default. One thing this does not change: HTTP.jl's connection tasks still run on the interactive
+thread, where the first request compiles their loop (#827). (The listener now opens only after the
+hooks have returned, so an answered request does mean start-up has finished, #799.)
 
 ### Handlers that compute
 
@@ -603,7 +603,10 @@ an autoscaled replica. Two remedies, in order of effort:
   from the same host (a health check that touches them, or a short script), and only then let
   the proxy or the orchestrator route to it — a Kubernetes readiness probe, or starting the new
   unit before stopping the old one. Each route compiles once per process, so this costs seconds
-  at startup and nothing after.
+  at startup and nothing after. An open port already means the startup hooks have returned:
+  `serve` runs every `on_startup` before it starts listening, so a worker runtime, a session
+  janitor or a pool a hook sets up is in place before the first connection. It does not mean the
+  routes are compiled, so point the probe at a route, not at the bare port.
 - **Build a system image** with [PackageCompiler.jl](https://github.com/JuliaLang/PackageCompiler.jl),
   giving it a precompile script that exercises your routes over a real socket. The compiled code
   is then in the image the process starts from, including the HTTP.jl paths the workload above

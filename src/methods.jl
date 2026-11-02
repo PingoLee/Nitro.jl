@@ -52,7 +52,8 @@ _serve_owns_cleanup(app::App)::Bool =
     serve(; middleware=(), host="127.0.0.1", port=8080, kwargs...) -> Union{Server, Nothing}
 
 Start the Nitro HTTP server with the registered routes. Runs until `terminate()`
-(or `Ctrl-C`); pass `async=true` to return immediately and serve in the background.
+(or `Ctrl-C`); pass `async=true` to return as soon as the server is listening, its startup
+hooks done, and serve in the background.
 
 Returns the running `Server` in `async=true` mode; in blocking mode it returns
 `nothing`, since the server has already shut down by the time control returns and a
@@ -230,9 +231,16 @@ port as soon as its drain begins, but a `serve` of the same app is refused until
 returned, so the old run's last teardown hooks can never release what the new run is using
 (#812). Another `App` in the same process is not affected.
 
+**The port opens only once every startup hook has returned (#799).** `serve` runs each
+`LifecycleMiddleware`'s `on_startup` first and then starts the listener, so a connection that
+succeeds reaches an app whose hooks are done: a worker runtime running, a janitor started,
+whatever the hooks compile already compiled. A hook that blocks keeps the port closed until it
+returns. If the listener then fails to start (the address is in use, say), every hook that ran
+gets its `on_shutdown` and `on_stopped` before `serve` throws, and the app can be served again.
+
 **Ctrl-C is honored at both points it can land (#185).** An interrupt inside a startup hook lets
-the remaining hooks finish, then unwinds through `terminate` and rethrows — so the app is left
-not-serving and `serve` can simply be retried. An interrupt out of the blocking wait
+the remaining hooks finish, then runs every hook's `on_shutdown` and `on_stopped` and rethrows,
+with no listener ever opened — so the app is left not-serving and `serve` can simply be retried. An interrupt out of the blocking wait
 (`async = false`) is the documented way to stop the server, and now tears it down before
 returning rather than leaving the listener up.
 
@@ -977,10 +985,10 @@ The App-first form: a lifecycle middleware for `serve(app; middleware = [...])` 
 worker runtime. Pass `store = …` to choose a backend, or `runtime = …` to adopt one you built.
 
 **The runtime is installed when this is called, not when the server starts**
-([#322](https://github.com/PingoLee/Nitro.jl/issues/322)). `serve()` opens its listener before it
-runs startup hooks, so a runtime installed by the hook left a window in which App-first calls
-found nothing installed. So `worker_store(app)` is available straight after building the
-middleware, which is the moment to install policy on it:
+([#322](https://github.com/PingoLee/Nitro.jl/issues/322)). So `worker_store(app)` is available
+straight after building the middleware, before `serve()` runs any hook, which is the moment to
+install policy on it. (`serve()` runs its startup hooks before it opens the listener (#799), so
+no request can reach the app before the hook has started the runtime either.)
 
 ```julia
 app = App(mod = @__MODULE__)

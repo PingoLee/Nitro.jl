@@ -245,11 +245,16 @@ end
     end
 end
 
-@testset "a serve() that fails to bind leaves the App idle and its lifecycle unregistered (#812)" begin
+@testset "a serve() that fails to bind unwinds its hooks and leaves the App idle (#812, #799)" begin
+    # The startup hooks run before the listener opens (#799), so by the time the bind fails each
+    # has started, and each must get its `on_shutdown` and `on_stopped`. The App is then idle,
+    # its serve-owned lifecycle unregistered, and a retry starts the list exactly once.
     ctx = Nitro.Core.App()
-    started = Threads.Atomic{Int}(0)
+    started, shut, stopped_ = Threads.Atomic{Int}(0), Threads.Atomic{Int}(0), Threads.Atomic{Int}(0)
     lifecycle = Nitro.LifecycleMiddleware(middleware = identity,
-        on_startup = () -> Threads.atomic_add!(started, 1))
+        on_startup  = () -> Threads.atomic_add!(started, 1),
+        on_shutdown = () -> Threads.atomic_add!(shut, 1),
+        on_stopped  = () -> Threads.atomic_add!(stopped_, 1))
     held = Sockets.listen(Sockets.localhost, 0)
     port = Int(Sockets.getsockname(held)[2])
     try
@@ -258,15 +263,59 @@ end
     finally
         close(held)
     end
+    @test (started[], shut[], stopped_[]) == (1, 1, 1)
     @test Nitro.Core.AppContext._idle(ctx.service)
     @test !isopen(ctx.service)
     @test isempty(ctx.service.serve_lifecycle)
-    @test started[] == 0
-    # A retry starts the list exactly once: the failed call left nothing to start twice.
+    @test ctx.service.external_url[] === nothing
     srv = _serve(ctx, get_free_port(); middleware = [lifecycle])
     try
-        @test started[] == 1
+        @test started[] == 2
     finally
+        Nitro.Core.terminate(ctx)
+    end
+    @test (shut[], stopped_[]) == (2, 2)
+end
+
+@testset "the port stays closed until every startup hook has returned (#799)" begin
+    # A hook that blocks keeps the listener from opening: a connection is refused, the App is not
+    # serving yet, and a second `serve` is refused as still starting. Once the hook returns, the
+    # same port answers.
+    entered, release = Base.Event(), Base.Event()
+    ctx = Nitro.Core.App()
+    Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
+        path("/ok", (req) -> Res.send("ok"), method = "GET"),
+    ])
+    hook = Nitro.LifecycleMiddleware(middleware = identity,
+        on_startup = () -> (notify(entered); wait(release)))
+    port = get_free_port()
+    # `async = true` still returns only once the listener is up, so the call runs on a task.
+    starting = Threads.@spawn _serve(ctx, port; middleware = [hook])
+    try
+        wait(entered)
+        @test !isopen(ctx.service)
+        @test isnothing(ctx.service.server[])
+        @test_throws Base.IOError Sockets.connect(Sockets.localhost, port)
+        refusal = try
+            _serve(ctx, get_free_port())
+            nothing
+        catch e
+            e
+        end
+        @test refusal isa ArgumentError
+        @test occursin("already starting", sprint(showerror, refusal))
+        # A `terminate` has nothing to stop yet; it leaves the start alone.
+        @test Nitro.Core.terminate(ctx) === nothing
+        @test !istaskdone(starting)
+
+        notify(release)
+        @test timedwait(() -> istaskdone(starting), 20.0; pollint = 0.05) === :ok
+        @test !istaskfailed(starting)
+        @test isopen(ctx.service)
+        @test HTTP.get("http://$HOST:$port/ok"; retry = false).status == 200
+    finally
+        notify(release)
+        wait(starting)
         Nitro.Core.terminate(ctx)
     end
 end

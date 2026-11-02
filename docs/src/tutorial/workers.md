@@ -497,9 +497,8 @@ serve(app;
 This is the simplest setup for most Nitro applications.
 
 **`worker_startup(app; …)` installs the runtime when it is called, not when the server starts.**
-`serve` opens its listener before it runs startup hooks, so a runtime installed by the hook left a
-window in which a request found none. So `worker_store(app)` is available as soon as the
-middleware is built, which is where to install policy:
+So `worker_store(app)` is available as soon as the middleware is built, before `serve` runs any
+hook, which is where to install policy:
 
 ```julia
 workers = worker_startup(app; queues=["reports"])
