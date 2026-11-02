@@ -104,7 +104,7 @@ That keeps the production process simpler and avoids loading any hot-reload mach
 
 ## Package-Based Apps
 
-Many Nitro applications are packaged as a Julia module instead of a single script. Your `BI.jl` layout is a good example of that pattern.
+Many Nitro applications are packaged as a Julia module instead of a single script.
 
 In that setup, the end user usually does not call `serve(app; ...)` directly. They call a package function such as `start_server(...)`.
 
@@ -144,7 +144,7 @@ using MyApp
 MyApp.start_server()
 ```
 
-## Does This Fit A `BI.jl`-Style App?
+## Does This Fit A Package-Based App?
 
 Yes, with one requirement.
 
@@ -185,9 +185,9 @@ Then the end user can do:
 
 ```julia
 using Revise
-using BI
+using MyApp
 
-BI.start_server("dev"; revise=:lazy)
+MyApp.start_server("dev"; revise=:lazy)
 ```
 
 ## Important Rule About Load Order
@@ -198,13 +198,13 @@ Good:
 
 ```julia
 using Revise
-using BI
+using MyApp
 ```
 
 Not recommended:
 
 ```julia
-using BI
+using MyApp
 using Revise
 ```
 

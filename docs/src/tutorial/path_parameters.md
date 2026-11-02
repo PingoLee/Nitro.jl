@@ -449,7 +449,7 @@ The final registered paths will be `/api/worker/status/<str:task_id>`, `/api/wor
 In the application entry point, pass the routes and config to Nitro:
 
 ```julia
-# src/BI.jl / main.jl
+# src/MyApp.jl / main.jl
 const app = App(mod = @__MODULE__)
 
 function start_server(env::String = "development")
