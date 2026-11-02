@@ -20,8 +20,8 @@ printed once the port is open. If the listener then fails to start (an address a
 every hook that ran gets its `on_shutdown` and `on_stopped` before `serve` throws, and the app can
 be served again. An interrupt in a hook unwinds the same way, with no listener ever opened.
 
-A `terminate` called while the hooks are running finds nothing to stop and returns; it does not
-cancel the start.
+A `terminate` called while the hooks are running cancels the start: see the #834 entry
+(`terminate(app)` cancels a start in progress and waits for a stop in progress).
 
 ### How to find the calls to migrate
 

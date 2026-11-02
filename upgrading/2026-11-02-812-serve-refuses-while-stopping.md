@@ -22,8 +22,8 @@ another `serve` of the app is still starting. A second `App` in the same process
 
 Two smaller changes come with it:
 
-- A `terminate` called while another `terminate` of the same app is running returns at once. It
-  used to run every shutdown hook a second time.
+- A `terminate` called while another `terminate` of the same app is running no longer runs every
+  shutdown hook a second time. It waits for the first to finish (#834).
 - A `serve` that fails before its listener is up (an address already in use) no longer leaves its
   `serve(middleware = …)` lifecycle registered, so the next `serve` does not start that list
   alongside its own.
