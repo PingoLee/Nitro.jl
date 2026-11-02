@@ -131,6 +131,20 @@ press in most, and ended the whole Julia session in 2 of 10. Develop at the defa
 stop a production server with `terminate` or its process supervisor rather than Ctrl-C (see
 `serve`'s docstring).
 
+**A `SIGTERM` during start-up.** A supervisor can stop a process before it is ready, in a rolling
+restart or after a failed readiness probe. Julia ends a script on `SIGTERM` by running its `atexit`
+hooks on thread 1, on top of whatever thread 1 was running, and a frame caught compiling there can
+leave the exit hung: a served PormG app stopped during its Workers boot sweep never exited (#824).
+So outside a REPL, whenever thread 1 is the interactive thread (the default layout), `serve` runs
+the `on_startup` hooks on the default pool and thread 1 only waits for them. The exit does not stop
+a hook, which goes on running while the process ends and may log an error from a pool the exit has
+closed. At `--threads=N,0`
+and `--threads=1` every thread is a default one, and the hooks still run on thread 1. Give the
+supervisor a stop timeout that ends in `SIGKILL`; systemd's `TimeoutStopSec=` does, after 90 s by
+default. Two things this does not change: the listener opens before the hooks run, so an answered
+request does not mean start-up has finished (#799), and HTTP.jl's connection tasks still run on
+the interactive thread, where the first request compiles their loop (#827).
+
 ### Handlers that compute
 
 A task gives up its thread only when it waits: on I/O, a lock, a `sleep` or a `yield()`. Julia
