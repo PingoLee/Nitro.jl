@@ -181,7 +181,7 @@ What the pipeline binds for one request's dynamic extent, as the single value of
   [`request_max_fields`](@ref).
 - `shutting_down` -- the flag `terminate` sets for the server run this pipeline was built in
   (#466), read by `cancel_reason(req)` as `:shutdown`. Captured per pipeline, not read off the
-  service per request, so a run that is still draining keeps its own flag while a new `serve`
+  service per request, so each server run keeps its own flag and the next run of the same app
   starts with a clean one. The two-argument form uses `NEVER_SHUTTING_DOWN`, which is never set.
 
 **Mutable only so that it is a heap object**, every field `const`. A scope stores its values in a

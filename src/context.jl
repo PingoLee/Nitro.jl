@@ -16,6 +16,17 @@ using ..Errors: loggable
 export App, EagerReviseService, Service, wait, close, isopen
 export set_extension!, get_extension, delete_extension!, has_extension
 
+# The server lifecycle phases a `Service` moves through (#812), read and written only through
+# `Service.phase`. Internal: `isopen(app.service)` stays the public question "is a listener open".
+#
+#   IDLE ──serve──▶ STARTING ──listener up──▶ SERVING ──terminate──▶ STOPPING ──last hook──▶ IDLE
+#                      │
+#                      └── any failure before SERVING ──▶ IDLE
+const PHASE_IDLE     = 0x00
+const PHASE_STARTING = 0x01
+const PHASE_SERVING  = 0x02
+const PHASE_STOPPING = 0x03
+
 
 
 @kwdef struct EagerReviseService
@@ -229,9 +240,17 @@ end
     # force-closed. It is a flag, not a registry of in-flight requests, so nothing is written per
     # request. Each pipeline captures the flag current when it is built (`_app_context_seed`).
     # `terminate` swaps in a fresh one and only then sets the old one. So the run it stops
-    # drains with its own flag set, while a `serve` admitted during that drain (the port is
-    # free before the drain ends) builds on the clean one.
+    # drains with its own flag set, and the next run builds on the clean one. (A `serve` can no
+    # longer start during that drain, #812; the swap keeps the two runs' flags apart regardless.)
     shutting_down         :: Base.RefValue{Threads.Atomic{Bool}} = Ref(Threads.Atomic{Bool}(false))
+    # Where this App is in its server lifecycle (#812): `PHASE_IDLE`, `PHASE_STARTING`,
+    # `PHASE_SERVING` or `PHASE_STOPPING`. `isopen(service)` answers a narrower question, whether a
+    # listener is open, and `terminate` closes the listener when its drain STARTS, so a guard on
+    # `isopen` alone admitted a second `serve` while the first run's teardown hooks were still to
+    # run. `serve` claims `IDLE -> STARTING` and `terminate` claims `SERVING -> STOPPING`, each with
+    # one compare-and-swap, so two callers can never both win; the phase returns to `IDLE` only once
+    # the last `on_stopped` hook has run. See `_claim_phase!`.
+    phase                 :: Threads.Atomic{UInt8}  = Threads.Atomic{UInt8}(PHASE_IDLE)
     # `serve(max_fields = …)`. The pipeline's outermost layer binds THIS cell, not a copy, in
     # `REQUEST_SCOPE` for each request's extent (#327, #444), so a pipeline built before `serve`
     # sets it still sees it. Concrete `RefValue` so the scope can hold it without a conversion.
@@ -333,6 +352,14 @@ function Base.isopen(service::Service)
     handle = service.server[]
     return !isnothing(handle) && isopen(handle)
 end
+
+# Move `service` from phase `from` to `to` if, and only if, it is in `from` now. One
+# compare-and-swap, so of two tasks racing for the same transition exactly one wins (#812).
+_claim_phase!(service::Service, from::UInt8, to::UInt8)::Bool =
+    Threads.atomic_cas!(service.phase, from, to) === from
+
+# Whether `service` has no server run in any phase: not starting, serving or stopping.
+_idle(service::Service)::Bool = service.phase[] === PHASE_IDLE
 
 function Base.wait(service::Service)
     handle = service.server[]
@@ -448,10 +475,11 @@ function Base.close(service::Service; timeout::Real = service.shutdown_timeout[]
         # lets `serve()`'s already-serving guard mistake a corpse for a live listener.
         #
         # Compare-and-clear, NOT an unconditional nil. `HTTP.close` releases the listener up
-        # front, so `isopen(service)` goes false while the drain is still running and a
-        # concurrent `serve()` is admitted — legitimately, the port is free by then. Clearing
-        # blindly afterwards would strand *that* server: live, listening, and unreachable from
-        # `terminate()`, which is precisely the leak this whole change exists to remove.
+        # front, so `isopen(service)` goes false while the drain is still running. A concurrent
+        # `serve()` used to be admitted there, and clearing blindly afterwards stranded *that*
+        # server: live, listening, and unreachable from `terminate()`. `serve` now refuses until
+        # the phase is back to `PHASE_IDLE` (#812), which closes the window; the compare stays as
+        # the second line of defence, since a handle written by anyone else is never ours to drop.
         service.server[] === handle && (service.server[] = nothing)
     end
     _release_wake_guard!(service)
@@ -487,13 +515,14 @@ _needs_wake_guard(v::VersionNumber = VERSION) = v"1.13.0-rc3" <= v < v"1.14.0-"
 # Tests only: it drives the serve path wherever the gate is shut (a fixed 1.13.x, a later Julia).
 const _WAKE_GUARD_FORCED = Ref(false)
 
-# Called by `startserver` once the listener is set. Reuses a guard that is still open (a
-# `serve()` admitted while the previous run was still draining) rather than overwriting the
-# only handle to it.
+# Called by `startserver` once the listener is set. Reuses a guard that is still open rather
+# than overwriting the only handle to it.
 #
 # Both halves run under `wake_guard_lock`. `close` checks "nothing serves" and then closes, and
-# closing a `Timer` waits on the uv close callback; without the lock a `serve()` admitted in that
-# gap would set its listener, find the doomed guard still open, keep it, and serve unguarded.
+# closing a `Timer` waits on the uv close callback. A `serve()` used to be admitted in that gap
+# (the previous run's drain), and without the lock it would set its listener, find the doomed
+# guard still open, keep it, and serve unguarded. The phase guard refuses that `serve` now
+# (#812); the reuse and the lock stay, because neither costs anything on the request path.
 function _hold_wake_guard!(service::Service;
                            needed::Bool = _WAKE_GUARD_FORCED[] || _needs_wake_guard())
     needed || return nothing
@@ -504,9 +533,8 @@ function _hold_wake_guard!(service::Service;
     return nothing
 end
 
-# Called by `close(::Service)`. Only once nothing serves: a `serve()` admitted during the drain
-# (see `close`'s compare-and-clear) keeps the guard it found, and closing it here would unguard
-# that server.
+# Called by `close(::Service)`. Only once nothing serves, the same second line of defence as
+# `close`'s compare-and-clear: a server that holds the handle keeps the guard it found.
 function _release_wake_guard!(service::Service)
     lock(service.wake_guard_lock) do
         guard = service.wake_guard[]

@@ -204,9 +204,9 @@ is waiting for, and a request served during the drain would reopen it.
 
 A closed pool is not a dead one: PormG reopens it on the next query, so
 `serve(); terminate(); serve()` needs nothing more, and code that queries after `terminate`
-reconnects. Let `terminate` return before serving again, though: the port is free once the drain
-begins, so a `serve` that starts during it is running when these pools are closed, and a
-connection it still holds `drain_seconds` later is closed under it. PormG's own `atexit` hook still closes every pool when the process exits; this is
+reconnects. The port is free once the drain begins, but `serve` refuses the same app until
+`terminate` has returned (#812), so these pools are never closed under the next run of that app.
+PormG's own `atexit` hook still closes every pool when the process exits; this is
 for closing them at `terminate`, which is earlier, or not the end of the process at all.
 
 Requires `using PormG`; without the extension loaded this is a `MethodError`, exactly like

@@ -278,6 +278,39 @@ _default_serve_listener(ctx::App) =
                                     security_headers = nothing),
                     stream_handler, DEFAULT_MAX_BODY_BYTES, zero(Int64), zero(Int64), nothing)
 
+# The refusal `serve` throws when `ctx` is not idle, worded for the phase it is in (#812).
+function _not_idle_error(ctx::App)::ArgumentError
+    phase = ctx.service.phase[]
+    if phase === AppContext.PHASE_STOPPING
+        return ArgumentError(
+            "This App is still stopping: `terminate` is draining its previous run and has " *
+            "teardown hooks still to run, which would release what a new run starts using. Wait " *
+            "for `terminate` to return, then call `serve` again.")
+    elseif phase === AppContext.PHASE_STARTING
+        return ArgumentError(
+            "This App is already starting: another `serve()` call is bringing it up. Wait for " *
+            "that call, and `terminate` it before serving again, or give the second listener " *
+            "its own: `app = App(mod = @__MODULE__); serve(app; …)`.")
+    end
+    return ArgumentError(
+        "This App is already serving on " *
+        "$(something(ctx.service.external_url[], "an open listener")). A second `serve()` " *
+        "would overwrite the running server's handle, leaving it unreachable and its port " *
+        "bound until the process exits. Terminate THIS app first, or give the second " *
+        "listener its own: `app = App(mod = @__MODULE__); serve(app; …)`.")
+end
+
+# Undo a `serve` that failed while it still owned `PHASE_STARTING` (#812): no startup hook has
+# run and no listener is open, so the `serve(middleware = …)` lifecycle this call registered
+# belongs to a run that never existed. Cleared, or the next `serve` would start it alongside its
+# own. Then the phase goes back to `IDLE`, last, so a retry finds the App as it was.
+function _abandon_start!(ctx::App)
+    lock(() -> empty!(ctx.service.serve_lifecycle), ctx.service.lifecycle_lock)
+    ctx.service.external_url[] = nothing
+    ctx.service.phase[] = AppContext.PHASE_IDLE
+    return nothing
+end
+
 # Documented on the public `Nitro.serve` (src/methods.jl), which is the binding users call and
 # the one `docs/` renders. A docstring here is a second copy Documenter counts as missing (#186).
 function serve(ctx::App;
@@ -317,14 +350,12 @@ function serve(ctx::App;
     # leaving it unreachable and its port bound for the life of the process, with nothing left
     # to close it. That is a programming error, not something to paper over by silently killing
     # the first server's in-flight requests.
-    if isopen(ctx.service)
-        throw(ArgumentError(
-            "This App is already serving on " *
-            "$(something(ctx.service.external_url[], "an open listener")). A second `serve()` " *
-            "would overwrite the running server's handle, leaving it unreachable and its port " *
-            "bound until the process exits. Terminate THIS app first, or give the second " *
-            "listener its own: `app = App(mod = @__MODULE__); serve(app; …)`."))
-    end
+    #
+    # On the PHASE, not on `isopen` alone (#812): `terminate` closes the listener when its drain
+    # starts, and a `serve` admitted from then on ran while the old run's `on_stopped` hooks were
+    # still to come, so they released what the new run had just started using. This is the
+    # read-only half; the claim itself is the compare-and-swap below, after validation.
+    AppContext._idle(ctx.service) && !isopen(ctx.service) || throw(_not_idle_error(ctx))
 
     # Before any mutation (#401): the hook runs on every logged request, so a wrong shape -- a
     # non-function, or the old pre-handler `req -> Bool` -- is refused at the call that has it.
@@ -470,71 +501,87 @@ function serve(ctx::App;
         max_cookie_size=current.max_cookie_size,
     )
 
-    if !ismissing(context)
-        ctx.app_context[] = Context(context)
-    end
-    ctx.service.cookies[] = cookies
-
-    ctx.service.external_url[] = external_url isa String ? external_url : "http://$host:$port"
-    ctx.service.prefix[] = global_prefix
-    # Stored rather than passed through, because the *blocking* `serve()` calls `terminate()`
-    # from its own `finally` (the Ctrl-C path) with no way to hand it a keyword.
-    ctx.service.shutdown_timeout[] = Float64(shutdown_timeout)
-    ctx.service.max_fields[] = Int64(max_fields)
-
-    if revise == :lazy || revise == :eager
-        if Threads.nthreads() > 1
-            @warn "You are attempting to use Revise with multiple threads. Please note that Revise 3.5.18 and earlier are not threadsafe."
+    # The claim (#812). Here, after every refusal above and before the first mutation below, so a
+    # refused call leaves the App untouched and a call that loses the race to another `serve` is
+    # refused the same way. From here on every failure before the server is up hands the phase
+    # back to `PHASE_IDLE` (`_abandon_start!`), or the App could never serve again.
+    AppContext._claim_phase!(ctx.service, AppContext.PHASE_IDLE, AppContext.PHASE_STARTING) ||
+        throw(_not_idle_error(ctx))
+    # Whether THIS call still owns `PHASE_STARTING`. `startserver` clears it at the moment it moves
+    # the phase on (to `SERVING`, or back to `IDLE` through its own unwind), and from then on the
+    # `catch` below must leave the phase alone: once it is `IDLE` again another `serve` may already
+    # have claimed it, and resetting that claim would admit a third.
+    claim = Ref(true)
+    try
+        if !ismissing(context)
+            ctx.app_context[] = Context(context)
         end
-        if !has_revise_hooks()
-            error("Revise support is unavailable. Load Revise.jl in your development session before using the `revise` option")
+        ctx.service.cookies[] = cookies
+
+        ctx.service.external_url[] = external_url isa String ? external_url : "http://$host:$port"
+        ctx.service.prefix[] = global_prefix
+        # Stored rather than passed through, because the *blocking* `serve()` calls `terminate()`
+        # from its own `finally` (the Ctrl-C path) with no way to hand it a keyword.
+        ctx.service.shutdown_timeout[] = Float64(shutdown_timeout)
+        ctx.service.max_fields[] = Int64(max_fields)
+
+        if revise == :lazy || revise == :eager
+            if Threads.nthreads() > 1
+                @warn "You are attempting to use Revise with multiple threads. Please note that Revise 3.5.18 and earlier are not threadsafe."
+            end
+            if !has_revise_hooks()
+                error("Revise support is unavailable. Load Revise.jl in your development session before using the `revise` option")
+            end
+            if ctx.mod === nothing
+                @warn "`revise` was requested but this App tracks no module, so code in `Main` may not be revised. Construct it as `App(mod = @__MODULE__)` from the module you want tracked."
+            end
         end
-        if ctx.mod === nothing
-            @warn "`revise` was requested but this App tracks no module, so code in `Main` may not be revised. Construct it as `App(mod = @__MODULE__)` from the module you want tracked."
+
+        # Lifecycle registration lives HERE — once per server — not in `setupmiddleware`, which
+        # `internalrequest` also calls, per request (#68). `startup.` runs only in `startserver`,
+        # so a middleware registered from the request path got an `on_shutdown` at `terminate`
+        # with no paired `on_startup` — deterministic, needing no race at all — and additionally
+        # wrote to an unsynchronized `Set` that `startup.`/`shutdown.` broadcast over, which a
+        # concurrent `internalrequest` could overlap.
+        #
+        # SERVE-owned (#82): this list belongs to this server run, so `terminate` clears it. Route
+        # middleware registers itself as route-owned at `urlpatterns()` time instead, and survives.
+        #
+        # The user's list only: `ReviseHandler()`, prepended below, is a plain closure, not a
+        # `LifecycleMiddleware`, so it has nothing to register.
+        register_serve_lifecycle!(ctx, middleware)
+
+        # No warning for running on one thread (#149): single-threaded is a valid deployment, not a
+        # misconfiguration, and the banner already reports the thread count. `preprocesskwargs` drops
+        # `queuesize` unconditionally, so the warning that it is ignored is unconditional too.
+        if haskey(kwargs, :queuesize)
+            @warn "Deprecated: serve() ignores `queuesize`; remove the argument."
         end
-    end
 
-    # Lifecycle registration lives HERE — once per server — not in `setupmiddleware`, which
-    # `internalrequest` also calls, per request (#68). `startup.` runs only in `startserver`,
-    # so a middleware registered from the request path got an `on_shutdown` at `terminate`
-    # with no paired `on_startup` — deterministic, needing no race at all — and additionally
-    # wrote to an unsynchronized `Set` that `startup.`/`shutdown.` broadcast over, which a
-    # concurrent `internalrequest` could overlap.
-    #
-    # SERVE-owned (#82): this list belongs to this server run, so `terminate` clears it. Route
-    # middleware registers itself as route-owned at `urlpatterns()` time instead, and survives.
-    #
-    # The user's list only: `ReviseHandler()`, prepended below, is a plain closure, not a
-    # `LifecycleMiddleware`, so it has nothing to register.
-    register_serve_lifecycle!(ctx, middleware)
-
-    # No warning for running on one thread (#149): single-threaded is a valid deployment, not a
-    # misconfiguration, and the banner already reports the thread count. `preprocesskwargs` drops
-    # `queuesize` unconditionally, so the warning that it is ignored is unconditional too.
-    if haskey(kwargs, :queuesize)
-        @warn "Deprecated: serve() ignores `queuesize`; remove the argument."
-    end
-
-    # One `setupmiddleware` call per branch, each handing its pipeline to `_serve_pipeline`
-    # (#572). Prepending `ReviseHandler()` to `middleware` and building once made the list's type
-    # a `Union` of the two, and a keyword call over a `Union` is one `juliac --trim` cannot
-    # resolve, so the production path lost its typed pipeline to a dev-only option. Split like
-    # this, the `revise = :none` branch is concrete all the way to `HTTP.listen!`.
-    pipeline_kwargs = (; serialize, catch_errors, show_errors, access_log, access_log_query,
-                       access_log_skip, security_headers)
-    # `Types._trimmed()` first: Revise was refused above in a trimmed image, so the branch below is
-    # dead there.
-    if Types._trimmed() || revise == :none
-        return _serve_pipeline(ctx, setupmiddleware(ctx; middleware, pipeline_kwargs...),
+        # One `setupmiddleware` call per branch, each handing its pipeline to `_serve_pipeline`
+        # (#572). Prepending `ReviseHandler()` to `middleware` and building once made the list's type
+        # a `Union` of the two, and a keyword call over a `Union` is one `juliac --trim` cannot
+        # resolve, so the production path lost its typed pipeline to a dev-only option. Split like
+        # this, the `revise = :none` branch is concrete all the way to `HTTP.listen!`.
+        pipeline_kwargs = (; serialize, catch_errors, show_errors, access_log, access_log_query,
+                           access_log_skip, security_headers)
+        # `Types._trimmed()` first: Revise was refused above in a trimmed image, so the branch below is
+        # dead there.
+        if Types._trimmed() || revise == :none
+            return _serve_pipeline(ctx, setupmiddleware(ctx; middleware, pipeline_kwargs...),
+                                   handler, body_limit, request_limit, upgraded_limit, security_headers,
+                                   revise, host, port, show_banner, async, kwargs, claim)
+        end
+        # Prepended without `insert!`, so the `Tuple` form works too. Dev-only, and dynamic on
+        # purpose: `ReviseHandler` reaches the revised world through `invokelatest`.
+        return _serve_pipeline(ctx, setupmiddleware(ctx; middleware = (ReviseHandler(), middleware...),
+                                                    pipeline_kwargs...),
                                handler, body_limit, request_limit, upgraded_limit, security_headers,
-                               revise, host, port, show_banner, async, kwargs)
+                               revise, host, port, show_banner, async, kwargs, claim)
+    catch
+        claim[] && _abandon_start!(ctx)
+        rethrow()
     end
-    # Prepended without `insert!`, so the `Tuple` form works too. Dev-only, and dynamic on
-    # purpose: `ReviseHandler` reaches the revised world through `invokelatest`.
-    return _serve_pipeline(ctx, setupmiddleware(ctx; middleware = (ReviseHandler(), middleware...),
-                                                pipeline_kwargs...),
-                           handler, body_limit, request_limit, upgraded_limit, security_headers,
-                           revise, host, port, show_banner, async, kwargs)
 end
 
 # The rest of `serve`, once the pipeline exists: a function barrier, so everything below is
@@ -547,7 +594,7 @@ end
 function _serve_pipeline(ctx::App, configured_middelware::P, handler::H, body_limit::Int64,
                          request_limit::Int64, upgraded_limit::Int64, security_headers,
                          revise::Symbol, host, port, show_banner, async,
-                         kwargs) where {P<:Function, H}
+                         kwargs, claim::Base.RefValue{Bool}) where {P<:Function, H}
     # Once-assigned, because the `start` closure below captures it: a name reassigned before
     # capture is boxed (#364).
     listener = first(_serve_listener(configured_middelware, handler, body_limit, request_limit,
@@ -567,7 +614,7 @@ function _serve_pipeline(ctx::App, configured_middelware::P, handler::H, body_li
     _warn_if_no_gc_target(current_env(), _gc_target_bytes())
 
     try
-        return startserver(ctx; host, port, show_banner, async, kwargs, start=(kwargs) ->
+        return startserver(ctx; host, port, show_banner, async, kwargs, claim, start=(kwargs) ->
             HTTP.listen!(listener, host, port; kwargs...))
     catch
         # A `serve(async = true)` that never got its listener up (an address in use, say) returns
@@ -764,7 +811,12 @@ end
 
 # Documented on the public `Nitro.terminate` (src/methods.jl); see the note on `serve` above.
 function terminate(context::App; timeout::Nullable{Real} = nothing)
-    if isopen(context.service)
+    # The phase, not `isopen` (#812): the claim makes a second, concurrent `terminate` a no-op
+    # rather than a second run of every hook, and it is what keeps `serve` refused until the very
+    # end of this function. A run that is still starting is not stopped here; see `Nitro.terminate`.
+    AppContext._claim_phase!(context.service, AppContext.PHASE_SERVING,
+                             AppContext.PHASE_STOPPING) || return nothing
+    try
         # First, before any hook can block: every in-flight request now reads `:shutdown` from
         # `cancel_reason(req)` (#466), so a handler that polls it winds down during the drain
         # below instead of being force-closed at its end. Swap, then set: the pipelines of this
@@ -840,11 +892,16 @@ function terminate(context::App; timeout::Nullable{Real} = nothing)
         end
         # Re-raised only now: everything a later `serve()` depends on has already been done.
         isnothing(interrupt) || throw(interrupt)
+    finally
+        # The last statement, after the last `on_stopped` hook, and in a `finally`: whatever
+        # escapes above, an App left in `PHASE_STOPPING` could never serve again.
+        context.service.phase[] = AppContext.PHASE_IDLE
     end
     return nothing
 end
 
-function startserver(ctx::App; host, port, show_banner=false, async=false, kwargs, start)::Union{Server, Nothing}
+function startserver(ctx::App; host, port, show_banner=false, async=false, kwargs,
+                     claim::Base.RefValue{Bool}, start)::Union{Server, Nothing}
     show_banner && serverwelcome(ctx.service.external_url[], ctx.service.prefix[])
     # Concrete here, so this is where a trimmed build takes the handle's pointers (src/context.jl).
     server = start(preprocesskwargs(kwargs))
@@ -852,6 +909,9 @@ function startserver(ctx::App; host, port, show_banner=false, async=false, kwarg
     # Before the hooks: every exit from here on goes through `terminate`, whose `close` releases
     # it. A no-op outside the Julia versions JuliaLang/julia#63882 affects (src/context.jl).
     AppContext._hold_wake_guard!(ctx.service)
+    # The run is `terminate`'s to stop from here on (#812), so `serve` no longer owns the start.
+    ctx.service.phase[] = AppContext.PHASE_SERVING
+    claim[] = false
     # Route-owned first, then serve-owned: that is declaration order — routes are registered at
     # `urlpatterns()` time, the `serve(middleware = ...)` list only at `serve()` time (#82).
     # Within each half, registration order. `terminate` unwinds the exact reverse (#74).

@@ -1122,14 +1122,13 @@ drain may re-acquire it. This is Spring's phased shutdown: the web server stops,
 it served from are destroyed; and Go's `db.Close()` after `srv.Shutdown()` returns.
 [`pormg_nitro_pools`](@ref Nitro.pormg_nitro_pools) is the in-tree user.
 
-`on_stopped` is best effort in two cases:
+`on_stopped` is best effort in one case: when the drain hits its timeout, the connections are
+force-closed, but a handler task still running is not stopped, and it can reach the resource
+after `on_stopped` released it.
 
-- When the drain hits its timeout, the connections are force-closed, but a handler task still
-  running is not stopped, and it can reach the resource after `on_stopped` released it.
-- The port is released when the drain *starts*, so a `serve()` of the same app called while a
-  `terminate()` is still draining is admitted, and this run's `on_stopped` then runs while the
-  next run is already serving. Wait for `terminate()` to return before serving again when a
-  hook releases something the next run will use.
+It never runs against the next run of the same app. The port is released when the drain
+*starts*, but `serve()` refuses that app with an `ArgumentError` until `terminate()` has returned,
+its last `on_stopped` included (#812).
 
 Like `on_shutdown`, it runs only when `terminate()` does: not on a hard kill, and not when Ctrl-C
 ends a script run as `julia app.jl` (see the Ctrl-C note on `serve`). Its time adds to the exit
