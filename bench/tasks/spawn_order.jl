@@ -11,6 +11,8 @@
 #             HTTP.jl's connection task (it lands on `:default` from an `:interactive` caller)
 #   pool      nthreads(:default) long-lived tasks on `:default` taking requests from one `Channel`,
 #             FIFO by construction, as server.jl's `bare_pool`
+#   pool<N>   as pool with N workers instead of nthreads(:default) (`pool8`, `pool32`): a pool wider
+#             than the thread count, which only pays off when handlers wait (the `io` shape, #618)
 #   sticky    as spawn, but each handler is a `Task` made by hand, `sticky`, pinned with
 #             `jl_set_task_tid` to the next `:default` tid of one round-robin counter shared by every
 #             client (the way `@threads :static` pins its tasks), then scheduled. A pinned sticky
@@ -45,6 +47,8 @@
 #             latency the cell reports the handler's own wall time, its start to its last fetch:
 #             under sticky the children sit in the multiqueue behind every thread's sticky queue,
 #             and the handler, woken by its last child, goes to the back of its own queue.
+#   io        the handler `sleep`s its H ms instead of burning them: a request that waits on I/O
+#             and holds no thread meanwhile, the case a pool wider than the threads is for
 #
 # Clients run on `:interactive`, where HTTP.jl runs its connection tasks, or on `:default`. With no
 # interactive thread (`--threads=8,0`) only `default` runs, which is where HTTP.jl's connection
@@ -129,7 +133,8 @@ mutable struct Slot
     rtid::Int16      # the tid the handler started on
     prio::UInt16     # priority: the priority the handler was given
     depth::Int32     # sticky: handlers pinned to that tid and not yet started, at the pin
-    Slot() = new(Base.Event(true), 0.0, 0, 0, 0.0, 0, 0, 0, 0, 0, 0)   # autoreset: one notify, one wake
+    io::Bool         # io shape: the handler sleeps its h ms instead of burning them
+    Slot() = new(Base.Event(true), 0.0, 0, 0, 0.0, 0, 0, 0, 0, 0, 0, false)   # autoreset: one notify, one wake
 end
 
 const SPAWNED = Threads.Atomic{Int}(0)
@@ -197,6 +202,8 @@ function handle!(slot::Slot, inner::Bool)
         t3 = Threads.@spawn :default inner_child(q)
         t4 = Threads.@spawn :default inner_child(q)
         slot.sink += fetch(t1) + fetch(t2) + fetch(t3) + fetch(t4)
+    elseif slot.io
+        sleep(slot.h / 1000)
     else
         slot.sink += burn(slot.h)
     end
@@ -294,15 +301,17 @@ end
 
 # One cell: C clients for D seconds. Returns the per-client records and the wall time.
 function run_cell(mode::String, clients::Symbol, c::Int, h::Float64, d::Float64, shape::String = "plain")
-    shape in ("plain", "hetero", "inner") || error("unknown shape $shape")
+    shape in ("plain", "hetero", "inner", "io") || error("unknown shape $shape")
     hetero, inner = shape == "hetero", shape == "inner"
     mode == "priority" && MULTIQ_VARIANT != "A" && error("the priority mode runs on the build's own heap only (VARIANT=A)")
     slots = [Slot() for _ in 1:c]
+    foreach(sl -> sl.io = shape == "io", slots)
     recs = [Rec() for _ in 1:c]
     jobs = Channel{Slot}(Inf)
     workers = Task[]
-    if mode == "pool"
-        for _ in 1:Threads.nthreads(:default)
+    if startswith(mode, "pool")
+        # `pool` has nthreads(:default) workers; `pool<N>` has N.
+        for _ in 1:(mode == "pool" ? Threads.nthreads(:default) : parse(Int, mode[5:end]))
             worker = Threads.@spawn :default for slot in jobs
                 handle!(slot, inner)
             end
@@ -314,7 +323,7 @@ function run_cell(mode::String, clients::Symbol, c::Int, h::Float64, d::Float64,
     GC.gc()
     start = time_ns()
     deadline = start + round(UInt64, d * 1e9)
-    tasks = if mode == "pool"
+    tasks = if startswith(mode, "pool")
         clients === :interactive ?
             [Threads.@spawn :interactive client_pool(slots[i], recs[i], deadline, h, jobs, hetero, i) for i in 1:c] :
             [Threads.@spawn :default client_pool(slots[i], recs[i], deadline, h, jobs, hetero, i) for i in 1:c]
@@ -403,7 +412,7 @@ function measure()
         filter!(!=("priority"), modes)
     end
     # Compile every path before measuring; the warm-up cells are not reported.
-    for mode in modes, cl in clients, shape in ("plain", "hetero", "inner")
+    for mode in modes, cl in clients, shape in ("plain", "hetero", "inner", "io")
         run_cell(mode, cl, 8, 0.1, 0.2, shape)
     end
     get(ENV, "NOHEADER", "0") == "1" || println(join(COLUMNS, '\t'))

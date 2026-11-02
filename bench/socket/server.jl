@@ -123,6 +123,13 @@ const NITRO_MODE = MODE in ("nitro", "nitro_log", "nitro_notimeouts")
 # Only where it is used, so a `bare_*` process has no Nitro in it at all: `rss.sh` reports that
 # mode as the HTTP.jl-only floor (#451), and a loaded-but-idle Nitro would be counted in it.
 NITRO_MODE && @eval using Nitro
+# NITRO_WAKE_GUARD=0 (#609): `serve()` holds no wake guard on any version. On a 1.13.x the gate
+# (`_needs_wake_guard`, src/context.jl) covers, `serve()` holds its own never-firing Timer, so
+# without this `wake.sh`'s `<ch>/event/0` config still has a live Timer and passes vacuously.
+if NITRO_MODE && get(ENV, "NITRO_WAKE_GUARD", "1") == "0"
+    @eval Nitro.Core.AppContext _needs_wake_guard(v::VersionNumber = VERSION) = false
+    @info "bench: serve()'s wake guard disabled" needs = Nitro.Core.AppContext._needs_wake_guard()
+end
 # FILLER_ROUTES / ROUTE_MW: the route table's size and middleware shape (#718); see the file.
 NITRO_MODE && include(joinpath(@__DIR__, "..", "route_table.jl"))
 

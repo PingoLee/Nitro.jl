@@ -13,11 +13,14 @@
 #   timer/0   server.jl's usual shape: parked on a never-firing Timer, which is itself a guard
 #   event/0   no Timer of the bench's own: the shape of a `serve()` with no janitor
 #   event/1   the same plus `Timer(typemax(Int32))`, the workaround #598 proposes for `serve()`
+# On a 1.13.x that `_needs_wake_guard` covers, `serve()` holds that Timer itself, so GUARD=0 is a
+# real no-Timer server only with NITRO_WAKE_GUARD=0 as well (server.jl, #609).
 # Every pass runs twice: `quiet` (only the K yielding requests) and `traffic` (`/plaintext` at
 # c=CONNS alongside), in case busy sockets keep the event loop awake on their own.
 #
 # Usage: bench/socket/wake.sh [rounds]
 #   CONFIGS="1.12/event/0 1.13.2/event/0 1.13.2/event/1 1.13.2/timer/0" bench/socket/wake.sh 3
+#   NITRO_WAKE_GUARD=0 CONFIGS="1.13.3/event/0 1.13.3/event/1" bench/socket/wake.sh 3
 #
 # Results: one TSV per invocation under bench/results/ (gitignored).
 set -uo pipefail
@@ -78,7 +81,7 @@ for c in "${CONFIG_LIST[@]}"; do
   fi
   echo "  $c: $(julia +"$ch" --version)"
   log="$OUT/wake-$STAMP-${c//\//_}.log"
-  env MODE=nitro PORT="$port" LAG=1 PARK="$park" GUARD="$guard" CPU_MS="$SPIN_MS" YIELD_MS="$YIELD_MS" \
+  env MODE=nitro NITRO_WAKE_GUARD="${NITRO_WAKE_GUARD:-1}" PORT="$port" LAG=1 PARK="$park" GUARD="$guard" CPU_MS="$SPIN_MS" YIELD_MS="$YIELD_MS" \
     taskset -c "$SERVER_CPUS" julia +"$ch" --project="$ROOT/bench" --threads="$THREADS" \
     "$HERE/server.jl" >"$log" 2>&1 &
   pid=$!
