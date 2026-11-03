@@ -20,12 +20,23 @@ export set_extension!, get_extension, delete_extension!, has_extension
 # `Service.phase`. Internal: `isopen(app.service)` stays the public question "is a listener open".
 #
 #   IDLE ──serve──▶ STARTING ──listener up──▶ SERVING ──terminate──▶ STOPPING ──last hook──▶ IDLE
-#                      │
+#                      │  │
+#                      │  └── terminate ──▶ CANCELLING ──the start unwinds──▶ IDLE      (#834)
 #                      └── any failure before SERVING ──▶ IDLE
-const PHASE_IDLE     = 0x00
-const PHASE_STARTING = 0x01
-const PHASE_SERVING  = 0x02
-const PHASE_STOPPING = 0x03
+#
+# The phase shares one word with the run's GENERATION (#834), which the claim `IDLE → STARTING`
+# increments. Every transition is a compare-and-swap on the whole word, so a caller only ever
+# moves the run it read: a `terminate` can no longer stop, or cancel, a run that started after it
+# was called, and a blocking `serve` tears down only the run it won.
+const PHASE_IDLE       = 0x00
+const PHASE_STARTING   = 0x01
+const PHASE_SERVING    = 0x02
+const PHASE_STOPPING   = 0x03
+const PHASE_CANCELLING = 0x04
+
+_phase(word::UInt64)::UInt8 = word % UInt8
+_gen(word::UInt64)::UInt64 = word >> 8
+_word(gen::UInt64, phase::UInt8)::UInt64 = (gen << 8) | UInt64(phase)
 
 
 
@@ -249,8 +260,12 @@ end
     # `isopen` alone admitted a second `serve` while the first run's teardown hooks were still to
     # run. `serve` claims `IDLE -> STARTING` and `terminate` claims `SERVING -> STOPPING`, each with
     # one compare-and-swap, so two callers can never both win; the phase returns to `IDLE` only once
-    # the last `on_stopped` hook has run. See `_claim_phase!`.
-    phase                 :: Threads.Atomic{UInt8}  = Threads.Atomic{UInt8}(PHASE_IDLE)
+    # the last `on_stopped` hook has run. See `_claim_phase!`. The word also carries the run's
+    # generation (#834): `_phase`/`_gen` split it.
+    phase                 :: Threads.Atomic{UInt64} = Threads.Atomic{UInt64}(_word(UInt64(0), PHASE_IDLE))
+    # Notified, under its own lock, every time a run goes back to `IDLE` (`_settle_idle!`), which is
+    # what a `terminate` that found the run cancelling or stopping waits for (#834).
+    phase_cond            :: Threads.Condition      = Threads.Condition()
     # `serve(max_fields = …)`. The pipeline's outermost layer binds THIS cell, not a copy, in
     # `REQUEST_SCOPE` for each request's extent (#327, #444), so a pipeline built before `serve`
     # sets it still sees it. Concrete `RefValue` so the scope can hold it without a conversion.
@@ -353,13 +368,50 @@ function Base.isopen(service::Service)
     return !isnothing(handle) && isopen(handle)
 end
 
-# Move `service` from phase `from` to `to` if, and only if, it is in `from` now. One
-# compare-and-swap, so of two tasks racing for the same transition exactly one wins (#812).
-_claim_phase!(service::Service, from::UInt8, to::UInt8)::Bool =
+# Move `service` from the phase word `from` to `to` if, and only if, it holds `from` now. One
+# compare-and-swap, so of two tasks racing for the same transition exactly one wins (#812), and a
+# word from an earlier run never matches a later one (#834).
+_claim_phase!(service::Service, from::UInt64, to::UInt64)::Bool =
     Threads.atomic_cas!(service.phase, from, to) === from
 
 # Whether `service` has no server run in any phase: not starting, serving or stopping.
-_idle(service::Service)::Bool = service.phase[] === PHASE_IDLE
+_idle(service::Service)::Bool = _phase(service.phase[]) === PHASE_IDLE
+
+# Hand run `gen` back to `IDLE` and wake every `terminate` waiting for it (#834). The notify is
+# under the condition's lock, so a waiter that checked the word under that lock is either already
+# parked (and woken) or about to read the new word. The store and the notify both sit inside
+# one deferred-SIGINT region: an interrupt landing between them would leave such a waiter parked for
+# good. The raw `sigatomic_begin`/`sigatomic_end` pair rather than `Base.disable_sigint(f)`, whose closure allocates,
+# and so is a safepoint, BEFORE the region begins: an interrupt there would skip the store and leave
+# the run stopping for good. A press that arrived inside is raised by `sigatomic_end`, after both;
+# in `terminate`'s `finally` it then replaces whatever was propagating, which is the price of never
+# losing the settle.
+function _settle_idle!(service::Service, gen::UInt64)
+    Base.sigatomic_begin()
+    try
+        service.phase[] = _word(gen, PHASE_IDLE)
+        lock(service.phase_cond)
+        try
+            notify(service.phase_cond)
+        finally
+            unlock(service.phase_cond)
+        end
+    finally
+        Base.sigatomic_end()
+    end
+    return nothing
+end
+
+# Park until `service`'s phase word is no longer `word` (#834). Only a transition to `IDLE` is
+# notified, so this is for words that can only move there: `CANCELLING` and `STOPPING`.
+function _await_phase_change(service::Service, word::UInt64)
+    lock(service.phase_cond) do
+        while service.phase[] === word
+            wait(service.phase_cond)
+        end
+    end
+    return nothing
+end
 
 function Base.wait(service::Service)
     handle = service.server[]

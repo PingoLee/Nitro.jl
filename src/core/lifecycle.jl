@@ -280,8 +280,12 @@ _default_serve_listener(ctx::App) =
 
 # The refusal `serve` throws when `ctx` is not idle, worded for the phase it is in (#812).
 function _not_idle_error(ctx::App)::ArgumentError
-    phase = ctx.service.phase[]
-    if phase === AppContext.PHASE_STOPPING
+    phase = AppContext._phase(ctx.service.phase[])
+    if phase === AppContext.PHASE_CANCELLING
+        return ArgumentError(
+            "This App is still stopping: `terminate` cancelled its start, which is unwinding the " *
+            "startup hooks that already ran. Wait for `terminate` to return, then call `serve` again.")
+    elseif phase === AppContext.PHASE_STOPPING
         return ArgumentError(
             "This App is still stopping: `terminate` is draining its previous run and has " *
             "teardown hooks still to run, which would release what a new run starts using. Wait " *
@@ -300,14 +304,45 @@ function _not_idle_error(ctx::App)::ArgumentError
         "listener its own: `app = App(mod = @__MODULE__); serve(app; …)`.")
 end
 
+# What one `serve` call holds of the run it claimed (#812, #834): the run's generation, and whether
+# this call still owns `PHASE_STARTING`. `startserver` clears `owns` at the moment it moves the
+# phase on (to `SERVING`, or back to `IDLE` through its own unwind), and from then on `serve`'s
+# `catch` must leave the phase alone: once it is `IDLE` again another `serve` may already have
+# claimed it, and resetting that claim would admit a third.
+mutable struct StartClaim
+    const gen::UInt64
+    owns::Bool
+end
+
+# Whether `terminate` has cancelled the start `claim` holds (#834).
+_start_cancelled(ctx::App, claim::StartClaim)::Bool =
+    ctx.service.phase[] === AppContext._word(claim.gen, AppContext.PHASE_CANCELLING)
+
+# Set while a lifecycle broadcast runs, on the broadcasting task and on every task it spawns
+# (#834). A `terminate` called from inside a hook still cancels or stops the run, but never waits
+# for it: the run it would be waiting for is the one running that hook.
+const IN_LIFECYCLE_HOOK = ScopedValue(false)
+
 # Undo a `serve` that failed while it still owned `PHASE_STARTING` (#812): no startup hook has
 # run and no listener is open, so the `serve(middleware = …)` lifecycle this call registered
 # belongs to a run that never existed. Cleared, or the next `serve` would start it alongside its
-# own. Then the phase goes back to `IDLE`, last, so a retry finds the App as it was.
-function _abandon_start!(ctx::App)
-    lock(() -> empty!(ctx.service.serve_lifecycle), ctx.service.lifecycle_lock)
-    ctx.service.external_url[] = nothing
-    ctx.service.phase[] = AppContext.PHASE_IDLE
+# own. Then the phase goes back to `IDLE`, last, so a retry finds the App as it was, and a
+# `terminate` that cancelled this start (#834) is woken.
+#
+# The settle is in a `finally`: `serve`'s own `catch` skips this once `owns` is cleared, so an
+# interrupt landing in the clears would otherwise leave the run `STARTING` or `CANCELLING` for good,
+# and a `terminate` waiting on it parked forever (#834). The eager-Revise watcher this start may
+# have started is closed BEFORE the settle, while the App is still this call's: once it is `IDLE`
+# the slot may already hold the watcher of the next `serve` (#427).
+function _abandon_start!(ctx::App, claim::StartClaim)
+    claim.owns = false
+    try
+        lock(() -> empty!(ctx.service.serve_lifecycle), ctx.service.lifecycle_lock)
+        ctx.service.external_url[] = nothing
+        AppContext._close_eager_revise(ctx.service)
+    finally
+        AppContext._settle_idle!(ctx.service, claim.gen)
+    end
     return nothing
 end
 
@@ -342,6 +377,10 @@ function serve(ctx::App;
     max_fields=DEFAULT_MAX_FIELDS,
     max_concurrent_requests=nothing,
     max_upgraded_connections=nothing,
+    # Internal (#834): the blocking `Nitro.serve` wrappers pass a `Ref` and read back the
+    # generation of the run THIS call claimed, or `0` if it claimed none, so their cleanup stops
+    # exactly that run. Named here so it never reaches `HTTP.listen!` through `kwargs`.
+    _won_run::Nullable{Base.RefValue{UInt64}}=nothing,
     kwargs...)::Union{Server, Nothing} where {H}
 
     # FIRST, before any validation or context mutation, so a rejected call leaves the context
@@ -505,14 +544,16 @@ function serve(ctx::App;
     # refused call leaves the App untouched and a call that loses the race to another `serve` is
     # refused the same way. From here on every failure before the server is up hands the phase
     # back to `PHASE_IDLE` (`_abandon_start!`), or the App could never serve again.
-    AppContext._claim_phase!(ctx.service, AppContext.PHASE_IDLE, AppContext.PHASE_STARTING) ||
+    # The new run's generation is the idle word's plus one (#834).
+    idle_word = ctx.service.phase[]
+    AppContext._phase(idle_word) === AppContext.PHASE_IDLE || throw(_not_idle_error(ctx))
+    # Built before the swap, so no allocation (a safepoint) lies between winning it and the `try`.
+    claim = StartClaim(AppContext._gen(idle_word) + one(UInt64), true)
+    AppContext._claim_phase!(ctx.service, idle_word,
+                             AppContext._word(claim.gen, AppContext.PHASE_STARTING)) ||
         throw(_not_idle_error(ctx))
-    # Whether THIS call still owns `PHASE_STARTING`. `startserver` clears it at the moment it moves
-    # the phase on (to `SERVING`, or back to `IDLE` through its own unwind), and from then on the
-    # `catch` below must leave the phase alone: once it is `IDLE` again another `serve` may already
-    # have claimed it, and resetting that claim would admit a third.
-    claim = Ref(true)
     try
+        isnothing(_won_run) || (_won_run[] = claim.gen)
         if !ismissing(context)
             ctx.app_context[] = Context(context)
         end
@@ -579,7 +620,7 @@ function serve(ctx::App;
                                handler, body_limit, request_limit, upgraded_limit, security_headers,
                                revise, host, port, show_banner, async, kwargs, claim)
     catch
-        claim[] && _abandon_start!(ctx)
+        claim.owns && _abandon_start!(ctx, claim)
         rethrow()
     end
 end
@@ -594,7 +635,7 @@ end
 function _serve_pipeline(ctx::App, configured_middelware::P, handler::H, body_limit::Int64,
                          request_limit::Int64, upgraded_limit::Int64, security_headers,
                          revise::Symbol, host, port, show_banner, async,
-                         kwargs, claim::Base.RefValue{Bool}) where {P<:Function, H}
+                         kwargs, claim::StartClaim) where {P<:Function, H}
     # Once-assigned, because the `start` closure below captures it: a name reassigned before
     # capture is boxed (#364).
     listener = first(_serve_listener(configured_middelware, handler, body_limit, request_limit,
@@ -613,17 +654,13 @@ function _serve_pipeline(ctx::App, configured_middelware::P, handler::H, body_li
     # logged; that costs one accurate line about the process, which is harmless.
     _warn_if_no_gc_target(current_env(), _gc_target_bytes())
 
-    try
-        return startserver(ctx; host, port, show_banner, async, kwargs, claim, start=(kwargs) ->
-            HTTP.listen!(listener, host, port; kwargs...))
-    catch
-        # A `serve(async = true)` that never got its listener up (an address in use, say) returns
-        # no handle to `terminate`, so its watcher must stop here or nothing ever stops it (#427).
-        AppContext._close_eager_revise(ctx.service)
-        rethrow()
-    finally
-        async == false && AppContext._close_eager_revise(ctx.service)
-    end
+    # No close of the eager-Revise watcher here any more (#834). A start that never got its listener
+    # up (an address in use, a cancel) returns no handle to `terminate`, so its watcher must stop
+    # with it (#427), and `_abandon_start!`/`_unwind_start!` now close it before they hand the
+    # App back to `IDLE`. Closing it here, after that, could close the watcher a racing `serve` had
+    # just started. A run that served is stopped by `terminate`, whose `close` closes it.
+    return startserver(ctx; host, port, show_banner, async, kwargs, claim, start=(kwargs) ->
+        HTTP.listen!(listener, host, port; kwargs...))
 end
 
 # The `revise=:eager` watcher (#372). It used to be a bare `@async` loop, and each part of the
@@ -707,8 +744,21 @@ end
 # Named rather than written out at each of the four broadcast halves for two reasons: the
 # "first one wins" guard is easy to get wrong four times, and a named function is testable
 # without binding a port — the same argument `_janitor_loop` makes in src/middleware/janitor.jl.
-function _broadcast_lifecycle(hook::Function, entries,
-                              interrupt::Nullable{InterruptException} = nothing)
+#
+# Every hook runs inside `IN_LIFECYCLE_HOOK` (#834), so a `terminate` it calls never waits for the
+# run that is running it.
+#
+# `hook::F`, a type parameter: this method only passes `hook` on, so a `::Function` argument would
+# not be specialized, and the call in `_broadcast_entries` would be dynamic on the serve path (#572).
+function _broadcast_lifecycle(hook::F, entries,
+                              interrupt::Nullable{InterruptException} = nothing
+                             )::Nullable{InterruptException} where {F<:Function}
+    return @with IN_LIFECYCLE_HOOK => true _broadcast_entries(hook, entries, interrupt)
+end
+
+function _broadcast_entries(hook::F, entries,
+                            interrupt::Nullable{InterruptException}
+                           )::Nullable{InterruptException} where {F<:Function}
     for lf in entries
         raised = hook(lf)
         isnothing(interrupt) && (interrupt = raised)
@@ -884,13 +934,53 @@ function _teardown!(context::App, route_lf, serve_lf,
 end
 
 # Documented on the public `Nitro.terminate` (src/methods.jl); see the note on `serve` above.
-function terminate(context::App; timeout::Nullable{Real} = nothing)
-    # The phase, not `isopen` (#812): the claim makes a second, concurrent `terminate` a no-op
-    # rather than a second run of every hook, and it is what keeps `serve` refused until the very
-    # end of this function. A run that is still starting has no listener yet and is not stopped
-    # here; its `serve` unwinds it if its start fails (see `Nitro.terminate`).
-    AppContext._claim_phase!(context.service, AppContext.PHASE_SERVING,
-                             AppContext.PHASE_STOPPING) || return nothing
+#
+# It stops the run that is current when it is called, and only that one (#834): the generation is
+# read once, here, and `_terminate_run` gives up as soon as it has moved on.
+terminate(context::App; timeout::Nullable{Real} = nothing) =
+    _terminate_run(context, AppContext._gen(context.service.phase[]); timeout)
+
+# Stop run `gen` of `context`, whatever phase it is in, and return once it is idle (#834).
+#
+# - SERVING: claim `STOPPING` and stop it here. The phase, not `isopen` (#812): the claim makes a
+#   second, concurrent `terminate` wait rather than run every hook again, and it is what keeps
+#   `serve` refused until the very end of the stop.
+# - STARTING: claim `CANCELLING`. The start sees it at its next check (`startserver`), unwinds
+#   whatever hooks ran without ever opening the port, and settles the run back to `IDLE`, which is
+#   what this waits for. Spring's `close()` waits out a `refresh()` in progress the same way; Go's
+#   `Shutdown` before `Serve` makes `Serve` return `ErrServerClosed` — here `serve` returns `nothing`.
+# - CANCELLING or STOPPING: another call is already doing it; wait for it to finish. Returning at
+#   once, as #812 did, let a caller that then followed `serve`'s own advice ("wait for `terminate`
+#   to return") be refused as still stopping.
+#
+# Every wait is skipped inside a lifecycle hook (`IN_LIFECYCLE_HOOK`), where the run being waited
+# for is the one running the hook. A failed compare-and-swap means the run moved on between the
+# read and the claim, so the word is read again, and a new generation means the run is over.
+function _terminate_run(context::App, gen::UInt64; timeout::Nullable{Real} = nothing)
+    service = context.service
+    while true
+        word = service.phase[]
+        AppContext._gen(word) === gen || return nothing
+        phase = AppContext._phase(word)
+        if phase === AppContext.PHASE_SERVING
+            AppContext._claim_phase!(service, word,
+                                     AppContext._word(gen, AppContext.PHASE_STOPPING)) || continue
+            return _stop_serving!(context, gen, timeout)
+        elseif phase === AppContext.PHASE_STARTING
+            cancelling = AppContext._word(gen, AppContext.PHASE_CANCELLING)
+            AppContext._claim_phase!(service, word, cancelling) || continue
+            IN_LIFECYCLE_HOOK[] || AppContext._await_phase_change(service, cancelling)
+            return nothing
+        elseif phase === AppContext.PHASE_CANCELLING || phase === AppContext.PHASE_STOPPING
+            IN_LIFECYCLE_HOOK[] || AppContext._await_phase_change(service, word)
+            return nothing
+        end
+        return nothing
+    end
+end
+
+# The stop itself, once `_terminate_run` holds `STOPPING` for run `gen`.
+function _stop_serving!(context::App, gen::UInt64, timeout::Nullable{Real})
     interrupt = nothing
     try
         # First, before any hook can block: every in-flight request now reads `:shutdown` from
@@ -905,8 +995,9 @@ function terminate(context::App; timeout::Nullable{Real} = nothing)
                                timeout = something(timeout, context.service.shutdown_timeout[]))
     finally
         # After the last `on_stopped` hook, and in a `finally`: whatever escapes above, an App left
-        # in `PHASE_STOPPING` could never serve again.
-        context.service.phase[] = AppContext.PHASE_IDLE
+        # in `PHASE_STOPPING` could never serve again. It also wakes every `terminate` that found
+        # this one running (#834).
+        AppContext._settle_idle!(context.service, gen)
     end
     # Re-raised only now: everything a later `serve()` depends on has already been done.
     isnothing(interrupt) || throw(interrupt)
@@ -922,21 +1013,52 @@ end
 # on an inactive activation.
 #
 # The unwind hands the phase back to `IDLE` itself, last, and tells `serve` it no longer owns the
-# start first, so `serve`'s own reset cannot undo a later claim. Returns the first interrupt,
-# `interrupt` included, for the caller to raise.
-function _unwind_start!(ctx::App, claim::Base.RefValue{Bool}, route_lf, serve_lf,
+# start first, so `serve`'s own reset cannot undo a later claim. Settling to `IDLE` also wakes a
+# `terminate` that cancelled this start (#834). Returns the first interrupt, `interrupt` included,
+# for the caller to raise.
+function _unwind_start!(ctx::App, claim::StartClaim, route_lf, serve_lf,
                         interrupt::Nullable{InterruptException})::Nullable{InterruptException}
-    claim[] = false
+    claim.owns = false
     try
         interrupt = _teardown!(ctx, route_lf, serve_lf, interrupt; listener = false, timeout = 0)
     finally
-        ctx.service.phase[] = AppContext.PHASE_IDLE
+        # Before the settle, for the reason `_abandon_start!` gives (#427, #834), and nested so
+        # that a close that throws still settles: `owns` is already clear, so nothing else would.
+        try
+            AppContext._close_eager_revise(ctx.service)
+        finally
+            AppContext._settle_idle!(ctx.service, claim.gen)
+        end
     end
     return interrupt
 end
 
+# Close a listener `startserver` opened but never handed over (#834): the start was cancelled, or
+# something threw before the run reached `SERVING`. The listener has been accepting since the
+# bind, so a request may be in flight; it is cut, not drained, as a start that never began serving
+# owes nobody a graceful stop. The handle is cleared only if it is still this listener's.
+function _drop_listener!(ctx::App, server::Server)
+    try
+        HTTP.forceclose(server)
+    catch e
+        # Never rethrown: the caller unwinds the hooks next, and whatever it carries is what
+        # `serve` reports. Shutdown code never throws (concurrency §4); a second interrupt is
+        # dropped here, like the shutdown paths' (#185).
+        e isa InterruptException ||
+            @error "Nitro: closing a listener whose start was abandoned failed" exception=(loggable(e), catch_backtrace())
+    end
+    handle = ctx.service.server[]
+    !isnothing(handle) && handle.server === server && (ctx.service.server[] = nothing)
+    return nothing
+end
+
 function startserver(ctx::App; host, port, show_banner=false, async=false, kwargs,
-                     claim::Base.RefValue{Bool}, start)::Union{Server, Nothing}
+                     claim::StartClaim, start)::Union{Server, Nothing}
+    # Cancelled by `terminate` before a single hook ran (#834): nothing to unwind but the claim.
+    if _start_cancelled(ctx, claim)
+        _abandon_start!(ctx, claim)
+        return nothing
+    end
     # The startup hooks run FIRST, and the listener opens only once they have all returned
     # (#799). A port that answers is then an app that is ready: its worker runtime installed, its
     # janitors running, what its hooks compile compiled. Opening it first, as `serve` used to, let
@@ -973,6 +1095,14 @@ function startserver(ctx::App; host, port, show_banner=false, async=false, kwarg
         # is folded into the first: one `InterruptException` is indistinguishable from another.
         throw(something(_unwind_start!(ctx, claim, route_lf, serve_lf, interrupt), interrupt))
     end
+    # Cancelled by `terminate` while the hooks ran (#834): they all returned, so each gets its
+    # teardown, and the port is never opened.
+    if _start_cancelled(ctx, claim)
+        # An interrupt raised in the teardown is re-raised once it is done, as every unwind does (#185).
+        unwound = _unwind_start!(ctx, claim, route_lf, serve_lf, nothing)
+        isnothing(unwound) || throw(unwound)
+        return nothing
+    end
 
     # Concrete here, so this is where a trimmed build takes the handle's pointers (src/context.jl).
     server = try
@@ -983,14 +1113,34 @@ function startserver(ctx::App; host, port, show_banner=false, async=false, kwarg
         _unwind_start!(ctx, claim, route_lf, serve_lf, nothing)
         rethrow()
     end
-    ctx.service.server[] = AppContext.ServerHandle(server)
-    # The run is `terminate`'s to stop from here on (#812), so `serve` no longer owns the start.
-    # In the statements right after the handle, with no call between them: an interrupt landing
-    # any later, at a safepoint in the wake guard below, would otherwise reach `serve`'s reset
-    # while it still owned the start, which hands the phase back to `IDLE` over an open listener
-    # that `terminate` then refuses to close.
-    ctx.service.phase[] = AppContext.PHASE_SERVING
-    claim[] = false
+    # The hand-over to `terminate` (#812): the handle first, so a `terminate` that sees `SERVING`
+    # always finds a listener to close, then the phase, by compare-and-swap. A plain store would
+    # overwrite a `CANCELLING` that landed after the check above (#834); the swap fails on it
+    # instead, and the start is dropped here exactly as it would have been before the bind.
+    #
+    # Guarded, because building the handle allocates and so is a safepoint: an interrupt landing
+    # there left the hooks started and the listener open, with no teardown (#834). Until the swap
+    # succeeds this call still owns the start, so whatever happens in the block, it closes the
+    # listener and unwinds the hooks itself.
+    serving = try
+        ctx.service.server[] = AppContext.ServerHandle(server)
+        AppContext._claim_phase!(ctx.service, AppContext._word(claim.gen, AppContext.PHASE_STARTING),
+                                 AppContext._word(claim.gen, AppContext.PHASE_SERVING))
+    catch
+        _drop_listener!(ctx, server)
+        _unwind_start!(ctx, claim, route_lf, serve_lf, nothing)
+        rethrow()
+    end
+    if !serving
+        _drop_listener!(ctx, server)
+        unwound = _unwind_start!(ctx, claim, route_lf, serve_lf, nothing)
+        isnothing(unwound) || throw(unwound)
+        return nothing
+    end
+    # The run is `terminate`'s to stop from here on, so `serve` no longer owns the start. A field
+    # store, no safepoint: an interrupt landing before it would reach `serve`'s reset while it
+    # still owned the start, which hands the phase back to `IDLE` over an open listener.
+    claim.owns = false
     # Every exit from here on goes through `terminate`, whose `close` releases it. A no-op outside
     # the Julia versions JuliaLang/julia#63882 affects (src/context.jl).
     AppContext._hold_wake_guard!(ctx.service)
@@ -1007,11 +1157,13 @@ function startserver(ctx::App; host, port, show_banner=false, async=false, kwarg
             _with_stdout(out -> println(out))
             # Ctrl-C out of the blocking wait is THE documented way to stop a blocking `serve` —
             # the banner says so. Without this the listener survives the interrupt and only a
-            # process restart clears it. `terminate` is a no-op when nothing is serving, so this
-            # is safe on the normal exit path too, and idempotent against the `finally
-            # terminate()` in `src/methods.jl`.
+            # process restart clears it. THIS run only (#834): it is a no-op once the run is over,
+            # so this is safe on the normal exit path too, and idempotent against the blocking
+            # wrappers' own cleanup in `src/methods.jl`. If another task's `terminate` is what
+            # ended the wait, this waits for that stop to finish, so a blocking `serve` returns
+            # only once its run's last `on_stopped` hook has.
             try
-                terminate(ctx)
+                _terminate_run(ctx, claim.gen)
             catch e
                 # `terminate` completes its teardown before rethrowing, so a second interrupt
                 # here has nothing left to do and should not print over a clean shutdown.

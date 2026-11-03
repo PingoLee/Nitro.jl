@@ -42,11 +42,27 @@ function _rethrow_value_free(@nospecialize(e))
     rethrow()
 end
 
-# Whether a blocking `serve` on `app` may tear down what it finds in its `finally`: only when the
-# App had no server run in any phase before the call (#812). One that is starting, serving or
-# stopping belongs to another call, which the refusal leaves alone.
-_serve_owns_cleanup(app::App)::Bool =
-    Nitro.Core.AppContext._idle(app.service) && !isopen(app.service)
+# A blocking `serve`'s own cleanup: stop the run THIS call claimed, and nothing else (#834).
+# `won[]` is that run's generation, set by `Core.serve` the moment its claim succeeds, and `0`
+# when the call was refused before claiming: the run then belongs to another call, which the
+# refusal leaves alone. Ownership used to be read off the phase BEFORE the call, which two
+# blocking calls could both read as idle; the loser's `finally` then stopped the winner's healthy
+# server. Returns whether this call claimed a run.
+function _blocking_serve_cleanup!(app::App, won::Base.RefValue{UInt64})::Bool
+    iszero(won[]) && return false
+    try
+        Nitro.Core._terminate_run(app, won[])
+    catch e
+        # This path's contract is already "Ctrl-C is the quiet exit". `terminate` rethrows an
+        # interrupt raised inside a shutdown hook or the drain (#185), but only AFTER completing the
+        # teardown, so there is nothing left to clean up, and an exception out of a `finally`
+        # REPLACES whatever was propagating: a second Ctrl-C here would overwrite the interrupt
+        # `startserver` is already carrying, or print a stacktrace over a clean shutdown. Anything
+        # else is a real teardown failure and stays loud.
+        e isa InterruptException || rethrow()
+    end
+    return true
+end
 
 """
     serve(; middleware=(), host="127.0.0.1", port=8080, kwargs...) -> Union{Server, Nothing}
@@ -231,6 +247,10 @@ port as soon as its drain begins, but a `serve` of the same app is refused until
 returned, so the old run's last teardown hooks can never release what the new run is using
 (#812). Another `App` in the same process is not affected.
 
+A `terminate` called while `serve` is still running its startup hooks cancels the start (#834):
+the listener is never handed over, every hook that ran is torn down, and `serve` returns
+`nothing`, in blocking and `async = true` mode alike.
+
 **The port opens only once every startup hook has returned (#799).** `serve` runs each
 `LifecycleMiddleware`'s `on_startup` first and then starts the listener, so a connection that
 succeeds reaches an app whose hooks are done: a worker runtime running, a janitor started,
@@ -290,36 +310,28 @@ function serve(; async::Bool = false, kwargs...)
     # `async` is a named keyword, not read out of the kwargs bag, so this layer stays statically
     # typed (#571) -- same for the `App` form below. (Inside the body: a comment between the
     # docstring and `function` detaches the docstring.)
-    # Whether the server this `finally` would tear down is OURS to tear down. Decided from
-    # the context *before* the call, not from a flag set after it: if something is already
-    # serving, `Core.serve` rejects this call and that server belongs to somebody else —
-    # terminating it here would do the very thing the rejection message asks the caller to do
-    # deliberately, making a refused `serve()` lethal to a healthy one. Reading the context up
-    # front also still cleans up when a throw lands *after* the handle was installed, which a
-    # post-hoc `started = true` would miss.
-    ours = _serve_owns_cleanup(CONTEXT[])
+    # The run this call claims, if any (#834): a refused `serve()` claims none, so its `finally`
+    # leaves alone the healthy server that caused the refusal, and a call that did claim still
+    # cleans up when a throw lands after its handle was installed.
+    app = CONTEXT[]
+    won = Ref(zero(UInt64))
     try
         try
             # Returns the running `HTTP.Server` when async; `nothing` in blocking mode (the
-            # server is already down by then, so the handle would be useless). Either way the
-            # handle is safe to display — `Nitro.Core.NitroStreamHandler` gives it a `show`
-            # that prints only the address, never the secrets captured in handler closures.
-            return Nitro.Core.serve(CONTEXT[]; async, kwargs...)
+            # server is already down by then, so the handle would be useless), and in either
+            # mode when `terminate` cancelled the start (#834). The handle is safe to display —
+            # `Nitro.Core.NitroStreamHandler` gives it a `show` that prints only the address,
+            # never the secrets captured in handler closures.
+            return Nitro.Core.serve(app; async, _won_run = won, kwargs...)
         finally
             # close server on exit if we aren't running asynchronously
-            if !async && ours
+            if !async
                 try
-                    terminate()
-                catch e
-                    # This path's contract is already "Ctrl-C is the quiet exit". `terminate` now
-                    # rethrows an interrupt raised inside a shutdown hook or the drain (#185), but it
-                    # does so only AFTER completing the teardown, so there is nothing left to clean
-                    # up — and printing a stacktrace over a clean shutdown would be noise. Anything
-                    # else is a real teardown failure and stays loud.
-                    e isa InterruptException || rethrow()
+                    _blocking_serve_cleanup!(app, won)
                 finally
-                    # only reset state on exit if we aren't running asynchronously & are running it interactively
-                    isinteractive() && resetstate()
+                    # Only reset state on exit if this call ran a server, isn't asynchronous, and
+                    # is running interactively.
+                    !iszero(won[]) && isinteractive() && resetstate()
                 end
             end
         end
@@ -857,12 +869,28 @@ end
     terminate(; timeout = nothing)
 
 Stop the running server: run every `LifecycleMiddleware` shutdown hook and close the listener.
-A no-op when nothing is serving, while another `terminate` of the same app is already running,
-and while a `serve` of it is still starting. (There is no middleware cache to drop: each
-pipeline owns its own, so the next `serve()` starts cold.)
+(There is no middleware cache to drop: each pipeline owns its own, so the next `serve()` starts
+cold.) It stops the run that is current when it is called, whatever phase that run is in, and
+returns once the app is idle (#834):
+
+- **Serving:** the stop described below.
+- **Still starting** (a `serve` is running its `on_startup` hooks): the start is cancelled. The
+  startup broadcast runs to its end, every hook that ran gets its `on_shutdown` and `on_stopped`,
+  the listener is not handed over (if the cancel lands during the bind itself, the listener that
+  just opened is force-closed, cutting anything it accepted), and that `serve` returns `nothing`.
+  `terminate` waits for all of it.
+- **Already stopping** (another `terminate` is running): it waits for that one to finish rather
+  than running the teardown a second time.
+- **Idle:** a no-op.
 
 Until `terminate` returns, a `serve` of the same app is refused with an `ArgumentError`, though
 the port is already free (#812). Call `serve` again once it has returned.
+
+Called from inside a `LifecycleMiddleware` hook, `terminate` still cancels or stops the run but
+never waits for it, since the run it would wait for is the one running that hook: from
+`on_startup`, it aborts the start. The same holds on any task a hook spawns, which inherits that
+context. A task that does *not* come from a hook, and that a hook waits on, must not call
+`terminate` for the same app: it would wait for the hook, and the hook for it.
 
 Shutdown is a **bounded graceful drain**, modeled on Go's `http.Server.Shutdown(ctx)`. Once the
 `on_shutdown` hooks have run, the listening socket is released — the port is free from the
@@ -952,25 +980,13 @@ it started.
 """
 function serve(app::App; async::Bool = false, secret_key = nothing, kwargs...)
     _warn_shadowed_cookie_key(app, secret_key)
-    # Same reasoning as the singleton form above: decide ownership BEFORE the call, so a
-    # rejected `serve` never tears down the healthy server that caused the rejection.
-    ours = _serve_owns_cleanup(app)
+    # Same as the singleton form above: only the run this call claimed is its to stop (#834).
+    won = Ref(zero(UInt64))
     try
         try
-            return Nitro.Core.serve(app; async, secret_key, kwargs...)
+            return Nitro.Core.serve(app; async, secret_key, _won_run = won, kwargs...)
         finally
-            if !async && ours
-                try
-                    terminate(app)
-                catch e
-                    # Same guard as the singleton form above, and for a sharper reason: an exception
-                    # out of a `finally` REPLACES whatever was propagating. Unguarded, a second Ctrl-C
-                    # landing in this teardown would overwrite the interrupt `startserver` is already
-                    # carrying — or print a stacktrace over a clean shutdown. `terminate` completes
-                    # its sequence before rethrowing (#185), so there is nothing left to do here.
-                    e isa InterruptException || rethrow()
-                end
-            end
+            async || _blocking_serve_cleanup!(app, won)
         end
     catch e
         # Same as the singleton form above: value-free in a juliac executable (#749, #752).
