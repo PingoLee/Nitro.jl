@@ -279,8 +279,10 @@ function main(; root::AbstractString = pkgdir(@__MODULE__), kwargs...)
     #   PormG.Models.set_models(models, joinpath(root, "db"))
     workers = worker_startup(app; queues = ["reports"], store = pormg_nitro_worker(db_key = "db"))
     urlpatterns(app, "", Routes.urlpatterns())
+    # Global middleware is a Tuple, not a Vector: a Tuple keeps the request pipeline's
+    # type known before the first request.
     serve(app; port = parse(Int, get(ENV, "PORT", "8000")),
-          middleware = [pormg_nitro_pools(keys = ["db"]), workers],
+          middleware = (pormg_nitro_pools(keys = ["db"]), workers),
           secret_key = SecretString(ENV["API_SECRET_KEY"]), kwargs...)
 end
 
@@ -319,13 +321,16 @@ Line by line:
 - `pormg_nitro_pools(keys = ["db"])` closes the database pools when the server stops. See
   *Closing the database pools on `terminate`* below.
 
-Global middleware goes in `serve`'s `middleware` list, after `pormg_nitro_pools` and next to
-`workers`, and runs before every route, whichever handler it targets:
+Global middleware goes in `serve`'s `middleware` tuple, after `pormg_nitro_pools` and next to
+`workers`, and runs before every route, whichever handler it targets. `serve` also accepts a
+`Vector`, but converts it at run time, so the type of the request pipeline is not known before
+the first request; a `Tuple` keeps it known, which is what lets a `juliac --trim` build follow a
+request through it:
 
 ```julia
 serve(app; port = parse(Int, get(ENV, "PORT", "8000")),
-      middleware = [pormg_nitro_pools(keys = ["db"]), workers,
-                    SessionMiddleware(store = MemoryStore()), RateLimiter()],
+      middleware = (pormg_nitro_pools(keys = ["db"]), workers,
+                    SessionMiddleware(store = MemoryStore()), RateLimiter()),
       secret_key = SecretString(ENV["API_SECRET_KEY"]))
 ```
 
@@ -346,7 +351,7 @@ middleware is built, before `serve`. So build it after `load_many`, as `main` do
 
 ```julia
 PormG.Configuration.load_many(["db", "db_audit"]; root, env)
-serve(app; middleware = [pormg_nitro_pools(keys = ["db", "db_audit"]), workers], …)
+serve(app; middleware = (pormg_nitro_pools(keys = ["db", "db_audit"]), workers), …)
 ```
 
 ## The entry point `newapp` writes
@@ -418,7 +423,7 @@ rewritten request still gets its new route's guards. See
 ### Global middleware
 
 ```julia
-serve(app; middleware=[SessionMiddleware(store=MemoryStore()), RateLimiter()])
+serve(app; middleware=(SessionMiddleware(store=MemoryStore()), RateLimiter()))
 ```
 
 ### Route-level middleware
@@ -488,7 +493,7 @@ list.
 
 ### Per-route middleware and global middleware
 
-Global middleware — the `middleware=[...]` you pass to [`serve`](@ref) — runs on **every**
+Global middleware — the `middleware=(...)` you pass to [`serve`](@ref) — runs on **every**
 request, including requests that match no route (404) and requests whose path matches but
 whose method does not (405).  A route cannot opt out of it.
 

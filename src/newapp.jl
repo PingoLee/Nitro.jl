@@ -314,11 +314,18 @@ function _newapp_module(name::String, db::_NewappDB)
         "function main(; $(db.main_kwargs)kwargs...)",
     ])
     append!(lines, ("    " * l for l in db.boot))
+    # A `Tuple`, which `serve` folds at a type known before the first request; a `Vector` is
+    # converted at run time, so the pipeline's type and the listener's are not (#572, #744). A
+    # one-element tuple needs its trailing comma.
+    global_middleware = [db.middleware; "workers"]
+    middleware_tuple = "(" * join(global_middleware, ", ") * (length(global_middleware) == 1 ? ",)" : ")")
     append!(lines, [
         "    workers = worker_startup(app; queues = [\"reports\"], store = $(db.store))",
         "    urlpatterns(app, \"\", Routes.urlpatterns())",
+        "    # Global middleware is a Tuple, not a Vector: a Tuple keeps the request pipeline's",
+        "    # type known before the first request.",
         "    serve(app; port = parse(Int, get(ENV, \"PORT\", \"8000\")),",
-        "          middleware = [$(join([db.middleware; "workers"], ", "))],",
+        "          middleware = $(middleware_tuple),",
         "          secret_key = SecretString(ENV[\"API_SECRET_KEY\"]), kwargs...)",
         "end",
         "",

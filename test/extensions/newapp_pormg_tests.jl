@@ -57,7 +57,7 @@ src = read(joinpath(root, "src", "MyApp.jl"), String)
     @test occursin("store = pormg_nitro_worker(db_key = \"db\")", main)
     # The pools close on `terminate` (#810), and the layer is first: teardown is LIFO, so they
     # close after the worker runtime's hooks.
-    @test occursin("middleware = [pormg_nitro_pools(keys = [\"db\"]), workers],", main)
+    @test occursin("middleware = (pormg_nitro_pools(keys = [\"db\"]), workers),", main)
 end
 
 entry = read(joinpath(root, "main.jl"), String)
