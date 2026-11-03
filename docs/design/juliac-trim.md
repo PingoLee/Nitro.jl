@@ -304,8 +304,10 @@ concrete, the outer fold needed three things, and each landed as written:
   five flags is a union of up to 32 shapes, which inference widens away. A built-or-pass-through
   layer with one predictable branch per request keeps one type;
 - **user middleware passed as a `Tuple`** for the typed path. `serve(middleware = [ … ])` stays
-  valid, but a `Vector` of mixed closures is folded dynamically. A `LifecycleMiddleware` member is
-  abstract either way, because its `middleware` field is typed `Function`.
+  valid, but a `Vector` of mixed closures is folded dynamically, and the pipeline's type (with the
+  listener built around it) is then left to runtime. A `LifecycleMiddleware` member no longer
+  breaks the `Tuple` form: since [#719](https://github.com/PingoLee/Nitro.jl/issues/719) it is
+  parameterized on its functions' types, so a tuple holding one is concrete (§3.4).
 
 Behind that sat **the route boundary**, [#718](https://github.com/PingoLee/Nitro.jl/issues/718).
 Per-route and group middleware chains were composed and cached per route (`compose`, `ChainCache`

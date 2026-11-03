@@ -391,10 +391,14 @@ end
     #
     # Measured over a socket (`ACCESS_LOG=1 bench/socket/first_request.sh`, `-t 8`): the first
     # `/plaintext` request to a fresh default server drops from ~2.4 s to ~1.5 s. Only the
-    # DEFAULT shape benefits: a server with other middleware, or `access_log = false`, has another
-    # listener type and still compiles its chain on the first request. Most of the ~1.5 s left is
-    # HTTP.jl's own connection loop, specialized on the listener type; the app's own handler
-    # closures are the rest. The loop is compiled in HTTP's private
+    # DEFAULT shape benefits, and `serve`'s flags do not leave it: every framework layer is built
+    # whatever they say (#572), so `access_log` does not change the listener type, and neither
+    # does a `LifecycleMiddleware` whose `middleware` is `identity`. User middleware that wraps
+    # the handler does: that server has another listener type and compiles its chain on the
+    # first request. Nearly all of the ~1.5 s left is HTTP.jl's own connection loop, specialized
+    # on the listener type: on #744 the minimal app spent 1.44–1.49 s compiling HTTP's
+    # `_serve_listener!` closure for exactly the type warmed here, and ~6 ms on its route's
+    # leaf. The loop is compiled in HTTP's private
     # `_serve_conn!`/`_serve_listener!`, which no public API reaches and no socket-free call
     # drives, so it stays out. One stream type covers every HTTP/1.1 request, with a body or
     # without: HTTP builds each `Stream` around `_stream_request_metadata(request)`, which is
