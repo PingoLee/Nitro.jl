@@ -55,6 +55,9 @@ src = read(joinpath(root, "src", "MyApp.jl"), String)
     # note on JuliaC. Nothing in the body: `load_many` and `set_models` take `root`.
     @test count("pkgdir", main) == 3
     @test occursin("store = pormg_nitro_worker(db_key = \"db\")", main)
+    # The pools close on `terminate` (#810), and the layer is first: teardown is LIFO, so they
+    # close after the worker runtime's hooks.
+    @test occursin("middleware = [pormg_nitro_pools(keys = [\"db\"]), workers],", main)
 end
 
 entry = read(joinpath(root, "main.jl"), String)
@@ -267,14 +270,22 @@ mv(joinpath(root, "db", "connection.yml"), joinpath(root, "db", "connection.yml.
     ENV["API_SECRET_KEY"] = "x"^32    # a placeholder: the boot requires 32 bytes
     ShopApp.main(; root = $(repr(alt)), host = "127.0.0.1", async = true, show_banner = false,
                  access_log = nothing)
+    # The pool's open handles, the way `close_pool!` leaves them: every slot emptied (#810).
+    pool = ShopApp.PormG.Configuration.get_settings("db").connections
+    open_handles() = Base.lock(() -> count(!isnothing, pool.connections), pool.lock)
     try
         ShopApp.appM.Item.connect_key == "db" ||
             error("the models are bound to \$(repr(ShopApp.appM.Item.connect_key)), not \\"db\\"")
         r = HTTP.get("http://127.0.0.1:\$port/health"; retry = false, status_exception = false)
         r.status == 200 || error("GET /health answered \$(r.status)")
+        # Open one, as a query does, so the close below has something to close.
+        conn = ShopApp.PormG.ConnectionPool.acquire_connection(pool)
+        ShopApp.PormG.ConnectionPool.release_connection(pool, conn)
+        open_handles() > 0 || error("the pool had no open handle while serving")
     finally
         terminate(ShopApp.app)
     end
+    open_handles() == 0 || error("terminate left \$(open_handles()) pool handles open")
     println("bound and served")
     """; timeout = 180)
 @test occursin("bound and served", read(logfile, String))

@@ -24,6 +24,7 @@ Base.@kwdef struct _NewappDB
     entry_kwargs::String = ""                   # what `main.jl` passes to `main`
     entry_comment::Vector{String} = String[]    # `main.jl`'s comment lines on those
     store::String                               # the worker-store expression
+    middleware::Vector{String} = String[]       # global layers `serve` lists before `workers`
     deps::Vector{Pair{String,String}} = Pair{String,String}[]      # name => uuid
     sources::Vector{Pair{String,String}} = Pair{String,String}[]   # name => inline table
     compat::Vector{Pair{String,String}} = Pair{String,String}[]    # name => compat
@@ -77,11 +78,13 @@ there would be gone at runtime.
 With `pormg = true` (the default) `using PormG` must come first. The boot then loads `db/` with
 `PormG.Configuration.load_many` in the environment a set `PORMG_ENV` names, else Nitro's
 ([`current_env`](@ref): `NITRO_ENV`, else `GENIE_ENV`, else `"dev"`), binds the models to it once
-you include them, and stores worker tasks through
-[`pormg_nitro_worker`](@ref). The models are `include`d in the module body rather than
-`@import_models`ed: PormG registers models only against a folder already loaded, and loading in
-the module body would read `db/connection.yml` while the package precompiles. The folder holding
-`db/` is `main`'s `root` keyword, by default the package's own directory, `pkgdir`.
+you include them, stores worker tasks through [`pormg_nitro_worker`](@ref), and serves with
+[`pormg_nitro_pools`](@ref Nitro.pormg_nitro_pools) first in the global middleware, so
+`terminate` closes the `"db"` pools once the server has stopped. The models are `include`d in the
+module body rather than `@import_models`ed: PormG registers models only against a folder already
+loaded, and loading in the module body would read `db/connection.yml` while the package
+precompiles. The folder holding `db/` is `main`'s `root` keyword, by default the package's own
+directory, `pkgdir`.
 
 `main.jl` is the program: `(@main)` calls `main` inside a `try` and, when start-up fails, prints
 one line built by [`Nitro.startup_failure_text`](@ref Nitro.Core.Errors.startup_failure_text) on
@@ -314,7 +317,8 @@ function _newapp_module(name::String, db::_NewappDB)
     append!(lines, [
         "    workers = worker_startup(app; queues = [\"reports\"], store = $(db.store))",
         "    urlpatterns(app, \"\", Routes.urlpatterns())",
-        "    serve(app; port = parse(Int, get(ENV, \"PORT\", \"8000\")), middleware = [workers],",
+        "    serve(app; port = parse(Int, get(ENV, \"PORT\", \"8000\")),",
+        "          middleware = [$(join([db.middleware; "workers"], ", "))],",
         "          secret_key = SecretString(ENV[\"API_SECRET_KEY\"]), kwargs...)",
         "end",
         "",

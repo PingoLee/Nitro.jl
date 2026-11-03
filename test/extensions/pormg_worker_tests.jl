@@ -369,13 +369,17 @@ function _record_lock!(qs::MockTaskQuerySet)
     return nothing
 end
 
-# PormG refuses a NUL in any bound text value before a statement is sent (PormG#951, 0.8):
-# PostgreSQL text cannot hold one and SQLite cannot read a value back past it. Modelled on the
-# writes, the path where free text -- a task's error message -- reaches the store.
-function _mock_refuse_nul(pairs)
+# The mock's VALUE refusals are PormG's own (#791): every column a `create` or `update` writes
+# goes through `PormG.validate_value` (PingoLee/PormG.jl#1239), the write path's per-field checks,
+# against the real `nitro_task` model -- an unknown column, NULL in a NOT NULL one, a wrong type, a
+# string over `max_length`, a NUL in text (PormG#951). `MOCK_VALUE_MODEL` is bound to an offline key
+# below. The query-SHAPE refusals (no connection, an unmodelled filter, an unfiltered update...)
+# are the mock's own, above and below: `validate_value` checks values, not queries. One gap, where
+# the mock is laxer than PormG: `validate_value` applies `create`'s rules, which allow the primary
+# key, so the mock's `update` accepts a primary-key write a real `update` refuses.
+function _mock_validate_values(pairs)
     for (k, v) in pairs
-        v isa AbstractString && '\0' in v &&
-            error("MockTaskQuerySet: `$k` contains a NUL character, which PormG refuses (PormG#951).")
+        PormG.validate_value(MOCK_VALUE_MODEL, k, v)
     end
 end
 
@@ -465,7 +469,7 @@ function Base.getproperty(qs::MockTaskQuerySet, name::Symbol)
         end
     elseif name === :create
         return function(pairs::Pair{String,<:Any}...)
-            _mock_refuse_nul(pairs)
+            _mock_validate_values(pairs)
             row = Dict{String,Any}()
             for (k, v) in pairs
                 row[k] = v
@@ -485,7 +489,7 @@ function Base.getproperty(qs::MockTaskQuerySet, name::Symbol)
             isempty(getfield(qs, :filters)) &&
                 error("MockTaskQuerySet: update() requires a filter -- refusing to update " *
                       "every row, as PormG does.")
-            _mock_refuse_nul(pairs)
+            _mock_validate_values(pairs)
             # Return the affected-row count, matching PormG's Django-style `update`.
             # It used to return `nothing`, which would make every compare-and-set in
             # the store read as a failure — or, worse, as an untested success.
@@ -990,6 +994,39 @@ end
 # The extension module itself, for the private `task_model` accessor the #202 guard drives.
 const PormGExt = Base.get_extension(Nitro, :NitroPormGExt)
 
+# The model the mock's values are validated against (`_mock_validate_values`, #791), bound to an
+# offline key for the whole file and removed at its end. Its own key, never "db": the file's
+# other fixtures register and remove "db" around single assertions. Held for the whole item
+# because `validate_value` reads the key's settings on every call (a per-call registration would
+# race under the threaded fixtures), and not in a `finally` because the item defines `const`s and
+# types at top level, which a `try` block refuses. An error that escapes a `@testset` therefore
+# leaks it; the key is offline, so a later query that fell back to it fails loudly rather than
+# reaching a database.
+const MOCK_VALUE_KEY = "nitro-791-mock-values-task"
+haskey(PormG.config, MOCK_VALUE_KEY) &&
+    error("test-only PormG connection key is already registered: $MOCK_VALUE_KEY")
+PormG.Configuration.register_offline(MOCK_VALUE_KEY)
+const MOCK_VALUE_MODEL = PormGExt.task_model(MOCK_VALUE_KEY)
+
+# `_bind_model!` goes through `PormG.Models.bind!`, which refuses a key no configuration is loaded
+# under (#791). A test that only BUILDS a model or store registers the key offline for the build:
+# SQL renders, nothing connects, and the binding outlives the entry. A key something else already
+# loaded is left alone, and only the keys registered here are removed -- `PormG.config` is global,
+# and a leaked entry would become PormG's sole-connection fallback for every later item.
+function with_offline_keys(f, keys::String...)
+    added = String[]
+    try
+        for k in keys
+            haskey(PormG.config, k) && continue
+            PormG.Configuration.register_offline(k; adapter = :sqlite)
+            push!(added, k)
+        end
+        return f()
+    finally
+        foreach(PormG.Configuration.unregister_connection, added)
+    end
+end
+
 # `claim_next!` runs in a transaction (#514), through a seam on the store's model. The mocks have
 # no transactions, so their method runs the body directly -- and marks the database as inside one
 # for its duration, which is what `MockDB.locks` records against each `FOR UPDATE` read.
@@ -1229,8 +1266,11 @@ else
                 # A task's error is its own exception message, which can quote request data.
                 # PormG 0.8 refuses a NUL in any bound text value, so storing it raw would make
                 # the terminal write raise and drop the failure record. The premise first: the
-                # mock refuses what PormG refuses, or the two asserts below prove nothing.
+                # mock refuses what PormG refuses -- by PormG's own rule, `validate_value` (#791)
+                # -- or the two asserts below prove nothing.
                 m = MockTaskModel()
+                @test_throws PormG.InvalidValueError m.objects.db("db").create(
+                    "id" => "x", "error" => "a\0b")
                 @test_throws "contains a NUL character" m.objects.db("db").create(
                     "id" => "x", "error" => "a\0b")
 
@@ -3031,7 +3071,7 @@ else
                             m.objects.db("db").create(
                                 "id" => id, "run_id" => "run-$t", "status" => "PENDING",
                                 "progress" => 0.0, "result" => "", "error" => "",
-                                "created_at" => nothing, "started_at" => nothing,
+                                "created_at" => DateTime(2026, 1, 1), "started_at" => nothing,
                                 "completed_at" => nothing, "watchers" => "[]",
                                 "queue_name" => "default")
                             m.objects.db("db").filter("id" => id).first()
@@ -3451,12 +3491,14 @@ else
             #
             # Mirrors the session-side guard in `pormg_session_tests.jl`; the two stores had the
             # identical gap and #202 closes both.
-            @test getproperty(PormGExt, :task_model)().connect_key == "db"
-            @test getproperty(PormGExt, :task_model)("tasks").connect_key == "tasks"
+            with_offline_keys("db", "tasks") do
+                @test getproperty(PormGExt, :task_model)().connect_key == "db"
+                @test getproperty(PormGExt, :task_model)("tasks").connect_key == "tasks"
 
-            # One model per store, never a shared singleton -- `connect_key` names exactly one
-            # connection, so two stores on different keys could not share an object.
-            @test getproperty(PormGExt, :task_model)() !== getproperty(PormGExt, :task_model)()
+                # One model per store, never a shared singleton -- `connect_key` names exactly
+                # one connection, so two stores on different keys could not share an object.
+                @test getproperty(PormGExt, :task_model)() !== getproperty(PormGExt, :task_model)()
+            end
 
             key = "nitro-test-task-tx"
             haskey(PormG.config, key) &&
@@ -3512,9 +3554,20 @@ else
             # too, so without this the `isnothing(model)` arm of `PormGWorkerStore` has no
             # coverage at all -- regressing it to `task_model()` would leave a store at
             # `db_key="tasks"` carrying a model bound to `"db"` and the suite would stay green.
-            # Neither constructor touches `PormG.config`, so no fixture is needed.
-            @test RealPormGWorkerStore(db_key="tasks").model.connect_key == "tasks"
-            @test RealPormGWorkerStore().model.connect_key == "db"
+            # The binding needs the key loaded (#791), and nothing here queries, so an offline
+            # entry is enough.
+            with_offline_keys("db", "tasks") do
+                @test RealPormGWorkerStore(db_key="tasks").model.connect_key == "tasks"
+                @test RealPormGWorkerStore().model.connect_key == "db"
+            end
+
+            # A key nothing loaded is refused when the store builds its model, with PormG's own
+            # error naming the key, before any SQL runs (#791).
+            unloaded = "nitro-791-task-unloaded"
+            @test !haskey(PormG.config, unloaded)
+            err = try RealPormGWorkerStore(db_key=unloaded); nothing catch e; e end
+            @test err isa PormG.InvalidConfigurationError
+            @test occursin(unloaded, sprint(showerror, err))
         end
 
         @testset "the run_id migration probes before it alters (#366)" begin
@@ -3534,7 +3587,7 @@ else
             # database the column. That premise is asserted, not assumed: a model that stopped
             # emitting `run_id` would put every boot back on the migration path, logging on each.
             booted = FakeSchemaPool(true)
-            getproperty(PormGExt, :_ensure_task_table!)(booted, getproperty(PormGExt, :task_model)())
+            getproperty(PormGExt, :_ensure_task_table!)(booted, with_offline_keys(getproperty(PormGExt, :task_model), "db"))
             @test occursin("CREATE TABLE", first(booted.sql))
             @test occursin("\"run_id\"", first(booted.sql))
             @test !any(is_alter, booted.sql)
@@ -4051,7 +4104,7 @@ else
         @testset "the claim columns are added on boot, each probed first (#514)" begin
             is_alter(s) = startswith(s, "ALTER TABLE")
             pre = FakeSchemaPool(true; claim_columns = Set{String}())
-            getproperty(PormGExt, :_ensure_task_table!)(pre, getproperty(PormGExt, :task_model)())
+            getproperty(PormGExt, :_ensure_task_table!)(pre, with_offline_keys(getproperty(PormGExt, :task_model), "db"))
             @test pre.claim_columns == Set(ADDED_COLUMNS)
             alters = filter(is_alter, pre.sql)
             @test length(alters) == 6
@@ -4071,7 +4124,7 @@ else
 
             # A fresh database gets them from CREATE TABLE, so its boot alters nothing.
             fresh = FakeSchemaPool(true)
-            getproperty(PormGExt, :_ensure_task_table!)(fresh, getproperty(PormGExt, :task_model)())
+            getproperty(PormGExt, :_ensure_task_table!)(fresh, with_offline_keys(getproperty(PormGExt, :task_model), "db"))
             @test all(c -> occursin("\"$c\"", first(fresh.sql)), ADDED_COLUMNS)
             @test !any(is_alter, fresh.sql)
 
@@ -4092,7 +4145,7 @@ else
             is_alter(s) = startswith(s, "ALTER TABLE")
             # A table from step 1: the claim columns, not the job columns. Exactly two ALTERs.
             step1 = FakeSchemaPool(true; claim_columns = Set(CLAIM_COLUMNS))
-            getproperty(PormGExt, :_ensure_task_table!)(step1, getproperty(PormGExt, :task_model)())
+            getproperty(PormGExt, :_ensure_task_table!)(step1, with_offline_keys(getproperty(PormGExt, :task_model), "db"))
             @test step1.claim_columns == Set(ADDED_COLUMNS)
             @test filter(is_alter, step1.sql) == ["ALTER TABLE \"nitro_task\" ADD COLUMN \"job_name\" VARCHAR(255)",
                                                   "ALTER TABLE \"nitro_task\" ADD COLUMN \"job_args\" TEXT"]
@@ -4269,6 +4322,8 @@ end
             @test record.kwargs[:exception_type] === :ErrorException
         end
     end
+
+    PormG.Configuration.unregister_connection(MOCK_VALUE_KEY)
 end
 
 end

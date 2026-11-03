@@ -97,17 +97,22 @@ end
     _bind_model!(model, db_key) -> model
 
 Bind one of Nitro's infrastructure models (`nitro_session`, `nitro_task`) to a PormG
-connection key, by assigning `connect_key` directly.
+connection key, through `PormG.Models.bind!` (PormG 0.9, PingoLee/PormG.jl#1230).
 
-**Why not `set_models`.** That is PormG's documented binder, but it does far more than bind:
+**What `bind!` checks.** It resolves the key first, so a key a connection resolver serves is
+registered on the spot, and then refuses a key that is still not loaded, with an
+`InvalidConfigurationError` that names it (#791). The factories build the model before they
+look the connection up, so a misnamed `db_key` fails here, before any SQL runs. Before #791 this
+function assigned `connect_key` itself and accepted any string; the lookup that followed then
+failed with a bare `KeyError`, and a resolver-served key was never resolved.
+
+**Why not `set_models`.** That is PormG's application binder, and it does far more than bind:
 it writes the `REGISTERED_MODULES` global, `Core.eval`s a `const __pormg_init_path__` into
 the calling module, may implicitly `Configuration.load(path)`, and wires reverse accessors
 onto *other* models. None of that is wanted for two tables that
-`register_ignore_tables!` deliberately keeps out of migrations. `set_models` itself binds by
-doing exactly this assignment (`PormG/src/Models.jl`), and PormG's own `src/precompile.jl`
-binds the same way, so this is the narrow half of a supported operation rather than a
-workaround. It is migration-neutral: `makemigrations` reads `models.jl` from disk and never
-consults `REGISTERED_MODULES`.
+`register_ignore_tables!` deliberately keeps out of migrations. `bind!` is the narrow half,
+which PormG ships for a host library binding its own models. It is migration-neutral:
+`makemigrations` reads `models.jl` from disk and never consults `REGISTERED_MODULES`.
 
 **Why bind at all, when `.db(key)` already routes the query.** Because every store query
 starts with `model.objects`, and PormG resolves that property by the model *before* `.db()`
@@ -139,12 +144,10 @@ the query's `.db(...)` come from the one `store.db_key` field, so they cannot di
 
 Passing `model=` explicitly opts out of that coupling — the caller then owns keeping the
 model's `connect_key` and the store's `db_key` in agreement, and nothing checks it. The test
-doubles rely on this, since they carry no `connect_key` at all.
+doubles rely on this, since they carry no `connect_key` at all, and it is the one path that never
+checks the key is loaded.
 """
-function _bind_model!(model, db_key::String)
-    model.connect_key = db_key
-    return model
-end
+_bind_model!(model, db_key::String) = PormG.Models.bind!(model, db_key)
 
 """
 PormG model for the `nitro_session` table, bound to `db_key`.
@@ -211,7 +214,8 @@ Prefer `pormg_nitro_session(db_key=...)`, which creates the table and returns a 
 pointed at the same connection.
 
 A `model` passed explicitly is used as given, including its `connect_key`; omit it and the
-store builds one bound to `db_key` (see `_bind_model!`). A supplied model whose `connect_key`
+store builds one bound to `db_key` (see `_bind_model!`), which must then be a loaded PormG
+connection. A supplied model whose `connect_key`
 is unset still routes correctly through `db_key`, but pays PormG's self-heal scan on every
 query — bind it to `db_key` first.
 
@@ -724,7 +728,8 @@ you bootstrapped. Prefer `pormg_nitro_worker(db_key=...)`, which creates the tab
 returns a store pointed at the same connection.
 
 A `model` passed explicitly is used as given, including its `connect_key`; omit it and the
-store builds one bound to `db_key` (see `_bind_model!`). A supplied model whose `connect_key`
+store builds one bound to `db_key` (see `_bind_model!`), which must then be a loaded PormG
+connection. A supplied model whose `connect_key`
 is unset still routes correctly through `db_key`, but pays PormG's self-heal scan on every
 query — bind it to `db_key` first.
 """
@@ -2139,6 +2144,13 @@ function Nitro._newapp_pormg(write_app::Function, root::String)
             "# temporary copy of the project it was built from, gone by the time it runs.",
         ],
         store = "pormg_nitro_worker(db_key = \"db\")",
+        # The pools close after `terminate` has drained (#810), in `on_stopped`. That runs after
+        # every `on_shutdown`, the worker runtime's drain included, so the workers are stopped
+        # first wherever the pools are listed. First in the list because `terminate` runs the
+        # serve-level `on_stopped` hooks in reverse, so the pools also close after any such hook
+        # an app adds to the list. Built after `load_many`, which it needs: a key that is not
+        # loaded is refused when the middleware is built.
+        middleware = ["pormg_nitro_pools(keys = [\"db\"])"],
         deps = ["PormG" => string(Base.PkgId(PormG).uuid); [n => drivers[n][1] for n in names]],
         sources = ["PormG" => "{url = \"$(pin.url)\", rev = \"$(pin.rev)\"}"],
         compat = ["PormG" => pin.compat; [n => drivers[n][2] for n in names]],
