@@ -15,7 +15,7 @@ PormG = {url = "https://github.com/PingoLee/PormG.jl.git", rev = "5531c68cf482ca
 
 [compat]
 HTTP = "~2.13"
-Nitro = "0.6.0"
+Nitro = "0.7.0"
 PormG = "^0.9"
 Postgres = "2.4"
 PrecompileTools = "1"
