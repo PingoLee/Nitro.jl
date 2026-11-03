@@ -1,0 +1,13 @@
+[deps]
+Nitro = "e5efdb2c-68ee-4494-894d-55bb80f0a340"
+PormG = "7d8d7541-4d3d-4580-80a2-17064efb0993"
+SQLite = "0aa819cd-b072-5ff4-a722-6bc24af294d9"
+
+[sources]
+Nitro = {path = "../../.."}
+PormG = {url = "https://github.com/PingoLee/PormG.jl.git", rev = "5531c68cf482ca0723878bc6c593720a8cbf3502"}
+
+[compat]
+PormG = "^0.9"
+SQLite = "1.6.1"
+julia = "^1.13"

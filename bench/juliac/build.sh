@@ -3,6 +3,7 @@
 #
 #   bench/juliac/build.sh [no|unsafe-warn|safe]      # the --trim mode; default `no`
 #   ENTRY=probe bench/juliac/build.sh unsafe-warn     # build probe.jl instead (#718)
+#   PROJECT=bench/juliac/pools ENTRY=pools bench/juliac/build.sh unsafe-warn   # another project (#813)
 #
 # The frontend is the JuliaC.jl app (`julia +1.13 -e 'using Pkg; Pkg.Apps.add("JuliaC")'`), run as
 # JULIAC_BIN (default ~/.julia/bin/juliac): Julia 1.13 ships no driver of its own. Julia 1.12's
@@ -17,6 +18,9 @@
 #      OUT (default bench/juliac/out, gitignored),
 #      ENTRY (default `app`): `app` is the served minimal app, `probe` calls the request pipeline
 #        directly so the verifier reaches it whatever stands in front of the listener.
+#      PROJECT (default bench/juliac): the project the entry lives in and JuliaC builds against.
+#        bench/juliac/pools (#813) needs PormG and SQLite, which bench/juliac deliberately does not
+#        carry, so the app and probe counts are built from the same environment as before.
 # The environment is instantiated under JULIA first, into its own Manifest-v<major>.<minor>.toml
 # (gitignored), so builds under two Julia minors never re-resolve each other's manifest. JuliaC
 # compiles against a temporary copy of --project=bench/juliac.
@@ -29,7 +33,8 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/../.." && pwd)
 MODE=${1:-no}
 ENTRY=${ENTRY:-app}
-[ -f "$HERE/$ENTRY.jl" ] || { echo "no entry $HERE/$ENTRY.jl"; exit 2; }
+PROJ=$(cd "${PROJECT:-$HERE}" && pwd)
+[ -f "$PROJ/$ENTRY.jl" ] || { echo "no entry $PROJ/$ENTRY.jl"; exit 2; }
 JULIA=${JULIA:-"julia +1.13"}
 OUT=${OUT:-"$HERE/out"}
 JULIA_CPU_TARGET=${JULIA_CPU_TARGET:-native}
@@ -53,7 +58,7 @@ if [ "$ENTRY" = app ]; then EXE="$OUT/nitro-min-$MODE"; else EXE="$OUT/nitro-$EN
 {
   echo "julia:    $($JULIA --startup-file=no -e 'print(VERSION)')"
   echo "frontend: $FRONTEND"
-  echo "entry:    $ENTRY.jl"
+  echo "entry:    ${PROJ#"$ROOT"/}/$ENTRY.jl"
   echo "mode:     --trim=$MODE"
   echo "cpu:      $JULIA_CPU_TARGET"
   echo "exe:      $EXE"
@@ -61,7 +66,7 @@ if [ "$ENTRY" = app ]; then EXE="$OUT/nitro-min-$MODE"; else EXE="$OUT/nitro-$EN
 } | tee "$LOG"
 
 START=$(date +%s)
-$JULIA --startup-file=no --project="$HERE" -e '
+$JULIA --startup-file=no --project="$PROJ" -e '
   using Pkg
   m = joinpath(dirname(Base.active_project()), "Manifest-v$(VERSION.major).$(VERSION.minor).toml")
   isfile(m) || touch(m)
@@ -70,8 +75,8 @@ rm -f "$EXE"
 # `--output-exe` takes a file name, not a path: JuliaC writes it to the working directory.
 # Unbundled, the exe links against JULIA's own lib/ by absolute path, which is what a local
 # measurement wants; `--bundle` would copy ~100 MB of libraries per build.
-( cd "$OUT" && "$JULIAC_BIN" --project "$HERE" --output-exe "$(basename "$EXE")" \
-    --trim="$MODE" --experimental "$HERE/$ENTRY.jl" ) 2>&1 | tee -a "$LOG"
+( cd "$OUT" && "$JULIAC_BIN" --project "$PROJ" --output-exe "$(basename "$EXE")" \
+    --trim="$MODE" --experimental "$PROJ/$ENTRY.jl" ) 2>&1 | tee -a "$LOG"
 RC=${PIPESTATUS[0]}
 echo "build: rc=$RC, $(( $(date +%s) - START )) s" | tee -a "$LOG"
 [ -f "$EXE" ] && ls -la "$EXE" | tee -a "$LOG"
