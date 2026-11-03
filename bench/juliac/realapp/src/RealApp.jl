@@ -40,11 +40,13 @@ at least 32 bytes); keyword arguments go to `serve` (tests pass `async = true`).
 default, passes `[workers, ready]` as the scaffold does; `Val(:tuple)` passes `(workers, ready)`.
 A `Vector` is converted to a `Tuple` at run time, so the listener's type does not infer from
 `main`; the `Tuple` does. It is a type, not a `Bool`, so the branch folds and both forms compile
-the same code otherwise (`main.jl` against `main_tuple.jl`). `Val(:ready_only)` still builds
-`workers` but serves `(ready,)` alone (`main_ready_only.jl`): `worker_startup`'s return type does
-not infer (its `on_startup` captures a `WorkerRuntime{S}` with `S` open), so with it in either form
-the `serve` call is a dynamic one from `main`, and without it the call is static. The worker hook
-then never runs, so nothing is submitted to a queue in that form; no route submits one anyway.
+the same code otherwise (`main.jl` against `main_tuple.jl`). Since #845 `worker_startup(app; store
+= …)` infers, so the `serve` call is a static one from `main` in both forms; the listener `serve`
+builds still infers only from the `Tuple`. `Val(:ready_only)` still builds `workers` but serves
+`(ready,)` alone (`main_ready_only.jl`): the diagnostic from before #845, when `worker_startup`'s
+`on_startup` captured a `WorkerRuntime{S}` with `S` open, so `serve` was static only without it.
+The worker hook then never runs, so nothing is submitted to a queue in that form; no route
+submits one anyway.
 """
 function main(; middleware_form::Val = Val(:vector), kwargs...)
     # PormG reads db/connection.yml, from any working directory, in the environment

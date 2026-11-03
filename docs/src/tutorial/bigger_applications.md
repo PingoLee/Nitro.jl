@@ -324,8 +324,12 @@ Line by line:
 Global middleware goes in `serve`'s `middleware` tuple, after `pormg_nitro_pools` and next to
 `workers`, and runs before every route, whichever handler it targets. `serve` also accepts a
 `Vector`, but converts it at run time, so the type of the request pipeline is not known before
-the first request; a `Tuple` keeps it known, which is what lets a `juliac --trim` build follow a
-request through it:
+the first request; a `Tuple` keeps it known. In a JuliaC executable that decides whether the
+server's listener is compiled into the image or on the first request, provided every layer has a
+known type, as `worker_startup(app; store = …)` does. In
+[one measured app](https://github.com/PingoLee/Nitro.jl/issues/744#issuecomment-6612245023), the
+first request to most routes that do not touch the database took about 1.7 s with the `Vector`
+and under 7 ms with the `Tuple` (`health`: 1,660 ms against 0.8 ms):
 
 ```julia
 serve(app; port = parse(Int, get(ENV, "PORT", "8000")),

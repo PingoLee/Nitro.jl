@@ -4327,3 +4327,37 @@ end
 end
 
 end
+
+# #845 on the PormG backend: `pormg_nitro_worker` returns a concrete store type, and with it
+# `worker_startup(app; store = …)` infers, so `serve` is a static call from the caller. A real
+# SQLite file, because the factory creates its table on the connection it resolves; nothing serves.
+@testitem "PormG worker store: worker_startup infers (#845)" tags=[:extension, :pormg, :workers] setup=[NitroCommon] begin
+
+using Test
+using Nitro
+using PormG
+using SQLite
+
+key = "nitro_worker_infers_845"
+PormG.register_connection(key, joinpath(mktempdir(), "workers.sqlite"); adapter = "SQLite", env = "test")
+try
+    PormG.config[key].change_data = true
+    PormG.config[key].change_db = true
+    factory(k) = pormg_nitro_worker(db_key = k)
+    S = Base.infer_return_type(factory, (String,))
+    @test isconcretetype(S)
+    store = factory(key)
+    @test typeof(store) === S
+
+    build_store(app, s) = worker_startup(app; queues = ["q"], store = s)
+    serve_with(app, s) = serve(app; async = true, middleware = (worker_startup(app; queues = ["q"], store = s),))
+    @test isconcretetype(Base.infer_return_type(build_store, (App, S)))
+    @test isempty(kwcalls(serve_with, (App, S)))
+    @test invokes(serve_with, (App, S), serve)
+finally
+    # Closes the pool the factory opened, then drops the entry: a leaked entry could be picked up
+    # by a later test item, since PormG falls back to the sole loaded connection for an unbound model.
+    PormG.Configuration.unregister_connection(key)
+end
+
+end

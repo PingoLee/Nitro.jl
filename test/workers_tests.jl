@@ -7317,3 +7317,57 @@ end
 end
 
 end
+
+# #845: `worker_startup(app; store = s)` used to return a `LifecycleMiddleware` whose `on_startup`
+# closure captured a `WorkerRuntime{S}` with `S` open, because `_start_runtime_for!` narrowed the
+# installed runtime only to the UnionAll. Every caller's `serve(app; middleware = (workers, …))`
+# was then a dynamic `Core.kwcall`, and a JuliaC executable compiles HTTP's listener closure into
+# its image only when `serve` is reached by a static call (#744). Nothing here runs `serve`: the
+# caller is inspected with `code_typed`, so no port is bound.
+@testitem "Workers -- worker_startup infers, so serve is a static call (#845)" tags=[:core, :workers] setup=[NitroCommon] begin
+
+using Test
+using Nitro
+using Nitro.Workers
+using Nitro.Workers: InMemoryWorkerStore, WorkerRuntime, worker_runtime
+
+const IMS = InMemoryWorkerStore
+build_store(app, s) = worker_startup(app; queues = ["q"], store = s)
+build_runtime(app, r) = worker_startup(app; queues = ["q"], runtime = r)
+build_bare(app) = worker_startup(app; queues = ["q"])
+serve_with(app, s) = serve(app; async = true, middleware = (worker_startup(app; queues = ["q"], store = s),))
+
+@testset "the store and runtime forms infer concretely" begin
+    @test Base.infer_return_type(Nitro.Workers._start_runtime_for!,
+                                 (App, Symbol, IMS, Nothing, Int)) === WorkerRuntime{IMS}
+    @test isconcretetype(Base.infer_return_type(build_store, (App, IMS)))
+    # Already concrete before #845 (`install!` returns its argument); a guard, so it stays so.
+    @test isconcretetype(Base.infer_return_type(build_runtime, (App, WorkerRuntime{IMS})))
+    # The documented trade: with neither keyword, the installed runtime is reused whatever its
+    # store type, so the type is unknown here by design. Narrowing it would stop it reusing a
+    # runtime over another store, a behavior change; doing so must be deliberate, and this says so.
+    @test !isconcretetype(Base.infer_return_type(build_bare, (App,)))
+end
+
+@testset "serve(app; middleware = (workers,)) from a caller is a static call" begin
+    @test isempty(kwcalls(serve_with, (App, IMS)))
+    @test invokes(serve_with, (App, IMS), serve)
+end
+
+@testset "the narrowed reuse keeps its behavior" begin
+    app = App()
+    try
+        s1, s2 = IMS(), IMS()
+        build_store(app, s1)
+        first = worker_runtime(app)
+        @test first isa WorkerRuntime{IMS} && first.store === s1
+        build_store(app, s1)                         # the same store object: reused
+        @test worker_runtime(app) === first
+        build_store(app, s2)                         # another object of the same type: replaced
+        @test worker_runtime(app) !== first && worker_runtime(app).store === s2
+    finally
+        Nitro.Workers.uninstall!(app; drain_timeout = 0)
+    end
+end
+
+end
