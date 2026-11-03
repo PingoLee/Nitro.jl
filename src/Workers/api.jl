@@ -273,6 +273,12 @@ end
 
 # `store` selects a BACKEND and builds a runtime over it; `runtime` adopts one that already
 # exists. Passing both is a contradiction rather than a precedence puzzle, so it is refused.
+#
+# The `store`-alone case is the method below, which returns `WorkerRuntime{S}`. This one takes
+# what is left: both (refused), `runtime` alone (`install!` returns its argument, so that infers
+# too), and neither, which reuses whatever runtime is installed, of any store type. That last
+# case is genuinely `WorkerRuntime` with `S` unknown, which is why `worker_startup(app)` alone
+# does not infer and the `store`/`runtime` forms do (#845).
 function _start_runtime_for!(ctx::App, key::Symbol,
                              store::Union{Nothing, AbstractWorkerStore},
                              runtime::Union{Nothing, WorkerRuntime},
@@ -282,19 +288,33 @@ function _start_runtime_for!(ctx::App, key::Symbol,
             "pass `store` (build a runtime over this backend) or `runtime` (use this one), not both"))
     end
     !isnothing(runtime) && return install!(ctx, runtime; key, drain_timeout)
-
+    # Here `store === nothing`: a store with no runtime dispatches to the method below.
     existing = worker_runtime(ctx; key)
-
-    if !isnothing(store)
-        # Reuse the installed runtime when it already wraps this very backend, so repeated
-        # `start!(app; store = s)` stays idempotent. Minting a fresh runtime each time would
-        # displace the previous one mid-flight -- and a displaced runtime that nobody shut down
-        # is the #29 leak, rebuilt one level up.
-        existing isa WorkerRuntime && existing.store === store && return existing
-        return install!(ctx, WorkerRuntime(store); key, drain_timeout)
-    end
-
     return existing isa WorkerRuntime ? existing : install!(ctx; key, drain_timeout)
+end
+
+# Narrowed on the store's own type (#845), so `worker_startup(app; store = s)` infers: its
+# `on_startup` closure captures what this returns, and with `S` open there every caller's
+# `serve(app; middleware = (workers, …))` was a dynamic call.
+function _start_runtime_for!(ctx::App, key::Symbol, store::S, runtime::Nothing,
+                             drain_timeout::Real) where {S <: AbstractWorkerStore}
+    # Reuse the installed runtime when it already wraps this very backend, so repeated
+    # `start!(app; store = s)` stays idempotent. Minting a fresh runtime each time would
+    # displace the previous one mid-flight -- and a displaced runtime that nobody shut down
+    # is the #29 leak, rebuilt one level up.
+    reused = _reusable_runtime(worker_runtime(ctx; key), store)
+    reused === nothing || return reused
+    return install!(ctx, WorkerRuntime(store); key, drain_timeout)
+end
+
+# The installed runtime when it wraps this very `store`, else `nothing`. Shared by
+# `_start_runtime_for!` and `_runtime_to_reuse`, so the runtime a start is checked against and
+# the one it then reuses cannot disagree. Testing `WorkerRuntime{S}` rather than the UnionAll is
+# what narrows the result, and it refuses nothing the identity test would accept: the only
+# constructor is `WorkerRuntime(store::S) = new{S}(…)`, so a runtime whose store `===` this one
+# is a `WorkerRuntime{S}` already.
+function _reusable_runtime(existing, store::S) where {S <: AbstractWorkerStore}
+    return existing isa WorkerRuntime{S} && existing.store === store ? existing : nothing
 end
 
 # The runtime `_start_runtime_for!` would START, when it would reuse one rather than build it --
@@ -306,8 +326,8 @@ function _runtime_to_reuse(ctx::App, key::Symbol,
                            runtime::Union{Nothing, WorkerRuntime})
     runtime === nothing || return runtime
     existing = worker_runtime(ctx; key)
-    existing isa WorkerRuntime || return nothing
-    return (store === nothing || existing.store === store) ? existing : nothing
+    store === nothing || return _reusable_runtime(existing, store)
+    return existing isa WorkerRuntime ? existing : nothing
 end
 
 # Shape first (`_queue_specs`), then conflicts with the runtime about to be started, both before

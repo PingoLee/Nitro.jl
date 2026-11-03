@@ -1010,8 +1010,19 @@ no request can reach the app before the hook has started the runtime either.)
 app = App(mod = @__MODULE__)
 workers = worker_startup(app; queues = ["reports"], store = persistent_store)
 set_queue_authorizer!(worker_store(app), my_authorizer)
-serve(app; middleware = [workers])
+serve(app; middleware = (workers,))
 ```
+
+**The `store = …` and `runtime = …` forms have a concrete return type**
+([#845](https://github.com/PingoLee/Nitro.jl/issues/845)), so a caller's `serve(app; middleware =
+…)` that includes them is resolved when it is compiled rather than dispatched at run time,
+provided the other layers' types are known too. Passed as a `Tuple`, the middleware also gives
+the listener `serve` builds a known type, and in a JuliaC executable that is what lets the
+listener be compiled into the image instead of on the first request. `worker_startup(app)` with
+neither keyword reuses whatever runtime is installed under `key`, over any store type, so its
+type is known only at run time. To get the inferring form, name the backend you mean with
+`store` or `runtime`; a store other than the installed runtime's replaces that runtime (see
+below).
 
 The startup hook still does the running part: the zombie sweep, each queue's processors (as many
 as its declared concurrency), and the retention scheduler. The shutdown hook drains and uninstalls, and a later

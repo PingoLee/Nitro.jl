@@ -19,7 +19,7 @@ export get_free_port
 export jwtkey
 export raw_exchange, read_failed, abort_with_reset!
 export allocs, Allocs
-export dynamic_calls
+export dynamic_calls, kwcalls, invokes
 
 # ── Constants ────────────────────────────────────────────────────────
 
@@ -307,6 +307,45 @@ function dynamic_calls(f, types)
         callee isa Core.Builtin || push!(found, sprint(show, st))
     end
     return found
+end
+
+"""
+    kwcalls(f, types) -> Vector{String}
+
+The `Core.kwcall` statements left as `:call`s in the optimized code of `f` on `types`: keyword
+calls inference could not resolve, so they dispatch at run time. Narrower than `dynamic_calls`,
+for a caller whose other calls are not the point (#845).
+"""
+function kwcalls(f, types)
+    found = String[]
+    for (ci, _) in code_typed(f, types; optimize = true), st in ci.code
+        st isa Expr && st.head === :call || continue
+        g = st.args[1]
+        callee = g isa GlobalRef ? getglobal(g.mod, g.name) : g isa QuoteNode ? g.value : g
+        callee === Core.kwcall && push!(found, sprint(show, st))
+    end
+    return found
+end
+
+"""
+    invokes(f, types, g) -> Bool
+
+Whether the optimized code of `f` on `types` calls `g` through a static `:invoke`: of a method
+of `g`, of its keyword body (`#g#N`), or of `Core.kwcall` on `g`. Each of those carries
+`typeof(g)` among its argument types, which is what is matched; which one the compiler picks
+depends on inlining. The argument types must be concrete too: a static call compiled for widened
+types would not carry the caller's types into `g`. A dynamic keyword call is a `:call`, never
+counted here (`kwcalls`, #845).
+"""
+function invokes(f, types, g)
+    for (ci, _) in code_typed(f, types; optimize = true), st in ci.code
+        st isa Expr && st.head === :invoke || continue
+        x = st.args[1]
+        mi = x isa Core.CodeInstance ? x.def : x
+        mi isa Core.MethodInstance || (mi = getproperty(mi, :def))
+        Base.isdispatchtuple(mi.specTypes) && typeof(g) in mi.specTypes.parameters && return true
+    end
+    return false
 end
 
 end # module NitroCommon
@@ -630,4 +669,16 @@ end # module ExampleHarness
     typed(r::Base.RefValue{Any}) = (r[]::Int) + 1   # concrete field, asserted value: both resolve
     @test length(dynamic_calls(untyped, (Ref{Any},))) == 2
     @test isempty(dynamic_calls(typed, (Base.RefValue{Any},)))
+end
+
+@testitem "NitroCommon: kwcalls and invokes tell a dynamic keyword call from a static one (#845)" tags=[:core] setup=[NitroCommon] begin
+    using Test
+    # `@noinline`, so the call stays a call rather than being folded into the caller.
+    @noinline kwtarget(x; k::Int = 1) = x + k
+    dyn(r::Ref{Any}) = kwtarget(r[]; k = 2)          # `r[]` is `Any`: the keyword call dispatches
+    stat(x::Int) = kwtarget(x; k = 2)                # concrete: an `invoke`
+    @test length(kwcalls(dyn, (Ref{Any},))) == 1
+    @test !invokes(dyn, (Ref{Any},), kwtarget)
+    @test isempty(kwcalls(stat, (Int,)))
+    @test invokes(stat, (Int,), kwtarget)
 end

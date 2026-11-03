@@ -1063,6 +1063,28 @@ Only `bare` leaks. The verifier counts are 59 errors with 2 warnings (`ENTRY=fat
 4 (no route), against §3.8's 63 and 113. No before-tree build was made, so those two moves are
 not split by first frame.
 
+### 3.10 The `serve` call from the app: cleared in #845
+
+This one is not a verifier error, and it showed up in the untrimmed build too: JuliaC compiles
+into the image what `main` reaches statically, and the realapp's `serve(app; middleware = …)` was
+a dynamic `Core.kwcall`. `worker_startup(app; store = …)` returned a `LifecycleMiddleware` whose
+`on_startup` closure captured a `WorkerRuntime{S}` with `S` open, because `_start_runtime_for!`
+narrowed the runtime it read from the `Any` extension slot only to the UnionAll. So neither the
+`serve` specialization nor HTTP's `_serve_listener!` closure was in the image, and every first
+request paid for compiling them.
+
+#845 gives the `store` form its own method, which reuses an installed runtime only when it is a
+`WorkerRuntime{S}` over that very store. That changes no behavior: the only constructor is
+`WorkerRuntime(store::S) = new{S}(…)`. `serve` is now a static `invoke` from `main` with either
+middleware form (probed); `test/workers_tests.jl` pins the `Tuple` form. Measured on the realapp
+(`--trim=no`, native,
+[#744](https://github.com/PingoLee/Nitro.jl/issues/744#issuecomment-6612245023)), first request
+on `health`: JIT 1,917 ms, `Vector` 1,660 ms, `Tuple` **0.8 ms**. The `Vector` still builds its
+listener at run time, so only the `Tuple` loses the closure. Five of the six non-database routes
+read 0.8–6.6 ms; `json_validate` reads 297 ms (13%), a cost it shares with `write`, not
+root-caused. The PormG routes read 22–38% of the JIT: see #813, and #744's start-up workload
+follow-up.
+
 ## 4. The decision: `--trim=safe` is a target
 
 **The question was:** is `--trim=safe` a product target for Nitro, or a ratchet that only keeps
