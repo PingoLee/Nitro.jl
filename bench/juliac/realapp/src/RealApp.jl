@@ -35,8 +35,18 @@ const ready = Nitro.LifecycleMiddleware(middleware = identity, on_startup = _mar
 
 Boot the app and serve it. Reads `PORT` (default 8000), `API_SECRET_KEY` and `JWT_SECRET` (each
 at least 32 bytes); keyword arguments go to `serve` (tests pass `async = true`).
+
+`middleware_form` (bench only, #744) picks how `serve` gets the middleware: `Val(:vector)`, the
+default, passes `[workers, ready]` as the scaffold does; `Val(:tuple)` passes `(workers, ready)`.
+A `Vector` is converted to a `Tuple` at run time, so the listener's type does not infer from
+`main`; the `Tuple` does. It is a type, not a `Bool`, so the branch folds and both forms compile
+the same code otherwise (`main.jl` against `main_tuple.jl`). `Val(:ready_only)` still builds
+`workers` but serves `(ready,)` alone (`main_ready_only.jl`): `worker_startup`'s return type does
+not infer (its `on_startup` captures a `WorkerRuntime{S}` with `S` open), so with it in either form
+the `serve` call is a dynamic one from `main`, and without it the call is static. The worker hook
+then never runs, so nothing is submitted to a queue in that form; no route submits one anyway.
 """
-function main(; kwargs...)
+function main(; middleware_form::Val = Val(:vector), kwargs...)
     # PormG reads db/connection.yml, from any working directory, in the environment
     # `PORMG_ENV` names, else `NITRO_ENV` (or `GENIE_ENV`), else "dev"
     ROOT[] = get(ENV, "REALAPP_ROOT", pkgdir(@__MODULE__))
@@ -47,7 +57,9 @@ function main(; kwargs...)
     session = SessionMiddleware(store = pormg_nitro_session(db_key = "db"), secure = false)
     bearer = BearerAuth(Auth.jwt_validator(SecretString(ENV["JWT_SECRET"])))
     urlpatterns(app, "", Routes.urlpatterns(; session, bearer))
-    serve(app; port = parse(Int, get(ENV, "PORT", "8000")), middleware = [workers, ready],
+    middleware = middleware_form isa Val{:tuple} ? (workers, ready) :
+                 middleware_form isa Val{:ready_only} ? (ready,) : [workers, ready]
+    serve(app; port = parse(Int, get(ENV, "PORT", "8000")), middleware,
           secret_key = SecretString(ENV["API_SECRET_KEY"]), kwargs...)
 end
 

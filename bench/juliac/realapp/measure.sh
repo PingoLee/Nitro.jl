@@ -7,20 +7,27 @@
 #   bench/juliac/realapp/measure.sh sequence <jit|exe> [label]   # ONE process: each route's first request, in order, after READY
 #   bench/juliac/realapp/measure.sh rss   <jit|exe> [label]    # RSS at rest, and after every route
 #
-# `jit` runs main.jl under the real julia binary of JULIA (not the juliaup launcher, so the pid,
-# its RSS and the kill are the server's). An exe is a JuliaC build of the same main.jl.
+# `jit` runs main.jl (JIT_ENTRY, default `main`) under the real julia binary of JULIA (not the
+# juliaup launcher, so the pid, its RSS and the kill are the server's). An exe is a JuliaC build of
+# the same entry.
 # Readiness is the listening socket (`ss`), never a connection, as bench/socket/first_request.sh
 # does, so nothing warms the request path before the measured request. `listen` is launch to
 # listening socket. `warm` is the median of WARM_N requests after the first.
 # `first_after_ready` waits instead for the app's `READY` line on fd 2, written by the lifecycle
 # hook RealApp registers after `worker_startup`'s, so the start-up hooks have returned before the
 # first request (#744, #799); `ready` is launch to that line. Still no request before it.
+# Since #835 `serve` runs the start-up hooks BEFORE it opens the listener, so READY is written
+# before the socket opens and an open socket already means start-up is done: `first` and
+# `first_after_ready` now time the same request, and `ready` reads when READY was SEEN (just after
+# `listen`), not when it was written. Every request still waits for the socket, so none can reach
+# a closed port.
 #
 # REALAPP_ROOT is set to this directory for both: see src/RealApp.jl.
 # Env: SECRETS (required) a file of `API_SECRET_KEY=…` / `JWT_SECRET=…` lines, AUTH_HEADER
 #        (required) a file holding `Authorization: Bearer <token>` signed with JWT_SECRET;
 #        both stay outside the repository. db/connection.yml (gitignored) holds the database.
 #      PORT (default 18744), THREADS (default 8,1), JULIA (default "julia +1.13"), WARM_N (5),
+#      JIT_ENTRY (default `main`; `main_tuple` for the `Tuple` form, #744),
 #      LOGS (default bench/results/realapp-logs, gitignored): each process's output, per route.
 # Every line printed is TSV: mode, label, route, then the readings.
 set -uo pipefail
@@ -81,7 +88,7 @@ start() {
   t0=$(date +%s.%N); T0=$t0
   if [ "$TARGET" = jit ]; then
     ( set -a; . "$SECRETS"; set +a; cd "$LOGS" && PORT=$PORT REALAPP_ROOT="$HERE" PORMG_POSTGRES_DRIVER=Postgres \
-      exec "$JULIA_BIN" --startup-file=no --project="$HERE" --threads="$THREADS" "$HERE/main.jl" ) >"$1" 2>&1 &
+      exec "$JULIA_BIN" --startup-file=no --project="$HERE" --threads="$THREADS" "$HERE/${JIT_ENTRY:-main}.jl" ) >"$1" 2>&1 &
   else
     ( set -a; . "$SECRETS"; set +a; cd "$LOGS" && PORT=$PORT REALAPP_ROOT="$HERE" PORMG_POSTGRES_DRIVER=Postgres \
       JULIA_NUM_THREADS=$THREADS exec "$TARGET" ) >"$1" 2>&1 &
