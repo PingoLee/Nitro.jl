@@ -698,7 +698,9 @@ A router-wide default allowlist is just the same guard at the router level, with
 per-route subsets where needed. Router middleware wraps route middleware, so a router-level
 guard runs before any route-level auth layer: put the `BearerAuth` on the router, not only on
 its routes. See the service-token section of [Sessions & Auth](sessions_and_auth.md) for
-`iat`-only tokens and `exp_timeout`.
+`iat`-only tokens and `exp_timeout`, and its
+[Cost at high request rates](sessions_and_auth.md#Cost-at-high-request-rates) for what a
+bearer-authenticated request pays and why service traffic stays on tokens rather than sessions.
 
 ## 6. Guards & authorization
 
