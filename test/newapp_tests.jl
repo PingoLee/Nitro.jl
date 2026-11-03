@@ -66,6 +66,8 @@ end
         @test !occursin(call, body)
     end
     @test occursin("serve(app; port = parse(Int, get(ENV, \"PORT\", \"8000\"))", src)
+    # A one-element Tuple, trailing comma included: `(workers)` would be the bare middleware.
+    @test occursin("middleware = (workers,),", src)
     @test occursin("function main(; kwargs...)", src)   # no `root`: there is no db/ to find
     @test Meta.parseall(src) isa Expr   # it is Julia
 
