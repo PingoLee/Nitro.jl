@@ -224,8 +224,8 @@ end
     # ── Second pass: the shapes still compiled on a fresh server's first request (#551) ─────────
     #
     # Measured over a socket, one shape per FRESH process (Julia 1.13.2, `-t 8`), as the excess
-    # over a first-request floor of ~1.44 s that is HTTP.jl's own connection loop (see the
-    # transport block). Before -> after this block: `Cookie{T}` 345 -> 50 ms, `payload(req)`
+    # over a first-request floor of ~1.44 s that was HTTP.jl's own connection loop (the transport
+    # block caches it since #827). Before -> after this block: `Cookie{T}` 345 -> 50 ms, `payload(req)`
     # 495 -> 55, `Files{FormFile}` 270 -> 40, `MultipartForm{T}` 400 -> 180, `url()` 175 -> 15.
     #
     # Measured and left out, because a workload cannot hold them: `Header{T}` and a `Query{T}`
@@ -395,12 +395,20 @@ end
     # whatever they say (#572), so `access_log` does not change the listener type, and neither
     # does a `LifecycleMiddleware` whose `middleware` is `identity`. User middleware that wraps
     # the handler does: that server has another listener type and compiles its chain on the
-    # first request. Nearly all of the ~1.5 s left is HTTP.jl's own connection loop, specialized
-    # on the listener type: on #744 the minimal app spent 1.44–1.49 s compiling HTTP's
-    # `_serve_listener!` closure for exactly the type warmed here, and ~6 ms on its route's
-    # leaf. The loop is compiled in HTTP's private
-    # `_serve_conn!`/`_serve_listener!`, which no public API reaches and no socket-free call
-    # drives, so it stays out. One stream type covers every HTTP/1.1 request, with a body or
+    # first request.
+    #
+    # HTTP.jl's own connection loop is named here too (#827), by signature: the task
+    # `_serve_listener!` spawns for each connection runs `_serve_conn!(server, tracked)`, compiled
+    # for `Server{typeof(listener)}`. No socket-free call drives it, but `precompile` needs no
+    # call. Before it, nearly all of a default server's first request was that loop: on `main` at
+    # ec5625c9 (Julia 1.13.2, HTTP 2.13.5, `-t 8,1`, `bench/juliac/app.jl`), `/plaintext` took
+    # 1,462–1,469 ms, 1,455–1,462 of them the `_serve_listener!` closure. With the line it takes
+    # 10–12 ms, the closure 3–4 ms. It costs ~0.9 s of Nitro's precompile time and ~0.7 MB of
+    # pkgimage. The name is private: test/http_internals_contract_tests.jl pins it and that the
+    # spawn calls it. Like the rest of this block it covers only the DEFAULT listener type; a
+    # server with its own middleware still compiles the loop on its first request (~1.5 s).
+    #
+    # One stream type covers every HTTP/1.1 request, with a body or
     # without: HTTP builds each `Stream` around `_stream_request_metadata(request)`, which is
     # always a `Request{EmptyBody}`, and keeps the live body in an abstract `request_body` field.
     # What stays cold is only the body READ for `FixedLengthBody`/`ChunkedBody`, which dispatches
@@ -408,6 +416,7 @@ end
     let (listener, request_handler) = Core._default_serve_listener(ctx)
         stream = Stream{false, Request{Core.HTTP.EmptyBody}}
         precompile(listener, (stream,))
+        precompile(Core.HTTP._serve_conn!, (Core.HTTP.Server{typeof(listener)}, Core.HTTP._ServerConn))
         precompile(request_handler, (stream,))
         # What the spawn runs: a `@spawn` closure's body is not compiled with the listener.
         precompile(Core._handle_reporting, (typeof(request_handler), stream))
@@ -428,7 +437,7 @@ end
     # added. Binding a real port inside the precompile worker is the one thing in this file that
     # could hang a build rather than merely slow it; the earlier Reseau loopback deadlock (fixed in
     # HTTP 2.3.0 / Reseau 1.3.1) is why that is not hypothetical. The block above warms what a
-    # socket would have, minus HTTP.jl's own loop.
+    # socket would have, HTTP.jl's own loop included (#827), by signature.
     #
     # (Until #242 this NOTE also claimed the live path "is specialized on the user's specific
     # handler/middleware closure types ... so the first real network request recompiles them
