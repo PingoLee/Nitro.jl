@@ -137,7 +137,7 @@ route and no middleware, so the probe stays the measure of the route path.
 The lesson that generalizes: **`repr`/`string` of an un-inferred value is the most expensive single
 trim mistake**, and that includes a `Symbol`. Type the value, then `print` it.
 
-## 3. Remaining (40 errors on the minimal app on Julia 1.12.7; on 1.13, 96, then 87 after §3.6, 59 after the start-up walls, 27 after §3.7, 11 after §3.8 and 4 on HTTP 2.13, §3.9; the probe 22 after §3.11, 18 after #851; on 1.14, the app 5 and the probe 20, §3.12)
+## 3. Remaining (40 errors on the minimal app on Julia 1.12.7; on 1.13, 96, then 87 after §3.6, 59 after the start-up walls, 27 after §3.7, 11 after §3.8 and 4 on HTTP 2.13, §3.9, then 8 since #840, §3.13; the probe 22 after §3.11, 18 after #851; on 1.14, the app 5 and the probe 20, §3.12, then 3 and 18, §3.13)
 
 Measured 2026-10-22 on Julia 1.12.7, before and after #572. Each error is printed twice, so 20
 sites. `main` before #572 had **22**: the 20 below plus `CookieKey`'s, which arrived with a later
@@ -1273,6 +1273,88 @@ here.
 The probe never reaches either call fixed here: it builds the pipeline with `setupmiddleware`. Its
 14 unexpected answers, every routed request answering 500 and only the 404 path working, come
 from that wall. Its output is the same before and after.
+
+§3.13 takes up the `lock` and path-parameter rows, and the 1.13 app's 8.
+
+### 3.13 Julia 1.14's `lock(f, l)`, a `Type{T}` field, and the 1.13 app's 8 (#861)
+
+Built 2026-11-04 with JuliaC 0.3.12 (registry), HTTP.jl 2.13.5, JSON.jl 1.13.4,
+`--trim=unsafe-warn`, `JULIA_CPU_TARGET=native`, on Julia 1.13.2 and on 1.14.0-alpha1.112
+(`80ba946e97e`). Counted by first frame.
+
+**On 1.13 the app's 4 → 8 is the `ScopedValue` HAMT in a new place, recorded rather than fixed.**
+A `git bisect run` over `main`'s merges between `050d7782` (4) and `55b7ced6` (8) points at #840
+(`5e96696e`, the one commit `860b89be`, "terminate cancels a start and waits for a stop"). Every
+step was built from the same pinned HTTP, JSON, Reseau and OpenSSL, and `050d7782` reads 4 under
+them too, so the rise is Nitro's, not a dependency's. The four rows:
+
+| first frame | rows | statement |
+|---|--:|---|
+| `src/core/lifecycle.jl` `_broadcast_lifecycle`, through the `stopped` hooks of `serve`'s cleanup (`_blocking_serve_cleanup!` → `_terminate_run` → `_teardown!`) | 2 | `HashState(h, getfield(leaf, :key)::AbstractScopedValue)` in Base's `insert!` (`hamt.jl:205`) |
+| the same | 2 | `next(h::HashState{K} where K)` (`hamt.jl:220`) |
+
+#840 runs every lifecycle broadcast inside `@with IN_LIFECYCLE_HOOK => true`, so a `terminate`
+that a hook calls does not wait for the run that is running it. That `@with` inserts into the
+scope's HAMT, which is §3.5's upstream wall, the same 2 + 2 statements as `_app_context_seed`'s
+row. The flag stays a `ScopedValue` on purpose: it must reach a task the hook spawns, which
+`task_local_storage` would not. The app still starts, serves and stops; these rows are reached
+only on the way out.
+
+**On 1.14, `lock(f, l)` went through a keyword body, and two of Nitro's sites stopped verifying.**
+1.14's `lock` takes a `cancel` keyword (`base/lock.jl`). `lock(f, l::ReentrantLock)` now forwards
+to `#lock#448(DEFAULT_CANCEL, lock, f, l)`, and that call resolves only when the compiler sees
+`f`'s concrete type:
+- **`cache_chain!`** (`src/types.jl`, every routed request on a cache miss) took `chain::Function`
+  and only captured it, so it was compiled for the abstract type. Its closure's type was a
+  `UnionAll`, and the call into the keyword body was dynamic (2 rows on the probe, 1 on the app).
+  In a trimmed image it failed, and the probe answered 500 on every routed request.
+- **`_await_phase_change`** (`src/context.jl`, `terminate`'s wait) called `lock(f, ::Threads.Condition)`,
+  which is Base's `lock(f, c::GenericCondition) = lock(f, c.lock)`. That method only passes `f` on,
+  so it is compiled for `f::Function`, and its inner call is dynamic (2 rows on the app).
+
+Both now go through `_locked` (`src/utilities/locked.jl`): `lock(l)`, `try f() finally unlock(l)`,
+specialized on `f`. `cache_chain!` also takes `chain::F`, which by itself should clear its row:
+under the JIT on 1.14, `lock(f, ::ReentrantLock)` with a concrete closure resolves to static
+invokes, and the `lock(chains_lock) do` in `_route_chain` beside it is not reported. No build was
+made with `chain::F` alone. `_locked` is used there as well so the two sites lock the same way. At
+`_await_phase_change` it is the fix, since Base's `lock(f, ::Threads.Condition)` loses `f`'s
+type whatever the caller holds. Cancellation does not change: the
+positional `lock(l)` is `lock(l; cancel = DEFAULT_CANCEL)` on 1.14, which is what `lock(f, l)`
+passes. Only these two sites move. `test/locked_tests.jl` pins the helper and the two sites'
+shape in 1.13's CI, and the pins fail against the old code. Under the JIT on 1.13 a routed
+`internalrequest` allocates the same before and after (2,112 B on an exact route, 2,784 B on a
+converter route). `cache_chain!` on an already cached key goes from 80 B to 0, since its closure
+is no longer boxed.
+
+**The path-parameter rows are #460, and the cause is Julia's.** `PathParamStrategy` reads its type
+from `param.type`, a field declared `::Type{T}`. 1.13 folds that `getfield` to the constant `Int64`
+and calls `parseparam_checked` statically. 1.14 does not: the value stays `Type{Int64}`, which is
+not a dispatch type there (a type's own type is now `Core.TypeEgal{T}`). The call becomes dynamic
+(`parseparam_checked`, 2 rows) and its result `Any`, which is #460's `Tuple{Any, String, Any}`. A
+repro with JSON.jl and no Nitro shows the same: `JSON.parse(s, p.type)` is an `invoke` returning
+`Int64` on 1.13, and a dynamic call returning `Any` on 1.14, while `JSON.parse(s, T)` with the
+static parameter stays `Int64`. Not worked around here. The `pathparams(::LazyRequest)` row
+(2) sits beside it: `LazyRequest.req` is typed `HTTP.Request`, a `UnionAll`, so the call on it is
+the #856 pattern, static on 1.13 only by inlining.
+
+**Outside Nitro on 1.14:**
+- OpenSSL.jl's `get_error` (`OpenSSL.jl:3307`) is reached from OpenSSL's own `__init__`
+  (`OpenSSLInit` → `OpenSSLError()`): a `string(…)` of an untyped `jl_eqtable_get` result. It is
+  OpenSSL.jl's, on every load.
+- With `_await_phase_change` cleared, the app shows Base's `close(::BufferStream)`
+  (`stream.jl:2232`), reached from HTTP's `SSEStream` close in `_release_response_body!`. It is
+  `lock(f, ::GenericCondition)` inside Base, the same mechanism, with no Nitro site to change.
+- `uv_readcb`, as on 1.13 (§3.9).
+
+| | 1.13.2, `main` | 1.13.2, after | 1.14, `main` | 1.14, after |
+|---|--:|--:|--:|--:|
+| `ENTRY=app` verifier | 8 | 8 | 5 | **3** |
+| `ENTRY=probe` verifier | 18 | 18 | 20 | **18** |
+| probe answers not as expected | 0 | 0 | 14 | **1**: `GET /users/7` → 500, the path-parameter rows |
+
+On 1.14 the app's 3 are `get_error`, `close(::BufferStream)` and `uv_readcb`, and the probe's 18 are
+the path-parameter rows (4) and 14 outside `src/`. On 1.13 the app's 8 are §3.9's 4 and #840's 4,
+and the probe's 18 have no row in `src/` but the `_app_context_seed` HAMT.
 
 ## 4. The decision: `--trim=safe` is a target
 

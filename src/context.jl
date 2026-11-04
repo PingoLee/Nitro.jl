@@ -12,6 +12,7 @@ using ..Constants: SHUTDOWN_TIMEOUT_SECONDS, DEFAULT_MAX_FIELDS, AbstractApp
 # The serve task, a shutdown and a Revise hook log what they caught as `loggable(e)`, never `e`:
 # each logs whatever reached it, and the rule holds everywhere in `src/` (#658).
 using ..Errors: loggable
+using ..Util: _locked
 
 export App, EagerReviseService, Service, wait, close, isopen
 export set_extension!, get_extension, delete_extension!, has_extension
@@ -404,8 +405,10 @@ end
 
 # Park until `service`'s phase word is no longer `word` (#834). Only a transition to `IDLE` is
 # notified, so this is for words that can only move there: `CANCELLING` and `STOPPING`.
+# `_locked`, not `lock(f, c)` (#861): on Julia 1.14 `lock(f, ::Threads.Condition)` is compiled for
+# `f::Function`, so its call into `lock`'s keyword body is dynamic, on `serve`'s stop path.
 function _await_phase_change(service::Service, word::UInt64)
-    lock(service.phase_cond) do
+    _locked(service.phase_cond) do
         while service.phase[] === word
             wait(service.phase_cond)
         end

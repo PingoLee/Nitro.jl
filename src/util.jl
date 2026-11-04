@@ -9,6 +9,8 @@ using ..Res
 include("utilities/typememo.jl");
 # `BoundedLRU` (#850): `Types` (`MemoryStore`) and `Core` (the `:lazy` mount cache) both use it.
 include("utilities/boundedlru.jl");
+# `_locked` (#861): `Types` (the route-chain cache) and `AppContext` (the phase wait) both use it.
+include("utilities/locked.jl");
 include("utilities/bodyparsers.jl"); @reexport using .BodyParsers
 # No `import .BodyParsers: ...` here on purpose (#28). That import existed ONLY so the
 # deleted `render.jl` could ADD response-building methods to the parser generics rather
