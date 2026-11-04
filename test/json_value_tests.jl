@@ -226,3 +226,76 @@ req = HTTP.Request("GET", "/")
 req.context[:user] = Dict{String, Any}("scope" => Any[missing, "write"])
 @test contains(req) === nothing
 end
+
+@testitem "Session values: the marker compare, the copy and the framework's cookie" tags=[:core, :middleware] setup=[NitroCommon] begin
+using Test
+using HTTP
+using JSON
+using Dates
+using Nitro
+
+# #748 moved the session middleware's compares and copies to the walks over JSON values, and its
+# cookie write (and CSRF's and the auth cookie's) off `set_cookie!`'s `attrs` branch. Under the
+# JIT each answers what it did; the expected values come from the calls they replaced.
+S = Nitro.Core.Middleware.SessionMiddleware_
+const CookieConfig = Nitro.Types.CookieConfig
+C = Nitro.Core.Cookies
+
+@testset "_auth_marker_changed is !isequal" begin
+    markers = Any[nothing, "u1", "u2", 1, 1.0, true, NaN, Any["a"], Dict{String, Any}("id" => 1),
+                  Dict{String, Any}("id" => 1.0), :sym, missing]
+    wrong = [(a, b) for a in markers, b in markers if S._auth_marker_changed(a, b) !== !isequal(a, b)]
+    @test isempty(wrong)
+    # It was `!isequal(::Any, ::Any)`, a dynamic call (`dynamic_calls`, test/setup_tests.jl).
+    @test isempty(dynamic_calls(S._auth_marker_changed, (Any, Any)))
+end
+
+@testset "the session copy is deepcopy under the JIT" begin
+    shared = Any[1, 2]
+    data = Dict{String, Any}("a" => shared, "b" => shared, "n" => 1, "d" => Dict{String, Any}("x" => [1]))
+    c = S._copy_session(data)
+    @test c == data
+    @test c["a"] !== shared
+    @test c["a"] === c["b"]                 # deepcopy keeps two keys sharing one copy
+    @test c["d"]["x"] !== data["d"]["x"]
+    @test S._copy_session(:not_a_session) === :not_a_session
+    # The store's own copy too (#318): deep, under the JIT as before.
+    stored = Nitro.Types._copy_session_value(data)
+    @test stored == data && stored["d"] !== data["d"]
+end
+
+@testset "_set_framework_cookie! writes what set_cookie! wrote" begin
+    configs = [CookieConfig(), CookieConfig(secure = false, httponly = false, samesite = "Strict"),
+               CookieConfig(path = "/app", domain = "example.com", maxage = 60),
+               CookieConfig(expires = DateTime(2030, 1, 2, 3, 4, 5))]
+    for config in configs, (value, maxage) in (("tok-1", 3600), ("", 0))
+        a = HTTP.Headers()
+        b = HTTP.Headers()
+        C.set_cookie!(a, "sid", value; config = config, encrypted = false, maxage = maxage)
+        C._set_framework_cookie!(b, "sid", value, config, false, maxage)
+        @test collect(a) == collect(b)
+        @test !isempty(a)
+    end
+end
+end
+
+@testitem "missing session values: the change check is Base's" tags=[:core, :middleware] setup=[NitroCommon] begin
+using Test
+using Nitro
+
+# A `MemoryStore` session can hold a `missing`, over which Base's dict `!=` is three-valued. Under
+# the JIT the change check is that `!=` (`_session_changed`); the reference is `!=` itself, run on
+# the same input: changed, the same, or throw.
+S = Nitro.Core.Middleware.SessionMiddleware_
+outcome(f) = try
+    f() ? :changed : :same
+catch
+    :error
+end
+base = Dict{String, Any}("a" => missing, "b" => 1)
+for current in (Dict{String, Any}("a" => missing, "b" => 2), Dict{String, Any}("a" => missing, "b" => 1),
+                Dict{String, Any}("a" => 1, "b" => 1), Dict{String, Any}("b" => 1))
+    @test isequal((current, outcome(() -> S._session_changed(current, base))),
+                  (current, outcome(() -> current != base)))
+end
+end

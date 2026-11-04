@@ -7,10 +7,11 @@ using UUIDs
 using ...Types: AbstractSessionStore, MemoryStore, SessionPayload, Nullable, is_expired,
     update_session!, delete_session!, session_store_full, SESSION_AUTH_HASH_KEY,
     _session_auth_hash_current, _session_auth_hash_of, _store_call, _store_bool
-using ...Types: CookieConfig, LifecycleMiddleware, with_response, _stored_session, _stored_session_id
+using ...Types: CookieConfig, LifecycleMiddleware, with_response, _stored_session, _stored_session_id,
+    _trimmed, _json_equal, _json_copy
 using ..JanitorMiddleware: _janitor
 using ...Cookies: get_cookie, set_cookie!, storesession!, prunesessions!, regenerate_session!,
-    _validate_cookie_prefix
+    _validate_cookie_prefix, _set_framework_cookie!
 using ...Crypto: secure_uuid4
 using ...Errors: ValidatorFault, is_unrecoverable
 using ...Util: _rebuild_with_headers, _cookie_on_raw_value
@@ -440,7 +441,7 @@ function SessionMiddleware(;
             # ever compared, so a new one takes no snapshot; a store whose stored payload nothing
             # mutates hands `_load_session`'s baseline back instead of a second deep copy (#547).
             original_session = is_new ? nothing :
-                               baseline !== nothing ? baseline : deepcopy(session_data)
+                               baseline !== nothing ? baseline : _copy_session(session_data)
             original_auth_marker = _auth_marker(session_data, session_id, auth_key, validator)
 
             # New visitors start with a fresh random session identifier.
@@ -573,7 +574,7 @@ function SessionMiddleware(;
                 ttl = _write_ttl(max_age, absolute_max_age, write_now, write_now)
                 _save_session(store, final_session_id, current_session, ttl)
                 session_written = true
-            elseif !is_new && (rotated || forced || current_session != original_session)
+            elseif !is_new && (rotated || forced || _session_changed(current_session, original_session))
                 # The contract's `Bool`, checked so inference does not carry `Any`
                 # (`current_session` comes out of `req.context`) into the branch below, and so a
                 # wrong return fails by name without the value in the error (#612).
@@ -596,7 +597,7 @@ function SessionMiddleware(;
             # the new response is built from it once, at its body type (`with_response`).
             headers = copy(response.headers)
             # Append the session cookie without clobbering any sibling Set-Cookie headers.
-            set_cookie!(headers, session_cookie, final_session_id; config=config, encrypted=false, maxage=ttl)
+            _set_framework_cookie!(headers, session_cookie, final_session_id, config, false, ttl)
             _mark_private!(headers)
             return with_response(_rebuild_with_headers, response, headers)
         end
@@ -673,7 +674,7 @@ function _load_session(store::AbstractSessionStore{String, Dict{String,Any}}, se
             _end_session!(store, session_id, "past its absolute lifetime")
             return Dict{String,Any}(), true, now, false, nothing
         end
-        return deepcopy(payload.data), false, payload.created,
+        return _copy_session(payload.data), false, payload.created,
                _unconfirmed_payload(payload, unconfirmed_max_age),
                _payload_is_private(store) ? payload.data : nothing
     end
@@ -892,8 +893,34 @@ function _auth_marker_for_key(session_data::Dict{String,Any}, auth_key::String)
     return nothing
 end
 
-function _auth_marker_changed(original_auth_marker, current_auth_marker)
-    return !isequal(original_auth_marker, current_auth_marker)
+# `!isequal(original, current)`. A marker is whatever the session or the validator holds, `Any`, so
+# both are unspecialized and compared through the walk over JSON values, which is static where
+# `isequal` on two `Any`s dispatched (#748, docs/design/juliac-trim.md §3.11).
+_auth_marker_changed(@nospecialize(original_auth_marker), @nospecialize(current_auth_marker)) =
+    !_json_equal(isequal, original_auth_marker, current_auth_marker)
+
+# The change check: `current != original`. Under the JIT exactly that, `missing` and all (Base's dict
+# `==` is three-valued, and a `MemoryStore` session can hold a `missing`). A trimmed image cannot
+# compare `Any` values that way and uses the walk over JSON values, which is `!=` on every JSON
+# value (#748).
+_session_changed(current::Dict{String,Any}, @nospecialize(original)) =
+    _trimmed() ? !_json_equal(==, current, original) : current != original
+
+# The loaded session's private copy, for the handler to work on and the change check to compare
+# against (#318, #452). Under the JIT, `deepcopy`, which also keeps two keys that share one mutable
+# value sharing one copy. A trimmed image cannot `deepcopy` an `Any` value, and copies through the
+# walk over JSON values instead, which refuses a value of any other type (#748). A stored payload's
+# `data` reads as `Any` (`payload isa SessionPayload` narrows only to the UnionAll), so the
+# `Dict{String,Any}` every store of this middleware holds is tested first.
+function _copy_session(@nospecialize(data))
+    data isa Dict{String,Any} || return _copy_foreign_session(data)
+    return _trimmed() ? _json_copy(data)::Dict{String,Any} : deepcopy(data)
+end
+
+@noinline function _copy_foreign_session(@nospecialize(data))
+    _trimmed() && throw(ArgumentError(
+        "Nitro: a trimmed image loads only a Dict{String,Any} session; got a $(nameof(typeof(data)))"))
+    return deepcopy(data)
 end
 
 function _save_session(store::AbstractSessionStore{String, Dict{String,Any}}, session_id::String, data::Dict{String,Any}, max_age::Int)

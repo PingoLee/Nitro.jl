@@ -1146,6 +1146,42 @@ the auth middleware answers `401` and a guard `500`; and an application's own cl
 type, so `claim_required("role", "admin")` is static, but a container value
 (`claim_required("roles", ["a"])`) still compares element by element through a dynamic `==`.
 
+**The session store (#748).** 37 rows on top of the 59, 28 of them Nitro's:
+
+| First frame in `src/` | before | after | What it was, and the change |
+|---|---:|---:|---|
+| `middleware/session_middleware.jl` the auth-marker compare | 6 | 0 | `isequal` on two `Any`s: `_json_equal(isequal, …)`, unspecialized |
+| `middleware/session_middleware.jl` the dirty check | 4 | 0 | `Dict{String, Any}` `!=`, which compares values as `Any`: `_json_equal(==, …)` in a trimmed image, Base's `!=` under the JIT (`_session_changed`), because Base's dict `==` is three-valued and a `MemoryStore` session can hold a `missing` |
+| `middleware/session_middleware.jl` `_load_session` | 2 | 0 | `deepcopy` of the loaded payload, read as `Any`: `_copy_session`, which is `deepcopy` under the JIT and `_json_copy` in a trimmed image |
+| `types.jl` `MemoryStore`'s copy (#318) | 0 | 0 | newly reached once the above cleared (2 rows); the same `_trimmed()` switch |
+| `cookies.jl` `set_cookie!` | 16 | 0 | its `attrs` branch, a `Dict{Symbol, Any}`. Every framework write (the session id, the CSRF token, the auth cookie) passes no `attrs`, and now calls `_set_framework_cookie!`, the `attrs`-free path, directly |
+| `types.jl` LRUCache.jl's `by` and `finalizer` | 9 | 9 | upstream, below |
+
+The copy is the one place the two builds differ on purpose. `deepcopy` keeps two keys that share
+one mutable value sharing one copy, and the JIT keeps that. A trimmed image's walk gives each a
+copy of its own, which nothing parsed from JSON can tell apart.
+
+**LRUCache.jl is what keeps the session write failing.** The probe reads **31** with the above,
+and the trimmed session write and the global session read still answer `500`. Built with the
+pipeline's error catching off, the image says why: `storesession!` throws a `MethodError`, which is
+how a trimmed image fails a call it never compiled. `LRU{K, V}` declares `by::Any` and
+`finalizer::Any` (LRUCache.jl 1.6.2), and `setindex!` calls both on every insert. So the 9 rows are
+not cosmetic: a `MemoryStore` cannot store a session in a trimmed image, and a `:lazy` static mount's
+cache, which is the same type, cannot cache. JuliaCollections/LRUCache.jl#56 (open, 2026-11-01)
+makes `LRU` trim-compatible. The decision is to wait for it rather than hold a typed LRU in Nitro;
+#748 stays open for those rows. The session's own walls are cleared, so with a fixed `LRU` the
+session answers should be the JIT's, but that is untested until #56 lands.
+
+The 31 left: those 9; the `@with` HAMT inside Base (4, §3.5); 14 outside `src/`; and 4 at
+`csrf_middleware.jl` `_foreign_binding`, which §3.9 left without a cause. They are its refusal
+message: `nameof(typeof(value))` on a `value::AbstractString` is itself an unresolved call, because
+`typeof` of an abstractly typed value infers `Type{<:AbstractString}`. The refusals in this
+section take their argument `@nospecialize`, where `typeof` infers `DataType`, and verify clean.
+
+What a trimmed image asks of an application's session: values of the JSON types, as a JSON
+store holds anyway. A `MemoryStore` session holding another value (a `Symbol`, a `DateTime`) is
+refused when it is copied or compared, as an `ArgumentError`, which the request answers `500`.
+
 ## 4. The decision: `--trim=safe` is a target
 
 **The question was:** is `--trim=safe` a product target for Nitro, or a ratchet that only keeps

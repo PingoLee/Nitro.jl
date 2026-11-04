@@ -76,12 +76,12 @@ Use `clear_auth_cookie!` to expire it.
 """
 function set_auth_cookie!(res::HTTP.Response, token::AbstractString; ttl::Int, cookie_name::String=DEFAULT_AUTH_COOKIE_NAME, secure::Bool=true, httponly::Bool=true, samesite::String="Lax", path::String="/", domain=nothing)
     config = CookieConfig(secure=secure, httponly=httponly, samesite=samesite, path=path, domain=domain, maxage=ttl)
-    set_cookie!(res, cookie_name, token; config=config, encrypted=false, maxage=ttl)
+    _set_framework_cookie!(res, cookie_name, String(token), config, false, ttl)
     return res
 end
 
 function clear_auth_cookie!(res::HTTP.Response; cookie_name::String=DEFAULT_AUTH_COOKIE_NAME, secure::Bool=true, httponly::Bool=true, samesite::String="Lax", path::String="/", domain=nothing)
     config = CookieConfig(secure=secure, httponly=httponly, samesite=samesite, path=path, domain=domain)
-    set_cookie!(res, cookie_name, ""; config=config, encrypted=false, maxage=0)
+    _set_framework_cookie!(res, cookie_name, "", config, false, 0)
     return res
 end

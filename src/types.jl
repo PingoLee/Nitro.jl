@@ -808,8 +808,14 @@ end
 # request of one session mutating ONE vector: lost appends, `ConcurrencyViolationError`, and a
 # nested `Dict` corrupted badly enough that every later request on the session threw. A stored
 # value must never be reachable from a request, in either direction.
+#
+# A trimmed image cannot `deepcopy` a dict of `Any` values, so it copies the `Dict{String,Any}`
+# sessions `SessionMiddleware` stores through the walk over JSON values, which refuses a value of any
+# other type (#748, docs/design/juliac-trim.md §3.11). The JIT keeps `deepcopy`.
 function _copy_session_value(value)
-    if value isa AbstractDict || value isa AbstractArray
+    if _trimmed() && value isa Dict{String, Any}
+        return _json_copy(value)::Dict{String, Any}
+    elseif value isa AbstractDict || value isa AbstractArray
         return deepcopy(value)
     end
     return value

@@ -75,6 +75,11 @@ too. Two scalars go to `cmp`, which Base resolves for every pair of the listed t
 
 A value outside the list, on either side, is compared by `cmp` itself: one dynamic call under the
 JIT, refused in a trimmed image.
+
+It answers a `Bool`, always. Where Base's three-valued `==` would answer `missing` (a `missing`
+inside a container) it throws, and where Base's dict `==` goes past a `missing` to a later
+difference it may not. JSON holds no `missing`, but a `MemoryStore` session can, so the JIT's
+session change check keeps Base's `!=` (`_session_changed`). `isequal` has no such case.
 """
 function _json_equal(cmp::C, @nospecialize(a), @nospecialize(b))::Bool where {C}
     (_is_json_value(a) && _is_json_value(b)) || return _foreign_equal(cmp, a, b)
