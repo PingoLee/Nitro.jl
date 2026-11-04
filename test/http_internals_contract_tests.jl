@@ -49,6 +49,9 @@ import Sockets
 #   • src/context.jl — `_shutdown_server`'s bounded drain: it depends on `close(::Server)`
 #       releasing the listener BEFORE its unbounded quiesce loop, and escalates to
 #       `HTTP.forceclose`.
+#   • src/precompile.jl — the transport block names the connection loop by signature,
+#       `_serve_conn!(::Server{typeof(listener)}, ::_ServerConn)` (#827), so a default server's
+#       first request does not compile it.
 #
 # None of these are part of HTTP's public, SemVer-guaranteed API, so a 2.x bump
 # can rename or remove them WITHOUT a breaking-version signal. The compat pin
@@ -494,6 +497,31 @@ end
     @test isdefined(HTTP, :_set_read_deadline!)
     @test hasmethod(HTTP._set_read_deadline!, Tuple{HTTP.TCP.Conn, Int64})
     @test hasmethod(HTTP._set_read_deadline!, Tuple{HTTP.TLS.Conn, Int64})
+end
+
+@testset "connection-loop surface (src/precompile.jl, #827)" begin
+    # The workload caches HTTP's connection loop for the default listener by naming
+    # `_serve_conn!(::Server{typeof(listener)}, ::_ServerConn)`, which is what the task
+    # `_serve_listener!` spawns for each accepted connection runs. A rename fails the
+    # workload's `precompile` (test/precompilation_test.jl). This testset catches the quiet
+    # failure instead: the spawn calling something else, so the cached code is never used and a
+    # fresh server's first request is ~1.5 s again, with nothing failing.
+    @test isdefined(HTTP, :_serve_conn!)
+    @test hasmethod(HTTP._serve_conn!, Tuple{HTTP.Server, HTTP._ServerConn})
+    @test isconcretetype(HTTP._ServerConn)
+    @test length(Base.unwrap_unionall(HTTP.Server).parameters) == 1
+    spawns = [getglobal(HTTP, n) for n in names(HTTP; all = true)
+              if startswith(String(n), "#_serve_listener!##") && getglobal(HTTP, n) isa Type]
+    call_methods(T) = [r.method for r in Base._methods_by_ftype(
+        Base.rewrap_unionall(Tuple{Base.unwrap_unionall(T)}, T), -1, Base.get_world_counter())]
+    globalrefs(x) = x isa GlobalRef ? GlobalRef[x] :
+                    x isa Expr ? reduce(vcat, map(globalrefs, x.args); init = GlobalRef[]) :
+                    GlobalRef[]
+    calls_serve_conn(m) = any(Base.uncompressed_ast(m).code) do stmt
+        any(g -> g.mod === HTTP && g.name === :_serve_conn!, globalrefs(stmt))
+    end
+    @test !isempty(spawns)
+    @test any(T -> any(calls_serve_conn, call_methods(T)), spawns)
 end
 
 @testset "h2c refusal surface (src/core/lifecycle.jl `preprocesskwargs`, `allow_h2c`)" begin

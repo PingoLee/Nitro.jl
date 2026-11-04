@@ -60,11 +60,16 @@ server = serve(app; host = HOST, port = get_free_port(), async = true, show_bann
 try
     listener, request_handler = Nitro.Core._default_serve_listener(app)
     @test typeof(server.handler) == typeof(listener)
+    # HTTP's connection loop is specialized on the server's type, so the workload names it as
+    # `Server{typeof(listener)}` (#827); a server built some other way would miss that cache.
+    @test typeof(server) === Nitro.Core.HTTP.Server{typeof(listener)}
     # And the workload's `precompile` calls are not silently refused: `precompile` returns `false`
     # rather than throwing when a signature does not apply, e.g. if HTTP changes `Stream`'s
     # parameters, and the workload would then cache nothing.
     stream = Nitro.Stream{false, Nitro.Request{Nitro.Core.HTTP.EmptyBody}}
     @test precompile(listener, (stream,))
+    @test precompile(Nitro.Core.HTTP._serve_conn!,
+                     (Nitro.Core.HTTP.Server{typeof(listener)}, Nitro.Core.HTTP._ServerConn))
     @test precompile(request_handler, (stream,))
     @test precompile(Nitro.Core._handle_reporting, (typeof(request_handler), stream))
     @test precompile(Nitro.Core._send_response!, (Nitro.Core.HTTP.Response{String}, stream,

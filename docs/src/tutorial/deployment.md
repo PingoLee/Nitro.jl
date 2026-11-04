@@ -584,17 +584,20 @@ Then work out which of the two causes it was:
 
 Julia compiles a method the first time it runs with a given set of argument types, so the first
 request a fresh process serves pays for compiling the code it reaches. On a default
-`serve()` with one plain route (Julia 1.12.7, `bench/socket/first_request.sh`), the first request
-took about **1 second** and the second about half a millisecond. Most of that second is paid
-once per process; every route your app adds then pays its own, smaller share the first time it
-is hit, and so does a middleware stack other than the default one.
+`serve()` with one plain route (Julia 1.13.2, `bench/juliac/app.jl`), the first request takes
+about **50 ms**, most of it the access log's first line; with `access_log = false` it is about
+10 ms. Pass your own `middleware` to `serve` and the first request costs about
+**1.5 seconds** more: HTTP.jl compiles its connection loop for each server's handler type, and
+that type changes with the middleware stack. That cost is paid once per process; every route
+your app adds then pays its own, smaller share the first time it is hit.
 
 Nitro already ships what it can: its `PrecompileTools` workload (`src/precompile.jl`) runs the
 router, the serializer, the typed extractors and static and SPA mounts while the package
-precompiles, and compiles (without running) the transport layer of a default `serve()` — no
-`middleware`, the access log on — so that code is cached with Nitro itself. What it cannot reach
-is HTTP.jl's own connection loop, which only a live socket drives, a transport with any other
-middleware stack, and your application's handlers.
+precompiles. It also compiles, without running, the transport layer of a default `serve()` and
+HTTP.jl's connection loop for it, so that code is cached with Nitro itself. A default `serve()`
+means no `middleware`; flags such as the access log do not change the shape. What the workload
+cannot reach is the transport and connection loop of a server with any other middleware stack,
+and your application's handlers.
 
 That matters wherever a fresh process takes traffic at once: a deploy, a restart after a crash,
 an autoscaled replica. Two remedies, in order of effort:
