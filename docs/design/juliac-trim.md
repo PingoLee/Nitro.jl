@@ -1219,7 +1219,23 @@ buy is a startup and deployment win:
 - resident memory and time to first request: **neither measured trimmed yet.** Untrimmed, the
   first request is no faster (1.33 s against 1.28 s), because the image keeps the JIT. That was
   1.12. On 1.13 the untrimmed exe's first request is ≈ 0.02 s against the JIT's 1.4 s
-  (indicative, §3.5).
+  (indicative, §3.5);
+- one file to deploy, with `--static-runtime` (JuliaLang/JuliaC.jl#182, a draft; measured in
+  [#730](https://github.com/PingoLee/Nitro.jl/issues/730#issuecomment-6631936426), on a 1.15
+  nightly, 2026-11-04). The flag links `libjulia-internal.a` into the exe, which needs Julia
+  1.14 or later; 1.13 does not ship the archive.
+  - **`RouteEndpoint` works with it.** JuliaC links with `-Wl,--export-dynamic`, so every
+    `nitro_route_endpoint_*` thunk stays in `.dynsym` through `--gc-sections`, and `jl_dlsym`
+    finds it at run time.
+  - **It does not give one file yet.** On the minimal app, the exe grows from 8.8 to 14.4 MB and
+    drops `libjulia*`. It still NEEDs `libunwind`, `libzstd`, `libatomic` and `libstdc++`, and
+    loads OpenSSL, so the bundle keeps 22 files of 24. Its stack is executable (`GNU_STACK RWE`).
+    A process that runs requests through the pipeline and exits takes 1.5–2 ms less.
+  - **It does not apply to `--trim=no`.** The archive's codegen is a stub, so an untrimmed
+    image segfaults at start-up.
+  - **The served app's size, listen and RSS rows wait** until the trimmed app starts on Julia
+    1.14 and later. Two keyword calls verify on 1.13 but not there: `CookieConfig(; …)` in
+    `serve`, and the request constructor in `_http_stream_request`.
 
 The order:
 
