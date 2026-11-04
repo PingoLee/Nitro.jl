@@ -11,6 +11,7 @@
 #        (e.g. "generic;x86-64-v3").
 #      ENTRY (default `main`): the entry file in this directory.
 #      JULIA, JULIAC_BIN, OUT as in bench/juliac/build.sh. OUT defaults to ./out (gitignored).
+#      JULIAC_FLAGS, BUNDLE as in bench/juliac/build.sh.
 # Nothing secret is read while building: main.jl reads ENV, and `main` loads db/connection.yml,
 # when the executable starts. RealApp includes its models rather than `@import_models`ing them
 # (#790), because that macro registered them by loading db/connection.yml implicitly in the build
@@ -43,6 +44,13 @@ export JULIA_APPS_JULIA_CMD
 STAMP=$(date +%Y%m%d-%H%M%S)
 LOG="$ROOT/bench/results/juliac-$STAMP-realapp-$ENTRY-$MODE-$CPU_TAG.log"
 EXE="$OUT/realapp-$ENTRY-$MODE-$CPU_TAG"
+NAME=$(basename "$EXE")
+BUNDLE_ARGS=()
+if [ -n "${BUNDLE:-}" ]; then
+  mkdir -p "$BUNDLE"; BUNDLE=$(cd "$BUNDLE" && pwd)
+  BUNDLE_ARGS=(--bundle "$BUNDLE"); EXE="$BUNDLE/bin/$NAME"
+fi
+read -r -a FLAGS <<< "${JULIAC_FLAGS:-}"
 {
   echo "julia:    $($JULIA --startup-file=no -e 'print(VERSION)')"
   echo "frontend: $FRONTEND"
@@ -50,6 +58,7 @@ EXE="$OUT/realapp-$ENTRY-$MODE-$CPU_TAG"
   echo "mode:     --trim=$MODE"
   echo "cpu:      ${JULIA_CPU_TARGET:-(JuliaC default)}"
   echo "exe:      $EXE"
+  echo "flags:    ${JULIAC_FLAGS:-(none)}${BUNDLE:+, bundled in $BUNDLE}"
   echo "nitro:    $(git -C "$ROOT" rev-parse --short HEAD)"
 } | tee "$LOG"
 
@@ -58,7 +67,7 @@ $JULIA --startup-file=no --project="$HERE" -e 'using Pkg; Pkg.instantiate()' 2>&
 rm -f "$EXE"
 # `--output-exe` takes a file name: JuliaC writes it to the working directory. Unbundled, as
 # bench/juliac/build.sh builds: the exe links against JULIA's own lib/ by absolute path.
-( cd "$OUT" && "$JULIAC_BIN" --project "$HERE" --output-exe "$(basename "$EXE")" \
+( cd "$OUT" && "$JULIAC_BIN" --project "$HERE" --output-exe "$NAME" "${BUNDLE_ARGS[@]}" "${FLAGS[@]}" \
     --trim="$MODE" --experimental "$HERE/$ENTRY.jl" ) 2>&1 | tee -a "$LOG"
 RC=${PIPESTATUS[0]}
 echo "build: rc=$RC, $(( $(date +%s) - START )) s" | tee -a "$LOG"
