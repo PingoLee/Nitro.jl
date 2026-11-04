@@ -137,7 +137,7 @@ route and no middleware, so the probe stays the measure of the route path.
 The lesson that generalizes: **`repr`/`string` of an un-inferred value is the most expensive single
 trim mistake**, and that includes a `Symbol`. Type the value, then `print` it.
 
-## 3. Remaining (40 errors on the minimal app on Julia 1.12.7; on 1.13, 96, then 87 after §3.6, 59 after the start-up walls, 27 after §3.7, 11 after §3.8 and 4 on HTTP 2.13, §3.9; the probe 22 after §3.11)
+## 3. Remaining (40 errors on the minimal app on Julia 1.12.7; on 1.13, 96, then 87 after §3.6, 59 after the start-up walls, 27 after §3.7, 11 after §3.8 and 4 on HTTP 2.13, §3.9; the probe 22 after §3.11, 18 after #851)
 
 Measured 2026-10-22 on Julia 1.12.7, before and after #572. Each error is printed twice, so 20
 sites. `main` before #572 had **22**: the 20 below plus `CookieKey`'s, which arrived with a later
@@ -1051,7 +1051,8 @@ version this record's earlier counts were built with, the after tree's probe rea
   (#747) removes the call.
 - **The other 6 rows.** 121 is 6 more than §3.8's 115: 4 at `csrf_middleware.jl`
   `_foreign_binding` (the trimmed image's refusal of a non-`String` session id) and 2 more
-  outside `src/`. Neither is root-caused here.
+  outside `src/`. Neither is root-caused here; §3.11 finds the cause of the 4 and clears them
+  (#851).
 
 **The fatal check (#749, #752) still passes on HTTP 2.13.** On the after tree, `fatal_check.sh`
 gives the table at the end of §3.8, mode for mode, for all three builds:
@@ -1178,11 +1179,20 @@ branch on `b89ce573`, same toolchain as above, the probe reads **22**: the 9 row
 was added, and every probe answers as under the JIT, `/session/set` and the global
 `/session/get` with `200`.
 
-The 22 left: the `@with` HAMT inside Base (4, §3.5); 14 outside `src/`; and 4 at
-`csrf_middleware.jl` `_foreign_binding`, which §3.9 left without a cause. They are its refusal
-message: `nameof(typeof(value))` on a `value::AbstractString` is itself an unresolved call, because
-`typeof` of an abstractly typed value infers `Type{<:AbstractString}`. The refusals in this
-section take their argument `@nospecialize`, where `typeof` infers `DataType`, and verify clean.
+Of those 22, 4 were at `csrf_middleware.jl` `_foreign_binding`, which §3.9 left without a cause.
+They were its refusal message. `nameof(typeof(value))` on a `value::AbstractString` is itself an
+unresolved call, because `typeof` of an abstractly typed value infers `Type{<:AbstractString}`.
+The refusals in this section take their argument `@nospecialize` with no annotation; there
+`typeof` infers `DataType`, and they verify clean. [#851](https://github.com/PingoLee/Nitro.jl/issues/851)
+dropped the annotation the same way. Rebuilt 2026-11-04 from `main` at `6e0022ca` with Julia
+1.13.2, JuliaC 0.3.12, HTTP.jl 2.13.5 and JSON.jl 1.13.4, the probe reads **18**: the 4 rows
+are gone, no row was added, and every probe answers as under the JIT. The JIT is unchanged: its
+one caller has already checked `value isa AbstractString`, and the conversion is the same
+`String(value)`. `test/middleware/csrf_middleware_tests.jl` pins it without a build, in a child
+with `_trimmed()` redefined to `true`: under the JIT the refusal is dead code, so inference never
+looks at it.
+
+The 18 left are the `@with` HAMT inside Base (4, §3.5) and 14 outside `src/`.
 
 What a trimmed image asks of an application's session: values of the JSON types, as a JSON
 store holds anyway. A `MemoryStore` session holding another value (a `Symbol`, a `DateTime`) is

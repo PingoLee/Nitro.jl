@@ -202,8 +202,10 @@ function _binding(req::HTTP.Request)::Nullable{String}
 end
 
 # Any other string type an app stored: converted under the JIT, as before; a trimmed image, which
-# has no code for the conversion, refuses it rather than leave the token unbound.
-@noinline function _foreign_binding(@nospecialize(value::AbstractString))::String
+# has no code for the conversion, refuses it rather than leave the token unbound. The argument is
+# unannotated, as every trimmed-image refusal's is: declared `::AbstractString`, `typeof(value)`
+# inferred `Type{<:AbstractString}`, and the refusal's own `nameof` was an unresolved call (#851).
+@noinline function _foreign_binding(@nospecialize(value))::String
     _trimmed() && throw(ArgumentError(
         "Nitro: a trimmed image binds CSRF tokens only to a String session id; got a $(nameof(typeof(value)))"))
     return String(value)
