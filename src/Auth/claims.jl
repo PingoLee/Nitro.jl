@@ -23,19 +23,52 @@ _claim_value(claims::Dict{String, Any}, key::AbstractString, default=nothing) = 
 #   the only branch that returns without a call. The abstract ones narrow `value` no further
 #   than `Integer`, so their `Int(value)` dispatches dynamically -- fine for the float and string
 #   spellings another issuer might use, measurably worse for the common one.
+#
+# The float and string spellings come next at the types JSON.jl parses them into, `Float64` and
+# `String`, so that `trunc` and `tryparse` are static calls: on an `AbstractFloat` or an
+# `AbstractString` they were not, which `juliac --trim` rejects (docs/design/juliac-trim.md
+# §3.11). Other numbers and strings, which only a claims dict an application built can hold, go
+# to `_claim_int_abstract`.
 function _claim_int(@nospecialize(value), field::String)::Int
-    if value isa Int
-        return value
-    elseif value isa Integer
-        return Int(value)
-    elseif value isa AbstractFloat
-        return trunc(Int, value)
-    elseif value isa AbstractString
-        parsed = tryparse(Int, value)
-        isnothing(parsed) && throw(AuthError("Invalid $field claim"))
-        return parsed
-    end
+    value isa Int && return value
+    value isa Float64 && return trunc(Int, value)
+    value isa String && return _claim_int_parse(value, field)
+    # `Int(value)` on an abstract `Integer` resolves statically only while few `Integer` methods are
+    # loaded, so it is out of line too: in a full test run, it was a dynamic call.
+    (value isa Integer || value isa AbstractFloat || value isa AbstractString) &&
+        return _claim_int_abstract(value, field)
     throw(AuthError("Invalid $field claim"))
+end
+
+function _claim_int_parse(value::String, field::String)::Int
+    parsed = tryparse(Int, value)
+    isnothing(parsed) && throw(AuthError("Invalid $field claim"))
+    return parsed
+end
+
+@noinline function _claim_int_abstract(@nospecialize(value), field::String)::Int
+    _trimmed() && throw(ArgumentError(
+        "Nitro: a trimmed image reads a time claim as an Int64, a Float64 or a String; got a $(nameof(typeof(value)))"))
+    value isa Integer && return Int(value)
+    value isa AbstractFloat && return trunc(Int, value)
+    parsed = tryparse(Int, value)
+    isnothing(parsed) && throw(AuthError("Invalid $field claim"))
+    return parsed
+end
+
+# `string(value)` for a claim value, which is `Any`. JSON's scalars are listed, so their `string` is
+# static; a container or a value outside the list keeps the JIT's dynamic call, and a trimmed image
+# refuses it (`with_json_value`). Used for the principal's `id` and the `iss` that `warn_claims`
+# reports.
+_claim_string(@nospecialize(value))::String = with_json_value(_claim_string_typed, value)
+
+_claim_string_typed(value::Union{String, Int64, Float64, Bool}) = string(value)
+_claim_string_typed(value) = _claim_string_other(value)
+
+@noinline function _claim_string_other(@nospecialize(value))::String
+    _trimmed() && throw(ArgumentError(
+        "Nitro: a trimmed image reads a claim as a string only from a JSON scalar; got a $(nameof(typeof(value)))"))
+    return string(value)
 end
 
 _current_timestamp() = trunc(Int, Dates.datetime2unix(Dates.now(Dates.UTC)))

@@ -4,7 +4,7 @@ using HTTP
 import JSON
 
 using ...Types: CookieConfig, Nullable, with_response, _trimmed
-using ...Cookies: get_cookie, set_cookie!
+using ...Cookies: get_cookie, set_cookie!, _set_framework_cookie!
 import ...Cookies
 using ...Crypto: secure_random_bytes, _empty_hmac_key, _hmac_sha256, SecretString, reveal, base64url_encode,
     base64url_decode
@@ -296,7 +296,7 @@ end
 function _set_token_cookie!(res::Union{HTTP.Response, HTTP.Headers}, secret::String, raw_token::String,
                             binding::AbstractString, cookie_name::String, ttl::Int,
                             config::CookieConfig)
-    set_cookie!(res, cookie_name, _signed_token(secret, raw_token, binding); config=config, encrypted=false, maxage=ttl)
+    _set_framework_cookie!(res, cookie_name, _signed_token(secret, raw_token, binding), config, false, ttl)
     return nothing
 end
 

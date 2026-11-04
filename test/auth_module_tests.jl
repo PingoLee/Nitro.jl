@@ -679,7 +679,8 @@ end
     end
 end
 
-# A `dicttype` whose constructor throws: it runs inside `_jwt_segment_json`'s `try`, which is
+# A `dicttype` whose constructor throws, in a parser handed to `_jwt_segment_json`: it runs inside
+# that function's `try`, which is
 # the only way left to reach that block with something other than an `ArgumentError` now that
 # the header cap and the depth bound answer a deep token first.
 struct JWTBoomDict <: AbstractDict{String, Any} end
@@ -746,7 +747,9 @@ JWTBoomDict() = throw(OutOfMemoryError())
     # JSON) is "Invalid JWT encoding"; anything else is not a bad token and goes through
     # (#254). A real overflow used to pin this from the bearer path; the cap now answers that
     # token first, so pin it from inside the guarded block instead.
-    @test_throws OutOfMemoryError Nitro.Auth._jwt_segment_json(raw64("{}"); dicttype = JWTBoomDict)
+    boom_parse(buf; max_fields) =
+        Nitro.Core.Util.BodyParsers._parse_json_bounded(buf; max_fields, dicttype = JWTBoomDict)
+    @test_throws OutOfMemoryError Nitro.Auth._jwt_segment_json(boom_parse, raw64("{}"))
     @test msg(() -> Nitro.Auth._jwt_segment_json("!")) == "Invalid JWT encoding"
     @test msg(() -> Nitro.Auth._jwt_segment_json(raw64(repeat("[", 513)))) == "Invalid JWT encoding"
 end

@@ -1085,6 +1085,103 @@ read 0.8–6.6 ms; `json_validate` reads 297 ms (13%), a cost it shares with `wr
 root-caused. The PormG routes read 22–38% of the JIT: see #813, and #744's start-up workload
 follow-up.
 
+### 3.11 JWT claims and the session's values: a closed dispatch over JSON (#747, #748)
+
+Built 2026-11-04 with Julia 1.13.2, JuliaC 0.3.12, HTTP.jl 2.13.1 and JSON.jl 1.13.4 on Linux
+x86-64, `ENTRY=probe`, `unsafe-warn`, counted by first frame, from `main` at `7f1609b7` and the
+change on top of it. `main` reads **121**, §3.9's count, with the same 5 wrong answers.
+
+**The machinery, shared by both.** A verified token's claims and a loaded session are
+`Dict{String, Any}`. Their values are whatever the token's author or the application put there,
+so every compare, copy or `string` of one was a dynamic call. `Types.with_json_value`
+(`src/jsonvalue.jl`) is the closed dispatch over the types JSON.jl parses into (`String`, `Int64`,
+`Float64`, `Bool`, `Nothing`, `Vector{Any}`, `Dict{String, Any}`, `JSON.Object{String, Any}`), in
+the style of `with_response` and `with_session`. Anything else keeps the JIT's dynamic call and is
+refused in a trimmed image. Three walks over those values replace Base where a trimmed image needs
+them: `_json_equal` (`==` and `isequal`), `_json_copy` (`deepcopy`) and `_json_dicts` (a `dicttype`
+parse). Their tests take every expected value from Base on the same inputs.
+
+**A recursive walk must be one self-recursive method.** The first version recursed back through
+`with_json_value`'s `f`. That verified with no error at the walk, but the image threw at run time
+at the first call into the cycle ("unresolved invoke" of `_json_dicts_typed(::JSON.Object)`): the
+verifier leaves a cycle of method instances unresolved. Each walk is now one `@nospecialize`
+method that calls itself, with its own chain of `isa` tests, and folds its object cases inline.
+Splitting them into helpers would bring the cycle back.
+
+**JWT claims (#747).** 62 rows, all cleared:
+
+| First frame in `src/` | `main` | after | What it was, and the change |
+|---|---:|---:|---|
+| `Auth/jwt.jl` `_decode_jwt` (the header) | 12 | 0 | the header narrowed only to `AbstractDict`, so `get`, `haskey` and the `alg` compare dispatched. It is checked at `JSON.Object{String, Any}`, the one type that parse produces, and `kid` and `alg` at `String`, the one type a JSON string parses to |
+| `utilities/bodyparsers.jl` `_parse_json_bounded` (the claims, `dicttype`) | 2 | 0 | below |
+| `Auth/validators.jl` `_principal`, `_warn_iss` | 14 | 0 | `string` of a claim value: `_claim_string`, static for a JSON scalar |
+| `Auth/claims.jl` `_claim_int` | 6 | 0 | `trunc` on `AbstractFloat`, `tryparse` on `AbstractString`: `Float64` and `String` branches first |
+| `middleware/guards.jl` the claim compare, `_session_claims` | 10 | 0 | the claims source read as `AbstractDict` and its value as `Any`; `_with_claims` (a `Principal`, a `Dict{String, Any}`, a `JSON.Object`) and `with_json_value`. `_is_identity` is unspecialized, with the concrete string and dict types first |
+| `middleware/auth_middleware.jl` `_handle_validated` | 8 | 0 | `_deny(unauthorized::Function, …)`: Julia does not specialize on a function argument a method only passes on; `unauthorized::U where U` |
+| `utilities/misc.jl` `_has_two_arg_method` | 10 | 0 | the validator's arity by reflection on a memo miss. Answered when the middleware is built, and used in a trimmed image; the JIT keeps its per-request memo, which exists for Revise |
+
+**`dicttype` is a wall twice over.** A type keyword reaches `JSON.parse`'s keyword body as a plain
+`DataType`, so the keyword call itself does not resolve. That is not about forwarding: a literal
+`dicttype = Dict{String, Any}` at the call site reads the same, because a `NamedTuple` types the
+field `DataType`. `Core.kwcall` with a `NamedTuple` whose field is typed `Type{Dict{String, Any}}`
+does resolve (`_parse_json_dict_bounded`, kept for the JIT's static call). Past that call, JSON.jl's
+parse under a non-default `dicttype` goes through `StructUtils.make`, whose `applyarray` and
+`applyobject` calls the verifier rejects, while its default-object parse verifies clean. So a
+trimmed image parses the claims to `JSON.Object`s and rebuilds them as `Dict{String, Any}`
+(`_json_dicts`), and the JIT keeps JSON.jl's own parse (`Auth._parse_jwt_claims`, behind
+`_trimmed()`). This corrects §3.9 and #801's comment, which said the constant form verifies.
+
+The trimmed probe's three bearer-token requests now answer `200`, `401` and `403`, as under the
+JIT. The probe reads **59**.
+
+The validator's arity is still found by reflection (`Base.methods`), only now when `BearerAuth`,
+`CookieAuthMiddleware` or `jwt_validator` is called. Built at top level, as the probe and an
+application's `urlpatterns` do, that runs while the image is built. Built inside `main`, it runs in
+the image, and the `misc.jl` rows come back: build the auth middleware at top level.
+
+What a trimmed image asks of an application, all on paths that refuse rather than misanswer: a
+claim value outside the JSON types (one a custom claims dict holds) is an `ArgumentError`, which
+the auth middleware answers `401` and a guard `500`; and an application's own claims dict type in
+`req.context[:user]` is refused the same way. A guard's configured value is compared at its own
+type, so `claim_required("role", "admin")` is static, but a container value
+(`claim_required("roles", ["a"])`) still compares element by element through a dynamic `==`.
+
+**The session store (#748).** 37 rows on top of the 59, 28 of them Nitro's:
+
+| First frame in `src/` | before | after | What it was, and the change |
+|---|---:|---:|---|
+| `middleware/session_middleware.jl` the auth-marker compare | 6 | 0 | `isequal` on two `Any`s: `_json_equal(isequal, …)`, unspecialized |
+| `middleware/session_middleware.jl` the dirty check | 4 | 0 | `Dict{String, Any}` `!=`, which compares values as `Any`: `_json_equal(==, …)` in a trimmed image, Base's `!=` under the JIT (`_session_changed`), because Base's dict `==` is three-valued and a `MemoryStore` session can hold a `missing` |
+| `middleware/session_middleware.jl` `_load_session` | 2 | 0 | `deepcopy` of the loaded payload, read as `Any`: `_copy_session`, which is `deepcopy` under the JIT and `_json_copy` in a trimmed image |
+| `types.jl` `MemoryStore`'s copy (#318) | 0 | 0 | newly reached once the above cleared (2 rows); the same `_trimmed()` switch |
+| `cookies.jl` `set_cookie!` | 16 | 0 | its `attrs` branch, a `Dict{Symbol, Any}`. Every framework write (the session id, the CSRF token, the auth cookie) passes no `attrs`, and now calls `_set_framework_cookie!`, the `attrs`-free path, directly |
+| `types.jl` LRUCache.jl's `by` and `finalizer` | 9 | 9 | upstream, below |
+
+The copy is the one place the two builds differ on purpose. `deepcopy` keeps two keys that share
+one mutable value sharing one copy, and the JIT keeps that. A trimmed image's walk gives each a
+copy of its own, which nothing parsed from JSON can tell apart.
+
+**LRUCache.jl is what keeps the session write failing.** The probe reads **31** with the above,
+and the trimmed session write and the global session read still answer `500`. Built with the
+pipeline's error catching off, the image says why: `storesession!` throws a `MethodError`, which is
+how a trimmed image fails a call it never compiled. `LRU{K, V}` declares `by::Any` and
+`finalizer::Any` (LRUCache.jl 1.6.2), and `setindex!` calls both on every insert. So the 9 rows are
+not cosmetic: a `MemoryStore` cannot store a session in a trimmed image, and a `:lazy` static mount's
+cache, which is the same type, cannot cache. JuliaCollections/LRUCache.jl#56 (open, 2026-11-01)
+makes `LRU` trim-compatible. The decision is to wait for it rather than hold a typed LRU in Nitro;
+#748 stays open for those rows. The session's own walls are cleared, so with a fixed `LRU` the
+session answers should be the JIT's, but that is untested until #56 lands.
+
+The 31 left: those 9; the `@with` HAMT inside Base (4, §3.5); 14 outside `src/`; and 4 at
+`csrf_middleware.jl` `_foreign_binding`, which §3.9 left without a cause. They are its refusal
+message: `nameof(typeof(value))` on a `value::AbstractString` is itself an unresolved call, because
+`typeof` of an abstractly typed value infers `Type{<:AbstractString}`. The refusals in this
+section take their argument `@nospecialize`, where `typeof` infers `DataType`, and verify clean.
+
+What a trimmed image asks of an application's session: values of the JSON types, as a JSON
+store holds anyway. A `MemoryStore` session holding another value (a `Symbol`, a `DateTime`) is
+refused when it is copied or compared, as an `ArgumentError`, which the request answers `500`.
+
 ## 4. The decision: `--trim=safe` is a target
 
 **The question was:** is `--trim=safe` a product target for Nitro, or a ratchet that only keeps

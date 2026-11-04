@@ -615,14 +615,8 @@ function set_cookie!(
     # Path before domain, in both branches: when both are invalid, the path's error is the one
     # reported, as it always was.
     if isempty(attrs)
-        return _set_cookie!(res, name, value, config,
-                            _normalize_runtime_path(isnothing(path) ? config.path : path),
-                            isnothing(domain) ? config.domain : _normalize_domain(domain),
-                            isnothing(expires) ? config.expires : expires,
-                            isnothing(maxage) ? config.maxage : maxage,
-                            isnothing(httponly) ? config.httponly : httponly,
-                            isnothing(secure) ? config.secure : secure,
-                            isnothing(samesite) ? config.samesite : samesite, encrypted, secret_key)
+        return _set_cookie_plain!(res, name, value, config, path, domain, expires, maxage, httponly,
+                                  secure, samesite, encrypted, secret_key)
     end
     given = Dict{Symbol, Any}()
     for (k, v) in attrs
@@ -642,6 +636,34 @@ function set_cookie!(
                         pick(httponly, :httponly, config.httponly), pick(secure, :secure, config.secure),
                         pick(samesite, :samesite, config.samesite), encrypted, secret_key)
 end
+
+# `set_cookie!` with no `attrs`: each attribute is the explicit one, else the config's.
+function _set_cookie_plain!(res::Union{HTTP.Response, HTTP.Headers}, name, value, config::CookieConfig,
+                            path, domain, expires, maxage, httponly, secure, samesite, encrypted,
+                            secret_key)
+    return _set_cookie!(res, name, value, config,
+                        _normalize_runtime_path(isnothing(path) ? config.path : path),
+                        isnothing(domain) ? config.domain : _normalize_domain(domain),
+                        isnothing(expires) ? config.expires : expires,
+                        isnothing(maxage) ? config.maxage : maxage,
+                        isnothing(httponly) ? config.httponly : httponly,
+                        isnothing(secure) ? config.secure : secure,
+                        isnothing(samesite) ? config.samesite : samesite, encrypted, secret_key)
+end
+
+"""
+    _set_framework_cookie!(res, name, value, config, encrypted, maxage)
+
+`set_cookie!(res, name, value; config, encrypted, maxage)`, for Nitro's own writes: the session
+id, the CSRF token, the auth cookie. Each passes only those three, so this goes straight to the
+`attrs`-free path. Through `set_cookie!` the call also compiled its `attrs` branch, whose
+`Dict{Symbol,Any}` values a trimmed image cannot read (#748, docs/design/juliac-trim.md §3.11).
+`value` is a `String`, which `set_cookie!`'s refusal of a secret never applies to.
+"""
+_set_framework_cookie!(res::Union{HTTP.Response, HTTP.Headers}, name::String, value::String,
+                       config::CookieConfig, encrypted::Bool, maxage::Int) =
+    _set_cookie_plain!(res, name, value, config, nothing, nothing, nothing, maxage, nothing,
+                       nothing, nothing, encrypted, nothing)
 
 # `set_cookie!` past the resolution: every attribute is already the one to use (`path` and
 # `domain` normalized), and `nothing` means "none", not "the config's". Untyped, so it

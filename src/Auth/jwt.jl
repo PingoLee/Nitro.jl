@@ -154,7 +154,7 @@ function encode_jwt(payload::AbstractDict, secret_or_keyset; expires_in::Union{I
     # ArgumentError here, from the parser rather than the scope: decoding would refuse it too.
     scope = signing_kid === nothing ? nothing : _key_scope(secret_or_keyset, signing_kid)
     if scope !== nothing
-        _claims_in_scope(scope, _parse_json_bounded(encoded_claims; max_fields = 0, dicttype = Dict{String, Any})) ||
+        _claims_in_scope(scope, _parse_jwt_claims(encoded_claims; max_fields = 0)) ||
             throw(ArgumentError("JWT signing key $(repr(signing_kid)) is not permitted to assert every " *
                                 "claim in this payload; see its claims scope on the JWTKeyset"))
     end
@@ -235,14 +235,21 @@ function _decode_jwt(token::AbstractString, secret_or_keyset; issuer=nothing, au
     # their escapes -- a bad escape in `typ` parsed -- and RFC 7515 §5.2 requires the header
     # to be a completely valid JSON object. JSON.jl 1.12 checks escapes in a skip too (#721);
     # the Dict parse stays until a struct target is shown to refuse every row the test pins.
-    header isa AbstractDict || throw(AuthError("Invalid JWT header"))
+    #
+    # Checked at the one object type that parse produces, JSON.jl's own, rather than as an
+    # `AbstractDict`: that narrowed the slot no further, so the `get`s and `haskey` below were
+    # dynamic calls, which `juliac --trim` rejects (#747, docs/design/juliac-trim.md §3.11). The
+    # same objects pass and fail as before.
+    header isa JSON.Object{String, Any} || throw(AuthError("Invalid JWT header"))
 
     # Same class, one level down: a JSON `kid` is whatever the token's author typed --
     # `123`, `["a"]`, `null`. Anything but a string is a MethodError on
     # `_verify_candidates`, whose `header_kid` parameter is itself typed -- so it fires
     # for a plain string secret just as it does for a keyset.
+    # JSON.jl parses every string to a `String`, so `isa String` admits exactly what
+    # `isa AbstractString` did, and makes the `String(raw_kid)` below a static call.
     raw_kid = get(header, "kid", nothing)
-    (raw_kid === nothing || raw_kid isa AbstractString) ||
+    (raw_kid === nothing || raw_kid isa String) ||
         throw(AuthError("Invalid JWT key id"))
     # A fresh binding, not a reassignment of `raw_kid`: Julia types a slot by the join over
     # every assignment to it, so narrowing in place would leave the slot `Any` and keep
@@ -261,7 +268,9 @@ function _decode_jwt(token::AbstractString, secret_or_keyset; issuer=nothing, au
         #
         # Inside `verify` on purpose: `decode_jwt(...; verify=false)` is the offline
         # inspection path and must keep parsing a token whatever its header says.
-        get(header, "alg", nothing) == "HS256" ||
+        # A `String` test before the compare, so `==` is static: no other JSON value equals one.
+        alg = get(header, "alg", nothing)
+        (alg isa String && alg == "HS256") ||
             throw(AuthError("Unsupported JWT algorithm"))
 
         # RFC 7515 §4.1.11: a recipient that does not understand an extension listed in
@@ -337,7 +346,7 @@ function _decode_jwt(token::AbstractString, secret_or_keyset; issuer=nothing, au
     # (nitro-core §7). `Dict{String, Any}` is also what `Principal` stores, so the validator
     # does not copy the claims per request either. The VALUES stay `Any`: a claim is
     # whatever the token's author typed.
-    claims = _jwt_segment_json(segments[2]; dicttype = Dict{String, Any})
+    claims = _jwt_segment_json(_parse_jwt_claims, segments[2])
     # Checking the concrete type is what narrows the slot -- assigned exactly once, so
     # `_decode_jwt` infers `Tuple{Dict{String, Any}, Nullable{String}}`.
     claims isa Dict{String, Any} || throw(AuthError("Invalid JWT claims"))
@@ -353,13 +362,28 @@ function _decode_jwt(token::AbstractString, secret_or_keyset; issuer=nothing, au
 end
 
 """
-    _jwt_segment_json(segment; kwargs...)
+    _jwt_segment_json(segment)
+    _jwt_segment_json(parse, segment)
 
-Base64url-decode one JWT segment and parse it as JSON through `_parse_json_bounded`, so its
-nesting is bounded before the parser recurses (#314). Either decoder failing is
+Base64url-decode one JWT segment and parse it as JSON through `_parse_json_bounded` (or `parse`,
+one of the bounded parsers: the claims go through `_parse_json_dict_bounded`), so its nesting is
+bounded before the parser recurses (#314). Either decoder failing is
 `AuthError("Invalid JWT encoding")`.
+
+The parser is an argument rather than forwarded keywords: a `dicttype` keyword forwarded through
+`kwargs...` reached `JSON.parse` as a plain `DataType`, which a trimmed image cannot call (#747).
 """
-function _jwt_segment_json(segment::AbstractString; kwargs...)
+_jwt_segment_json(segment::AbstractString) = _jwt_segment_json(_parse_json_bounded, segment)
+
+# The claims parser: a `Dict{String, Any}` all the way down, which is what `Principal` stores.
+# Under the JIT, JSON.jl's own `dicttype` parse. A trimmed image cannot verify that parse, so it
+# parses to JSON.jl's default objects and rebuilds them (`_json_dicts`, #747); `_trimmed()` folds
+# the branch, so each build compiles one of the two.
+_parse_jwt_claims(buf; max_fields::Integer) = _trimmed() ?
+    _json_dicts(_parse_json_bounded(buf; max_fields)) :
+    _parse_json_dict_bounded(buf; max_fields)
+
+function _jwt_segment_json(parse::P, segment::AbstractString) where {P}
     try
         # No field cap (#327): a segment is already size-bounded, and the cap's `ValidationError`
         # is not the `AuthError` this function promises. The depth bound still applies.
@@ -367,7 +391,7 @@ function _jwt_segment_json(segment::AbstractString; kwargs...)
         # The decoded bytes are parsed as they are: `String(...)` around them copied the
         # segment once more per token (#456), and JSON.jl reads a byte vector with the same
         # grammar and the same refusals as a String.
-        return _parse_json_bounded(base64url_decode(segment); max_fields = 0, kwargs...)
+        return parse(base64url_decode(segment); max_fields = 0)
     catch e
         # Every byte of the segment is attacker-supplied, and BOTH decoders are sinks:
         # `base64url_decode` throws ArgumentError on a bad alphabet, an impossible length, or

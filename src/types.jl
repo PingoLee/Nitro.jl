@@ -221,12 +221,26 @@ Base.values(principal::Principal) = values(getfield(principal, :claims))
 # `0` (a real user id in some schemas), a non-empty `Principal` whose `id` is `nothing` (how a
 # service token authenticates), and a claim-less `Principal` that does carry an `id` (a
 # keyset-verified signer under `identity_from = :kid` is a principal whatever its payload).
-function _is_identity(x)::Bool
+#
+# The argument is usually `Any` (a validator's result, a session's login marker), so the method is
+# compiled once, unspecialized, and the call to it is static. The concrete string and dict types
+# come first so that their `isempty` is static too (docs/design/juliac-trim.md §3.11); any other
+# `AbstractString` or `AbstractDict` takes one dynamic call under the JIT, which a trimmed image
+# refuses.
+function _is_identity(@nospecialize(x))::Bool
     (x === nothing || x === missing || x isa Bool) && return false
-    x isa AbstractString && return !isempty(x)
+    x isa String && return !isempty(x)
     x isa Principal && return x.id !== nothing || !isempty(x)
-    x isa AbstractDict && return !isempty(x)
+    x isa Dict{String, Any} && return !isempty(x)
+    x isa JSON.Object{String, Any} && return !isempty(x)
+    (x isa AbstractString || x isa AbstractDict) && return _is_nonempty_abstract(x)
     return true
+end
+
+@noinline function _is_nonempty_abstract(@nospecialize(x))::Bool
+    _trimmed() && throw(ArgumentError(
+        "Nitro: a trimmed image reads an identity as a String or a Dict{String,Any}; got a $(nameof(typeof(x)))"))
+    return !isempty(x)
 end
 
 @kwdef struct Param{T}
@@ -794,8 +808,14 @@ end
 # request of one session mutating ONE vector: lost appends, `ConcurrencyViolationError`, and a
 # nested `Dict` corrupted badly enough that every later request on the session threw. A stored
 # value must never be reachable from a request, in either direction.
+#
+# A trimmed image cannot `deepcopy` a dict of `Any` values, so it copies the `Dict{String,Any}`
+# sessions `SessionMiddleware` stores through the walk over JSON values, which refuses a value of any
+# other type (#748, docs/design/juliac-trim.md §3.11). The JIT keeps `deepcopy`.
 function _copy_session_value(value)
-    if value isa AbstractDict || value isa AbstractArray
+    if _trimmed() && value isa Dict{String, Any}
+        return _json_copy(value)::Dict{String, Any}
+    elseif value isa AbstractDict || value isa AbstractArray
         return deepcopy(value)
     end
     return value
@@ -2314,5 +2334,6 @@ end
 (h::DeclaredMethodHandler)(req::HTTP.Request) = h.handler(req)
 
 include("routeendpoint.jl")
+include("jsonvalue.jl")
 
 end # module Types
