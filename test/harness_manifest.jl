@@ -67,6 +67,7 @@ const TEST_FILES = [
     "cookies_tests.jl",
     "session_tests.jl",
     "sessionstores_tests.jl",
+    "boundedlru_tests.jl",
     "ctrl_c_child_tests.jl",
     "workers_tests.jl",
     "workers_consumer_e2e_tests.jl",

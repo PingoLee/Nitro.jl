@@ -1147,8 +1147,8 @@ end
             # Read ONCE across three hits: the cache is real.
             @test reads["small.txt"] == 1
 
-            # big.bin is 300 KB against a 128 KB budget. LRUCache does NOT evict to make room for
-            # an entry larger than `maxsize` -- it declines to store it and leaves the cache
+            # big.bin is 300 KB against a 128 KB budget. The cache (`BoundedLRU`) does NOT evict to
+            # make room for an entry larger than `maxsize` -- it declines to store it and leaves the cache
             # intact -- so this is the "oversized entry cannot wedge the cache" case: it is
             # served correctly, re-read every time, and small.txt keeps its slot.
             for _ in 1:2
