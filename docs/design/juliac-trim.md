@@ -137,7 +137,7 @@ route and no middleware, so the probe stays the measure of the route path.
 The lesson that generalizes: **`repr`/`string` of an un-inferred value is the most expensive single
 trim mistake**, and that includes a `Symbol`. Type the value, then `print` it.
 
-## 3. Remaining (40 errors on the minimal app on Julia 1.12.7; on 1.13, 96, then 87 after §3.6, 59 after the start-up walls, 27 after §3.7, 11 after §3.8 and 4 on HTTP 2.13, §3.9)
+## 3. Remaining (40 errors on the minimal app on Julia 1.12.7; on 1.13, 96, then 87 after §3.6, 59 after the start-up walls, 27 after §3.7, 11 after §3.8 and 4 on HTTP 2.13, §3.9; the probe 22 after §3.11)
 
 Measured 2026-10-22 on Julia 1.12.7, before and after #572. Each error is printed twice, so 20
 sites. `main` before #572 had **22**: the 20 below plus `CookieKey`'s, which arrived with a later
@@ -952,9 +952,9 @@ Under the JIT the same probe found that `jwt_validator` captures a string secret
 the CSRF one prints masked. That is #751.
 
 **The next walls:**
-- The session store's internals: the auth-marker compare and the dirty check over the session's
-  `Any` values, `deepcopy`, `set_cookie!`'s attribute `Dict`, and LRUCache.jl's untyped fields.
-  `SessionMiddleware` cannot answer a request in a trimmed image until they are cleared.
+- ~~The session store's internals: the auth-marker compare and the dirty check over the session's
+  `Any` values, `deepcopy`, `set_cookie!`'s attribute `Dict`, and LRUCache.jl's untyped fields.~~
+  **Cleared** (§3.11, #748 and #850): `SessionMiddleware` answers in a trimmed image.
 - Auth: JWT claims read as `Any` (`_principal`, `_claim_int`, `_warn_iss`, the guards' claim
   compare), `unauthorized::Function`, and the validator's arity check by reflection. The claims
   want the same closed dispatch over JSON values that the session's values do.
@@ -1155,24 +1155,30 @@ type, so `claim_required("role", "admin")` is static, but a container value
 | `middleware/session_middleware.jl` `_load_session` | 2 | 0 | `deepcopy` of the loaded payload, read as `Any`: `_copy_session`, which is `deepcopy` under the JIT and `_json_copy` in a trimmed image |
 | `types.jl` `MemoryStore`'s copy (#318) | 0 | 0 | newly reached once the above cleared (2 rows); the same `_trimmed()` switch |
 | `cookies.jl` `set_cookie!` | 16 | 0 | its `attrs` branch, a `Dict{Symbol, Any}`. Every framework write (the session id, the CSRF token, the auth cookie) passes no `attrs`, and now calls `_set_framework_cookie!`, the `attrs`-free path, directly |
-| `types.jl` LRUCache.jl's `by` and `finalizer` | 9 | 9 | upstream, below |
+| `types.jl` LRUCache.jl's `by` and `finalizer` | 9 | 0 | **cleared** in #850: Nitro's own `BoundedLRU`, below |
 
 The copy is the one place the two builds differ on purpose. `deepcopy` keeps two keys that share
 one mutable value sharing one copy, and the JIT keeps that. A trimmed image's walk gives each a
 copy of its own, which nothing parsed from JSON can tell apart.
 
-**LRUCache.jl is what keeps the session write failing.** The probe reads **31** with the above,
-and the trimmed session write and the global session read still answer `500`. Built with the
-pipeline's error catching off, the image says why: `storesession!` throws a `MethodError`, which is
-how a trimmed image fails a call it never compiled. `LRU{K, V}` declares `by::Any` and
-`finalizer::Any` (LRUCache.jl 1.6.2), and `setindex!` calls both on every insert. So the 9 rows are
-not cosmetic: a `MemoryStore` cannot store a session in a trimmed image, and a `:lazy` static mount's
-cache, which is the same type, cannot cache. JuliaCollections/LRUCache.jl#56 (open, 2026-11-01)
-makes `LRU` trim-compatible. The decision is to wait for it rather than hold a typed LRU in Nitro;
-#748 stays open for those rows. The session's own walls are cleared, so with a fixed `LRU` the
-session answers should be the JIT's, but that is untested until #56 lands.
+**LRUCache.jl kept the session write failing, until #850.** With the rows above cleared the probe
+read **31**, and the trimmed session write and the global session read still answered `500`. Built
+with the pipeline's error catching off, the image said why: `storesession!` threw a `MethodError`,
+which is how a trimmed image fails a call it never compiled. `LRU{K, V}` declared `by::Any` and
+`finalizer::Any` (LRUCache.jl 1.6.2), and `setindex!` called both on every insert. So the 9 rows
+were not cosmetic: a `MemoryStore` could not store a session in a trimmed image, and a `:lazy`
+static mount's cache, the same type, could not cache. The first plan was to wait for
+JuliaCollections/LRUCache.jl#56, which makes `LRU` trim-compatible and is still open.
 
-The 31 left: those 9; the `@with` HAMT inside Base (4, §3.5); 14 outside `src/`; and 4 at
+[#850](https://github.com/PingoLee/Nitro.jl/issues/850) replaced it instead with `Util.BoundedLRU{K,
+V, F}` (`src/utilities/boundedlru.jl`): a `Dict` plus an intrusive recency list, with `by` a type
+parameter and no finalizer, so every call in it is static. It keeps LRUCache 1.6's recency and
+oversized-entry rules, and LRUCache.jl is no longer a dependency. Rebuilt 2026-11-04 at the
+branch on `b89ce573`, same toolchain as above, the probe reads **22**: the 9 rows are gone, no row
+was added, and every probe answers as under the JIT, `/session/set` and the global
+`/session/get` with `200`.
+
+The 22 left: the `@with` HAMT inside Base (4, §3.5); 14 outside `src/`; and 4 at
 `csrf_middleware.jl` `_foreign_binding`, which §3.9 left without a cause. They are its refusal
 message: `nameof(typeof(value))` on a `value::AbstractString` is itself an unresolved call, because
 `typeof` of an abstractly typed value infers `Type{<:AbstractString}`. The refusals in this
@@ -1241,8 +1247,9 @@ The order:
      from `_parseparam_fallback`~~ **cleared** in JSON.jl 1.13.4 (JuliaIO/JSON.jl#553 / #555;
      #801, re-measured 2026-11-02: 231 → 121). The `dicttype` keyword's 2 rows belong to #747;
    - Auth's claims, 60 with the guards' claim compare ([#747](https://github.com/PingoLee/Nitro.jl/issues/747));
-   - the session store's internals, 37 with `set_cookie!` and LRUCache.jl
-     ([#748](https://github.com/PingoLee/Nitro.jl/issues/748)).
+   - ~~the session store's internals, 37 with `set_cookie!` and LRUCache.jl
+     ([#748](https://github.com/PingoLee/Nitro.jl/issues/748))~~ **cleared** (§3.11; LRUCache.jl
+     replaced by `BoundedLRU`, [#850](https://github.com/PingoLee/Nitro.jl/issues/850)).
 
 Two rules come with the target:
 

@@ -195,16 +195,28 @@ struct CachedBody
     modtime::Nullable{DateTime}
 end
 
-# The read-through cache for `:lazy`, or `nothing` for the policies that do not have one.
+# The `:lazy` cache's size measure: the body, not the wrapper, so the budget means what it says.
+_body_bytes(cb::CachedBody) = sizeof(cb.bytes)
+
+# The read-through cache for `:lazy`: a `BoundedLRU` (#850) and the one lock that guards it, since
+# the LRU has none of its own and every request on the mount shares it.
 #
 # The bound is a BYTE budget rather than an entry count, which is the only bound that means
-# anything here: 200 icons and 200 videos are not the same working set. `by` measures the body, not
-# the wrapper, so the budget still means what it says. LRUCache locks around both the probe and the
-# insert; it releases the lock while computing a missing value, so a cold-key stampede reads the
-# file twice and last-write-wins with identical bytes — benign.
+# anything here: 200 icons and 200 videos are not the same working set. A file larger than the
+# whole budget is served and not stored, and evicts nothing (`BoundedLRU`'s oversized rule).
+# `get_locked!` reads a missing file OUTSIDE the lock, so a slow disk never blocks hits on other
+# files; a cold-key stampede reads the file once per task that missed, the first insert wins, and
+# every task serves the cached bytes -- benign.
+struct MountCache
+    lru::Util.BoundedLRU{String, CachedBody, typeof(_body_bytes)}
+    lock::ReentrantLock
+end
+
+# `nothing` for the policies that do not cache.
 _mount_cache(policy::MountPolicy) =
     policy.cache === :lazy ?
-        LRU{String,CachedBody}(maxsize = policy.cache_max_bytes, by = cb -> sizeof(cb.bytes)) :
+        MountCache(Util.BoundedLRU{String, CachedBody}(policy.cache_max_bytes, _body_bytes),
+                   ReentrantLock()) :
         nothing
 
 # One mounted file, with what a response needs that can be decided once.
@@ -324,11 +336,11 @@ function _serve_mounted(req::HTTP.Request, mf::MountedFile, policy::MountPolicy,
         (mf.bytes, mf.etag, mf.modtime)
     elseif cache !== nothing
         # `:lazy` — the tag is cached WITH the bytes, so it always identifies the body in hand
-        # even after an eviction re-reads a file that has since changed on disk. The assertion
-        # pins an implementation detail: LRUCache's function-form `get!` infers concretely only
-        # because it takes its lock without a do-block, while its value form already infers
-        # `Any`. A release that rewrote this one the same way would otherwise go unnoticed.
-        cb = get!(() -> _read_with_validators(mf.path, policy, loadfile), cache, mf.path)::CachedBody
+        # even after an eviction re-reads a file that has since changed on disk. `cache` is a
+        # `MountCache` here, whose `BoundedLRU` is concretely typed, so this infers `CachedBody`
+        # (pinned in test/boundedlru_tests.jl).
+        cb = Util.get_locked!(() -> _read_with_validators(mf.path, policy, loadfile),
+                              cache.lru, mf.path, cache.lock)
         (cb.bytes, cb.etag, cb.modtime)
     else
         # `:none` — re-read per request, so the validators are derived from that read. This is the

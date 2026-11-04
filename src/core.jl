@@ -13,7 +13,6 @@ using Base
 using Dates
 using Reexport
 using DataStructures: CircularDeque
-using LRUCache: LRU
 import Base.Threads: lock, nthreads
 using Base.ScopedValues: ScopedValue, @with
 import ..has_revise_hooks, ..revise_hooks, ..ReviseWaitCancelled

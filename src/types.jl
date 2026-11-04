@@ -9,8 +9,8 @@ using JSON
 using Dates
 using Base: @kwdef
 using DataStructures: CircularDeque
-using LRUCache: LRU
 using ..Util
+using ..Util: BoundedLRU, _count_one
 using ..Errors: ValidationError, StoreInterfaceError, ValidatorFault, SessionStoreFault,
     implements_contract_method, store_contract_error, is_unrecoverable, loggable
 using ..Crypto: SecretString, CookieKey, _cookie_secret
@@ -738,11 +738,11 @@ const DEFAULT_MAX_SESSIONS = 100_000
 # A thread-safe, size-bounded in-memory store for sessions. `data` is an LRU (#317): it used to be
 # a plain `Dict` with no bound, which pruning shrank only by EXPIRED rows -- so a cookieless loop
 # grew it by one 24 h session per request until the process ran out of memory, and the janitor's
-# O(N) sweep then held `lock` for seconds per tick. `lock` still guards every compound operation
-# (`update_session!`'s check-and-write, the prune's two-pass sweep); the LRU's own lock covers only
-# its single calls.
+# O(N) sweep then held `lock` for seconds per tick. `lock` is the store's ONE lock and guards every
+# access to `data`, single calls included: a `BoundedLRU` has no lock of its own (#850), and even a
+# read moves an entry in its recency list.
 struct MemoryStore{K, V} <: AbstractSessionStore{K, V}
-    data::LRU{K, SessionPayload{V}}
+    data::BoundedLRU{K, SessionPayload{V}, typeof(_count_one)}
     lock::Base.ReentrantLock
     max_sessions::Int
     warned_full::Threads.Atomic{Bool}
@@ -751,7 +751,7 @@ struct MemoryStore{K, V} <: AbstractSessionStore{K, V}
         max_sessions > 0 ||
             throw(ArgumentError("MemoryStore: max_sessions must be positive, got $max_sessions"))
         n = Int(max_sessions)
-        return new{K, V}(LRU{K, SessionPayload{V}}(maxsize = n), Base.ReentrantLock(), n,
+        return new{K, V}(BoundedLRU{K, SessionPayload{V}}(n), Base.ReentrantLock(), n,
                          Threads.Atomic{Bool}(false))
     end
 end
@@ -887,10 +887,9 @@ end
 
 function delete_session!(store::MemoryStore{K, V}, key) where {K, V}
     lock(store.lock) do
-        # `LRU`'s `delete!` throws `KeyError` on a missing key where `Dict`'s is a no-op, and
-        # deleting an id that is not there is routine: a session that was never stored (#317),
-        # or one a concurrent logout or rotation already removed.
-        haskey(store.data, key) && delete!(store.data, key)
+        # Deleting an id that is not there is routine -- a session that was never stored (#317),
+        # or one a concurrent logout or rotation already removed -- and a no-op (`BoundedLRU`).
+        delete!(store.data, key)
     end
     return nothing
 end
@@ -898,13 +897,11 @@ end
 function cleanup_expired_sessions!(store::MemoryStore{K, V}) where {K, V}
     current_time = Dates.now(Dates.UTC)
     lock(store.lock) do
-        # Collect first, delete after -- and keep it that way. `data` is an `LRU` (#317), and
-        # LRUCache promises nothing about `delete!` during iteration: its iterator walks an
-        # internal linked key list and stops by comparing against the list's `first` node, which
-        # `delete!` can move. Whether a one-pass sweep happens to survive that is an internal
-        # detail, not a contract. (When `data` was a `Dict`, measured, the one-pass form did
-        # work, because `delete!` only tombstoned a slot.) The rate limiter's sweep
-        # (src/middleware/rate_limiter.jl) is two-pass for the same reason.
+        # Collect first, delete after. `data` is a `BoundedLRU` (#850), whose iteration any
+        # mutation invalidates: a `delete!` mid-sweep throws `ConcurrencyViolationError` rather
+        # than skip an entry. Iterating does not refresh recency, so the sweep leaves the
+        # eviction order as it found it. The rate limiter's sweep
+        # (src/middleware/rate_limiter.jl) is two-pass too.
         expired = K[]
         for (key, payload) in store.data
             if is_expired(payload, current_time)
