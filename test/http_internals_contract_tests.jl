@@ -9,7 +9,8 @@ import Sockets
 # Nitro reaches into the HTTP internals asserted below from:
 #   • src/core/ — `getfield(req, :context)` on the raw `HTTP.RequestContext`
 #       (`request_input`, `Types.request_cache!`), and the `Stream` head/body split that
-#       `_http_stream_request` reads to cap a request body (#17).
+#       `_http_stream_request` reads to cap a request body (#17), and `_request_nocopy`, the typed
+#       positional constructor it rebuilds the request through (#856).
 #   • `_request_context_metadata!` — reached TRANSITIVELY, which is why it is still canaried
 #       below. Nitro no longer calls it directly (the wrapper that did died with #151), but
 #       every `req.context[…]` read and write in `src/` now goes through HTTP's own
@@ -125,6 +126,27 @@ end
 
     # Control: the matcher must be capable of answering false, or none of the above means anything.
     @test !defines_server_stream_method(Base.countlines, 1)
+end
+
+@testset "_request_nocopy: the typed constructor the rebuilt request goes through (#856)" begin
+    # Private: `_http_stream_request` builds its request through it instead of the keyword
+    # `Request(method, target; …)`, whose call a trimmed build on Julia 1.14 cannot resolve. The
+    # exact positional signature is the contract: a renamed, reordered or retyped argument must
+    # fail here, not as a `MethodError` on the first request.
+    for B in (HTTP.EmptyBody, HTTP.BytesBody{Vector{UInt8}})
+        @test hasmethod(HTTP._request_nocopy,
+                        Tuple{String, String, HTTP.Headers, HTTP.Headers, B, Union{Nothing, String},
+                              Int64, UInt8, UInt8, Bool, HTTP.RequestContext})
+    end
+    # It stores what it is given, in field order, and copies nothing.
+    h, t, ctx = HTTP.Headers(["A" => "1"]), HTTP.Headers(), HTTP.RequestContext()
+    body = HTTP.BytesBody(UInt8[0x68, 0x69])
+    r = HTTP._request_nocopy("POST", "/x", h, t, body, "host.example", Int64(2), 0x01, 0x01, true, ctx)
+    @test r isa HTTP.Request{HTTP.BytesBody{Vector{UInt8}}}
+    @test (r.method, r.target, r.host, r.content_length, r.proto_major, r.proto_minor, r.close) ==
+          ("POST", "/x", "host.example", 2, 0x01, 0x01, true)
+    @test r.headers === h && r.trailers === t && r.body === body
+    @test HTTP.get_request_context(r) === ctx
 end
 
 @testset "Stream keeps the head and the body separate" begin
@@ -853,7 +875,9 @@ import Sockets
 # place must not reach it (#374). The TRAILERS are adopted: nothing reads the head's copy once the
 # body is read, so copying them cost two allocations per request for no isolation.
 
-# HTTP's half of the contract: `copyheaders = false` stores the given `Headers` as-is.
+# HTTP's half of the contract: `copyheaders = false` stores the given `Headers` as-is. Nitro
+# builds the request through `_request_nocopy` since #856, which stores everything as given (the
+# contract item pins it); the keyword form below is the reference the field comparison builds.
 h = HTTP.Headers(["A" => "1"])
 t = HTTP.Headers()
 adopted = HTTP.Request("GET", "/"; headers = h, trailers = t, copyheaders = false)
@@ -862,14 +886,51 @@ adopted = HTTP.Request("GET", "/"; headers = h, trailers = t, copyheaders = fals
 @test HTTP.Request("GET", "/"; headers = h, trailers = t).headers !== h
 
 const SEEN = Channel{Any}(1)
+const FIELDS = Channel{Any}(2)
+
+# #856: the request `_http_stream_request` builds through `_request_nocopy`, against the one the
+# keyword form it replaced builds from the same head: every field, by name.
+body_bytes(b::HTTP.BytesBody) = b.data
+body_bytes(::HTTP.EmptyBody) = UInt8[]
+function mismatched_fields(req::HTTP.Request, head::HTTP.Request)
+    ref = HTTP.Request(head.method, head.target; headers = copy(head.headers),
+                       trailers = head.trailers, copyheaders = false,
+                       body = req.body isa HTTP.EmptyBody ? HTTP.EmptyBody() : HTTP.BytesBody(copy(body_bytes(req.body))),
+                       host = head.host, content_length = length(body_bytes(req.body)),
+                       proto_major = Int(head.proto_major), proto_minor = Int(head.proto_minor),
+                       close = head.close, context = HTTP.get_request_context(head))
+    checks = (method = req.method == ref.method,
+              target = req.target == ref.target,
+              headers = collect(req.headers) == collect(ref.headers) && req.headers !== head.headers,
+              trailers = req.trailers === ref.trailers,
+              body = typeof(req.body) == typeof(ref.body) && body_bytes(req.body) == body_bytes(ref.body),
+              host = req.host == ref.host,
+              content_length = req.content_length == ref.content_length,
+              proto_major = req.proto_major == ref.proto_major,
+              proto_minor = req.proto_minor == ref.proto_minor,
+              close = req.close == ref.close,
+              context = HTTP.get_request_context(req) === HTTP.get_request_context(ref),
+              type = typeof(req) == typeof(ref))
+    return (target = req.target, body = String(copy(body_bytes(req.body))),
+            mismatched = [k for (k, ok) in pairs(checks) if !ok])
+end
+
 function handler(stream::HTTP.Stream)
     head = HTTP.startread(stream)
     req = Nitro.Core._http_stream_request(stream, Int64(1 << 20))
-    HTTP.setheader(req, "Origin" => "https://rewritten.example")
-    put!(SEEN, (; owns = req.headers !== head.headers,
-                  head_origin = HTTP.header(head, "Origin", ""),
-                  same_text = HTTP.header(req, "X-Probe", "") == HTTP.header(head, "X-Probe", ""),
-                  adopts = req.trailers === head.trailers))
+    # A throw is reported as the mismatch, so the item names it instead of timing out.
+    put!(FIELDS, try
+        mismatched_fields(req, head)
+    catch e
+        (target = head.target, body = "", mismatched = [Symbol("threw ", nameof(typeof(e)))])
+    end)
+    if req.target == "/x"
+        HTTP.setheader(req, "Origin" => "https://rewritten.example")
+        put!(SEEN, (; owns = req.headers !== head.headers,
+                      head_origin = HTTP.header(head, "Origin", ""),
+                      same_text = HTTP.header(req, "X-Probe", "") == HTTP.header(head, "X-Probe", ""),
+                      adopts = req.trailers === head.trailers))
+    end
     HTTP.setstatus(stream, 204)
     HTTP.startwrite(stream)
     return nothing
@@ -889,12 +950,44 @@ try
         @test seen.head_origin == "https://app.example"   # the rewrite stayed on `req`
         @test seen.same_text
         @test seen.adopts
+        fields = take!(FIELDS)
+        @test (fields.target, fields.body) == ("/x", "hi")
+        @test isempty(fields.mismatched)
+    finally
+        close(sock)
+    end
+    # A request with no body: the other body type, and no `Host`.
+    sock = Sockets.connect(HOST, port)
+    try
+        write(sock, "GET /y?q=1 HTTP/1.0\r\n\r\n")
+        timedwait(() -> isready(FIELDS), 30.0; pollint = 0.01) === :ok || error("the handler reported nothing in 30 s")
+        fields = take!(FIELDS)
+        @test (fields.target, fields.body) == ("/y?q=1", "")
+        @test isempty(fields.mismatched)
     finally
         close(sock)
     end
 finally
     close(server)
 end
+end
+
+@testitem "The transport builds its request without a keyword call (#856)" tags=[:core] setup=[NitroCommon] begin
+using Test
+import HTTP
+import Nitro
+
+# `_http_stream_request` used to build the request through `Request(method, target; …)`. That
+# call's `NamedTuple` holds the body and `host`, both `Union`s, so it was static only while the
+# compiler split or inlined it: Julia 1.13 did, 1.14 does not, and a trimmed server failed every
+# request. Pinned on the shape: on 1.13 the keyword call was static too, so only
+# `optimize = false` tells it from the positional `_request_nocopy`.
+const F = Nitro.Core._http_stream_request
+const T = (HTTP.Stream{false, HTTP.Request{HTTP.EmptyBody}}, Int64)
+@test isconcretetype(T[1])        # the stream type a served request arrives on
+@test isempty(kwcalls(F, T; optimize = false))
+@test isempty(kwcalls(F, T))
+@test constructs(F, T, HTTP.Request)
 end
 
 @testitem "HTTP logs a stream handler's error unless it is `stream.io_error` (HTTP 2.11)" tags=[:core, :network] setup=[NitroCommon] begin
