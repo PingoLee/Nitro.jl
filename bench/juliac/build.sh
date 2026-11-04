@@ -21,6 +21,10 @@
 #      PROJECT (default bench/juliac): the project the entry lives in and JuliaC builds against.
 #        bench/juliac/pools (#813) needs PormG and SQLite, which bench/juliac deliberately does not
 #        carry, so the app and probe counts are built from the same environment as before.
+#      JULIAC_FLAGS (default empty): extra words for the JuliaC frontend, split on whitespace and
+#        printed in the log header, e.g. JULIAC_FLAGS=--static-runtime (JuliaC.jl#182, #730).
+#      BUNDLE (default unset): a directory for JuliaC's --bundle. The exe is then <BUNDLE>/bin/<name>,
+#        with the libraries it needs beside it, which is what a bundle size or file count reads.
 # The environment is instantiated under JULIA first, into its own Manifest-v<major>.<minor>.toml
 # (gitignored), so builds under two Julia minors never re-resolve each other's manifest. JuliaC
 # compiles against a temporary copy of --project=bench/juliac.
@@ -55,6 +59,13 @@ STAMP=$(date +%Y%m%d-%H%M%S)
 LOG="$ROOT/bench/results/juliac-$STAMP-$ENTRY-$MODE.log"
 # `nitro-min-<mode>` for the app, the name smoke.sh and the README use.
 if [ "$ENTRY" = app ]; then EXE="$OUT/nitro-min-$MODE"; else EXE="$OUT/nitro-$ENTRY-$MODE"; fi
+NAME=$(basename "$EXE")
+BUNDLE_ARGS=()
+if [ -n "${BUNDLE:-}" ]; then
+  mkdir -p "$BUNDLE"; BUNDLE=$(cd "$BUNDLE" && pwd)
+  BUNDLE_ARGS=(--bundle "$BUNDLE"); EXE="$BUNDLE/bin/$NAME"
+fi
+read -r -a FLAGS <<< "${JULIAC_FLAGS:-}"
 {
   echo "julia:    $($JULIA --startup-file=no -e 'print(VERSION)')"
   echo "frontend: $FRONTEND"
@@ -62,6 +73,7 @@ if [ "$ENTRY" = app ]; then EXE="$OUT/nitro-min-$MODE"; else EXE="$OUT/nitro-$EN
   echo "mode:     --trim=$MODE"
   echo "cpu:      $JULIA_CPU_TARGET"
   echo "exe:      $EXE"
+  echo "flags:    ${JULIAC_FLAGS:-(none)}${BUNDLE:+, bundled in $BUNDLE}"
   echo "nitro:    $(git -C "$ROOT" rev-parse --short HEAD)"
 } | tee "$LOG"
 
@@ -73,9 +85,9 @@ $JULIA --startup-file=no --project="$PROJ" -e '
   Pkg.resolve(); Pkg.instantiate()' 2>&1 | tee -a "$LOG"
 rm -f "$EXE"
 # `--output-exe` takes a file name, not a path: JuliaC writes it to the working directory.
-# Unbundled, the exe links against JULIA's own lib/ by absolute path, which is what a local
-# measurement wants; `--bundle` would copy ~100 MB of libraries per build.
-( cd "$OUT" && "$JULIAC_BIN" --project "$PROJ" --output-exe "$(basename "$EXE")" \
+# Unbundled by default, the exe links against JULIA's own lib/ by absolute path, which is what a
+# local measurement wants; BUNDLE copies ~80 MB of libraries per build.
+( cd "$OUT" && "$JULIAC_BIN" --project "$PROJ" --output-exe "$NAME" "${BUNDLE_ARGS[@]}" "${FLAGS[@]}" \
     --trim="$MODE" --experimental "$PROJ/$ENTRY.jl" ) 2>&1 | tee -a "$LOG"
 RC=${PIPESTATUS[0]}
 echo "build: rc=$RC, $(( $(date +%s) - START )) s" | tee -a "$LOG"
