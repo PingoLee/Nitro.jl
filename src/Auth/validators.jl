@@ -1,7 +1,9 @@
-function _invoke_user_validator(validator::Function, claims)
-    _takes_request(validator) && return validator(claims, nothing)
-    return validator(claims)
-end
+# Whether `validator` takes the request as well (`_takes_request`). Under the JIT it is asked per
+# request: the memo exists so a method Revise adds is seen on the next one. A trimmed image cannot
+# reflect on a method table (`Base.methods` is a dynamic call) and refuses Revise, so there the
+# answer taken when the validator was built, `built`, is the answer (#747).
+_validator_takes_request(validator::F, built::Bool) where {F} =
+    _trimmed() ? built : _takes_request(validator)
 
 # Build the normalized principal for a verified token. `kid` must already be trusted
 # (keyset-resolved) or `nothing`.
@@ -15,7 +17,7 @@ function _principal(claims::Dict{String, Any}, kid::Nullable{String}, identity_f
         kid
     else
         value = _claim_value(claims, identity_claim, nothing)
-        value === nothing ? nothing : string(value)
+        value === nothing ? nothing : _claim_string(value)
     end
     return Principal(id, claims, kid, identity_from)
 end
@@ -42,11 +44,18 @@ const _WARN_ISS_MAX = 128
 # And bound the set itself, so a high-cardinality `iss` cannot grow it without limit.
 const _WARN_SEEN_CAP = 64
 
-# A claim value is `Any` by nature, so this call is dynamic; the return annotation stops
-# that `Any` from reaching `_report_missing_claim!` on the per-request path (#265).
-function _warn_iss(value)::Nullable{String}
+# A claim value is `Any` by nature. Unspecialized, the call is static, and `_claim_string` reads
+# the value through the closed dispatch over JSON values (docs/design/juliac-trim.md §3.11); the
+# return annotation stops an `Any` from reaching `_report_missing_claim!` (#265).
+#
+# The report is diagnostic, so it must never refuse a token the validator accepted. A trimmed image
+# cannot `string` a JSON array or object (`_claim_string` refuses one), so there it reports the
+# value's type instead, `"(Vector)"`; the JIT prints the value as it always did.
+function _warn_iss(@nospecialize(value))::Nullable{String}
     value === nothing && return nothing
-    text = string(value)
+    _trimmed() && !(value isa Union{String, Int64, Float64, Bool}) &&
+        return string("(", nameof(typeof(value)), ")")
+    text = _claim_string(value)
     return length(text) > _WARN_ISS_MAX ? string(first(text, _WARN_ISS_MAX), "…") : text
 end
 
@@ -269,6 +278,7 @@ function jwt_validator(secret_or_keyset;
 
     seen_warned = Set{NTuple{3, Nullable{String}}}()
     seen_lock = ReentrantLock()
+    user_takes_request = user_validator === nothing ? false : _takes_request(user_validator)
 
     if profile === :strict
         get(kwargs, :issuer, nothing) === nothing &&
@@ -302,9 +312,10 @@ function jwt_validator(secret_or_keyset;
         if user_validator === nothing
             return principal
         end
+        takes_request = _validator_takes_request(user_validator, user_takes_request)
         user = if req === nothing
-            _invoke_user_validator(user_validator, principal)
-        elseif _takes_request(user_validator)
+            takes_request ? user_validator(principal, nothing) : user_validator(principal)
+        elseif takes_request
             user_validator(principal, req)
         else
             user_validator(principal)

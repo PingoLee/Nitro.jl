@@ -2,7 +2,7 @@ module AuthMiddleware
 
 using HTTP
 using ...Types
-using ...Types: _is_identity
+using ...Types: _is_identity, _trimmed
 using ...Cookies: get_cookie
 using ...Errors: CookieError, is_unrecoverable
 using ...Crypto: SecretString, CookieKey, _cookie_secret
@@ -79,7 +79,11 @@ function _set_auth_claims!(req::HTTP.Request, claims)
     return nothing
 end
 
-function _handle_validated(handle::Function, req::HTTP.Request, user_info, unauthorized)
+#
+# `U` is a type parameter so the method specializes on the factory: Julia does not specialize on a
+# function argument a method only passes on, and `_deny(unauthorized::Function, …)` was then a
+# dynamic call, which `juliac --trim` rejects (#747).
+function _handle_validated(handle::Function, req::HTTP.Request, user_info, unauthorized::U) where {U}
     if !_is_identity(user_info)
         return _deny(unauthorized, req, :invalid_credentials)
     elseif user_info isa Tuple && length(user_info) == 2
@@ -134,6 +138,7 @@ function CookieAuthMiddleware(validate_token::Function; cookie_name::String = "a
     # request (#545).
     secret = _cookie_secret(secret_key)
     sealed = secret === nothing ? nothing : CookieKey(secret)
+    takes_request = _takes_request(validate_token)
     return function (handle::Function)
         return function(req::HTTP.Request)
             # Try to extract the authentication cookie. A `CookieError` (one that does not
@@ -155,7 +160,7 @@ function CookieAuthMiddleware(validate_token::Function; cookie_name::String = "a
             # three `is_unrecoverable` names, which propagate. Both halves of that contract,
             # and why the carve-out is a deny-list, are at the top of this file (#254).
             user_info = try
-                _validate_token(validate_token, req, token)
+                _validate_token(validate_token, req, token, takes_request)
             catch e
                 is_unrecoverable(e) && rethrow()
                 nothing
@@ -233,6 +238,7 @@ not a `LifecycleMiddleware` — pass it to `serve(middleware = [...])` or `path(
 function BearerAuth(validate_token::Function; header::String = "Authorization", scheme::String = "Bearer", cookie_name::Nullable{String} = nothing,
                     unauthorized = _bearer_unauthorized)
     _check_denial_factory(unauthorized, :unauthorized)
+    takes_request = _takes_request(validate_token)
     return function (handle::Function)
         return function(req::HTTP.Request)
 
@@ -246,7 +252,7 @@ function BearerAuth(validate_token::Function; header::String = "Authorization", 
             # three `is_unrecoverable` names, which propagate. Both halves of that contract,
             # and why the carve-out is a deny-list, are at the top of this file (#254).
             user_info = try
-                _validate_token(validate_token, req, token)
+                _validate_token(validate_token, req, token, takes_request)
             catch e
                 is_unrecoverable(e) && rethrow()
                 nothing
@@ -276,8 +282,13 @@ function _extract_token(req::HTTP.Request, header::String, scheme::String, cooki
     return nothing
 end
 
-function _validate_token(validate_token::Function, req::HTTP.Request, token::String)
-    _takes_request(validate_token) && return validate_token(token, req)
+# `built` is whether `validate_token` takes the request, answered when the middleware was built.
+# Under the JIT the memo is asked per request instead, so a method Revise adds is seen on the next
+# one; a trimmed image cannot reflect on a method table and refuses Revise, so `built` is the answer
+# there (#747).
+function _validate_token(validate_token::F, req::HTTP.Request, token::String, built::Bool) where {F}
+    takes_request = _trimmed() ? built : _takes_request(validate_token)
+    takes_request && return validate_token(token, req)
     return validate_token(token)
 end
 

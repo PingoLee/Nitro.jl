@@ -724,6 +724,25 @@ function _parse_json_bounded(buf::Union{AbstractVector{UInt8}, AbstractString}, 
     return JSON.parse(buf, T; kwargs...)
 end
 
+# `(max_fields = n, dicttype = Dict{String, Any})` with the second field typed
+# `Type{Dict{String, Any}}`. A literal NamedTuple types it `DataType`, as it does any type, so the
+# keyword call's own method reads `dicttype::DataType` and cannot pick `JSON.parse`'s keyword body
+# for it: a dynamic call, whatever the caller wrote (#747, docs/design/juliac-trim.md §3.11). Typed
+# this way, the field keeps its type through `_parse_json_bounded`'s `kwargs...` into `JSON.parse`,
+# and the call is static.
+const _DICT_STRING_ANY = NamedTuple{(:max_fields, :dicttype), Tuple{Int, Type{Dict{String, Any}}}}
+
+"""
+    _parse_json_dict_bounded(buf; max_fields = request_max_fields())
+
+`_parse_json_bounded(buf; max_fields, dicttype = Dict{String, Any})` as a static call: the keywords
+go through `Core.kwcall` as a typed NamedTuple (`_DICT_STRING_ANY`), because a type keyword written
+the ordinary way is not resolvable. Same parse, same result, the same one door to `JSON.parse`.
+"""
+_parse_json_dict_bounded(buf::Union{AbstractVector{UInt8}, AbstractString};
+                         max_fields::Integer = request_max_fields()) =
+    Core.kwcall(_DICT_STRING_ANY((Int(max_fields), Dict{String, Any})), _parse_json_bounded, buf, Any)
+
 ### Helper functions used to parse the body of a HTTP.Request object
 
 """

@@ -2,7 +2,8 @@ module GuardsMiddleware
 
 using HTTP
 using ...Core: getsession, getprincipal, with_session   # `getsession`: the docstrings link it
-using ...Types: Nullable, _is_identity
+using JSON
+using ...Types: Nullable, Principal, _is_identity, _trimmed, with_json_value
 using ...Util: _check_denial_factory, _deny
 
 export GuardMiddleware, login_required, role_required, permission_required,
@@ -114,6 +115,66 @@ function _request_claims(req::HTTP.Request, session_key::String)::Nullable{Abstr
 	# it carries the login marker `login_required` checks (#337). A logout that deletes or
 	# nulls `session_key` but leaves `role` behind must not stay authorized as that role.
 	return with_session(_session_claims, req, session_key)
+end
+
+# `f(claims, args...)`, with the claims source at its concrete type when it is one Nitro produces:
+# the `Principal` an auth middleware stores, or a `Dict{String,Any}` / `JSON.Object{String,Any}`
+# (a session, an app's claims dict). `_request_claims` can only say `AbstractDict`, and every read
+# of an abstract dict was a dynamic call, which `juliac --trim` rejects (#747,
+# docs/design/juliac-trim.md §3.11). An app's own dict type keeps the JIT's dynamic call, and a
+# trimmed image refuses it, as `with_session` refuses a session of its own shape.
+#
+# `@nospecialize`, as in `with_response`: the argument arrives as `AbstractDict`, and a method
+# specialized per dict type made the call to it the dynamic dispatch this exists to remove.
+function _with_claims(f::F, @nospecialize(claims::AbstractDict), args::Vararg{Any,N}) where {F,N}
+	claims isa Principal && return f(claims, args...)
+	claims isa Dict{String, Any} && return f(claims, args...)
+	claims isa JSON.Object{String, Any} && return f(claims, args...)
+	return _with_foreign_claims(f, claims, args...)
+end
+
+@noinline function _with_foreign_claims(f::F, @nospecialize(claims), args::Vararg{Any,N}) where {F,N}
+	_trimmed() && throw(ArgumentError(
+		"Nitro: a trimmed image reads claims from a Principal or a Dict{String,Any}; got a $(nameof(typeof(claims)))"))
+	return f(claims, args...)
+end
+
+# `claim_required`'s two kinds. The claim value is `Any`, so it is read through the closed dispatch
+# over JSON values; `value` is the guard's own, at its concrete type, so `==` against each JSON type
+# is static. Each answers what `get(claims, claim, nothing) == value` and `value in container` did.
+_claim_equals(claims, claim::String, value) = with_json_value(_is_equal_to, get(claims, claim, nothing), value)
+# Not asserted `Bool`: `missing == value` is `missing`, which reaches the guard's `||` exactly as
+# `get(claims, claim, nothing) != value` did.
+_is_equal_to(actual, value) = actual == value
+
+function _claim_contains(claims, claim::String, value)
+	container = get(claims, claim, nothing)
+	container isa Vector{Any} && return _vector_contains(container, value)
+	container isa AbstractVector || return false
+	return _foreign_contains(container, value)
+end
+
+# `value in container`, which is `any(x -> x == value, container)`, element by element through the
+# closed dispatch. Including `any`'s three-valued answer: a compare that answers `missing` (a
+# `missing` element, which only an app's own claims dict can hold) does not stop a later match, and
+# with no match it makes the answer `missing`, which the guard's `||` refuses as it always did.
+function _vector_contains(container::Vector{Any}, value)
+	saw_missing = false
+	for item in container
+		matched = with_json_value(_is_equal_to, item, value)
+		if matched === missing
+			saw_missing = true
+		elseif matched
+			return true
+		end
+	end
+	return saw_missing ? missing : false
+end
+
+@noinline function _foreign_contains(@nospecialize(container), value)
+	_trimmed() && throw(ArgumentError(
+		"Nitro: a trimmed image reads a :contains claim as a JSON array; got a $(nameof(typeof(container)))"))
+	return value in container
 end
 
 # The session as a claims source, at its concrete type (`with_session`).
@@ -241,7 +302,7 @@ function claim_required(claim::String, value; kind::Symbol=:equals, session_key:
 	if kind === :equals
 		return function(req::HTTP.Request)
 			claims = _request_claims(req, session_key)
-			if claims === nothing || get(claims, claim, nothing) != value
+			if claims === nothing || !_with_claims(_claim_equals, claims, claim, value)
 				return _deny(denied, req, :forbidden)
 			end
 			return nothing
@@ -249,8 +310,7 @@ function claim_required(claim::String, value; kind::Symbol=:equals, session_key:
 	elseif kind === :contains
 		return function(req::HTTP.Request)
 			claims = _request_claims(req, session_key)
-			container = claims === nothing ? nothing : get(claims, claim, nothing)
-			if !(container isa AbstractVector) || !(value in container)
+			if claims === nothing || !_with_claims(_claim_contains, claims, claim, value)
 				return _deny(denied, req, :forbidden)
 			end
 			return nothing
