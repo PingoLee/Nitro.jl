@@ -2239,3 +2239,58 @@ end
     end
 end
 end
+
+@testitem "serve builds its cookie config without a keyword call (#856)" tags=[:core, :security] setup=[NitroCommon] begin
+using Test
+using Dates
+using Nitro
+using Nitro.Types: CookieConfig, SecretString
+
+# `serve` builds the config it installs from the App's current one (`_serve_cookies`). Through the
+# keyword form, with the current config's five `Nullable` fields, that call was static only when
+# the compiler inlined the constructor: Julia 1.13 did and 1.14 does not, so a trimmed `serve`
+# died with a `MethodError` there. It goes through `CookieConfig`'s `base` form, whose only
+# `Union` argument is the key. Pinned on the shape, not on 1.13's verdict: there the keyword call
+# was static too, so only `optimize = false` tells the two apart.
+const S = Nitro.Core._serve_cookies
+key = "k" ^ 32
+for types in ((CookieConfig, Nothing, Nothing, Nothing, Nothing),        # serve's defaults
+              (CookieConfig, String, Bool, Bool, String),               # every override passed
+              (CookieConfig, SecretString, Nothing, Bool, Nothing))
+    @test isempty(kwcalls(S, types; optimize = false))
+    @test isempty(kwcalls(S, types))
+    @test constructs(S, types, CookieConfig)
+end
+# ...and `serve` builds its config there, not through a keyword call of its own. Read in its
+# keyword body, where its code is; its other keyword calls are not this pin's business.
+body, body_types = keyword_body(Nitro.Core.serve, (App,))
+@test calls_to(body, body_types, S)
+@test isempty(kwcalls(body, body_types; optimize = false, to = CookieConfig))
+@test !isempty(kwcalls(body, body_types; optimize = false))   # the reader does see its others
+
+# The same config the keyword form builds, for every combination of overrides.
+base = CookieConfig(secret_key = "b" ^ 32, httponly = false, secure = false, samesite = "Strict",
+                    path = "/app", domain = "Example.COM", maxage = 60,
+                    expires = DateTime(2030, 1, 2), max_cookie_size = 2048)
+keyword_form(current, secret_key, httponly, secure, samesite) = CookieConfig(
+    secret_key = isnothing(secret_key) ? current.secret_key : secret_key,
+    httponly = isnothing(httponly) ? current.httponly : httponly,
+    secure = isnothing(secure) ? current.secure : secure,
+    samesite = isnothing(samesite) ? current.samesite : samesite,
+    path = current.path, domain = current.domain, maxage = current.maxage,
+    expires = current.expires, max_cookie_size = current.max_cookie_size)
+for current in (base, CookieConfig()), secret_key in (nothing, key, SecretString(key)),
+    httponly in (nothing, true), secure in (nothing, false), samesite in (nothing, "None")
+    built = S(current, secret_key, httponly, secure, samesite)
+    @test built == keyword_form(current, secret_key, httponly, secure, samesite)
+    @test built.domain == current.domain && built.path == current.path
+    @test (built.cookie_key === nothing) == (built.secret_key === nothing)
+end
+@test S(base, nothing, nothing, nothing, nothing).domain == "example.com"   # carried, normalized once
+
+# The key is still sealed and checked on this path.
+@test S(CookieConfig(), key, nothing, nothing, nothing).secret_key isa SecretString
+@test_throws ArgumentError S(CookieConfig(), "s" ^ 31, nothing, nothing, nothing)
+@test_throws ArgumentError S(CookieConfig(), Vector{UInt8}(key), nothing, nothing, nothing)
+@test_throws ArgumentError S(CookieConfig(), "", nothing, nothing, nothing)
+end

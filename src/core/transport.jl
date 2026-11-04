@@ -165,21 +165,30 @@ function _http_stream_request(stream::HTTP.Stream, max_body_bytes::Int64)::Union
     # route pins (#374). The trailers are ADOPTED (#533): nothing in HTTP's server reads the
     # head's, and on this path they are always empty (HTTP keeps a chunked request's trailers on
     # its `ChunkedBody`, not on the head), so the default copy bought two allocations per request
-    # and no isolation. `copyheaders = false` applies to both, which is why the
+    # and no isolation. The constructor below stores both as given, which is why the
     # headers are copied by hand.
-    return HTTP.Request(
+    #
+    # Built through HTTP's typed positional `_request_nocopy`, not `Request(method, target; …)`
+    # (#856). The keyword call's `NamedTuple` holds two `Union`s, the body and `host`, so its type
+    # is abstract and the call was static only while the compiler split or inlined it: Julia 1.13
+    # did, 1.14 does not, and a trimmed server then fails every request. HTTP's own server
+    # rebuilds a request through `_request_nocopy` for the same reason (`http_server.jl`). It sets
+    # the same fields as the keyword form with `copyheaders = false`; what it skips is the keyword
+    # form's checks of the method, target, length and version, all of which a head HTTP parsed
+    # has passed. `test/http_internals_contract_tests.jl` pins the name and its field-for-field
+    # equivalence on a served request.
+    return HTTP._request_nocopy(
         head.method,
-        head.target;
-        headers        = copy(head.headers),
-        trailers       = head.trailers,
-        copyheaders    = false,
-        body           = body,
-        host           = head.host,
-        content_length = length(body_bytes),
-        proto_major    = Int(head.proto_major),
-        proto_minor    = Int(head.proto_minor),
-        close          = head.close,
-        context        = HTTP.get_request_context(head),
+        head.target,
+        copy(head.headers),
+        head.trailers,
+        body,
+        head.host,
+        Int64(length(body_bytes)),
+        head.proto_major,
+        head.proto_minor,
+        head.close,
+        HTTP.get_request_context(head),
     )
 end
 

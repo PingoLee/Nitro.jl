@@ -346,6 +346,18 @@ function _abandon_start!(ctx::App, claim::StartClaim)
     return nothing
 end
 
+# The cookie config `serve` installs: the App's current one, with `serve`'s `secret_key`,
+# `httponly`, `secure` and `samesite` where they were passed. Through `CookieConfig`'s `base` form
+# rather than its keyword form, so a trimmed `serve` builds it with a static call (#856):
+# the keyword form with `current`'s `Nullable` fields was static only when the compiler inlined
+# the constructor, which Julia 1.14 does not. `test/cookies_tests.jl` pins the call.
+_serve_cookies(current::CookieConfig, secret_key, httponly, secure, samesite)::CookieConfig =
+    CookieConfig(current,
+                 isnothing(secret_key) ? current.secret_key : secret_key,
+                 isnothing(httponly) ? current.httponly : httponly,
+                 isnothing(secure) ? current.secure : secure,
+                 isnothing(samesite) ? current.samesite : samesite)
+
 # Documented on the public `Nitro.serve` (src/methods.jl), which is the binding users call and
 # the one `docs/` renders. A docstring here is a second copy Documenter counts as missing (#186).
 function serve(ctx::App;
@@ -527,18 +539,7 @@ function serve(ctx::App;
     # Built BEFORE any mutation: `CookieConfig` validates the key (#307, #309 -- a non-string or
     # sub-32-byte `secret_key` is an `ArgumentError`), and a rejected `serve` must leave the app
     # untouched, as the guards above do.
-    current = ctx.service.cookies[]
-    cookies = CookieConfig(
-        secret_key=isnothing(secret_key) ? current.secret_key : secret_key,
-        httponly=isnothing(httponly) ? current.httponly : httponly,
-        secure=isnothing(secure) ? current.secure : secure,
-        samesite=isnothing(samesite) ? current.samesite : samesite,
-        path=current.path,
-        domain=current.domain,
-        maxage=current.maxage,
-        expires=current.expires,
-        max_cookie_size=current.max_cookie_size,
-    )
+    cookies = _serve_cookies(ctx.service.cookies[], secret_key, httponly, secure, samesite)
 
     # The claim (#812). Here, after every refusal above and before the first mutation below, so a
     # refused call leaves the App untouched and a call that loses the race to another `serve` is

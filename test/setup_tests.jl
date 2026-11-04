@@ -19,7 +19,7 @@ export get_free_port
 export jwtkey
 export raw_exchange, read_failed, abort_with_reset!
 export allocs, Allocs
-export dynamic_calls, kwcalls, invokes
+export dynamic_calls, kwcalls, invokes, constructs, calls_to, keyword_body
 
 # ── Constants ────────────────────────────────────────────────────────
 
@@ -310,21 +310,84 @@ function dynamic_calls(f, types)
 end
 
 """
-    kwcalls(f, types) -> Vector{String}
+    kwcalls(f, types; optimize = true, to = nothing) -> Vector{String}
 
 The `Core.kwcall` statements left as `:call`s in the optimized code of `f` on `types`: keyword
 calls inference could not resolve, so they dispatch at run time. Narrower than `dynamic_calls`,
 for a caller whose other calls are not the point (#845).
+
+With `optimize = false` it reads the code before inlining, where every keyword call `f`'s source
+makes is still a `:call`, resolved or not. That pins the SHAPE: a construction that must not go
+through a keyword call at all, because whether one is resolved depends on the compiler inlining
+or splitting it, and Julia versions differ there (#856). `to` keeps only the keyword calls of
+that one function, for a caller that makes others on purpose.
 """
-function kwcalls(f, types)
+function kwcalls(f, types; optimize::Bool = true, to = nothing)
     found = String[]
-    for (ci, _) in code_typed(f, types; optimize = true), st in ci.code
-        st isa Expr && st.head === :call || continue
-        g = st.args[1]
-        callee = g isa GlobalRef ? getglobal(g.mod, g.name) : g isa QuoteNode ? g.value : g
-        callee === Core.kwcall && push!(found, sprint(show, st))
+    for (ci, _) in code_typed(f, types; optimize)
+        for st in ci.code
+            st = _unassigned(st)
+            st isa Expr && st.head === :call || continue
+            _resolve(ci, st.args[1]) === Core.kwcall || continue
+            # `kwcall(keywords, g, positional...)`: the called function is the second argument.
+            to === nothing || (length(st.args) >= 3 && _resolve(ci, st.args[3]) === to) || continue
+            push!(found, sprint(show, st))
+        end
     end
     return found
+end
+
+# Code before inlining writes a call whose value is kept as `slot = call(…)`, and names a callee
+# through an earlier statement (`%1 = f; %1(…)`). Both are looked through, so a call is seen
+# however the source spells it.
+_unassigned(st) = st isa Expr && st.head === :(=) ? st.args[2] : st
+function _resolve(ci, x)
+    if x isa Core.SSAValue
+        # A module-qualified name (`M.f`) is a `getproperty` there, whose value inference knows.
+        t = ci.ssavaluetypes[x.id]
+        t isa Core.Const && return t.val
+        return _resolve(ci, _unassigned(ci.code[x.id]))
+    end
+    x isa GlobalRef && return isdefined(x.mod, x.name) ? getglobal(x.mod, x.name) : x
+    x isa QuoteNode && return x.value
+    return x
+end
+
+"""
+    calls_to(f, types, g) -> Bool
+
+Whether the code of `f` on `types`, before inlining, calls `g`: the call its source makes,
+whatever the compiler then does with it (#856).
+"""
+function calls_to(f, types, g)
+    for (ci, _) in code_typed(f, types; optimize = false), st in ci.code
+        st = _unassigned(st)
+        st isa Expr && st.head === :call && _resolve(ci, st.args[1]) === g && return true
+    end
+    return false
+end
+
+"""
+    keyword_body(f, types) -> (body, body_types)
+
+The keyword body (`#f#N`) that `f(types...)`, called with no keywords, invokes, and the argument
+types it is invoked with: the keyword defaults, then the positional arguments. That is where a
+function with keywords keeps its code, so a pin on what `f` does reads it there (#856).
+"""
+function keyword_body(f, types)
+    # `bodyfunction` names the last call of a method without keywords too, so the name is checked.
+    body = Base.bodyfunction(which(f, types))
+    body !== nothing && startswith(string(nameof(body)), string("#", nameof(f), "#")) ||
+        error("$(f)$(types) has no keyword body")
+    for (ci, _) in code_typed(f, types; optimize = true), st in ci.code
+        st isa Expr && st.head === :invoke || continue
+        x = st.args[1]
+        mi = x isa Core.CodeInstance ? x.def : x
+        mi isa Core.MethodInstance || (mi = getproperty(mi, :def))
+        p = mi.specTypes.parameters
+        p[1] === typeof(body) && return body, Tuple(p[2:end])
+    end
+    error("$(f)$(types) inlines its keyword body, so it has no code of its own to read")
 end
 
 """
@@ -344,6 +407,34 @@ function invokes(f, types, g)
         mi = x isa Core.CodeInstance ? x.def : x
         mi isa Core.MethodInstance || (mi = getproperty(mi, :def))
         Base.isdispatchtuple(mi.specTypes) && typeof(g) in mi.specTypes.parameters && return true
+    end
+    return false
+end
+
+"""
+    constructs(f, types, T) -> Bool
+
+Whether the optimized code of `f` on `types` builds a `T` statically: a `:new` of a `T` (the
+constructor inlined), or an `:invoke` of a constructor of `T` on concrete argument types. `invokes`
+cannot answer this, because a constructor's `MethodInstance` carries `Type{T}`, not `typeof(T)`.
+A `T` built through a dynamic `:call` is not counted. For a `UnionAll` `T`, any instance of it
+counts (#856).
+"""
+function constructs(f, types, T::Type)
+    for (ci, _) in code_typed(f, types; optimize = true), st in ci.code
+        st isa Expr || continue
+        if st.head === :new
+            R = st.args[1]
+            R isa GlobalRef && (R = getglobal(R.mod, R.name))
+            R isa Type && R <: T && return true
+        elseif st.head === :invoke
+            x = st.args[1]
+            mi = x isa Core.CodeInstance ? x.def : x
+            mi isa Core.MethodInstance || (mi = getproperty(mi, :def))
+            Base.isdispatchtuple(mi.specTypes) || continue
+            p = mi.specTypes.parameters
+            !isempty(p) && p[1] isa Type && p[1] <: Type{<:T} && return true
+        end
     end
     return false
 end
@@ -681,4 +772,67 @@ end
     @test !invokes(dyn, (Ref{Any},), kwtarget)
     @test isempty(kwcalls(stat, (Int,)))
     @test invokes(stat, (Int,), kwtarget)
+end
+
+@testitem "NitroCommon: kwcalls(optimize = false) sees a resolved keyword call; constructs sees a static construction (#856)" tags=[:core] setup=[NitroCommon] begin
+    using Test
+    @noinline kwtarget(x; k::Int = 1) = x + k
+    stat(x::Int) = kwtarget(x; k = 2)                # resolved: gone from the optimized code...
+    @test isempty(kwcalls(stat, (Int,)))
+    @test length(kwcalls(stat, (Int,); optimize = false)) == 1   # ...but the source makes it
+    plain(x::Int) = kwtarget(x)                      # no keyword passed: no `kwcall` to report
+    @test isempty(kwcalls(plain, (Int,); optimize = false))
+    # A keyword call whose value is kept in a variable is written `slot = kwcall(…)` there.
+    kept(x::Int) = (y = kwtarget(x; k = 3); y * 2)
+    @test length(kwcalls(kept, (Int,); optimize = false)) == 1
+    # `to`: only the keyword calls of one function.
+    @noinline other(x; k::Int = 1) = x - k
+    both(x::Int) = kwtarget(x; k = 2) + other(x; k = 2)
+    @test length(kwcalls(both, (Int,); optimize = false)) == 2
+    @test length(kwcalls(both, (Int,); optimize = false, to = other)) == 1
+    @test isempty(kwcalls(plain, (Int,); optimize = false, to = kwtarget))
+    # ...also when the source names it through its module (`M.f(…; …)`).
+    qualified(v::Vector{Int}) = Base.sort(v; rev = true)
+    @test length(kwcalls(qualified, (Vector{Int},); optimize = false, to = sort)) == 1
+    # `calls_to` sees the source's call even when the compiler inlines it away.
+    @inline tiny(x) = x + 1
+    uses_tiny(x::Int) = tiny(x) * 2
+    @test calls_to(uses_tiny, (Int,), tiny)
+    @test !calls_to(uses_tiny, (Int,), kwtarget)
+    # `keyword_body`: where a function with keywords keeps its code. `@noinline` reaches the
+    # keyword body, so this small one stays a call of its own, as `serve`'s large one does.
+    @noinline function withkw(x::Int; k::Int = 4)
+        return x + other(x; k = k)
+    end
+    body, body_types = keyword_body(withkw, (Int,))
+    @test occursin("withkw", string(nameof(body)))
+    @test body_types[end] === Int
+    @test length(kwcalls(body, body_types; optimize = false, to = other)) == 1
+    @test_throws ErrorException keyword_body(plain, (Int,))
+
+    struct Small
+        a::Int
+    end
+    # Out of line, with work the compiler keeps: an `:invoke` of the constructor. Four methods,
+    # one past `max_methods`, so a call on an `Any` cannot be split over them into static ones.
+    struct Kept
+        a::Int
+        @noinline Kept(a::Int) = new(a + 1)
+        @noinline Kept(a::String) = new(length(a))
+        @noinline Kept(a::Float64) = new(round(Int, a))
+        @noinline Kept(a::Char) = new(Int(a))
+    end
+    inlined(x::Int) = Small(x)                       # a `:new`
+    invoked(x::Int) = Kept(x)                        # an `:invoke` of `Type{Kept}`
+    dynamic(r::Ref{Any}) = Kept(r[])                 # `r[]` is `Any`: dispatched at run time
+    @test constructs(inlined, (Int,), Small)
+    @test constructs(invoked, (Int,), Kept)
+    @test !constructs(dynamic, (Ref{Any},), Kept)
+    @test !constructs(inlined, (Int,), Kept)         # another type is not counted
+    # A `UnionAll`: any instance counts.
+    struct Wrapped{T}
+        x::T
+    end
+    wrap(x::Int) = Wrapped(x)
+    @test constructs(wrap, (Int,), Wrapped)
 end

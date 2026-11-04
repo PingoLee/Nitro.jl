@@ -566,15 +566,36 @@ struct CookieConfig
     cookie_key::Nullable{CookieKey}
 
     # Every construction path -- the keyword form below, `configcookies`, `serve(secret_key = …)`
-    # -- lands here, so this is where a key becomes a `SecretString`. See `_cookie_secret`.
+    # -- lands in one of these two, so this is where a key becomes a `SecretString` (see
+    # `_cookie_secret`) and where its AES key is derived (`_derived_cookie_key`), once each.
     function CookieConfig(secret_key, httponly, secure, samesite, path, domain, maxage, expires,
                           max_cookie_size)
         sealed = _cookie_secret(secret_key)
         return new(sealed, httponly, secure, samesite, path,
                    domain === nothing ? nothing : _normalize_domain(domain), maxage,
-                   expires, max_cookie_size, sealed === nothing ? nothing : CookieKey(sealed))
+                   expires, max_cookie_size, _derived_cookie_key(sealed))
+    end
+
+    # `base` with a new key and new flags, the rest carried over: what `serve` builds from the
+    # `App`'s config (`_serve_cookies`). Internal, not a documented form. `base`'s `domain` was
+    # normalized and its other fields converted to their types when `base` was built, so neither
+    # is redone: normalizing a normalized domain returns it unchanged.
+    #
+    # It exists for `juliac --trim` (#856). The general form above, called with `base`'s five
+    # `Nullable` fields, has 2^5 combinations of argument types: past the compiler's union-split
+    # limit, so the call is static only if the compiler happens to inline the constructor. Julia
+    # 1.13 did; 1.14 does not, and a trimmed `serve` then fails with a `MethodError`. Here `base`
+    # is concrete and only `secret_key` can be a `Union`, so the call is split statically on any
+    # version. `test/cookies_tests.jl` pins that.
+    function CookieConfig(base::CookieConfig, secret_key, httponly, secure, samesite)
+        sealed = _cookie_secret(secret_key)
+        return new(sealed, httponly, secure, samesite, base.path, base.domain, base.maxage,
+                   base.expires, base.max_cookie_size, _derived_cookie_key(sealed))
     end
 end
+
+_derived_cookie_key(::Nothing) = nothing
+_derived_cookie_key(sealed::SecretString) = CookieKey(sealed)
 
 CookieConfig(; secret_key = nothing, httponly = true, secure = true, samesite = "Lax", path = "/",
              domain = nothing, maxage = nothing, expires = nothing, max_cookie_size = nothing) =

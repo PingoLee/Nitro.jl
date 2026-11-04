@@ -137,7 +137,7 @@ route and no middleware, so the probe stays the measure of the route path.
 The lesson that generalizes: **`repr`/`string` of an un-inferred value is the most expensive single
 trim mistake**, and that includes a `Symbol`. Type the value, then `print` it.
 
-## 3. Remaining (40 errors on the minimal app on Julia 1.12.7; on 1.13, 96, then 87 after §3.6, 59 after the start-up walls, 27 after §3.7, 11 after §3.8 and 4 on HTTP 2.13, §3.9; the probe 22 after §3.11, 18 after #851)
+## 3. Remaining (40 errors on the minimal app on Julia 1.12.7; on 1.13, 96, then 87 after §3.6, 59 after the start-up walls, 27 after §3.7, 11 after §3.8 and 4 on HTTP 2.13, §3.9; the probe 22 after §3.11, 18 after #851; on 1.14, the app 5 and the probe 20, §3.12)
 
 Measured 2026-10-22 on Julia 1.12.7, before and after #572. Each error is printed twice, so 20
 sites. `main` before #572 had **22**: the 20 below plus `CookieKey`'s, which arrived with a later
@@ -1197,6 +1197,82 @@ The 18 left are the `@with` HAMT inside Base (4, §3.5) and 14 outside `src/`.
 What a trimmed image asks of an application's session: values of the JSON types, as a JSON
 store holds anyway. A `MemoryStore` session holding another value (a `Symbol`, a `DateTime`) is
 refused when it is copied or compared, as an `ArgumentError`, which the request answers `500`.
+
+### 3.12 Julia 1.14: two calls that were static only by inlining (#856)
+
+**Julia 1.14 is outside CI** (#526: CI runs 1.13 only). These counts are from local builds, and
+a non-blocking 1.14 leg in CI is an open proposal on #856.
+
+A trimmed app that serves did not start on Julia 1.14: `serve` died with a `MethodError`. #730
+found it; it is the first release line that ships `libjulia-internal.a`, so the first on which a
+single-file deploy could exist. Two calls, both verified on 1.13, were left unresolved:
+
+- `CookieConfig(; secret_key, httponly, …)` in `serve`, where the start-up dies;
+- `Request(method, target; headers, trailers, …)` in `_http_stream_request`, which would fail every
+  served request after it.
+
+**The cause is Nitro's calls, not a 1.14 regression.** Each passes values that are `Union`s:
+the five `Nullable` fields of the App's current config, and the request's body (`EmptyBody` or
+`BytesBody`) and `host`. A call on those types is static only if the compiler inlines it, or splits
+it over at most 4 combinations of concrete types. Past that limit, a call that is not inlined
+dispatches at run time, on 1.13 as on 1.14. Checked under the JIT with `code_typed`:
+
+- on 1.13, the keyword `CookieConfig` call inlined down to a `new`, and the keyword `Request` call
+  split into four static invokes of its keyword body (body × `host`);
+- on 1.14, both are a `Core.apply_type` of an abstract `NamedTuple` followed by a dynamic
+  `Core.kwcall`;
+- on 1.14, the positional `CookieConfig(…)` with the same nine values is dynamic too. So the
+  keyword form was never the point: the argument types were.
+
+A minimal repro with no Nitro did not show 1.14 doing worse. A struct of up to 12 keyword fields,
+any number of them `Union`s, resolves on both. With the keyword body kept out of line, 1.13 leaves
+every `Union`-valued call dynamic while 1.14 resolves it. What differs is which callees each
+version inlines, so no upstream report was filed.
+
+**The fix gives both calls argument types that resolve without inlining:**
+
+- `serve` builds its config through `_serve_cookies`, which calls an internal `base` form of
+  `CookieConfig`: `CookieConfig(base, secret_key, httponly, secure, samesite)`. It carries over
+  `base`'s path and limits, and its domain, which was normalized when `base` was built. Its only
+  `Union` argument is the key, which splits statically. Both constructors seal the key through
+  `_cookie_secret` and derive its AES key through one helper, and the keyword form is unchanged.
+  `serve`'s keyword body is pinned too: it calls `_serve_cookies`, and makes no keyword call of
+  `CookieConfig` (`keyword_body`, `calls_to`).
+- The transport builds its request through HTTP's typed positional `_request_nocopy`. HTTP's own
+  server rebuilds a request the same way, for the same reason. It sets the same fields as the
+  keyword form with `copyheaders = false`, which `test/http_internals_contract_tests.jl` checks
+  field by field on two served requests, and it is pinned there as a private name.
+
+The pins are in today's 1.13 CI: `kwcalls(…; optimize = false)` and `constructs` (`NitroCommon`).
+They pin the shape and not 1.13's verdict, since on 1.13 both keyword calls were static too.
+
+Built 2026-11-04 on `55b7ced6` with JuliaC 0.3.12 (registry), HTTP.jl 2.13.5,
+`--trim=unsafe-warn`, `JULIA_CPU_TARGET=native`:
+
+| | 1.13.2, before | 1.13.2, after | 1.14.0-alpha1.112 (`80ba946e97e`), before | 1.14, after |
+|---|--:|--:|--:|--:|
+| `ENTRY=app` verifier | 8 | 8 | 8 | **5** |
+| `ENTRY=app` served | starts, `/plaintext` 200 | the same | `MethodError` at `serve` | **starts, `/plaintext` 200, `/missing` 404** |
+| `ENTRY=probe` verifier | 18 | 18 | 20 | 20 |
+| probe answers not as expected | 0 | 0 | 14 | 14 |
+
+The three rows cleared on 1.14 are `serve` (2) and `_http_stream_request` (1). Nothing changed
+on 1.13. There the app reads 8, not §3.9's 4. The extra rows are `_broadcast_lifecycle`
+(`src/core/lifecycle.jl`) and `src/core/pipeline.jl`, unrelated to these calls and not chased
+here.
+
+**What 1.14 has left, not cleared here:**
+
+- `lock(f, l) do … end` now goes through `Base.#lock#448(DEFAULT_CANCEL, lock, f::Function, l)`,
+  which the verifier cannot resolve. It shows up at `cache_chain!` (`src/types.jl`, the route-chain
+  cache) and at `_await_phase_change` (`src/context.jl`).
+- Path-parameter binding: `parseparam_checked` at `src/core/parambinding.jl` and `pathparams` on
+  a `LazyRequest` (`src/types.jl`).
+- OpenSSL's `get_error`, and Base's `uv_readcb`.
+
+The probe never reaches either call fixed here: it builds the pipeline with `setupmiddleware`. Its
+14 unexpected answers, every routed request answering 500 and only the 404 path working, come
+from that wall. Its output is the same before and after.
 
 ## 4. The decision: `--trim=safe` is a target
 
