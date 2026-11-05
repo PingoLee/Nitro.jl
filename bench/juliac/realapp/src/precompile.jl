@@ -30,5 +30,16 @@ using PrecompileTools: @setup_workload, @compile_workload
                   HTTP.Request("GET", "/bad"))
             Nitro.internalrequest(wapp, r)
         end
+
+        # The listener `main` serves (#827): `Nitro.precompile_server` with `main`'s middleware,
+        # so HTTP.jl's connection loop for this app's server type is in the package image. The
+        # real worker store is built by `pormg_nitro_worker`, which opens a connection; this one
+        # has the same type, `PormGWorkerStore`, and a placeholder model, so nothing connects.
+        # `wapp` stands in for `app`: the listener's type does not depend on which `App` it is.
+        store = Base.get_extension(Nitro, :NitroPormGExt).PormGWorkerStore(;
+            model = :workload, db_key = "db")
+        workers = worker_startup(wapp; queues = ["reports"], store)
+        Nitro.precompile_server(wapp; middleware = (workers, ready)) ||
+            error("Nitro.precompile_server: a signature no longer applies (#827)")
     end
 end

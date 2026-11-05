@@ -21,7 +21,6 @@ include("Handlers/HealthHandlers.jl")
 include("Handlers/ItemHandlers.jl")
 include("Handlers/MiscHandlers.jl")
 include("Routes.jl")
-include("precompile.jl")
 
 # Bench only (#744): the listener opens before the `startup` hooks run, so the socket is not
 # readiness. This hook is registered after `worker_startup`'s, and hooks run in registration
@@ -29,6 +28,9 @@ include("precompile.jl")
 # a trimmed executable's `Base.stdout` is stale, and a buffered stream would print late.
 _mark_ready() = (m = "READY\n"; ccall(:write, Cssize_t, (Cint, Ptr{UInt8}, Csize_t), 2, m, sizeof(m)); nothing)
 const ready = Nitro.LifecycleMiddleware(middleware = identity, on_startup = _mark_ready)
+
+# After `ready`, which the workload passes to `Nitro.precompile_server` (#827).
+include("precompile.jl")
 
 """
     main(; kwargs...)
