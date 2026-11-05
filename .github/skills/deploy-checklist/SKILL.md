@@ -98,8 +98,32 @@ Report missing env vars by name; do not invent secret values.
 If the user uses nginx (or similar) in front of Nitro:
 
 - [ ] `proxy_pass` to the Nitro listen address (e.g. `http://127.0.0.1:8080`).
-- [ ] SPA history fallback: `try_files $uri $uri/ /index.html;` for the frontend root.
+- [ ] **SPA history fallback through a named location**, so a file-shaped miss is a `404` and not
+      the app shell: `location / { try_files $uri @spa; }` with `location @spa` returning `404`
+      when the last segment has an extension and rewriting to `/index.html` otherwise. A bare
+      `try_files $uri /index.html` answers `/wp-login.php` with `200` and the shell, which a
+      scanner records as a hit. The two shorter regex forms are wrong: a top-level
+      `location ~ \.[^/]+$` captures `/api/report.csv` and `/assets/*`, and the same regex nested
+      in `location /` wins over `location ~ /\.` and serves `/.env`.
 - [ ] WebSocket upgrade headers if the app uses Nitro websockets.
+
+**Hostile traffic.** One line each; the reasoning is in the tutorial's *Hostile and scanner
+traffic* section (`docs/src/tutorial/reverse_proxy.md`), not here:
+
+- [ ] `limit_req` at the **server** level (zone and `limit_req_status 429` at http level). A
+      location with its own `limit_req` inherits none from above, so it repeats the line.
+- [ ] Catch-all `default_server` blocks on 80 (`return 444`) and 443 (`ssl_reject_handshake on`),
+      so the bare-IP and unknown-`Host` scans never reach the app. On Debian/Ubuntu, disable the
+      stock `sites-enabled/default` or strip its `default_server`, or `nginx -t` refuses the config.
+- [ ] `server_tokens off`.
+- [ ] No `error_page` hands a Nitro response to a location that proxies it to Nitro again — one
+      request, two handler runs.
+- [ ] Ban with fail2ban or CrowdSec reading the proxy's **access** log, not in the app. The stock
+      `nginx-botsearch` jail reads the error log, where `try_files … =404` and `return 404` write
+      nothing; point its `logpath` at the access log.
+- [ ] HSTS from the proxy **or** `serve(app; security_headers = SecurityHeaders(hsts = …))`, never
+      both. At the proxy use `add_header … always`, and repeat it in every location that has an
+      `add_header` of its own.
 - [ ] **Client IP / rate limiting behind a proxy.** `ExtractIP` and `RateLimiter`
       ignore every forwarding header by **default** — they cannot be trusted from
       arbitrary clients. Behind a reverse proxy this means every client collapses onto
