@@ -137,7 +137,7 @@ route and no middleware, so the probe stays the measure of the route path.
 The lesson that generalizes: **`repr`/`string` of an un-inferred value is the most expensive single
 trim mistake**, and that includes a `Symbol`. Type the value, then `print` it.
 
-## 3. Remaining (40 errors on the minimal app on Julia 1.12.7; on 1.13, 96, then 87 after §3.6, 59 after the start-up walls, 27 after §3.7, 11 after §3.8 and 4 on HTTP 2.13, §3.9, then 8 since #840, §3.13; the probe 22 after §3.11, 18 after #851; on 1.14, the app 5 and the probe 20, §3.12, then 3 and 18, §3.13)
+## 3. Remaining (40 errors on the minimal app on Julia 1.12.7; on 1.13, 96, then 87 after §3.6, 59 after the start-up walls, 27 after §3.7, 11 after §3.8 and 4 on HTTP 2.13, §3.9, then 8 since #840, §3.13; the probe 22 after §3.11, 18 after #851; on 1.14, the app 5 and the probe 20, §3.12, then 3 and 18, §3.13; on 1.14 alpha2, 2 and 18, then 2 and 14 with no row in `src/`, §3.14)
 
 Measured 2026-10-22 on Julia 1.12.7, before and after #572. Each error is printed twice, so 20
 sites. `main` before #572 had **22**: the 20 below plus `CookieKey`'s, which arrived with a later
@@ -636,7 +636,8 @@ response, `200` with `"Hello, World!"`, gets back to `probe.jl`'s `main`, which 
   middleware may return anything;
 - the transport's body reads and response write on the app (18, §3.5), behind the same `Any`;
 - `pathparams(::LazyRequest)` makes one dynamic call under the JIT, because `LazyRequest.req` is
-  declared as the `HTTP.Request` UnionAll. The trimmed build resolves it (§3.5).
+  declared as the `HTTP.Request` UnionAll. The trimmed build resolves it (§3.5). §3.14 types the
+  field.
 
 ### 3.7 The response type through the outer layers
 
@@ -1333,7 +1334,7 @@ not a dispatch type there (a type's own type is now `Core.TypeEgal{T}`). The cal
 (`parseparam_checked`, 2 rows) and its result `Any`, which is #460's `Tuple{Any, String, Any}`. A
 repro with JSON.jl and no Nitro shows the same: `JSON.parse(s, p.type)` is an `invoke` returning
 `Int64` on 1.13, and a dynamic call returning `Any` on 1.14, while `JSON.parse(s, T)` with the
-static parameter stays `Int64`. Not worked around here. The `pathparams(::LazyRequest)` row
+static parameter stays `Int64`. Not worked around here; §3.14 does. The `pathparams(::LazyRequest)` row
 (2) sits beside it: `LazyRequest.req` is typed `HTTP.Request`, a `UnionAll`, so the call on it is
 the #856 pattern, static on 1.13 only by inlining.
 
@@ -1355,6 +1356,76 @@ the #856 pattern, static on 1.13 only by inlining.
 On 1.14 the app's 3 are `get_error`, `close(::BufferStream)` and `uv_readcb`, and the probe's 18 are
 the path-parameter rows (4) and 14 outside `src/`. On 1.13 the app's 8 are §3.9's 4 and #840's 4,
 and the probe's 18 have no row in `src/` but the `_app_context_seed` HAMT.
+
+### 3.14 Path-parameter binding on Julia 1.14 (#460)
+
+Built 2026-11-04 with JuliaC 0.3.12 (registry), HTTP.jl 2.13.5, JSON.jl 1.13.4,
+`--trim=unsafe-warn`, `JULIA_CPU_TARGET=native`, on Julia 1.13.2 and on 1.14.0-alpha2.122
+(`a8aa31d2a1b`), from `main` at `9d7c18e9` (§3.13 merged) and the change on top of it. Counted by
+first frame.
+
+**The 1.14 nightly moved since §3.13** (alpha1.112 → alpha2.122), and the counts with it. On the
+newer alpha, `main` reads app 2 and probe 18. Base's `close(::BufferStream)` row (§3.13) is gone
+from the app. The probe's 18 still hold the 4 path-parameter rows, and `GET /users/7` still answers
+500. The "before" column below is that alpha, not §3.13's.
+
+**The four rows**, two statements, each reported once per request body type (`EmptyBody`,
+`BytesBody`):
+
+| first frame | rows | statement |
+|---|--:|---|
+| `src/core/parambinding.jl` `PathParamStrategy` | 2 | `parseparam_checked(getfield(getfield(s, :param), :type)::Type{Int64}, …)::Any` |
+| `src/types.jl` `pathparams(::LazyRequest)` | 2 | `pathparams(getfield(request, :req)::Request)` |
+
+**The first is Julia's, worked around on Nitro's side.** §3.13 has the cause: 1.13 folds the
+`::Type{T}` field to a constant, 1.14 does not. The three scalar strategies (`PathParamStrategy`,
+`QueryParamStrategy`, `RequiredQueryParamStrategy`) now pass `parseparam_checked` their own type
+parameter `T`, which is the same type, known statically on any version. `Param`'s `type::Type{T}`
+field does not change, so a JuliaLang report (queued on #729) still has its repro.
+
+**The second is Nitro's: `LazyRequest` now carries the request's type**, as
+`LazyRequest{R<:HTTP.Request}`. `HTTP.Request` alone is a `UnionAll` over its body type, so
+`req::HTTP.Request` was an abstract field, and every accessor on a `LazyRequest` dispatched at run
+time. Under the JIT on 1.13 that was already the case: `code_typed` of `pathparams`, `queryvars`
+and `headers` on a `LazyRequest` shows a dynamic `:call` each. The 1.13 build accepted the path
+strategy only because it inlined the strategies into the parser, which forwards the concrete
+request it was called with through the `LazyRequest` it builds. 1.14 does not inline them. The
+parser builds the `LazyRequest` positionally, `LazyRequest(req)`, not through a keyword call (§3.12);
+the keyword form stays for callers. Every `::LazyRequest` signature still matches.
+
+A function barrier at the call (a closed dispatch over the transport's two request types, as
+`with_response` does for responses) would also clear the row. It was not taken: it repeats the
+request-shape list `src/routeendpoint.jl` already owns, and it fixes one call site where the type
+parameter fixes every accessor, the extractors' body readers included. Under the JIT on 1.13 a
+routed `internalrequest` allocates the same before and after (2,048 B on an exact route and
+2,720 B on a converter route, the median of 101 with the request built outside the measure).
+
+| | 1.13.2, `main` | 1.13.2, after | 1.14 alpha2, `main` | 1.14 alpha2, after |
+|---|--:|--:|--:|--:|
+| `ENTRY=app` verifier | 8 | 8 | 2 | 2 |
+| `ENTRY=app` served | `/plaintext` 200, `/missing` 404 | the same | the same | the same |
+| `ENTRY=probe` verifier | 18 | 18 | 18 | **14** |
+| probe: `GET /users/7` | 200 | 200 | 500 | **200** |
+| probe: middleware answers | as expected | as expected | as expected | as expected |
+
+The 1.13 `main` column is §3.13's "after" column, which used the same toolchain. The probe's
+`all middleware probes answered as expected` line covers only its middleware section. The six
+`TARGETS` it prints first, `/users/7` among them, are not counted in that line, so read them too.
+
+**What 1.14 has left is outside `src/`.** The app's 2 are OpenSSL.jl's `get_error` and Base's
+`uv_readcb`. The probe's 14 are `task.jl` (5), `get_error` (2), `with_output_color` (2),
+`asyncevent.jl` (2), `uv_readcb`, `scrub_repl_backtrace` and `show_exception_stack`. On 1.13 nothing
+moved: the app's 8 and the probe's 18 are §3.13's.
+
+**The pins** are in `test/handler_tests.jl`, beside #37's guard, and run in 1.13's CI:
+- **The strategies.** Each scalar strategy's lowered code passes `parseparam_checked` its static
+  parameter. 1.13's inference folds the field read, so only the lowered code can tell the two
+  shapes apart. The pin therefore holds the shape, not 1.13's verdict.
+- **`LazyRequest`.** Its `req` field is concrete. `pathparams`, `queryvars` and `headers` on it call
+  the request's accessor through a static `invoke`. The parser makes no keyword call to
+  `LazyRequest`.
+- **Each pin fails against a local revert of its change.** The behaviour readings beside them pass
+  on 1.13 either way: each strategy's inferred type, and the `invoke` of `parseparam_checked`.
 
 ## 4. The decision: `--trim=safe` is a target
 

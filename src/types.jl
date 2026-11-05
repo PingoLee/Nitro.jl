@@ -1390,8 +1390,14 @@ end
 
 # ─── Lazy Request Accessors ───────────────────────────────────────────
 
-struct LazyRequest
-    req::HTTP.Request
+# The request's own type is a parameter (#460): `HTTP.Request` is a `UnionAll` over its body type,
+# so a field declared `::HTTP.Request` was abstract, and every accessor below (`pathparams`,
+# `queryvars`, `headers`, the body readers) dispatched on it at run time. Julia 1.13 hid that
+# where it inlined the param binder's strategies into the parser and forwarded the concrete
+# request through the `LazyRequest` it had just built; where it did not inline, and on 1.14, the
+# call was dynamic, and `juliac --trim` rejects it. Every `::LazyRequest` signature still matches.
+struct LazyRequest{R<:HTTP.Request}
+    req::R
 end
 
 LazyRequest(; request::HTTP.Request) = LazyRequest(request)
