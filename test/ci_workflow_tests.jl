@@ -80,6 +80,24 @@ end
     @test occursin(r"(?m)^          GITHUB_TOKEN:\s*\$\{\{\s*secrets\.GITHUB_TOKEN\s*\}\}", step)
 end
 
+@testset "the PostgreSQL race suite runs on both drivers, unprivileged (#407)" begin
+    # The only job that runs the worker store against a real PostgreSQL; nothing else would notice
+    # it going missing. It executes the pinned PormG source, so it carries the `test` job's
+    # hardening, and it needs no token: its database is a service container.
+    pg = match(r"(?m)^  postgres:\n((?:(?:    .*|)\n)*?)(?=^  [\w-]+:$)", CI_SRC)
+    @test pg !== nothing
+    job = pg === nothing ? "" : pg[1]
+    @test occursin(r"(?m)^    permissions:\n      contents: read$", job)
+    @test occursin(r"persist-credentials:\s*false", job)
+    @test occursin(r"delete-old-caches:\s*'false'", job)
+    @test occursin(r"driver:\s*\[LibPQ, Postgres\]", job)
+    @test occursin("PORMG_POSTGRES_DRIVER: \${{ matrix.driver }}", job)
+    @test occursin(r"run: julia --threads=2 test/postgres/run\.jl", job)
+    @test !occursin("secrets.", job)
+    # The service image is pinned by digest, as every action is pinned by commit.
+    @test occursin(r"image:\s*postgres:[\w.-]+@sha256:[0-9a-f]{64}", job)
+end
+
 @testset "workflows read no secret the repository does not define" begin
     # The repository defines no Actions secrets; every workflow runs on the job token. A
     # `secrets.<NAME>` reference to anything else resolves to an empty string with no error:
@@ -117,7 +135,11 @@ end
 # materialises and may execute PormG's code". `docs` does not use it -- it instantiates
 # `--project=docs`, which does not carry Nitro's `[sources]` -- which is what keeps the
 # write scope and the deploy token parked there, exactly as before.
-const PORMG_JOBS = count(r"julia-actions/julia-buildpkg", CI_SRC)
+#
+# The `postgres` job (#407) is the one other marker: `test/postgres/run.jl` adds PormG at the
+# `[sources]` url + rev itself, without `julia-buildpkg`, and then runs it. It counts once per
+# appearance of that script, so it is held to the same hardening floor below.
+const PORMG_JOBS = count(r"julia-actions/julia-buildpkg", CI_SRC) + count(r"test/postgres/run\.jl", CI_SRC)
 
 @testset "PormG is pinned to an immutable commit, defined exactly once" begin
     # The pin lives in Project.toml now, not in the workflow. Read the SHIPPED file, for

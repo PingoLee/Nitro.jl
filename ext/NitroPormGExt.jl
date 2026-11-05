@@ -1215,7 +1215,8 @@ end
 # is evaluated once, on the old snapshot: a key re-run committing while the DELETE waited on its
 # lock had its fresh PENDING row deleted (#379), so this was a hand-written DELETE until #398. The
 # `[compat]` bound is what keeps it closed -- an older PormG re-opens it. No mock can stage the
-# race; the rendered shape is pinned in `test/extensions/pormg_worker_tests.jl` instead.
+# race; the rendered shape is pinned in `test/extensions/pormg_worker_tests.jl`, and the race
+# itself runs against a real server in `test/postgres/run.jl` (#407).
 # SQLite serializes writers and never had the gap.
 
 # The delete counterpart of `try_transition!` (#323): the status and run preconditions sit in the

@@ -254,6 +254,60 @@ jobs:
       - uses: julia-actions/julia-buildpkg@e3eb439fad4f9aba7da2667e7510e4a46ebc46e1 # v1.7.0
       - name: Load, route and serve without the test environment
         run: julia --project=. .github/scripts/smoke_test.jl
+  postgres:
+    # The PormG worker store's PostgreSQL-only promises, against a real server (#407): the
+    # guarded deletes' re-check after a row-lock wait (#379, #398), `claim_next!`'s
+    # `SKIP LOCKED`, `requeue_expired!` against a renewal, the upgrade boot of a pre-#514 table,
+    # and several consumer processes draining one queue. SQLite serializes writers, so the
+    # `@testitem` suite can only pin the rendered SQL; each scenario here records the lock wait it
+    # depends on, so a pass cannot be vacuous. `test/postgres/run.jl` says how it is gated.
+    #
+    # Both drivers PormG can build a PostgreSQL pool with, on the correctness bar they share.
+    #
+    # This job EXECUTES the pinned PormG source -- `run.jl` adds it at the `[sources]` url + rev
+    # rather than through `julia-buildpkg` -- so it is hardened like `test`: `contents: read`,
+    # `persist-credentials: false`, no token, no secrets. `ci_workflow_tests.jl` counts it among
+    # the PormG jobs. The database is a throwaway service container; its password is not a secret.
+    name: PostgreSQL race suite (${{ matrix.driver }})
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        driver: [LibPQ, Postgres]
+    services:
+      postgres:
+        # Pinned by digest, as every action is pinned by commit.
+        image: postgres:17@sha256:748a18a54d3842d43bc156f0840d78029b8d349e0feca98c12b9c4ce3404a6b3
+        env:
+          POSTGRES_USER: nitro
+          POSTGRES_PASSWORD: nitro
+          POSTGRES_DB: nitro
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U nitro -d nitro"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false   # same reason as the `test` job
+      - uses: julia-actions/setup-julia@da908477b5db94c10ffce8cfea9f2b3b9d5db687 # v3.0.3
+        with:
+          version: '~1.13.0-0'
+      - uses: julia-actions/cache@9353db09a0f2bbbdec6f41791918c75d37391b36 # v3.5.0
+        with:
+          include-matrix: 'false'
+          delete-old-caches: 'false'   # same reason as the `test` job above
+          cache-name: julia-cache;workflow=${{ github.workflow }};job=${{ github.job }};driver=${{ matrix.driver }}
+      - name: Race suite
+        run: julia --threads=2 test/postgres/run.jl
+        env:
+          NITRO_PG_CONNINFO: host=localhost port=5432 user=nitro password=nitro dbname=nitro
+          PORMG_POSTGRES_DRIVER: ${{ matrix.driver }}
   docs:
     name: Documentation
     runs-on: ubuntu-latest

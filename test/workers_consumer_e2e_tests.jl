@@ -6,8 +6,9 @@
 # boundary through the database, which is what no in-process test can show.
 #
 # `NITRO_E2E_POSTGRES` set to a libpq conninfo (`host=… port=… dbname=…`) runs it against that
-# PostgreSQL database instead, by hand: CI has no PostgreSQL (#407), and the environment then
-# needs `LibPQ`, which is not a test dependency.
+# PostgreSQL database instead, by hand: the environment then needs `LibPQ`, which is not a test
+# dependency. CI covers the claim path on PostgreSQL in a separate race suite,
+# `test/postgres/run.jl` (#407), which does not include this item.
 
 using Test
 using Dates

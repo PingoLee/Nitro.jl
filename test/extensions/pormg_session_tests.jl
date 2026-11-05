@@ -1507,7 +1507,8 @@ end
 # The store's write through a REAL PormG connection (#567). Every other session test runs on a
 # mock, and the mock carries its own copy of `update_or_create`: its conflict target, its keyword
 # shape and its `created` flag are exactly what only a real database can confirm. SQLite is a test
-# dependency; PostgreSQL is checked by hand (CI has none).
+# dependency; PostgreSQL is checked by hand (CI's PostgreSQL job, `test/postgres/run.jl`, covers
+# only the worker store).
 @testitem "PormG session store on a real SQLite file (#567)" tags=[:extension, :pormg] setup=[NitroCommon] begin
 
 using Test

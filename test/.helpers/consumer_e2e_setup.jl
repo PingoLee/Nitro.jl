@@ -6,7 +6,7 @@
 const E2E_DB_KEY = "nitro_consumer_e2e"
 
 # The shared store: one SQLite file, or a PostgreSQL database when `spec` is a libpq conninfo
-# (`dbname=…`, how the test is run by hand against a real server, since CI has none). A dynamic
+# (`dbname=…`, how the test is run by hand against a real server). A dynamic
 # connection is read-only until writes are enabled; `change_db` lets `pormg_nitro_worker` create
 # the task table.
 e2e_is_postgres(spec::AbstractString) = occursin("dbname=", spec)
