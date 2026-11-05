@@ -278,6 +278,30 @@ _default_serve_listener(ctx::App) =
                                     security_headers = nothing),
                     stream_handler, DEFAULT_MAX_BODY_BYTES, zero(Int64), zero(Int64), nothing)
 
+# `_serve_listener` for the server `serve(ctx; kwargs...)` would build with `revise = :none`, for
+# `precompile_server(app; …)` (#827). Only the keywords that reach the pipeline's or the
+# listener's TYPE are read; every other `serve` keyword (`host`, `port`, `secret_key`, the
+# timeouts) is accepted and ignored, so one `NamedTuple` can be splatted into both calls. The
+# limits travel as `Int64` whatever their value, so they are passed as `serve`'s defaults.
+# Binds nothing and registers nothing: `setupmiddleware` is the half `internalrequest` also runs
+# per request; the lifecycle registration is `serve`'s alone.
+#
+# The same calls as `serve`'s `revise = :none` branch and `_serve_pipeline`, so the type is the
+# one `serve` builds; test/precompilation_test.jl asserts it for non-default shapes, as it does
+# `_default_serve_listener`'s for the default one.
+function _serve_listener_for(ctx::App; middleware::Union{Tuple,Vector} = (), handler::H = stream_handler,
+                             serialize = true, catch_errors = true, show_errors::Bool = true,
+                             access_log = true, access_log_query = false, access_log_skip = nothing,
+                             security_headers = nothing, kwargs...) where {H}
+    security_headers === nothing || security_headers isa SecurityHeaders ||
+        throw(ArgumentError("`security_headers` must be a `SecurityHeaders(...)` value or " *
+                            "`nothing`, got $(repr(security_headers))"))
+    pipeline = setupmiddleware(ctx; middleware, serialize, catch_errors, show_errors, access_log,
+                               access_log_query, access_log_skip, security_headers)
+    return _serve_listener(pipeline, handler, DEFAULT_MAX_BODY_BYTES, zero(Int64), zero(Int64),
+                           security_headers)
+end
+
 # The transport layer of one `_serve_listener` result (#450), COMPILED, not run, and `false` when
 # any signature stops applying, as `precompile` does. Running it would need a live connection:
 # `stream_handler` closes the write side itself (#453), and HTTP's socket-free `Stream(request)`

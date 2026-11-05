@@ -19,6 +19,17 @@ Nitro.Core.Constants.DEFAULT_MAX_BODY_BYTES
 Nitro.Core.Constants.DEFAULT_MAX_FIELDS
 ```
 
+## Warming a Server in a Precompile Workload
+
+A server with its own `middleware` compiles HTTP.jl's connection loop on its first request.
+Calling `Nitro.precompile_server` from your package's workload, with the keywords you pass to
+`serve`, caches that code in the package image. The recipe is in
+[Warming your own server shape](@ref).
+
+```@docs
+Nitro.precompile_server
+```
+
 ## Start-up Failures in a Compiled Executable
 
 In an executable built by `juliac`, an exception that escapes `main` is printed field by field,

@@ -122,6 +122,10 @@ export  # The application handle
 # belong in every `using Nitro` namespace. Called qualified, `Nitro.newapp(...)`.
 public newapp
 
+# Public, not exported (#827): an application's precompile workload calls it once, qualified as
+# `Nitro.precompile_server(app; …)`, and the bare name would read as HTTP.jl's own.
+public precompile_server
+
 # Public, not exported (#752): what an executable's `@main` prints when start-up fails
 # (docs/src/tutorial/deployment.md). Called qualified, `Nitro.startup_failure_text(e)`.
 using .Core.Errors: startup_failure_text
