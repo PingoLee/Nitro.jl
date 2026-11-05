@@ -89,6 +89,27 @@ an AWS ALB both close idle connections at 60 seconds, and a backend that closes 
 the proxy reusing them, which surfaces as sporadic `502`s. Keep it above your proxy's idle
 timeout if you lower it.
 
+**What the two timeouts cost under load.** The cost comes from re-arming the deadlines, not from
+having them. With both timeouts on, HTTP.jl re-arms a keep-alive connection's read deadline
+about three times per request. Each change takes the one lock of the poller thread that HTTP.jl
+2.13's transport, Reseau 1.6, runs for every socket in the process. With several threads busy,
+that lock is contended, and the contention makes every socket wait in the process slower. That
+includes the database driver's waits, which never carry a deadline.
+[#782](https://github.com/PingoLee/Nitro.jl/issues/782#issuecomment-6495112029) measured a
+Nitro server on 6 CPUs at `--threads=8,1`, with 50 clients and PormG on its Postgres.jl driver.
+With both timeouts at their defaults, it served 948 requests per second on a route making 20
+queries, and 10,973 on a route making one. With both set to 0, it served 1,026 and 11,755: about
+7–8% more. The poller thread used 60–80% more CPU with the timeouts on. The extra CPU per
+request grows with the number of queries, at about 20 µs per query, which is inferred from the
+two routes.
+
+The fix belongs in Reseau's deadline path, and is reported as
+[JuliaServices/Reseau.jl#227](https://github.com/JuliaServices/Reseau.jl/issues/227). The
+defaults stay on, because they are what stops a client that never finishes its request head or
+never closes an idle connection. Setting both to 0 recovers the cost, but leaves those clients to
+whatever is in front of Nitro. That is a trade to make only when the proxy enforces its own
+header and idle timeouts on every client connection.
+
 The other half of capacity is the process itself: how many threads it starts with, and how much
 memory its garbage collector aims for. Both are covered in
 [Running in Production](deployment.md).
