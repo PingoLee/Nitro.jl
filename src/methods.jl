@@ -433,8 +433,8 @@ Not every file in `folder` is served. These are refused:
 
 A filename that needs percent-encoding is **not** refused — it is served at its **encoded route**.
 `café.txt` mounts at `/static/caf%C3%A9.txt` and `my file.txt` at `/static/my%20file.txt`, which are
-the URLs a conforming client sends; the router compares path segments byte for byte and never
-decodes, so **no conforming client** could reach the unencoded spellings. The returned pair carries
+the URLs a conforming client sends. Nitro puts every request path in that one canonical encoding
+before routing (#351), so `caf%c3%a9.txt` and a raw `café.txt` reach the same file. The returned pair carries
 the encoded route and the raw filesystem path, so **do not re-derive one from the other** — read the
 route from `first(pair)` rather than rebuilding it from the filename.
 

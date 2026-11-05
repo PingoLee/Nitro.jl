@@ -14,7 +14,7 @@ Nitro = {path = "../../.."}
 PormG = {url = "https://github.com/PingoLee/PormG.jl.git", rev = "5531c68cf482ca0723878bc6c593720a8cbf3502"}
 
 [compat]
-HTTP = "~2.13"
+HTTP = "~2.15"
 Nitro = "0.7.0"
 PormG = "^0.9"
 Postgres = "2.4"

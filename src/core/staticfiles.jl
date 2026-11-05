@@ -7,9 +7,9 @@
 # A mount registers exactly TWO routes — `/<prefix>/**` and the bare `/<prefix>` — and resolves
 # the request against a table built at mount time. It used to register one literal route per
 # enumerated file, which is what every one of #101, #94, #121 and part of #95 came out of: the
-# router compares path segments byte for byte and never percent-decodes, so the registered route
-# and the request a conforming client sends were two independent strings that had to be made to
-# agree. They no longer are.
+# router compared path segments byte for byte and never percent-decoded (true until HTTP 2.14,
+# #868), so the registered route and the request a conforming client sends were two independent
+# strings that had to be made to agree. They no longer are.
 #
 # Every comparable framework already does it this way — Go `net/http.FileServer`, Express
 # `serve-static`/`send`, Phoenix `Plug.Static`, Django `static.serve`, nginx. All of them mount one

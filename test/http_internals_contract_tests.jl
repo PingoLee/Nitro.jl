@@ -21,7 +21,8 @@ import Sockets
 #       and its `max_parts` cap, whose plain-`error` message `_too_many_parts` reads (HTTP 2.13).
 #   • src/core/pipeline.jl — `_allowed_methods` walks the router's route tree to build a 405's
 #       `Allow` header (#281): `Router.routes`, the `Node`/`Leaf`/`Variable` fields, `match`,
-#       `_route_variable_matches` and `_router_request_path`.
+#       `_route_variable_matches`, `_router_request_path`, and `_decode_segment`, which it
+#       decodes the request's segments with as `gethandler` does (HTTP 2.14, #868).
 #   • src/types.jl — `NitroRouter` (#625) names the concrete router type as
 #       `Router{typeof(_404), typeof(_405), typeof(middleware)}`, which depends on `Router{T,S,F}`'s
 #       parameter order matching its positional constructor `Router(_404, _405, middleware)`.
@@ -50,13 +51,15 @@ import Sockets
 #   • src/context.jl — `_shutdown_server`'s bounded drain: it depends on `close(::Server)`
 #       releasing the listener BEFORE its unbounded quiesce loop, and escalates to
 #       `HTTP.forceclose`.
-#   • src/precompile.jl — the transport block names the connection loop by signature,
-#       `_serve_conn!(::Server{typeof(listener)}, ::_ServerConn)` (#827), so a default server's
-#       first request does not compile it.
+#   • src/core/lifecycle.jl — `_precompile_listener` compiles HTTP's accept loop, connection
+#       loop and HTTP/2 stream task through `HTTP.precompile_server` (public since HTTP 2.15,
+#       #868), so a warmed server's first request does not compile them. Pinned anyway: it
+#       returns `false` rather than throwing when a signature stops applying, which no request
+#       would notice.
 #
 # None of these are part of HTTP's public, SemVer-guaranteed API, so a 2.x bump
 # can rename or remove them WITHOUT a breaking-version signal. The compat pin
-# (`HTTP = "~2.13"`) caps that exposure to 2.13 patch releases; this testset is the
+# (`HTTP = "~2.15"`) caps that exposure to 2.15 patch releases; this testset is the
 # canary — if an upgrade moves the ground, it fails HERE, loud and naming the
 # missing symbol, instead of deep inside request handling.
 #
@@ -189,6 +192,16 @@ end
     @test hasmethod(H.match, Tuple{H.Node, String, Vector{SubString{String}}, Int})
     @test hasmethod(H._route_variable_matches, Tuple{Regex, SubString{String}})
     @test H._router_request_path("/a/b?x=1") == "/a/b"
+    # Since HTTP 2.14 the tree holds literal segments decoded, and `gethandler` decodes the
+    # request's with this, after the split, so `%2F` stays inside its segment (#868).
+    @test hasmethod(H._decode_segment, Tuple{SubString{String}})
+    @test H._decode_segment(SubString("%61dmin")) == "admin"
+    @test H._decode_segment(SubString("a%2Fb")) == "a/b"
+    @test H._decode_segment(SubString("%ZZ")) == "%ZZ"          # undecodable: matched as written
+    let d = HTTP.Router()
+        HTTP.register!(d, "GET", "/p/a%252F", req -> HTTP.Response(200))
+        @test only(only(d.routes.exact).exact).segment == "a%2F"  # stored decoded
+    end
 
     # Behavior, not only shape: a plain variable, a pattern-constrained one, and a `**`.
     r = HTTP.Router()
@@ -199,6 +212,14 @@ end
     @test Nitro.Core._allowed_methods(r, "/a/7") == ["DELETE", "GET"]
     @test Nitro.Core._allowed_methods(r, "/a/z") == ["GET"]
     @test Nitro.Core._allowed_methods(r, "/b/c/d?q") == ["PUT"]
+    # Decoded as `gethandler` decodes (#868): the walk agrees with `match` on an encoded target.
+    let e = HTTP.Router()
+        HTTP.register!(e, "GET", "/p/a%252F", h)
+        HTTP.register!(e, "PUT", "/admin", h)
+        @test Nitro.Core._allowed_methods(e, "/p/a%252F") == ["GET"]
+        @test isempty(Nitro.Core._allowed_methods(e, "/p/a%2F"))   # `match` serves no route here
+        @test Nitro.Core._allowed_methods(e, "/%61dmin") == ["PUT"]
+    end
     @test isempty(Nitro.Core._allowed_methods(r, "/c"))
 end
 
@@ -521,29 +542,17 @@ end
     @test hasmethod(HTTP._set_read_deadline!, Tuple{HTTP.TLS.Conn, Int64})
 end
 
-@testset "connection-loop surface (src/precompile.jl, #827)" begin
-    # The workload caches HTTP's connection loop for the default listener by naming
-    # `_serve_conn!(::Server{typeof(listener)}, ::_ServerConn)`, which is what the task
-    # `_serve_listener!` spawns for each accepted connection runs. A rename fails the
-    # workload's `precompile` (test/precompilation_test.jl). This testset catches the quiet
-    # failure instead: the spawn calling something else, so the cached code is never used and a
-    # fresh server's first request is ~1.5 s again, with nothing failing.
-    @test isdefined(HTTP, :_serve_conn!)
-    @test hasmethod(HTTP._serve_conn!, Tuple{HTTP.Server, HTTP._ServerConn})
-    @test isconcretetype(HTTP._ServerConn)
-    @test length(Base.unwrap_unionall(HTTP.Server).parameters) == 1
-    spawns = [getglobal(HTTP, n) for n in names(HTTP; all = true)
-              if startswith(String(n), "#_serve_listener!##") && getglobal(HTTP, n) isa Type]
-    call_methods(T) = [r.method for r in Base._methods_by_ftype(
-        Base.rewrap_unionall(Tuple{Base.unwrap_unionall(T)}, T), -1, Base.get_world_counter())]
-    globalrefs(x) = x isa GlobalRef ? GlobalRef[x] :
-                    x isa Expr ? reduce(vcat, map(globalrefs, x.args); init = GlobalRef[]) :
-                    GlobalRef[]
-    calls_serve_conn(m) = any(Base.uncompressed_ast(m).code) do stmt
-        any(g -> g.mod === HTTP && g.name === :_serve_conn!, globalrefs(stmt))
-    end
-    @test !isempty(spawns)
-    @test any(T -> any(calls_serve_conn, call_methods(T)), spawns)
+@testset "connection-loop surface (src/core/lifecycle.jl `_precompile_listener`, #827, #868)" begin
+    # The workload, and an app's `Nitro.precompile_server`, cache HTTP's accept loop, connection
+    # loop and HTTP/2 stream task for a listener type through `HTTP.precompile_server`. It is
+    # public, but it reports a signature that stopped applying by returning `false`, as
+    # `precompile` does, and the cost of that is invisible: a fresh server's first request is
+    # ~1.5 s again, with nothing failing. So the `true` is pinned here, for the default listener.
+    @test Base.ispublic(HTTP, :precompile_server)
+    @test hasmethod(HTTP.precompile_server, Tuple{Type})
+    app = Nitro.App()
+    listener, _ = Nitro.Core._default_serve_listener(app)
+    @test HTTP.precompile_server(typeof(listener)) === true
 end
 
 @testset "h2c refusal surface (src/core/lifecycle.jl `preprocesskwargs`, `allow_h2c`)" begin
@@ -778,7 +787,7 @@ end
 
 @testset "HTTP's SSE body contract, which Res.sse is built on (#160)" begin
     # `Res.sse` hands the transport an `HTTP.SSEStream` and nothing else. Three properties of that
-    # type are load-bearing for Nitro, and `HTTP = "~2.13"` is a deliberately tight pin, so they are
+    # type are load-bearing for Nitro, and `HTTP = "~2.15"` is a deliberately tight pin, so they are
     # pinned here next to the rest of the HTTP contract.
 
     # 1. It is an `AbstractBody`, so it dispatches to the STREAMING method of

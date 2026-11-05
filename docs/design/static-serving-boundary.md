@@ -272,16 +272,19 @@ So only space, `?` and control characters were *strictly* dead. The rest were re
 that sends raw bytes rather than percent-encoding — `curl` by default — and refusing them genuinely
 takes that away. Nor is the encoded spelling a transparent migration: `caf%C3%A9` and raw `café` are
 different byte strings, and matching is a byte comparison (the same fact the no-re-encoding rule above
-depends on), so the encoded route does not answer the raw client.
+depends on), so the encoded route does not answer the raw client. (Superseded: since #351 a raw
+`café` is canonicalized to `caf%C3%A9` before routing, and since HTTP 2.14 the router decodes both
+sides, #868, so the encoded mount does answer it.)
 
 The trade is still worth making — `mountdir` is judged by the same rule as a filename, and a prefix no
 browser can reach is a footgun whatever a hand-rolled client can do with it — but it is a capability
 change, not just a dead-mount cleanup, and the #101 upgrade-log entry says so.
 
 **Validated, never re-encoded.** A percent triplet is checked for well-formedness and passed through
-byte for byte. HTTP.jl matches path segments with a byte comparison rather than an RFC 3986
+byte for byte. HTTP.jl matched path segments with a byte comparison rather than an RFC 3986
 equivalence test, so case-normalizing `"%2f"` to `"%2F"`, or decoding unreserved triplets, would stop
-matching the client that sends the other spelling.
+matching the client that sends the other spelling. (Superseded twice: #351 canonicalizes the request
+path before routing, and since HTTP 2.14 the router itself decodes both sides, #868.)
 
 `mountdir` is app-authored — a single value with an obvious correction — so it throws. Filenames are
 not refused at all; they are **encoded**, which is the next sub-section.
@@ -393,7 +396,8 @@ routes a mount registers.
 `Dict` built from `mountable_files`. It no longer registers a route per enumerated file.
 
 **Why the change was worth making.** #101, #94, #121 and part of #95 are four instances of one
-cause: the router compares path segments byte for byte and never percent-decodes, so the route a
+cause: the router compared path segments byte for byte and never percent-decoded (true until
+HTTP 2.14, #868), so the route a
 mount registered and the request a conforming client sent were two independent strings that had to
 be made to agree. Each was fixed correctly and locally, and the cluster kept reopening, because the
 cause is a *representation* rather than a branch. §8 already recorded that every comparable

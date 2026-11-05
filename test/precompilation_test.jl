@@ -66,14 +66,8 @@ try
     # And the workload's `precompile` calls are not silently refused: `precompile` returns `false`
     # rather than throwing when a signature does not apply, e.g. if HTTP changes `Stream`'s
     # parameters, and the workload would then cache nothing.
-    stream = Nitro.Stream{false, Nitro.Request{Nitro.Core.HTTP.EmptyBody}}
-    @test precompile(listener, (stream,))
-    @test precompile(Nitro.Core.HTTP._serve_conn!,
-                     (Nitro.Core.HTTP.Server{typeof(listener)}, Nitro.Core.HTTP._ServerConn))
-    @test precompile(request_handler, (stream,))
-    @test precompile(Nitro.Core._handle_reporting, (typeof(request_handler), stream))
-    @test precompile(Nitro.Core._send_response!, (Nitro.Core.HTTP.Response{String}, stream,
-        Nitro.Core.Types.EmptyRequest, Nothing))
+    # `_precompile_listener` ANDs every one of them, HTTP's `precompile_server` included (#868).
+    @test Nitro.Core._precompile_listener(listener, request_handler) === true
 finally
     terminate(app)
 end

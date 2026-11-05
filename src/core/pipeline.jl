@@ -288,12 +288,18 @@ any one of them: the handler decides, and a static mount's catch-all is a `"*"` 
 drops nothing when `match` itself reported the mismatch: it returns a `"*"` leaf for any method
 that reaches one, so such a target reaches none.
 
+The segments are percent-decoded as upstream `gethandler` decodes them (HTTP 2.14, #868), by
+upstream's own `_decode_segment`: the tree holds literal segments decoded, so a raw walk would
+answer `405` for `/a%2F` beside a route `/a%252F` (stored `a%2F`) that `match` does not serve.
+
 Reads HTTP.jl internals (`Router.routes`, the `Node`/`Leaf`/`Variable` fields, `match`,
-`_route_variable_matches`, `_router_request_path`). Each one is canaried in
+`_route_variable_matches`, `_router_request_path`, `_decode_segment`). Each one is canaried in
 test/http_internals_contract_tests.jl.
 """
 function _allowed_methods(r::HTTP.Router, target::String)::Vector{String}
-    segments = split(HTTP.Handlers._router_request_path(target), '/'; keepempty = false)
+    path = HTTP.Handlers._router_request_path(target)
+    raw = split(path, '/'; keepempty = false)
+    segments = occursin('%', path) ? map(HTTP.Handlers._decode_segment, raw) : raw
     candidates = String[]
     _collect_leaf_methods!(candidates, r.routes, segments, 1)
     allowed = String[]

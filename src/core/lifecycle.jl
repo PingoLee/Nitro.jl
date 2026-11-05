@@ -278,6 +278,42 @@ _default_serve_listener(ctx::App) =
                                     security_headers = nothing),
                     stream_handler, DEFAULT_MAX_BODY_BYTES, zero(Int64), zero(Int64), nothing)
 
+# The transport layer of one `_serve_listener` result (#450), COMPILED, not run, and `false` when
+# any signature stops applying, as `precompile` does. Running it would need a live connection:
+# `stream_handler` closes the write side itself (#453), and HTTP's socket-free `Stream(request)`
+# has no connection to close. `precompile` needs only the types.
+#
+# HTTP.jl's accept loop, connection loop and HTTP/2 stream task are specialized on the server's
+# handler type, and `HTTP.precompile_server` (HTTP 2.15, #868) compiles all three for it. Before,
+# nearly all of a fresh server's first request was that loop, ~1.46 s on Julia 1.13.2 (#827).
+#
+# One stream type covers every HTTP/1.1 request, with a body or without: HTTP builds each `Stream`
+# around `_stream_request_metadata(request)`, which is always a `Request{EmptyBody}`, and keeps
+# the live body in an abstract `request_body` field. What stays cold is only the body READ for
+# `FixedLengthBody`/`ChunkedBody`, which dispatches at runtime off that field.
+#
+# Called by Nitro's own workload for the default shape (src/precompile.jl) and by the public
+# `precompile_server(app; …)` for any other (src/methods.jl).
+function _precompile_listener(listener::L, request_handler::R)::Bool where {L, R}
+    stream = HTTP.Stream{false, HTTP.Request{HTTP.EmptyBody}}
+    ok = precompile(listener, (stream,))
+    ok &= HTTP.precompile_server(L)
+    ok &= precompile(request_handler, (stream,))
+    # What the spawn runs: a `@spawn` closure's body is not compiled with the listener.
+    ok &= precompile(_handle_reporting, (R, stream))
+    # The write half, once per body type Nitro builds (`Types.with_response`), for the two
+    # requests the transport builds. The two streaming bodies (#551) cost ~120 ms each on a first
+    # request when cold: a streamed file (`Res.file(req, path)` over 8 MiB or with `stream = true`,
+    # and a mount's files over its threshold) and `Res.sse`'s `SSEStream`. The admission is
+    # `nothing` unless `max_concurrent_requests` holds a slot.
+    for B in (String, Vector{UInt8}, HTTP.EmptyBody, HTTP.BytesBody{Vector{UInt8}},
+              HTTP.BytesBody{Types.RangeBytes}, Types.StreamedFileBody, HTTP.SSEStream),
+        Q in (Types.EmptyRequest, Types.BytesRequest), A in (Nothing, _Admission)
+        ok &= precompile(_send_response!, (HTTP.Response{B}, stream, Q, A))
+    end
+    return ok
+end
+
 # The refusal `serve` throws when `ctx` is not idle, worded for the phase it is in (#812).
 function _not_idle_error(ctx::App)::ArgumentError
     phase = AppContext._phase(ctx.service.phase[])

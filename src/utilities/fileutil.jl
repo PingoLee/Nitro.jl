@@ -190,8 +190,8 @@ this function applied to the decoded bytes — so a client sending `caf%c3%a9.tx
 reaches the same route.
 
 This is the filename half of the rule `mount_segments` enforces on `mountdir`. The router
-compares path segments byte for byte and never percent-decodes, so a file whose name needs encoding
-used to register a route that no conforming client could ever match — enumerated, registered,
+compared path segments byte for byte and never percent-decoded (true until HTTP 2.14, #868), so a
+file whose name needs encoding used to register a route that no conforming client could ever match — enumerated, registered,
 counted and logged as served, and a 404 in every browser
 ([#121](https://github.com/PingoLee/Nitro.jl/issues/121)). Encoding the route is the only one of the
 available responses that *fixes* that rather than reporting it, and it is only expressible because
@@ -647,16 +647,18 @@ surviving segment is refused, with an `ArgumentError` naming it, when it is eith
   loudly at registration; `*` was the one that did not, which is what made it worth refusing here
   (#101); or
 - **not a legal URL path segment** ([`_first_unroutable`](@ref)) — anything outside RFC 3986 `pchar`.
-  The router compares raw path segments and never percent-decodes, and a conforming client
-  percent-encodes these characters before sending, so the registered route and the request can never
-  meet. Write the prefix pre-encoded (`"my%20static"`, `"caf%C3%A9"`) and it mounts and serves.
+  A conforming client percent-encodes these characters before sending, and when this rule was
+  written the router compared raw path segments, so the registered route and the request could never
+  meet. Since HTTP 2.14 the router decodes both sides (#868), so the refusal is now the one rule,
+  judged like a filename, more than a dead-mount guard. Write the prefix pre-encoded
+  (`"my%20static"`, `"caf%C3%A9"`) and it mounts and serves.
 
   Be precise about what this costs, because the two halves differ. `" "`, `"?"` and control
   characters are **strictly** unmatchable — the request line cannot carry them, so such a mount was
   always dead. The rest — `"café"`, `"a#b"`, `"a|b"`, `"a[b]"`, `"100%"` — *were* reachable by a client that
-  sends raw bytes rather than encoding them (curl does), so refusing them **does** take a working
-  mount away from those callers, and the encoded spelling is a different byte string that does not
-  answer them. That is a deliberate trade: one rule, judged like a filename, and a prefix no browser
+  sends raw bytes rather than encoding them (curl does), so refusing them took a working mount away
+  from those callers. The encoded spelling answers them now: `OriginFormMiddleware` canonicalizes a
+  raw `café` to `caf%C3%A9` before routing (#351). That is a deliberate trade: one rule, judged like a filename, and a prefix no browser
   can reach is a footgun whatever curl can do with it.
 
 A relative dot-segment (`.`, `..`) is refused for the same reason, separately: `.` is `unreserved`, so
@@ -674,7 +676,7 @@ through, while a filename is *data*, so a file named `my%20file.txt` really does
 **Validated, then canonicalized** ([#351](https://github.com/PingoLee/Nitro.jl/issues/351)). A
 percent triplet is checked for well-formedness and then rewritten by [`_canonical_segment`](@ref):
 `"%2f"` becomes `"%2F"` and `"%7e"` becomes `"~"`. This used to be forbidden, because HTTP.jl
-matches path segments byte for byte and a rewritten prefix would stop matching a client that sent
+matched path segments byte for byte and a rewritten prefix would stop matching a client that sent
 the other spelling. That reason is gone: `OriginFormMiddleware` puts every request path in the same
 canonical form before routing, so an un-canonicalized prefix is the one that would never match. A
 triplet that decodes to a pattern or a dot segment (`"%2A"`, `"%2E%2E"`) is refused like the raw
