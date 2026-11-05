@@ -10,7 +10,7 @@ using Dates
 using Base: @kwdef
 using DataStructures: CircularDeque
 using ..Util
-using ..Util: BoundedLRU, _count_one
+using ..Util: BoundedLRU, _count_one, _locked
 using ..Errors: ValidationError, StoreInterfaceError, ValidatorFault, SessionStoreFault,
     implements_contract_method, store_contract_error, is_unrecoverable, loggable
 using ..Crypto: SecretString, CookieKey, _cookie_secret
@@ -1899,7 +1899,7 @@ end
 
 """
     cache_chain!(c::ChainCache, table::CopyOnWriteDict{RouteMiddleware},
-                 source::Dict{String,RouteMiddleware}, key::ChainKey, chain::Function) -> Bool
+                 source::Dict{String,RouteMiddleware}, key::ChainKey, chain::F) where {F<:Function} -> Bool
 
 Record `chain`, built from the snapshot `source` of `table`, under `key`. Returns whether it
 published.
@@ -1916,10 +1916,17 @@ checked without holding `table`'s lock: a registration landing just after the ch
 generation nobody will match, and the next request replaces it.
 
 Takes the lock and, on the same-generation path, copies that generation's chain table.
+
+`chain::F`, not `chain::Function`, for `juliac --trim` on Julia 1.14 (#861): this method only
+captures `chain`, so typed `::Function` it was compiled for the abstract type. Its closure's type
+was then a `UnionAll`, and 1.14's `lock(f, l)`, which forwards to a keyword body, left the call
+dynamic on every routed request's cache miss. With the closure concrete that call resolves;
+`_locked` is used here too, so the two sites a trimmed build reported lock the same way.
 """
 function cache_chain!(c::ChainCache, table::CopyOnWriteDict{RouteMiddleware},
-                      source::Dict{String, RouteMiddleware}, key::ChainKey, chain::Function)::Bool
-    return lock(c.lock) do
+                      source::Dict{String, RouteMiddleware}, key::ChainKey,
+                      chain::F)::Bool where {F<:Function}
+    return _locked(c.lock) do
         state = @atomic :monotonic c.state
         if state.source === source
             haskey(state.chains, key) && return false
