@@ -16,6 +16,12 @@
 # replaces is Spring's `HandlerMethodArgumentResolver`, which only survives on JIT
 # devirtualization the Julia runtime does not do. nitro-core §7.
 #
+# The three scalar strategies below hand `parseparam_checked` that parameter `T`, never the
+# `param.type` field (#460). The field is declared `::Type{T}`, and a call that takes its value
+# as the type argument is static only while the compiler folds the read to a constant: Julia
+# 1.13 does, 1.14 does not (there `Type{T}` is not a dispatch type), so the call went dynamic
+# and the parser inferred `Any`. The static parameter is the same type known at compile time.
+#
 # `App` is a concrete struct, so carrying it by value costs no indirection.
 
 # Carries no `App` (#31): the app context now travels on the request, so this
@@ -48,13 +54,13 @@ struct PathParamStrategy{T}
     param::Param{T}
     name::String
 end
-function (s::PathParamStrategy)(lr::LazyRequest)
+function (s::PathParamStrategy{T})(lr::LazyRequest) where {T}
     raw_pathparams = Types.pathparams(lr)
     # The lookup is deliberately OUTSIDE any guard. A route brace always has a matching
     # handler parameter (enforced at registration, see `parse_func_params` above) and the
     # router always populates it, so a miss here is a framework bug rather than client
     # input — it must stay a 500 with a real stack trace, not be laundered into a 400.
-    return parseparam_checked(s.param.type, raw_pathparams[s.name], s.name, :path)
+    return parseparam_checked(T, raw_pathparams[s.name], s.name, :path)
 end
 
 # Selected only when `param.hasdefault`, so an absent key means "use the declared
@@ -64,23 +70,23 @@ struct QueryParamStrategy{T}
     param::Param{T}
     name::String
 end
-function (s::QueryParamStrategy)(lr::LazyRequest)
+function (s::QueryParamStrategy{T})(lr::LazyRequest) where {T}
     raw_queryparams = Types.queryvars(lr)
     haskey(raw_queryparams, s.name) || return s.param.default
-    return parseparam_checked(s.param.type, raw_queryparams[s.name], s.name, :query)
+    return parseparam_checked(T, raw_queryparams[s.name], s.name, :query)
 end
 
 struct RequiredQueryParamStrategy{T}
     param::Param{T}
     name::String
 end
-function (s::RequiredQueryParamStrategy)(lr::LazyRequest)
+function (s::RequiredQueryParamStrategy{T})(lr::LazyRequest) where {T}
     raw_queryparams = Types.queryvars(lr)
     # A required query parameter that was not sent is a client error. This used to be a
     # bare `raw_queryparams[name]`, whose `KeyError` surfaced as a 500.
     haskey(raw_queryparams, s.name) ||
         throw(ValidationError("Missing required query parameter '$(s.name)'"))
-    return parseparam_checked(s.param.type, raw_queryparams[s.name], s.name, :query)
+    return parseparam_checked(T, raw_queryparams[s.name], s.name, :query)
 end
 
 # The function barrier that makes the whole thing pay off. `strats` is assembled
@@ -96,7 +102,9 @@ end
 # pathological handler loses the optimization instead of blowing up compile time.
 function _make_param_parser(strats::S) where {S<:Tuple}
     return function(req::HTTP.Request)
-        lr = LazyRequest(request=req)
+        # Positional, not `LazyRequest(request = req)`: a keyword call on the hot path is static
+        # only where the compiler resolves it (#856). `lr` is a `LazyRequest{typeof(req)}`.
+        lr = LazyRequest(req)
         return map(s -> s(lr), strats)
     end
 end

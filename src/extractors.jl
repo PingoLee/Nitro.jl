@@ -567,12 +567,13 @@ end
 # request cheap (#508). Which parse a type takes is answered at run time, so the compiler, unable
 # to know it, used to compile BOTH for every `T`: for a `@kwdef` type the branch it never takes is
 # JSON.jl's whole plain-struct parse specialized on `T`, which cost more to compile than the
-# branch it does take. And it compiled them twice: `Json{T}` hands over the body through a
-# `LazyRequest`, whose abstractly typed request makes the text abstract, so each branch was
-# inferred once for `AbstractVector{UInt8}` and again for the body's concrete type. Behind the
-# barrier only the parse a request takes is compiled, for the text it has. The price is one
-# dynamic call per bind, about 25 ns, plus a box for the result when `T` is isbits. The call is
-# on an instance rather than on the `Type`, which dispatches about four times faster.
+# branch it does take. And it compiled them twice: `Json{T}` handed over the body through a
+# `LazyRequest` whose request was then abstractly typed (it carries the request's type since
+# #460), so each branch was inferred once for `AbstractVector{UInt8}` and again for the body's
+# concrete type. Behind the barrier only the parse a request takes is compiled, for the text it
+# has. The price is one dynamic call per bind, about 25 ns, plus a box for the result when `T` is
+# isbits. The call is on an instance rather than on the `Type`, which dispatches about four times
+# faster.
 struct JsonBinder{P} end
 (::JsonBinder{P})(text) where {P} = _parse_json_bounded(text, P; style = NITRO_READ_STYLE)
 
