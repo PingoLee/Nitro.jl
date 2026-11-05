@@ -42,7 +42,7 @@ end
     #
     # It is NOT third-party-code-free, and this comment must not imply otherwise:
     # `docs/Manifest.toml` is gitignored, so Documenter and its transitive tree resolve
-    # from the General registry at floating versions and then run, holding DOCUMENTER_KEY.
+    # from the General registry at floating versions and then run, holding the write token.
     # That is the residual exposure after #21 and is tracked in ci.yml's own comment.
     #
     # Counting rather than asserting absence keeps this honest -- a second occurrence
@@ -54,22 +54,21 @@ end
     @test occursin(r"(?m)^permissions:\n  contents: read$", CI_SRC)
 end
 
-@testset "secrets are scoped to the one step that deploys" begin
+@testset "the deploy token is scoped to the one step that deploys" begin
     # A workflow-level `env:` entry reaches every step of every job, PormG's build and test
     # steps included; a job-level one reaches every step of `docs`, including the instantiate
     # and doctest steps that resolve and run Documenter's floating dependency tree. Only
-    # `deploydocs`, in `docs/make.jl`, reads either secret -- so they sit on that step (#332).
+    # `deploydocs`, in `docs/make.jl`, reads the token -- so it sits on that step (#332).
     # These anchor on indent: two spaces is workflow level, six is job level.
     @test !occursin(r"(?m)^  GITHUB_TOKEN:", CI_SRC)
-    @test !occursin(r"(?m)^  DOCUMENTER_KEY:", CI_SRC)
     @test !occursin(r"(?m)^      GITHUB_TOKEN:", CI_SRC)
-    @test !occursin(r"(?m)^      DOCUMENTER_KEY:", CI_SRC)
-    # Present, once, on the deploy step -- not merely absent from the wider scopes. Asserting
-    # only the absences above would stay green if the lines were deleted outright, which
-    # would silently remove Documenter's fallback auth; the first rotation of DOCUMENTER_KEY
-    # would then reproduce #105: a green docs job that published nothing.
-    @test count(r"(?m)^\s+DOCUMENTER_KEY:", CI_SRC) == 1
+    # Present, once, on the deploy step -- not merely absent from the wider scopes. It is the
+    # ONLY deploy path (#389): deleting the line outright would reproduce #105, a green docs
+    # job that published nothing.
     @test count(r"(?m)^\s+GITHUB_TOKEN:", CI_SRC) == 1
+    # No deploy key. The repository defines no Actions secrets, so a `secrets.DOCUMENTER_KEY`
+    # reference resolves to an empty string and documents a path that never runs (#389).
+    @test !occursin("DOCUMENTER_KEY", CI_SRC)
     # The step's own lines are indented eight or more; the next step (`      - `) or job ends it.
     deploy = match(
         r"(?m)^      - (?:name: .*\n        )?run: julia --project=docs docs/make\.jl\n((?:        .*(?:\n|$))*)",
@@ -78,8 +77,24 @@ end
     @test deploy !== nothing
     step = deploy === nothing ? "" : deploy[1]
     @test occursin(r"(?m)^        env:$", step)
-    @test occursin(r"(?m)^          DOCUMENTER_KEY:\s*\$\{\{\s*secrets\.DOCUMENTER_KEY\s*\}\}", step)
     @test occursin(r"(?m)^          GITHUB_TOKEN:\s*\$\{\{\s*secrets\.GITHUB_TOKEN\s*\}\}", step)
+end
+
+@testset "workflows read no secret the repository does not define" begin
+    # The repository defines no Actions secrets; every workflow runs on the job token. A
+    # `secrets.<NAME>` reference to anything else resolves to an empty string with no error:
+    # CompatHelper read a PAT and a deploy key that did not exist and died with a 401 every
+    # night, unnoticed (#389). Comment lines are dropped first, as for `CI_SRC`.
+    for file in ("ci.yml", "CompatHelper.yml")
+        path = joinpath(pkgdir(Nitro), ".github", "workflows", file)
+        @test isfile(path)
+        src = isfile(path) ? read(path, String) : ""
+        code = join(filter(l -> !occursin(r"^\s*#", l), split(replace(src, "\r\n" => "\n"), '\n')), '\n')
+        # Both spellings GitHub accepts: `secrets.NAME` and `secrets['NAME']` / `secrets["NAME"]`.
+        refs = eachmatch(r"secrets(?:\.([A-Za-z0-9_]+)|\[\s*['\"]([^'\"]+)['\"]\s*\])", code)
+        names = unique(something(m[1], m[2]) for m in refs)
+        @test names == ["GITHUB_TOKEN"]
+    end
 end
 
 @testset "the docs job does not leave the job token on disk" begin
@@ -101,7 +116,7 @@ end
 # `julia-actions/julia-buildpkg`, and it is therefore the honest marker for "this job
 # materialises and may execute PormG's code". `docs` does not use it -- it instantiates
 # `--project=docs`, which does not carry Nitro's `[sources]` -- which is what keeps the
-# write scope and both secrets parked there, exactly as before.
+# write scope and the deploy token parked there, exactly as before.
 const PORMG_JOBS = count(r"julia-actions/julia-buildpkg", CI_SRC)
 
 @testset "PormG is pinned to an immutable commit, defined exactly once" begin
@@ -219,7 +234,7 @@ end
 # `uses: owner/repo@v2` names a TAG, and a tag is mutable: whoever controls the action's repo
 # can re-point it, and every workflow resolving it runs the new code on its next trigger --
 # the tj-actions/changed-files compromise (CVE-2025-30066) was exactly that. Nitro's jobs hand
-# those actions a write-scoped token, the Documenter deploy key, and a PAT. The repo already
+# those actions a write-scoped token (and, until #389, a deploy key and a PAT). The repo already
 # refuses a tag for the PormG `[sources]` pin for this reason (see the first item above), so
 # the same rule applies to actions: a full 40-hex commit, with the release as a comment.
 #

@@ -34,6 +34,17 @@ jobs:
           import CompatHelper
           CompatHelper.main()
         shell: julia --color=yes {0}
+        # The job token, scoped by `permissions:` above -- no PAT and no deploy key (#389). The
+        # repository defines no Actions secrets; this step used to read two that did not exist,
+        # and CompatHelper died with a 401 every night while nobody watched `[compat]`.
+        #
+        # The trade: GitHub does not run workflows for a PR opened with the job token, so a
+        # CompatHelper PR arrives WITHOUT CI. Close and reopen it to run CI. Its PRs are signals
+        # anyway: `HTTP` and `Reseau` are `~`-pinned and moved by hand (CONTRIBUTING.md), never
+        # by merging a CompatHelper PR.
+        #
+        # REQUIRES the repository setting "Allow GitHub Actions to create and approve pull
+        # requests" (Settings -> Actions -> General). With it off, GitHub refuses a PR opened with
+        # the job token whatever `permissions:` grants, and the nightly 401 becomes a 403.
         env:
-          GITHUB_TOKEN: ${{ secrets.NITRO_REPO_MANAGER_PAT }}
-          COMPATHELPER_PRIV: ${{ secrets.DOCUMENTER_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -193,7 +193,11 @@ because nothing comments as `JuliaTagBot`. Its job-level `if:` skipped every oth
 benefit. Re-add the standard `.github/workflows/TagBot.yml` from TagBot's README,
 pinned by commit SHA like every other action (`test/ci_workflow_tests.jl` enforces the pin).
 The release-cut step already emits the `vX.Y.Z`
-tags TagBot will continue.
+tags TagBot will continue. Its README passes `ssh: ${{ secrets.DOCUMENTER_KEY }}`, because a tag
+pushed with the job token triggers no workflow, so the tag's docs deploy would not run. The
+repository has had no Actions secrets since [#389](https://github.com/PingoLee/Nitro.jl/issues/389).
+Restoring TagBot therefore also means creating that deploy key and secret, and loosening the
+`ci_workflow_tests.jl` check that every workflow reads only `GITHUB_TOKEN`.
 
 ## 7. Decision: not taken
 
