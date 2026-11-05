@@ -1917,9 +1917,10 @@ generation nobody will match, and the next request replaces it.
 
 Takes the lock and, on the same-generation path, copies that generation's chain table.
 
-`chain::F`, not `chain::Function`, for `juliac --trim` on Julia 1.14 (#861): this method only
-captures `chain`, so typed `::Function` it was compiled for the abstract type. Its closure's type
-was then a `UnionAll`, and 1.14's `lock(f, l)`, which forwards to a keyword body, left the call
+`chain::F`, not `chain::Function`, for `juliac --trim` (#861): this method only captures `chain`,
+so typed `::Function` it was compiled for the abstract type. Its closure's type was then a
+`UnionAll`, and a `lock(f, l)` that forwards to a keyword body (the 1.14 alpha nightlies', and
+1.15's: JuliaLang/julia#64651 moved the cancellation work off the 1.14 branch) left the call
 dynamic on every routed request's cache miss. With the closure concrete that call resolves;
 `_locked` is used here too, so the two sites a trimmed build reported lock the same way.
 """

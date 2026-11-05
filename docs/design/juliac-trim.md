@@ -1300,8 +1300,19 @@ row. The flag stays a `ScopedValue` on purpose: it must reach a task the hook sp
 `task_local_storage` would not. The app still starts, serves and stops; these rows are reached
 only on the way out.
 
-**On 1.14, `lock(f, l)` went through a keyword body, and two of Nitro's sites stopped verifying.**
-1.14's `lock` takes a `cancel` keyword (`base/lock.jl`). `lock(f, l::ReentrantLock)` now forwards
+**Where these `lock` rows stand, 2026-11-05.** They are the 1.14 alpha1 nightly's
+(`1.14.0-alpha1.112`), not 1.14.0's. JuliaLang/julia#64415 (merged 2026-10-29, in the alpha2
+nightly) made Base's method `lock(f::F, c::GenericCondition) where {F}`, which is the
+`_await_phase_change` mechanism below fixed upstream: on `1.14.0-alpha2.122` the trimmed `main`
+app reads **2** (`get_error`, `uv_readcb`), the `close(::BufferStream)` row gone. And
+JuliaLang/julia#64651 (merged 2026-11-05) reverted the task-cancellation work from the 1.14
+branch to 1.15, so 1.14.0 ships no `cancel` keyword on `lock` at all; the keyword body this
+section describes is 1.15's shape. Nothing in Nitro moves: `_locked` is correct on every version,
+and `cache_chain!`'s `chain::F` was Nitro's own abstract signature. The upstream report for this
+row was dropped on #729 (item 6).
+
+**On the 1.14 alpha1 nightly, `lock(f, l)` went through a keyword body, and two of Nitro's sites
+stopped verifying.** Its `lock` takes a `cancel` keyword (`base/lock.jl`). `lock(f, l::ReentrantLock)` now forwards
 to `#lock#448(DEFAULT_CANCEL, lock, f, l)`, and that call resolves only when the compiler sees
 `f`'s concrete type:
 - **`cache_chain!`** (`src/types.jl`, every routed request on a cache miss) took `chain::Function`

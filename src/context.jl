@@ -405,8 +405,10 @@ end
 
 # Park until `service`'s phase word is no longer `word` (#834). Only a transition to `IDLE` is
 # notified, so this is for words that can only move there: `CANCELLING` and `STOPPING`.
-# `_locked`, not `lock(f, c)` (#861): on Julia 1.14 `lock(f, ::Threads.Condition)` is compiled for
-# `f::Function`, so its call into `lock`'s keyword body is dynamic, on `serve`'s stop path.
+# `_locked`, not `lock(f, c)` (#861): on the Julia 1.14 alpha1 nightly `lock(f, ::Threads.Condition)`
+# was compiled for `f::Function`, so its call into `lock`'s keyword body was dynamic, on `serve`'s
+# stop path. Fixed in Base by JuliaLang/julia#64415, and the keyword itself left the 1.14 branch
+# with JuliaLang/julia#64651 (it is 1.15's); `_locked` is correct on every version, so it stays.
 function _await_phase_change(service::Service, word::UInt64)
     _locked(service.phase_cond) do
         while service.phase[] === word

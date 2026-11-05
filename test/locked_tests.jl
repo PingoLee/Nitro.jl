@@ -37,8 +37,9 @@ end
 
 # The call to `f` is static from a caller's code, which is where a trimmed build reads it. Read
 # through a caller, not `code_typed(_locked, …)`: that specializes on the types it is given, so it
-# would pass for `lock` too. On 1.14 `lock(f, ::Threads.Condition)` fails this, being compiled
-# for `f::Function`; on 1.13 both pass, since `lock` inlines there. `g` is kept out of line and has
+# would pass for `lock` too. On the 1.14 alpha1 nightly `lock(f, ::Threads.Condition)` failed this,
+# being compiled for `f::Function` (JuliaLang/julia#64415 fixed it); on 1.13 both pass, since
+# `lock` inlines there. `g` is kept out of line and has
 # an effect, so the call stays a call: a pure `g() = 1` is folded to its value.
 const CALLS = Ref(0)
 @noinline g() = (CALLS[] += 1)
@@ -58,8 +59,10 @@ using Nitro.Core.AppContext: Service, _await_phase_change
 using Nitro.Core.RouterHOF: NO_ROUTE_CHAIN
 
 # Pinned on the shape, not on 1.13's verdict: on 1.13 `lock(f, l)` inlines and both sites verify,
-# so only the source's own call tells the two apart. On 1.14 `lock(f, l)` left each one dynamic in a
-# trimmed build: `cache_chain!` on every routed request, the phase wait on `serve`'s stop path.
+# so only the source's own call tells the two apart. On the 1.14 alpha1 nightly `lock(f, l)` left
+# each one dynamic in a trimmed build: `cache_chain!` on every routed request, the phase wait on
+# `serve`'s stop path. (1.14.0 ships without the `cancel` keyword, JuliaLang/julia#64651; the
+# keyword body is 1.15's shape, and the pins hold on every version.)
 for chain in (RouteEndpoint, typeof(NO_ROUTE_CHAIN))
     sig = (ChainCache, CopyOnWriteDict{RouteMiddleware}, Dict{String, RouteMiddleware}, ChainKey, chain)
     @test calls_to(cache_chain!, sig, _locked)
