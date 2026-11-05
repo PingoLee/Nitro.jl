@@ -276,16 +276,20 @@ path("/api/admin/users", AdminHandlers.list_users, method="GET",
 | `403` | Authenticated but not authorized | Guards |
 | `302` | Browser redirect to login | `login_required()` |
 
-Guards: `login_required(; redirect_url, session_key)`, `role_required(role; role_key)`,
-`permission_required(permission; permissions_key)`, `claim_required(claim, value; kind=:equals|:contains)`,
-`kid_required(allowed)`. `role_required` and `permission_required` are thin aliases over
-`claim_required`.
+Guards: `login_required(; redirect_url, session_key, denied)`, `role_required(role; role_key, denied)`,
+`permission_required(permission; permissions_key, denied)`,
+`claim_required(claim, value; kind=:equals|:contains, denied)`, `kid_required(allowed; denied)`.
+`role_required` and `permission_required` are thin aliases over `claim_required`.
 
 An app with its own error shape passes a factory `(req, reason) -> HTTP.Response`:
 `BearerAuth(v; unauthorized = f)` / `CookieAuthMiddleware(v; unauthorized = f)` and
 `denied = f` on every guard above. Reasons are `:missing_credentials`, `:invalid_credentials`,
 `:forbidden`, `:login_required` — never finer. The factory must return a response (anything else
 is a `500`, never an admission). Do not write an outer middleware that rewrites Nitro's `401`/`403`.
+
+A **custom guard** passed to `GuardMiddleware` follows the same fail-closed rule: return `nothing`
+to admit or an `HTTP.Response` to deny. Anything else (`false`, a `Dict`, a status `Int`) is a
+`500`, never an admission.
 
 The authenticated principal is a `Principal` — an immutable, dict-like wrapper over *verified* claims
 with typed `id` and `kid` fields. Read it with `getprincipal(req)` (`nothing` when no token

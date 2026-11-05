@@ -443,9 +443,12 @@ decide.
     to delete buys nothing — and it keeps `resetstate()` and every test `finally` off the drain
     path.
   - **The drain's budget is not the call's.** `stop_cleanup_scheduler!` waits without a deadline
-    and runs first, and a closed sequential queue keeps executing its buffered backlog, starting
-    runs that were never in the snapshot. Say so rather than implying `drain_timeout` bounds
-    teardown.
+    and runs first. Say so rather than implying `drain_timeout` bounds teardown. A queue's
+    buffered backlog is **not** part of the wait: since #182 teardown sets `draining`, closes the
+    channel and collects what was buffered, and `_abandon_queued_item!` settles each item
+    `CANCELLED` (cause `:shutdown`, fenced on the item's `run_id`) without starting it. Only runs
+    already executing are drained. Keep that order — `draining` before `close` before collect —
+    or an item a processor already took slips into `_execute_queued_task`.
   - **Hold no lock across the wait.** `active_lock` deadlocks against `_deregister_run!`, which is
     how a run settles; `queue_lock` is re-acquired by the processor's own `finally`. The predicate
     runs in a `Timer` callback, so it must stay cheap, total, and store-free.
