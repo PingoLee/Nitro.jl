@@ -5,7 +5,6 @@ using Nitro.Types
 using HTTP
 using Test
 using Dates
-using OpenSSL
 using SHA
 
 # Access Cookies module from Nitro to avoid ambiguity
@@ -1498,7 +1497,6 @@ using Nitro.Types: CookieConfig, LazyRequest, Param
 using HTTP
 using Test
 using Dates
-using OpenSSL
 using SHA
 using Base64
 const Cookies = Nitro.Cookies
@@ -1585,19 +1583,32 @@ end
     flipped = copy(bytes); flipped[end - 20] ⊻= 0x01
 
     # The pre-#309 format, built the way the old `encrypt_payload` built it: iv ‖ ct ‖ tag
-    # under sha256(secret), no version byte, no associated data.
-    legacy = let iv = Crypto.secure_random_bytes(12),
-                 cipher = OpenSSL.EvpCipher(ccall((:EVP_get_cipherbyname, OpenSSL.libcrypto),
-                                                  Ptr{Cvoid}, (Cstring,), "AES-256-GCM")),
-                 ctx = OpenSSL.EvpCipherContext()
-        OpenSSL.encrypt_init(ctx, cipher, SHA.sha256(key), iv)
-        ct = OpenSSL.cipher_update(ctx, Vector{UInt8}("value"))
-        fin = OpenSSL.cipher_final(ctx)
-        tag = Vector{UInt8}(undef, 16)
-        ccall((:EVP_CIPHER_CTX_ctrl, OpenSSL.libcrypto), Cint,
-              (OpenSSL.EvpCipherContext, Cint, Cint, Ptr{UInt8}), ctx, 0x10, 16, tag)
-        Crypto.base64url_encode(vcat(iv, ct, fin, tag))
+    # under sha256(secret), no version byte, no associated data. Straight libcrypto calls, so the
+    # construction does not go through the code under test (#867). The value is long enough, and
+    # the iv's first byte is the version byte, so the token gets past the length and version checks
+    # and is refused where it must be: by the tag.
+    legacy = let iv = (b = Crypto.secure_random_bytes(12); b[1] = Crypto.TOKEN_VERSION; b),
+                 plain = Vector{UInt8}("value" ^ 7), ct = Vector{UInt8}(undef, length(plain)),
+                 tag = Vector{UInt8}(undef, 16), scratch = Vector{UInt8}(undef, 16), n = Ref{Cint}(0),
+                 cipher = ccall((:EVP_get_cipherbyname, Crypto.libcrypto), Ptr{Cvoid}, (Cstring,), "AES-256-GCM"),
+                 ctx = ccall((:EVP_CIPHER_CTX_new, Crypto.libcrypto), Ptr{Cvoid}, ())
+        try
+            @test ccall((:EVP_EncryptInit_ex, Crypto.libcrypto), Cint, (Ptr{Cvoid}, Ptr{Cvoid}, Ptr{Cvoid}, Ptr{UInt8}, Ptr{UInt8}),
+                        ctx, cipher, C_NULL, SHA.sha256(key), iv) == 1
+            @test ccall((:EVP_EncryptUpdate, Crypto.libcrypto), Cint, (Ptr{Cvoid}, Ptr{UInt8}, Ref{Cint}, Ptr{UInt8}, Cint),
+                        ctx, ct, n, plain, length(plain)) == 1 && n[] == length(plain)
+            @test ccall((:EVP_EncryptFinal_ex, Crypto.libcrypto), Cint, (Ptr{Cvoid}, Ptr{UInt8}, Ref{Cint}),
+                        ctx, scratch, n) == 1 && n[] == 0
+            @test ccall((:EVP_CIPHER_CTX_ctrl, Crypto.libcrypto), Cint, (Ptr{Cvoid}, Cint, Cint, Ptr{UInt8}),
+                        ctx, 0x10, 16, tag) == 1
+        finally
+            ccall((:EVP_CIPHER_CTX_free, Crypto.libcrypto), Cvoid, (Ptr{Cvoid},), ctx)
+        end
+        Crypto.base64url_encode(vcat(iv, ct, tag))
     end
+    # It reaches the cipher, rather than being refused as too short.
+    legacy_err = try Crypto.decrypt_payload(key, legacy; purpose = "c"); nothing catch e; e end
+    @test legacy_err isa Nitro.CookieError && occursin("integrity check failed", legacy_err.msg)
 
     for (label, token) in ("other key" => token_of(Cookies.set_cookie!(HTTP.Response(200), "c", "value"; secret_key = other_key), "c"),
                            "version byte" => Crypto.base64url_encode(wrong_version),
@@ -1713,6 +1724,160 @@ end
     # The message says what to do and never echoes the key.
     msg = try CookieConfig(secret_key = short); "" catch e; e.msg end
     @test occursin("at least 32", msg) && occursin("ENV", msg) && !occursin(short, msg)
+end
+end
+
+# #867: the token format is a contract with every cookie already in a browser. These tokens were
+# sealed by the pre-#867 code (AES-256-GCM through OpenSSL.jl's wrapper) under fixed ivs, and
+# reproduced independently by another AES-GCM and HKDF implementation, before the cipher was
+# rewritten. Whatever seals and opens tokens must reproduce them byte for byte and open them.
+# The purposes are the sealed cookie names Nitro defaults to (`auth_token`, `session`) and
+# app-named cookies; the payloads cover empty, one block exactly, several blocks unaligned and
+# non-ASCII; the expiries cover none (`exp = 0`), a future one, and the logout clamp (`exp = 1`).
+@testitem "Sealed-token golden vectors (#867)" tags=[:core, :security] setup=[NitroCommon] begin
+using Nitro
+using Dates
+using Test
+const Crypto = Nitro.Crypto
+
+secret_a = "k" * "0123456789abcdef0123456789abcdef"
+secret_b = "golden-vector-secret-B-0123456789abcdef"
+t0 = DateTime(2026, 1, 1)
+iv_of(seed) = UInt8[(seed * 17 + 3i) % 256 for i in 0:11]
+
+# (secret, purpose, payload, expires, iv seed, token)
+const VECTORS = [
+    (secret_a, "auth_token", "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiI3In0.c2ln", nothing, 1,
+     "AREUFxodICMmKSwvMh6o6tQE7_mUlwJzVzzRUOqCx72tn2oO89e_BHQdakoBRI7O2p8OfRIU3TfRy1KCq2WbP38hdsEdYEVrxHcleggPkXciVkko3z8"),
+    (secret_a, "session", "6f1c2d3e-4a5b-4c6d-8e7f-90a1b2c3d4e5", t0 + Day(14), 2,
+     "ASIlKCsuMTQ3Oj1AQ_7y88hbi5Pt-S1BV5yee_wI_bfg7A7lpP-E4Lpz21bAKt4watHs06CM3eEOiSdHuZ6rvVV0fdhLjrst8xCcDWLcN3jt"),
+    (secret_a, "language", "", nothing, 3,
+     "ATM2OTw_QkVIS05RVNpMwhThasfV4CFoUk4XGrtY0X2WntNntXeW5CUwg6pa"),
+    (secret_a, "__Host-session", "0123456789abcdef", t0 + Hour(1), 4,
+     "AURHSk1QU1ZZXF9iZfvz3SP0u37-9cnXWwPJ02Ggl0CbTGGYEERkNI9uDWnxlYrAetyigo_kiqgqc3av9Q"),
+    (secret_b, "language", repeat("abcdefghij", 10), nothing, 5,
+     "AVVYW15hZGdqbXBzdlnLiwqk4297R-7rtSelBsDVr21N6SuMaIZ9g7IMmwfCfJwqCVioYrhEt3Q2WwI6jFBZL44yinICLP4aRRwfNZhm6iVeGM14zmtEp1epO0X3tkqe2k6XJ9eFnBW9hh0baS3BheWeBLi05wgfY-dylWqtsQWfEm0naTqDZZ3c02jNny4IPQ"),
+    (secret_b, "session", "olá, 世界 ✓", t0 + Second(60), 6,
+     "AWZpbG9ydXh7foGEh5SiJj9TsYAikb8QWBNAUTjBUh-iG8MqWi-hnLjsxAdacvTgJGrG_kJd36ls33Ai-g"),
+    (secret_a, "auth_token", "", DateTime(1960, 1, 1), 7,
+     "AXd6fYCDhomMj5KVmOaZkULVgP5uYeffYIDbIVozOcFpHSyes4mSdK5ODIs9"),
+]
+
+# The plaintext `encrypt_payload` seals: iat ‖ exp ‖ value, big-endian.
+plaintext_of(payload, expires) = vcat(Crypto._int64_be(Crypto._unix_seconds(t0)),
+    Crypto._int64_be(expires === nothing ? Int64(0) : max(Int64(1), Crypto._unix_seconds(expires))),
+    Vector{UInt8}(codeunits(payload)))
+
+@testset "seal reproduces each vector byte for byte" begin
+    for (secret, purpose, payload, expires, seed, token) in VECTORS
+        key = Crypto._cookie_key(Nitro.SecretString(secret))
+        sealed = Crypto._seal_token(key, iv_of(seed), purpose, plaintext_of(payload, expires))
+        @test Crypto.base64url_encode(sealed) == token
+    end
+end
+
+@testset "open accepts each vector, under every key form" begin
+    for (secret, purpose, payload, expires, seed, token) in VECTORS,
+        key in (secret, Nitro.SecretString(secret), Crypto.CookieKey(Nitro.SecretString(secret)))
+        if expires !== nothing && expires < t0
+            # The logout clamp: it authenticates, and is then refused as expired, not as forged.
+            err = try Crypto.decrypt_payload(key, token; purpose, now = t0); nothing catch e; e end
+            @test err isa Nitro.CookieError && occursin("expired", err.msg)
+        else
+            @test Crypto.decrypt_payload(key, token; purpose, now = t0) == payload
+        end
+    end
+end
+
+@testset "a vector opens for its own key and purpose only" begin
+    for (secret, purpose, payload, expires, seed, token) in VECTORS
+        other_secret = secret == secret_a ? secret_b : secret_a
+        @test_throws Nitro.CookieError Crypto.decrypt_payload(other_secret, token; purpose, now = t0)
+        @test_throws Nitro.CookieError Crypto.decrypt_payload(secret, token; purpose = purpose * "x", now = t0)
+        # One bit flipped in each region: iv, ciphertext header, tag.
+        bytes = Crypto.base64url_decode(token)
+        for at in (2, 14, length(bytes))
+            flipped = copy(bytes); flipped[at] ⊻= 0x01
+            @test_throws Nitro.CookieError Crypto.decrypt_payload(secret, Crypto.base64url_encode(flipped);
+                                                                   purpose, now = t0)
+        end
+    end
+end
+
+# The native cipher context holds the AES key schedule, so it is freed when the call that made it
+# returns or throws, never by a finalizer. A counting allocator over libcrypto's own pair sees
+# every `EVP_CIPHER_CTX_new` and `EVP_CIPHER_CTX_free`.
+mutable struct CountingCtx
+    news::Int
+    frees::Int
+end
+CountingCtx() = CountingCtx(0, 0)
+Crypto._ctx_new(c::CountingCtx) = (c.news += 1; Crypto._ctx_new(Crypto.LibcryptoCipherCtx()))
+Crypto._ctx_free(c::CountingCtx, ctx::Ptr{Cvoid}) = (c.frees += 1; Crypto._ctx_free(Crypto.LibcryptoCipherCtx(), ctx))
+mutable struct NullCtx
+    frees::Int
+end
+NullCtx() = NullCtx(0)
+Crypto._ctx_new(::NullCtx) = Ptr{Cvoid}(C_NULL)
+Crypto._ctx_free(c::NullCtx, ::Ptr{Cvoid}) = (c.frees += 1; nothing)
+
+@testset "the cipher context is freed on every path" begin
+    # Whatever the body throws -- a token failure, a bug, an interrupt -- it propagates unchanged
+    # and the context is freed exactly once.
+    for thrown in (Nitro.CookieError("x"), ErrorException("bug"), InterruptException())
+        alloc = CountingCtx()
+        caught = try
+            Crypto._with_cipher_ctx(ctx -> throw(thrown), alloc); nothing
+        catch e
+            e
+        end
+        @test caught === thrown
+        @test (alloc.news, alloc.frees) == (1, 1)
+    end
+
+    # A context libcrypto cannot allocate: a CookieError before the body runs, and nothing freed.
+    null_alloc = NullCtx()
+    ran = Ref(false)
+    @test_throws Nitro.CookieError Crypto._with_cipher_ctx(ctx -> (ran[] = true), null_alloc)
+    @test !ran[]
+    @test null_alloc.frees == 0
+
+    secret, purpose, payload, expires, seed, token = VECTORS[2]
+    key = Crypto._cookie_key(Nitro.SecretString(secret))
+    data = Crypto.base64url_decode(token)
+
+    # The real seal and open, through the same allocator: success...
+    alloc = CountingCtx()
+    @test Crypto.base64url_encode(Crypto._seal_token(key, iv_of(seed), purpose,
+                                                     plaintext_of(payload, expires), alloc)) == token
+    @test Crypto._open_token(key, data, purpose, alloc) == plaintext_of(payload, expires)
+    @test (alloc.news, alloc.frees) == (2, 2)
+
+    # ...and the failures an attacker can trigger, which throw from inside the context's lifetime.
+    flipped = copy(data); flipped[end] ⊻= 0x01
+    for (bad_data, bad_purpose) in ((flipped, purpose), (data, "auth_token"))
+        alloc = CountingCtx()
+        @test_throws Nitro.CookieError Crypto._open_token(key, bad_data, bad_purpose, alloc)
+        @test (alloc.news, alloc.frees) == (1, 1)
+    end
+    other_key = Crypto._cookie_key(Nitro.SecretString(secret_b))
+    alloc = CountingCtx()
+    @test_throws Nitro.CookieError Crypto._open_token(other_key, data, purpose, alloc)
+    @test (alloc.news, alloc.frees) == (1, 1)
+end
+
+@testset "the token cipher is Nitro's own, over OpenSSL_jll" begin
+    source = read(joinpath(pkgdir(Nitro), "src", "crypto.jl"), String)
+    # No OpenSSL.jl: no import, and no `OpenSSL.<name>` (its wrapper types and functions; the
+    # prose "OpenSSL.jl" is not a reference). Booleans, so a failure does not print the file.
+    imports_openssl = occursin(r"^\s*(using|import)\s+OpenSSL\b(?!_jll)"m, source)
+    names_openssl = occursin(r"\bOpenSSL\.(?!jl\b)\w", source)
+    @test !imports_openssl
+    @test !names_openssl
+    # No finalizer anywhere in the module: every native context is freed by its caller.
+    has_finalizer = occursin("finalizer(", source)
+    @test !has_finalizer
+    @test nameof(which(Crypto, :libcrypto)) === :OpenSSL_jll
 end
 end
 
