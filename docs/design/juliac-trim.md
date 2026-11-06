@@ -137,7 +137,7 @@ route and no middleware, so the probe stays the measure of the route path.
 The lesson that generalizes: **`repr`/`string` of an un-inferred value is the most expensive single
 trim mistake**, and that includes a `Symbol`. Type the value, then `print` it.
 
-## 3. Remaining (40 errors on the minimal app on Julia 1.12.7; on 1.13, 96, then 87 after §3.6, 59 after the start-up walls, 27 after §3.7, 11 after §3.8 and 4 on HTTP 2.13, §3.9, then 8 since #840, §3.13; the probe 22 after §3.11, 18 after #851; on 1.14, the app 5 and the probe 20, §3.12, then 3 and 18, §3.13; on 1.14 alpha2, 2 and 18, then 2 and 14 with no row in `src/`, §3.14)
+## 3. Remaining (40 errors on the minimal app on Julia 1.12.7; on 1.13, 96, then 87 after §3.6, 59 after the start-up walls, 27 after §3.7, 11 after §3.8 and 4 on HTTP 2.13, §3.9, then 8 since #840, §3.13; the probe 22 after §3.11, 18 after #851; on 1.14, the app 5 and the probe 20, §3.12, then 3 and 18, §3.13; on 1.14 alpha2, 2 and 18, then 2 and 14 with no row in `src/`, §3.14; without OpenSSL.jl, the app 6 and the probe 15 on 1.13, the app 0 and the probe 11 on 1.14 alpha2, §3.15)
 
 Measured 2026-10-22 on Julia 1.12.7, before and after #572. Each error is printed twice, so 20
 sites. `main` before #572 had **22**: the 20 below plus `CookieKey`'s, which arrived with a later
@@ -188,7 +188,7 @@ What #572 changed:
 | `startup`/`shutdown` | `LifecycleMiddleware.on_startup`/`on_shutdown` are `Union{Function,Nothing}`-typed | **cleared**: `LifecycleEntry` (§3.4), [#719](https://github.com/PingoLee/Nitro.jl/issues/719) |
 | the banner | `IO`-typed `stdout`, a runtime `DateFormat` | **cleared** (below) |
 | the `revise = :eager` watcher's cancel | `Base.invokelatest` | dev-only and dynamic on purpose: **refused** in a trimmed build and compiled out of it (§3.8) |
-| `OpenSSL.jl`, libuv read callback | outside Nitro | upstream |
+| `OpenSSL.jl`, libuv read callback | outside Nitro | **cleared**: OpenSSL.jl is no longer a dependency, and the libuv read callback left with it (§3.15, [#867](https://github.com/PingoLee/Nitro.jl/issues/867)) |
 
 **The start-up walls, cleared.** Four rows stood in front of the request path or on the way out of
 `serve`: the banner, `CookieKey`, `HTTP.listen!`'s keyword call and the server field. Measured
@@ -1438,6 +1438,44 @@ moved: the app's 8 and the probe's 18 are §3.13's.
 - **Each pin fails against a local revert of its change.** The behaviour readings beside them pass
   on 1.13 either way: each strategy's inferred type, and the `invoke` of `parseparam_checked`.
 
+### 3.15 OpenSSL.jl leaves (#867)
+
+Built 2026-11-06 with JuliaC 0.3.12 (tree `49a147f5`), HTTP.jl 2.15.0, JSON.jl 1.13.4, Reseau 1.6.6,
+OpenSSL_jll 3.5.8, `--trim=unsafe-warn`, `JULIA_CPU_TARGET=native`, on Julia 1.13.2 and on
+1.14.0-alpha2.217, from `main` at `0f72a4aa` and the change on top of it. Counted by first frame.
+
+Nitro no longer depends on OpenSSL.jl: `src/crypto.jl` calls libcrypto through `OpenSSL_jll`, and the
+sealed-token cipher is its own AES-256-GCM seal/open (the `src/crypto.jl` row of `CONTRIBUTING.md`
+has why). The package and its `__init__` leave the image.
+
+| | 1.13.2, `main` | 1.13.2, after | 1.14 alpha2, `main` | 1.14 alpha2, after |
+|---|--:|--:|--:|--:|
+| `ENTRY=app` verifier | 8 | **6** | 2 | **0** |
+| `ENTRY=app` served | `/plaintext` 200, `/missing` 404 | the same | the same | the same |
+| `ENTRY=probe` verifier | 18 | **15** | 14 | **11** |
+| probe answers (the six `TARGETS`, `/users/7` 200, and the middleware section) | as expected | as expected | as expected | as expected |
+| app exe, bytes | 14,558,800 | 14,389,600 | 8,876,680 | 8,707,272 |
+
+**Two rows leave, on every build, and nothing new appears:**
+- OpenSSL.jl's `get_error`, reached from its own `__init__` (§3.13). On 1.13 the verifier reports it
+  at its first frame, Base's `getproperty`, which is the "OpenSSL's `getproperty`" of §3.9. 1 on the
+  app, 2 on the probe.
+- Base's libuv read callback, `uv_readcb` (`stream.jl:988`), 1 on each. It is reached only while
+  OpenSSL.jl is in the image. An entry that only seals and opens tokens, with no listener and no
+  socket, reads 3 on `main` on both versions (`get_error` twice and `uv_readcb`), and 0 after.
+
+**On 1.14 alpha2 the minimal app now verifies with no error.** The probe's 11 are all outside
+`src/`: `task.jl` (5), `with_output_color` (2), `asyncevent.jl` (2), `scrub_repl_backtrace` and
+`show_exception_stack`. On 1.13 the app's 6 are #840's 4 (§3.13) and the `_app_context_seed`
+HAMT's 2 (§3.5), and the probe's 15 are that HAMT's 4 and the same 11 outside `src/`.
+
+**The new cipher verifies.** Neither `app.jl` nor `probe.jl` reaches the sealed-token cipher, so
+their counts say nothing about it. A throwaway entry did: it seals and opens through
+`encrypt_payload`/`decrypt_payload` under a string secret and under a `CookieKey`, opens one of
+the golden vectors in `test/cookies_tests.jl`, and refuses a tampered one. After the change it
+verifies with 0 errors on both versions and its executable passes all four checks. On `main` it
+passes them too, with the 3 rows above.
+
 ## 4. The decision: `--trim=safe` is a target
 
 **The question was:** is `--trim=safe` a product target for Nitro, or a ratchet that only keeps
@@ -1505,9 +1543,9 @@ The order:
    reaches the response and the request context at concrete types (§3.8). The minimal app went
    from 27 to 11 on 1.13; what is left on it is outside Nitro.
 6. **Outside Nitro.** HTTP.jl's request body read: **cleared** on HTTP 2.13 (§3.9). OpenSSL.jl
-   and the libuv read callback: reported upstream. With those gone, the last row on the minimal
-   app with a frame in `src/` is Base's `ScopedValue` HAMT, behind `_app_context_seed`'s `@with`
-   (§3.5).
+   and the libuv read callback: **cleared** by dropping OpenSSL.jl (§3.15). With those gone, the
+   last row on the minimal app with a frame in `src/` is Base's `ScopedValue` HAMT, behind
+   `_app_context_seed`'s `@with` (§3.5), on 1.13; on 1.14 alpha2 the minimal app verifies with none.
 7. **The extended probe's walls, largest first** (§3.9):
    - ~~JSON.jl 1.13.0's typed parse under a custom style (JuliaIO/JSON.jl#543), 110 rows, reached
      from `_parseparam_fallback`~~ **cleared** in JSON.jl 1.13.4 (JuliaIO/JSON.jl#553 / #555;
