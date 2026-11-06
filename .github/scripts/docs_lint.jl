@@ -40,16 +40,26 @@
 #      "`nitro-core.instructions.md` §4" must resolve to a real `## 4.` heading in
 #      that file. The hub's hard-stop index is built entirely out of these, so an
 #      unchecked § pointer is exactly how the index rots.
+#   H. Keyword-signature drift — for a curated set of calls (SIGNATURE_CHECKS: the guard
+#      factories and the auth middleware), the keyword names the usage reference writes, and
+#      the ones each method's own docstring writes, must equal the method's. Where both sides
+#      write a literal default, the defaults must match too. Read with Base's parser, so the
+#      script still loads no package (#873).
 #
 # What it does NOT catch (documented so nobody trusts it too far):
-#   - Wrong overload / signature drift (e.g. `Res.status(code, msg)` when only
-#     `Res.status(code)` exists). Symbol-*existence* only; no Julia parsing.
+#   - Wrong overload / signature drift outside check H's curated set (e.g.
+#     `Res.status(code, msg)` when only `Res.status(code)` exists), and positional arguments and keyword
+#     *types* even inside it (`session_key::Symbol` against `::String` passes).
+#     Check C is symbol-*existence* only.
 #   - A symbol that exists in the wrong namespace (`Res.html` vs `html`) — check C
 #     is namespace-blind. Add such pairs to REQUIRED_SYMBOLS only by their
 #     defining name.
 #   - Prose that is merely stale but references nothing concrete.
 #   - Anything in the private process material: it is not tracked here, so it is not
 #     read here. Its own cross-links are the maintainer's to keep.
+#
+# Known false finding: check H swaps any `<…>` in a documented signature for a placeholder,
+# including one inside a string-literal default, so a doc writing `"<b>"` reads as a mismatch.
 #
 # Run locally:  julia .github/scripts/docs_lint.jl
 # Exit code 1 on any finding.
@@ -143,6 +153,23 @@ const REQUIRED_SYMBOLS = String[
     "SecretString", "reveal",
     # Release-train tooling — the versioning rule names these.
     "upgrade_guide", "_parse_upgrading",
+]
+
+# Check H: the documented keyword signatures of the guard factories and the auth middleware.
+# Each name is checked twice against the one method defined in the file it maps to: the
+# signature `SIGNATURE_DOC` writes, and the signature line of the method's own docstring.
+# The list is curated on purpose, like REQUIRED_SYMBOLS: these are the calls whose keyword
+# contract (`denied`, `unauthorized`, `redirect_url`) drifted in prose before (#520, #872).
+# A definition that moves to another file fails the check until its entry here is updated.
+const SIGNATURE_DOC = ".github/skills/nitro-usage/reference.md"
+const SIGNATURE_CHECKS = Pair{String,String}[
+    "login_required"       => "src/middleware/guards.jl",
+    "claim_required"       => "src/middleware/guards.jl",
+    "role_required"        => "src/middleware/guards.jl",
+    "permission_required"  => "src/middleware/guards.jl",
+    "kid_required"         => "src/middleware/guards.jl",
+    "BearerAuth"           => "src/middleware/auth_middleware.jl",
+    "CookieAuthMiddleware" => "src/middleware/auth_middleware.jl",
 ]
 
 # ---- helpers ---------------------------------------------------------------
@@ -340,6 +367,261 @@ function lint_sections(file, text, errors)
     end
 end
 
+# H: documented keyword signatures. Both sides go through Base's own parser
+# (`Meta.parseall`/`Meta.parse`, no package loaded), so a signature split across lines reads
+# like a one-line one, and a call written inside a docstring is never taken for a definition.
+
+# A keyword with no default (`f(; x)`), and a default that is not a literal to compare.
+struct NoDefault end
+struct NotLiteral end
+
+# Prose placeholders the docs write where a default is a private value: `<403>`,
+# `<403 Forbidden>`, `<default 401s>`. Not Julia, so each is swapped for this symbol first.
+const DOC_PLACEHOLDER = :__doc_placeholder__
+const PLACEHOLDER_RE  = r"<[A-Za-z0-9][A-Za-z0-9 ]*>"
+
+argname(x::Symbol) = x
+argname(x::Expr) = (x.head === :(::) && !isempty(x.args)) ? argname(x.args[1]) : Symbol("?")
+argname(_) = Symbol("?")
+
+"""
+The keyword arguments of a call or signature expression, in order, as `name => default`
+(`NoDefault()` when there is none). A slurped `kw...` is recorded as `Symbol("kw...")`.
+"""
+function kwargs_of(call::Expr)
+    kws = Pair{Symbol,Any}[]
+    for a in call.args
+        (a isa Expr && a.head === :parameters) || continue
+        for p in a.args
+            if p isa Expr && p.head in (:kw, :(=))
+                push!(kws, argname(p.args[1]) => p.args[2])
+            elseif p isa Expr && p.head === :...
+                push!(kws, Symbol(argname(p.args[1]), "...") => NoDefault())
+            else
+                push!(kws, argname(p) => NoDefault())
+            end
+        end
+    end
+    return kws
+end
+
+# The `:call` signature of a `function f(…)` or `f(…) = …` definition, or `nothing`.
+function signature_call(def::Expr)
+    def.head in (:function, :(=)) && !isempty(def.args) || return nothing
+    sig = def.args[1]
+    while sig isa Expr && sig.head in (:where, :(::)) && !isempty(sig.args)
+        sig = sig.args[1]
+    end
+    return (sig isa Expr && sig.head === :call) ? sig : nothing
+end
+
+is_doc_macro(m) = (m isa GlobalRef && m.name === Symbol("@doc")) || m === Symbol("@doc")
+
+doc_text(d::AbstractString) = String(d)
+doc_text(d::Expr) = d.head === :string ? join(a for a in d.args if a isa AbstractString) : nothing
+doc_text(_) = nothing
+
+"""
+Every method definition of `name` in a parsed file, as `(signature, docstring)` pairs; the
+docstring is `nothing` when the definition has none. Recurses through modules, blocks and
+macro calls, and pairs each definition with the `Core.@doc` call that wraps it.
+"""
+function source_definitions(ex, name::Symbol, found = Tuple{Expr,Union{String,Nothing}}[], doc = nothing)
+    ex isa Expr || return found
+    if ex.head === :macrocall && length(ex.args) >= 4 && is_doc_macro(ex.args[1])
+        return source_definitions(ex.args[4], name, found, doc_text(ex.args[3]))
+    end
+    sig = signature_call(ex)
+    if sig !== nothing && sig.args[1] === name
+        push!(found, (sig, doc))
+        return found
+    end
+    # A docstring above `@noinline function f(…)` documents the definition inside the macro
+    # call, so it is carried into one; anywhere else it stops here.
+    carried = ex.head === :macrocall ? doc : nothing
+    for a in ex.args
+        source_definitions(a, name, found, carried)
+    end
+    return found
+end
+
+"""
+`line` with a trailing `#` comment removed. Quote-aware, so a `#` inside a string literal
+stays; deliberately not a tokenizer — the docs it reads write one signature per block.
+"""
+function strip_comment(line::AbstractString)
+    in_str = false
+    escaped = false
+    for (i, c) in pairs(line)
+        if in_str
+            escaped ? (escaped = false) : c == '\\' ? (escaped = true) : c == '"' && (in_str = false)
+        elseif c == '"'
+            in_str = true
+        elseif c == '#'
+            return line[1:prevind(line, i)]
+        end
+    end
+    return line
+end
+
+"""
+The index of the bracket closing the one at `open` in `s`, and whether a `;` sits directly
+inside it (the keyword separator) — or `nothing` when it never closes. Skips string literals.
+"""
+function balanced_close(s::AbstractString, open::Int)
+    depth = 0
+    semicolon = false
+    in_str = false
+    escaped = false
+    i = open
+    while i <= ncodeunits(s)
+        c = s[i]
+        if in_str
+            escaped ? (escaped = false) : c == '\\' ? (escaped = true) : c == '"' && (in_str = false)
+        elseif c == '"'
+            in_str = true
+        elseif c in "([{"
+            depth += 1
+        elseif c in ")]}"
+            depth -= 1
+            depth == 0 && return (i, semicolon)
+        elseif c == ';' && depth == 1
+            semicolon = true
+        end
+        i = nextind(s, i)
+    end
+    return nothing
+end
+
+"""
+The signatures of `name` written in `text`: each `name(…)` that starts a line and carries a
+`;`, comments removed, as `line => call`. The `;` is what tells a signature from an example
+call such as `login_required()`; a signature with no keywords is not one this check reads.
+So an example in `SIGNATURE_DOC` must not start a line, indented or not, with a keyword call
+(`BearerAuth(v; unauthorized = f)`): it reads as a second signature. Keep it on the line of
+what holds it (`middleware = [BearerAuth(v; unauthorized = f)]`).
+"""
+function doc_calls(text::AbstractString, name::AbstractString)
+    clean = join((strip_comment(l) for l in split(text, '\n')), '\n')
+    calls = Pair{Int,String}[]
+    for m in eachmatch(Regex("(?m)^[ \\t]*" * name * "\\("), clean)
+        open = m.offset + ncodeunits(m.match) - 1
+        closed = balanced_close(clean, open)
+        closed === nothing && continue
+        stop, semicolon = closed
+        line = count(==('\n'), SubString(clean, 1, prevind(clean, m.offset))) + 1
+        semicolon && push!(calls, line => String(strip(clean[m.offset:stop])))
+    end
+    return calls
+end
+
+# A docstring's signature block: its first paragraph, by Julia convention. Only that is read,
+# so a usage example further down (`BearerAuth(validator; unauthorized = …)`) is not mistaken
+# for the signature.
+signature_block(docstring::AbstractString) = first(split(lstrip(docstring, '\n'), r"\n[ \t]*\n"))
+
+# A documented signature as an expression, prose placeholders swapped out; `nothing` when it
+# does not parse.
+function parse_doc_call(call::AbstractString)
+    ex = Meta.parse(replace(call, PLACEHOLDER_RE => string(DOC_PLACEHOLDER)); raise = false)
+    return (ex isa Expr && ex.head === :call) ? ex : nothing
+end
+
+# The value of a literal default, or `NotLiteral()`. `nothing` and `missing` parse as symbols.
+literal_value(x::Union{AbstractString,Number}) = x
+literal_value(x::QuoteNode) = x.value isa Symbol ? x : NotLiteral()
+literal_value(x::Symbol) = x === :nothing ? nothing : x === :missing ? missing : NotLiteral()
+literal_value(_) = NotLiteral()
+
+# Same value and same type: a doc writing `1` for a `1.0` default has drifted.
+same_literal(a, b) = typeof(a) === typeof(b) && isequal(a, b)
+
+"""
+How the documented keywords `doc` differ from the method's `src`, one reason per difference.
+Names must match as sets. A literal default the doc writes is always checked: against the
+method's literal, and it is a finding when the method has no default (a required keyword) or
+one the doc could not write as a literal (`_forbidden`), which the doc writes as a
+placeholder (`<403>`) instead. A placeholder, a non-literal or an omitted default in the doc
+is never a finding. Types are not compared.
+"""
+function kwarg_drift(doc::Vector{Pair{Symbol,Any}}, src::Vector{Pair{Symbol,Any}})
+    reasons = String[]
+    docd = Dict(doc)
+    srcd = Dict(src)
+    missing_kws = [k for (k, _) in src if !haskey(docd, k)]
+    extra_kws   = [k for (k, _) in doc if !haskey(srcd, k)]
+    isempty(missing_kws) || push!(reasons, "does not document keyword(s) " * join(("`$k`" for k in missing_kws), ", "))
+    isempty(extra_kws)   || push!(reasons, "documents keyword(s) the method does not take: " * join(("`$k`" for k in extra_kws), ", "))
+    for (k, d) in doc
+        haskey(srcd, k) || continue
+        dv = literal_value(d)
+        dv isa NotLiteral && continue
+        s = srcd[k]
+        if s isa NoDefault
+            push!(reasons, "`$k` is a required keyword in the method, but the doc gives it the default `$(repr(dv))`")
+            continue
+        end
+        sv = literal_value(s)
+        if sv isa NotLiteral
+            push!(reasons, "`$k` defaults to `$(s)` in the method, but the doc writes `$(repr(dv))` " *
+                           "(write a placeholder such as `<403>` for a private default)")
+        elseif !same_literal(dv, sv)
+            push!(reasons, "`$k` defaults to `$(repr(sv))` in the method, but the doc writes `$(repr(dv))`")
+        end
+    end
+    return reasons
+end
+
+function lint_signatures(errors; root = ROOT, checks = SIGNATURE_CHECKS, doc = SIGNATURE_DOC)
+    doc_path = joinpath(root, doc)
+    doc_body = isfile(doc_path) ? readtext(doc_path) : nothing
+    doc_body === nothing && push!(errors, "SIGNATURE_DOC: `$(doc)` does not exist")
+    for (name, file) in checks
+        path = joinpath(root, file)
+        if !isfile(path)
+            push!(errors, "SIGNATURE_CHECKS: `$(name)` maps to `$(file)`, which does not exist")
+            continue
+        end
+        defs = source_definitions(Meta.parseall(readtext(path); filename = file), Symbol(name))
+        if length(defs) != 1
+            push!(errors, "SIGNATURE_CHECKS: `$(name)` has $(length(defs)) method definitions in `$(file)`, " *
+                          "expected exactly one — update the entry")
+            continue
+        end
+        sig, docstring = only(defs)
+        src_kws = kwargs_of(sig)
+
+        sources = Pair{String,Union{String,Nothing}}[]
+        doc_body === nothing || push!(sources, doc => doc_body)
+        push!(sources, "$(file) (docstring of `$(name)`)" =>
+                       docstring === nothing ? nothing : String(signature_block(docstring)))
+        for (label, text) in sources
+            if text === nothing
+                push!(errors, "$(label): no docstring, so no signature to check")
+                continue
+            end
+            calls = doc_calls(text, name)
+            if length(calls) != 1
+                # A docstring's lines count from its first paragraph, not from the file.
+                unit = label == doc ? "lines " : "lines of the docstring's first paragraph "
+                at = isempty(calls) ? "" : " ($(unit)" * join((string(l) for (l, _) in calls), ", ") * ")"
+                push!(errors, "$(label): expected one `$(name)(…; …)` signature at the start of a line, " *
+                              "found $(length(calls))$(at)")
+                continue
+            end
+            call = last(only(calls))
+            ex = parse_doc_call(call)
+            if ex === nothing
+                push!(errors, "$(label): the `$(name)` signature does not parse: $(call)")
+                continue
+            end
+            for r in kwarg_drift(kwargs_of(ex), src_kws)
+                push!(errors, "$(label): `$(name)` $(r) (method in `$(file)`)")
+            end
+        end
+    end
+end
+
 # ---- structural checks -----------------------------------------------------
 
 function lint_skill_frontmatter(errors)
@@ -481,9 +763,11 @@ function main()
     lint_instruction_frontmatter(errors)
     lint_registry(errors)
     lint_skill_stubs(errors)
+    lint_signatures(errors)
 
     if isempty(errors)
         println("docs_lint: OK — $(length(docs)) docs, $(length(REQUIRED_SYMBOLS)) symbols, " *
+                "$(length(SIGNATURE_CHECKS)) signatures, " *
                 "public skill/rule sets + stubs + § anchors checked")
         exit(0)
     else
