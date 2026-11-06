@@ -1716,6 +1716,84 @@ end
 end
 end
 
+# #867: the token format is a contract with every cookie already in a browser. These tokens were
+# sealed by the pre-#867 code (AES-256-GCM through OpenSSL.jl's wrapper) under fixed ivs, and
+# reproduced independently by another AES-GCM and HKDF implementation, before the cipher was
+# rewritten. Whatever seals and opens tokens must reproduce them byte for byte and open them.
+# The purposes are the sealed cookie names Nitro defaults to (`auth_token`, `session`) and
+# app-named cookies; the payloads cover empty, one block exactly, several blocks unaligned and
+# non-ASCII; the expiries cover none (`exp = 0`), a future one, and the logout clamp (`exp = 1`).
+@testitem "Sealed-token golden vectors (#867)" tags=[:core, :security] setup=[NitroCommon] begin
+using Nitro
+using Dates
+using Test
+const Crypto = Nitro.Crypto
+
+secret_a = "k" * "0123456789abcdef0123456789abcdef"
+secret_b = "golden-vector-secret-B-0123456789abcdef"
+t0 = DateTime(2026, 1, 1)
+iv_of(seed) = UInt8[(seed * 17 + 3i) % 256 for i in 0:11]
+
+# (secret, purpose, payload, expires, iv seed, token)
+const VECTORS = [
+    (secret_a, "auth_token", "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiI3In0.c2ln", nothing, 1,
+     "AREUFxodICMmKSwvMh6o6tQE7_mUlwJzVzzRUOqCx72tn2oO89e_BHQdakoBRI7O2p8OfRIU3TfRy1KCq2WbP38hdsEdYEVrxHcleggPkXciVkko3z8"),
+    (secret_a, "session", "6f1c2d3e-4a5b-4c6d-8e7f-90a1b2c3d4e5", t0 + Day(14), 2,
+     "ASIlKCsuMTQ3Oj1AQ_7y88hbi5Pt-S1BV5yee_wI_bfg7A7lpP-E4Lpz21bAKt4watHs06CM3eEOiSdHuZ6rvVV0fdhLjrst8xCcDWLcN3jt"),
+    (secret_a, "language", "", nothing, 3,
+     "ATM2OTw_QkVIS05RVNpMwhThasfV4CFoUk4XGrtY0X2WntNntXeW5CUwg6pa"),
+    (secret_a, "__Host-session", "0123456789abcdef", t0 + Hour(1), 4,
+     "AURHSk1QU1ZZXF9iZfvz3SP0u37-9cnXWwPJ02Ggl0CbTGGYEERkNI9uDWnxlYrAetyigo_kiqgqc3av9Q"),
+    (secret_b, "language", repeat("abcdefghij", 10), nothing, 5,
+     "AVVYW15hZGdqbXBzdlnLiwqk4297R-7rtSelBsDVr21N6SuMaIZ9g7IMmwfCfJwqCVioYrhEt3Q2WwI6jFBZL44yinICLP4aRRwfNZhm6iVeGM14zmtEp1epO0X3tkqe2k6XJ9eFnBW9hh0baS3BheWeBLi05wgfY-dylWqtsQWfEm0naTqDZZ3c02jNny4IPQ"),
+    (secret_b, "session", "olá, 世界 ✓", t0 + Second(60), 6,
+     "AWZpbG9ydXh7foGEh5SiJj9TsYAikb8QWBNAUTjBUh-iG8MqWi-hnLjsxAdacvTgJGrG_kJd36ls33Ai-g"),
+    (secret_a, "auth_token", "", DateTime(1960, 1, 1), 7,
+     "AXd6fYCDhomMj5KVmOaZkULVgP5uYeffYIDbIVozOcFpHSyes4mSdK5ODIs9"),
+]
+
+# The plaintext `encrypt_payload` seals: iat ‖ exp ‖ value, big-endian.
+plaintext_of(payload, expires) = vcat(Crypto._int64_be(Crypto._unix_seconds(t0)),
+    Crypto._int64_be(expires === nothing ? Int64(0) : max(Int64(1), Crypto._unix_seconds(expires))),
+    Vector{UInt8}(codeunits(payload)))
+
+@testset "seal reproduces each vector byte for byte" begin
+    for (secret, purpose, payload, expires, seed, token) in VECTORS
+        key = Crypto._cookie_key(Nitro.SecretString(secret))
+        sealed = Crypto._seal_token(key, iv_of(seed), purpose, plaintext_of(payload, expires))
+        @test Crypto.base64url_encode(sealed) == token
+    end
+end
+
+@testset "open accepts each vector, under every key form" begin
+    for (secret, purpose, payload, expires, seed, token) in VECTORS,
+        key in (secret, Nitro.SecretString(secret), Crypto.CookieKey(Nitro.SecretString(secret)))
+        if expires !== nothing && expires < t0
+            # The logout clamp: it authenticates, and is then refused as expired, not as forged.
+            err = try Crypto.decrypt_payload(key, token; purpose, now = t0); nothing catch e; e end
+            @test err isa Nitro.CookieError && occursin("expired", err.msg)
+        else
+            @test Crypto.decrypt_payload(key, token; purpose, now = t0) == payload
+        end
+    end
+end
+
+@testset "a vector opens for its own key and purpose only" begin
+    for (secret, purpose, payload, expires, seed, token) in VECTORS
+        other_secret = secret == secret_a ? secret_b : secret_a
+        @test_throws Nitro.CookieError Crypto.decrypt_payload(other_secret, token; purpose, now = t0)
+        @test_throws Nitro.CookieError Crypto.decrypt_payload(secret, token; purpose = purpose * "x", now = t0)
+        # One bit flipped in each region: iv, ciphertext header, tag.
+        bytes = Crypto.base64url_decode(token)
+        for at in (2, 14, length(bytes))
+            flipped = copy(bytes); flipped[at] ⊻= 0x01
+            @test_throws Nitro.CookieError Crypto.decrypt_payload(secret, Crypto.base64url_encode(flipped);
+                                                                   purpose, now = t0)
+        end
+    end
+end
+end
+
 # #308: the argument-less `get_cookie(req, …)`/`set_cookie!(res, …)` read the process-wide
 # `CONTEXT[]`, not the app serving the request. With an explicit `App` -- the recommended handle
 # since #31 -- they could not see its key: writes went out in plaintext and reads returned the

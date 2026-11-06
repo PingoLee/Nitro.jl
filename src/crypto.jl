@@ -567,6 +567,14 @@ function encrypt_payload(secret, payload::AbstractString; purpose::AbstractStrin
     plaintext = vcat(_int64_be(_unix_seconds(now)), _int64_be(exp),
                      Vector{UInt8}(codeunits(String(payload))))
 
+    return base64url_encode(_seal_token(key, iv, purpose, plaintext))
+end
+
+# The token's bytes, `0x01 ‖ iv ‖ ciphertext ‖ tag`, for a given key and iv. Split from
+# `encrypt_payload` so the golden vectors in `test/cookies_tests.jl` can seal under a fixed iv
+# (#867); `encrypt_payload` is the only caller that mints a token.
+function _seal_token(key::Vector{UInt8}, iv::Vector{UInt8}, purpose::AbstractString,
+                     plaintext::Vector{UInt8})
     ctx = OpenSSL.EvpCipherContext()
     OpenSSL.encrypt_init(ctx, _gcm_cipher(), key, iv)
     _gcm_aad!(ctx, _token_aad(purpose))
@@ -581,7 +589,7 @@ function encrypt_payload(secret, payload::AbstractString; purpose::AbstractStrin
           ctx, 0x10, 16, tag)
     ret == 1 || throw(CookieError("Encryption failed: could not read authentication tag"))
 
-    return base64url_encode(vcat(TOKEN_VERSION, iv, ciphertext, final_part, tag))
+    return vcat(TOKEN_VERSION, iv, ciphertext, final_part, tag)
 end
 
 """
