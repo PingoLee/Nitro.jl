@@ -225,13 +225,15 @@ Re-read this document when any of the following becomes true:
 Related, and **closed**: [#21](https://github.com/PingoLee/Nitro.jl/issues/21) was the same trust
 question at the supply-chain layer — CI cloned an unpinned personal PormG fork at default-branch
 HEAD in jobs carrying `contents: write` and the Documenter deploy key. It is fixed twice over: the
-write scope and both secrets now live only in the `docs` job, and the workflow no longer clones
+write scope now lives only in the `docs` job, and the workflow no longer clones
 PormG at all — `Project.toml`'s `[sources]` pins it by url plus an immutable 40-hex `rev` that Pkg
 fetches itself. `test/ci_workflow_tests.jl` asserts both properties against the shipped `ci.yml`.
 [#332](https://github.com/PingoLee/Nitro.jl/issues/332) applied the same immutability argument to
 the actions themselves. Every `uses:` is pinned to a full commit SHA, and
-[`.github/dependabot.yml`](../../.github/dependabot.yml) keeps those pins current. The two docs
-secrets moved from the job's `env` to the single step that deploys. TagBot was removed: before
+[`.github/dependabot.yml`](../../.github/dependabot.yml) keeps those pins current. The deploy
+credentials moved from the job's `env` to the single step that deploys, and since
+[#389](https://github.com/PingoLee/Nitro.jl/issues/389) they are only the job token: the repository
+defines no Actions secrets, so there is no deploy key or PAT to leak. TagBot was removed: before
 registration it has nothing to do, and on a `workflow_dispatch` it ran a mutable tag with
 `contents: write` and the deploy key. The same test file asserts the pins and the step scoping.
 

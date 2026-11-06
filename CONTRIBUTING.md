@@ -302,6 +302,13 @@ julia .github/scripts/docs_lint.jl
 # nothing about whether `src/` actually works there.
 julia --project=. .github/scripts/smoke_test.jl
 
+# PostgreSQL race suite (#407) — the worker store's PostgreSQL-only promises (guarded deletes,
+# SKIP LOCKED, renew vs requeue, upgrade boot, a three-consumer drain) against a real, DISPOSABLE
+# database with a superuser. Not part of the suite: it builds its own env (Nitro + the pinned
+# PormG + both drivers) and is CI's `postgres` job, on LibPQ and Postgres.jl.
+NITRO_PG_CONNINFO="host=… port=… user=… dbname=…" PORMG_POSTGRES_DRIVER=LibPQ \
+  julia --threads=2 test/postgres/run.jl
+
 # Docs build (the package env has no Documenter — `--project=.` fails)
 julia --project=docs -e 'using Pkg; Pkg.develop(PackageSpec(path=pwd())); Pkg.instantiate()'
 julia --project=docs docs/make.jl

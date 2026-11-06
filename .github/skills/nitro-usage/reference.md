@@ -62,7 +62,8 @@ param and body accessors (`getparams`, `getquery`, `getjson`, `getform`, `getpos
 | `getfiles(req)` | `Dict{String, Union{FormFile, Vector{FormFile}}}` | Multipart *file* parts (Django `request.FILES`) — **cached** |
 | `payload(req)` | `Dict{String,Any}` | Merged: `params > post > form > json > query` |
 | `getsession(req)` | `Dict` or `nothing` | Needs `SessionMiddleware` |
-| `getuser(req)` | anything, or `nothing` | Set by an auth middleware; a `Principal` only when `jwt_validator` ran without a `user_validator` |
+| `getuser(req)` | anything, or `nothing` | Set by an auth middleware; a `Principal` only when `jwt_validator` ran without a `user_validator`. For the verified token principal, use `getprincipal` |
+| `getprincipal(req)` | `Principal` or `nothing` | The verified token principal, whatever `user_validator` returned; `.kid` is set only for a keyset-verified token. `nothing` = unauthenticated, session-only, or a custom validator's non-`Principal` identity |
 | `getip(req)` | IP or `nothing` | Needs `ExtractIP`; `getpeerip(req)` for the socket peer |
 | `getcontext(req)` / `getcontext(req, T)` | app context | The object passed to `serve(context = …)`; use the typed form on the request path |
 | `setsession!(req, v)` / `setip!(req, v)` | — | The two writers |
@@ -222,13 +223,16 @@ Cors(; allowed_origins   = ["*"],
        paths             = nothing)             # Vector{String} or predicate Function
 
 BearerAuth(validate_token::Function;
-           header      = "Authorization",
-           scheme      = "Bearer",
-           cookie_name = nothing)
+           header       = "Authorization",
+           scheme       = "Bearer",
+           cookie_name  = nothing,      # a String: also read the token from that cookie
+                                        # when no header carries one
+           unauthorized = <401>)        # (req, reason) -> HTTP.Response; see Error contract
 
 CookieAuthMiddleware(validate_token::Function;
-                     cookie_name = "auth_token",
-                     secret_key  = nothing)          # String or SecretString, >= 32 bytes
+                     cookie_name  = "auth_token",
+                     secret_key   = nothing,         # String or SecretString, >= 32 bytes
+                     unauthorized = <401>)           # (req, reason) -> HTTP.Response
 
 CSRFMiddleware(secret::Union{AbstractString, SecretString};  # needs SessionMiddleware OUTSIDE it
                cookie_name = "__Host-csrf_token",   # prefix => Secure + Path=/ + no Domain
@@ -323,18 +327,28 @@ the leftmost value, and `:forwarded` takes the `proto=` of the element that name
 
 ## Guards
 
-Return `403` when the caller is authenticated but not authorized. `login_required` returns `302` for
-browsers.
+By default a guard returns `403` when the caller is authenticated but not authorized, and
+`login_required` returns `302` for browsers. Every guard takes `denied`, a
+`(req, reason) -> HTTP.Response` factory that replaces that default.
 
 ```julia
-login_required(;      redirect_url::String = "/login", session_key::String = "user_id")
-role_required(role::String;             role_key::String = "role")
-permission_required(permission::String; permissions_key::String = "permissions")
-claim_required(claim::String, value;    kind::Symbol = :equals)   # or :contains
-kid_required(allowed)
+login_required(;      redirect_url::Nullable{String} = nothing,  # nothing => "/login"
+                      session_key::String = "user_id", denied = nothing)  # not both
+role_required(role::String;             role_key::String = "role",
+                                        session_key::String = "user_id", denied = <403>)
+permission_required(permission::String; permissions_key::String = "permissions",
+                                        session_key::String = "user_id", denied = <403>)
+claim_required(claim::String, value;    kind::Symbol = :equals,   # or :contains
+                                        session_key::String = "user_id", denied = <403>)
+kid_required(allowed; denied = <403>)   # reads getprincipal(req).kid
 ```
 
-`role_required` and `permission_required` are thin aliases over `claim_required`.
+`role_required` and `permission_required` are thin aliases over `claim_required`. `login_required`'s
+`denied` replaces the redirect, so passing both it and `redirect_url` is an `ArgumentError`.
+
+**A custom guard** is `req -> nothing` to admit or `req -> HTTP.Response` to deny. Anything else
+(`false`, a `Dict`, a status `Int`) is an `ArgumentError` and therefore a `500`: a guard fails
+closed, never open (#519).
 
 `Principal` — immutable, dict-like wrapper over *verified* claims, with typed `id` and `kid` and a
 `source` of `:claim` or `:kid`. Claims read dict-style; JSON serialization is exactly the claims
@@ -342,11 +356,19 @@ object. A `kid` header on a single-secret token is never trusted — only keyset
 
 ### Error contract
 
-| Status | Meaning |
-|--------|---------|
-| `401` | Unauthenticated — auth middleware, including a validator that **throws** |
-| `403` | Authenticated but not authorized — guards |
-| `302` | `login_required` browser redirect |
+These are the **defaults**. Each one is replaceable per site: `unauthorized` on the auth
+middleware, `denied` on every guard.
+
+| Default | Meaning | `reason` passed to the factory |
+|--------|---------|--------------------------------|
+| `401` | Unauthenticated — auth middleware, including a validator that **throws** | `:missing_credentials` (no usable credential), `:invalid_credentials` (the validator refused it or threw) |
+| `403` | Authenticated but not authorized — guards | `:forbidden` |
+| `302` | `login_required` browser redirect | `:login_required` |
+
+A factory must accept `(req, reason)`; a one-argument function is an `ArgumentError` at
+construction. It must return an `HTTP.Response`; anything else is a `500`, never an admission.
+It may return a shared `const` response, but must never mutate one. The full contract is
+`docs/src/tutorial/authentication.md`, *Your own error contract*.
 
 ---
 

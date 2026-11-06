@@ -19,7 +19,7 @@ on:
 #     do not inject their own -- note `julia-actions/julia-buildpkg` DOES inject
 #     `GITHUB_TOKEN: ${{ github.token }}` on its own build step, which is precisely why
 #     the first two matter more than the third.
-# See the `docs` job for where the write scope and the secrets actually live.
+# See the `docs` job for where the write scope and the deploy token actually live.
 permissions:
   contents: read
 # There is ONE PormG pin now, and it lives in `Project.toml`:
@@ -254,20 +254,74 @@ jobs:
       - uses: julia-actions/julia-buildpkg@e3eb439fad4f9aba7da2667e7510e4a46ebc46e1 # v1.7.0
       - name: Load, route and serve without the test environment
         run: julia --project=. .github/scripts/smoke_test.jl
+  postgres:
+    # The PormG worker store's PostgreSQL-only promises, against a real server (#407): the
+    # guarded deletes' re-check after a row-lock wait (#379, #398), `claim_next!`'s
+    # `SKIP LOCKED`, `requeue_expired!` against a renewal, the upgrade boot of a pre-#514 table,
+    # and several consumer processes draining one queue. SQLite serializes writers, so the
+    # `@testitem` suite can only pin the rendered SQL; each scenario here records the lock wait it
+    # depends on, so a pass cannot be vacuous. `test/postgres/run.jl` says how it is gated.
+    #
+    # Both drivers PormG can build a PostgreSQL pool with, on the correctness bar they share.
+    #
+    # This job EXECUTES the pinned PormG source -- `run.jl` adds it at the `[sources]` url + rev
+    # rather than through `julia-buildpkg` -- so it is hardened like `test`: `contents: read`,
+    # `persist-credentials: false`, no token, no secrets. `ci_workflow_tests.jl` counts it among
+    # the PormG jobs. The database is a throwaway service container; its password is not a secret.
+    name: PostgreSQL race suite (${{ matrix.driver }})
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        driver: [LibPQ, Postgres]
+    services:
+      postgres:
+        # Pinned by digest, as every action is pinned by commit.
+        image: postgres:17@sha256:748a18a54d3842d43bc156f0840d78029b8d349e0feca98c12b9c4ce3404a6b3
+        env:
+          POSTGRES_USER: nitro
+          POSTGRES_PASSWORD: nitro
+          POSTGRES_DB: nitro
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U nitro -d nitro"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false   # same reason as the `test` job
+      - uses: julia-actions/setup-julia@da908477b5db94c10ffce8cfea9f2b3b9d5db687 # v3.0.3
+        with:
+          version: '~1.13.0-0'
+      - uses: julia-actions/cache@9353db09a0f2bbbdec6f41791918c75d37391b36 # v3.5.0
+        with:
+          include-matrix: 'false'
+          delete-old-caches: 'false'   # same reason as the `test` job above
+          cache-name: julia-cache;workflow=${{ github.workflow }};job=${{ github.job }};driver=${{ matrix.driver }}
+      - name: Race suite
+        run: julia --threads=2 test/postgres/run.jl
+        env:
+          NITRO_PG_CONNINFO: host=localhost port=5432 user=nitro password=nitro dbname=nitro
+          PORMG_POSTGRES_DRIVER: ${{ matrix.driver }}
   docs:
     name: Documentation
     runs-on: ubuntu-latest
-    # The only job that WRITES anything, and the only one holding the deploy secrets (`test`
+    # The only job that WRITES anything, and the only one holding a write-scoped token (`test`
     # hands a read-only GITHUB_TOKEN to one coveralls step -- see below). It fetches no PormG,
-    # so the third-party code #21 is about never runs here -- which is why the write scope and
-    # both secrets are parked in this job rather than at workflow level. Inside the job they
-    # are narrower still: both secrets live on the ONE step that deploys (#332).
+    # so the third-party code #21 is about never runs here -- which is why the write scope is
+    # parked in this job rather than at workflow level. Inside the job the token is narrower
+    # still: it lives on the ONE step that deploys (#332).
     #
     # That property is now a FACT ABOUT PKG rather than a structural impossibility, and the
     # difference is worth knowing. Under the old path dep it was fail-closed: a job that
     # somehow pulled PormG's `[sources]` would have died at resolve, because no
     # `../PormG.jl` exists on a runner. Under a url + rev source the same slip would clone
-    # PormG -- and potentially build and execute it -- while holding DOCUMENTER_KEY. Two
+    # PormG -- and potentially build and execute it -- while holding the write token. Two
     # independent things stop that, both checked in Pkg 1.12's `Operations.jl`:
     #
     #   * PormG is a WEAKDEP. `collect_project` resolves `[sources]` (via `get_path_repo`)
@@ -288,25 +342,26 @@ jobs:
     #   * this job is not third-party-code-free -- `docs/Manifest.toml` is gitignored, so
     #     the `Pkg.instantiate()` below resolves Documenter and its whole transitive tree
     #     from the General registry at floating versions and then runs it. Since #332 the
-    #     instantiate and doctest steps run it WITHOUT either secret; the deploy step still
-    #     runs that same floating tree while holding DOCUMENTER_KEY, because `deploydocs`
-    #     is Documenter code. That is the residual supply-chain exposure after #21. It was
-    #     never pinned before either, and closing it is a separate decision.
+    #     instantiate and doctest steps run it WITHOUT the token; the deploy step still
+    #     runs that same floating tree while holding the `contents: write` job token, because
+    #     `deploydocs` is Documenter code. That is the residual supply-chain exposure after
+    #     #21. It was never pinned before either, and closing it is a separate decision. The
+    #     token expires with the job, which a long-lived deploy key would not (#389).
     #
     # `actions: write` is cache eviction, which `test` and `smoke` give up
     # (`delete-old-caches: 'false'`) so they need neither.
     #
-    # `contents: write` + `GITHUB_TOKEN` are the FALLBACK deploy path, not the normal one.
-    # Documenter picks SSH whenever DOCUMENTER_KEY is non-empty and pushes `gh-pages` with
-    # the key, never the token -- so on the happy path neither is load-bearing. They stay
-    # because the day the key is empty (rotated, renamed) is the day Documenter falls back
-    # to HTTPS, and with no token it would instead print `Deploying: X` and return
-    # SUCCESSFULLY: a green job that published nothing (#105). Do not shave them to make
-    # the permission table look tidier -- and note an SSH deploy key is not governed by
-    # `permissions:` at all, so dropping them would not reduce the deploy surface anyway.
+    # `contents: write` + `GITHUB_TOKEN` ARE the deploy path, and the only one (#389).
+    # Documenter pushes `gh-pages` over HTTPS with a URL it builds from GITHUB_TOKEN. There is
+    # no DOCUMENTER_KEY: the repository defines no Actions secrets, so the SSH path this
+    # comment used to call the normal one never ran -- every deploy already went over the
+    # token. Both halves are load-bearing. Without the token Documenter prints `Deploying: X`
+    # and returns SUCCESSFULLY: a green job that published nothing (#105). Without
+    # `contents: write` the push is refused. Do not shave either to make the permission table
+    # look tidier; `ci_workflow_tests.jl` asserts both.
     #
-    # Both secrets are STEP-scoped, on the `docs/make.jl` step, not job `env` (#332): only
-    # `deploydocs` reads them, and a job-level `env` handed them to every step -- the
+    # The token is STEP-scoped, on the `docs/make.jl` step, not job `env` (#332): only
+    # `deploydocs` reads it, and a job-level `env` handed it to every step -- the
     # instantiate and doctest steps included, which run the floating Documenter tree.
     permissions:
       contents: write
@@ -357,8 +412,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # Nothing in this job pushes through the checkout. `deploydocs` clones into its own
-          # `mktempdir()` and authenticates with the key, or on the fallback path with a URL it
-          # builds from GITHUB_TOKEN in its environment. Persisting the job token into
+          # `mktempdir()` and authenticates with a URL it builds from GITHUB_TOKEN in its
+          # environment. Persisting the job token into
           # `.git/config` would only hand it to the instantiate and doctest steps below (#332).
           persist-credentials: false
       - uses: julia-actions/setup-julia@da908477b5db94c10ffce8cfea9f2b3b9d5db687 # v3.0.3
@@ -379,10 +434,9 @@ jobs:
             doctest(Nitro)'
       - name: Build and deploy
         run: julia --project=docs docs/make.jl
-        # The only step holding a secret: `deploydocs` in docs/make.jl is the only reader of
-        # either. Both must stay present -- see the #105 note above the job's `permissions`.
+        # The only step holding the token: `deploydocs` in docs/make.jl is its only reader. It
+        # must stay present -- see the #105 note above the job's `permissions`.
         env:
-          DOCUMENTER_KEY: ${{ secrets.DOCUMENTER_KEY }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
   docs-lint:
     name: Docs reference lint
