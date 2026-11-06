@@ -673,23 +673,23 @@ token's `Principal` first, as `getprincipal` does (#517).
 
 A recurring question for service traffic is whether moving it to sessions would save the JWT's
 CPU. It would not save anything that matters. These are medians from Nitro's own benchmark
-group (`bench/suite/jwt.jl`, run with `NITRO_BENCH_GROUPS="jwt session"`). They were measured
+group (`bench/suite/jwt.jl`, run with `NITRO_BENCH_GROUPS="jwt"`). They were measured
 in-process, on one thread pinned to one core of a Ryzen 5 5500, under Julia 1.13.2 on
-2026-10-28. There is no socket, HTTP parsing or TLS in them, so read them as relative costs, not
+2026-11-06. There is no socket, HTTP parsing or TLS in them, so read them as relative costs, not
 as what one request costs in production.
 
 | What | Median | Allocations |
 |---|---:|---:|
-| `decode_jwt(token, secret)`, service claim set (`iss`, `aud`, `exp`, `iat`, one scope) | 3.9 µs | 44 |
-| `jwt_validator(secret)(token)` — `BearerAuth`'s per-request call | 4.0 µs | 44 |
-| `jwt_validator(keys; identity_from = :kid)`, 4-key keyset, token with `kid` | 4.2 µs | 49 |
-| the same, token **without** `kid` (every key tried; the worst case) | 5.1 µs | 48 |
+| `decode_jwt(token, secret)`, service claim set (`iss`, `aud`, `exp`, `iat`, one scope) | 2.0 µs | 39 |
+| `jwt_validator(secret)(token)` — `BearerAuth`'s per-request call | 2.0 µs | 39 |
+| `jwt_validator(keys; identity_from = :kid)`, 4-key keyset, token with `kid` | 2.1 µs | 44 |
+| the same, token **without** `kid` (every key tried; the worst case) | 2.5 µs | 44 |
 | `internalrequest` to a trivial route | 1.4 µs | 42 |
-| the same route behind `BearerAuth(jwt_validator(secret))` | 6.9 µs | 90 |
+| the same route behind `BearerAuth(jwt_validator(secret))` | 4.4 µs | 85 |
 | the same route behind `SessionMiddleware` on a `MemoryStore`, session loaded | 2.6 µs | 55 |
 
 The JWT check is the largest single cost in a trivial authenticated request, yet one core still
-verifies roughly 250,000 tokens a second. What usually costs more sits around it:
+verifies roughly 500,000 tokens a second. What usually costs more sits around it:
 
 - **The caller mints once per token lifetime, not once per request.** It caches the token and
   re-mints shortly before `exp` — a lifetime of 5–15 minutes is typical. Verification stays per

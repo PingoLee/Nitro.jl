@@ -1,6 +1,7 @@
 # What a bearer-authenticated request pays for its JWT (#723), against the request it rides on.
-# The last number was #449's: `jwt_validator(...)(tok)` at 13.4 µs and 145 allocations, taken
-# before #432 (base64url) and #449 (libcrypto HMAC).
+# `jwt_validator(...)(tok)` was 13.4 µs and 145 allocations before #432 (base64url) and #449
+# (libcrypto HMAC), 4.0 µs and 44 at #723, and 2.0 µs and 39 after #837 (HMAC over a once-fetched
+# digest, allocation-free `iss`/`aud` checks).
 #
 #   decode                 `decode_jwt` with a service claim set (iss, aud, exp, iat, one scope)
 #   validator_secret       `jwt_validator(secret)(tok)`: BearerAuth's per-request call
