@@ -698,6 +698,10 @@ through `_fail_task!`, never rethrown (#367).
   `RUNNING` until a zombie sweep marked it failed with no hint of why, where `FAILED` with the
   exception's type is the honest record. It is group 2's argument one level down: a background
   task, where the failure has no request to fail.
+- **One exception, checked before all of it**: when `process_exiting()` says the failure is the
+  exit's own wake, the catch (`_run_attempts!`, shared by both executors and a consumer's run)
+  returns without a read, a write or a log (#807). There the record staying `RUNNING` *is* the
+  honest one: the process ended under the run, which then sits where a crash would have left it.
 
 Those three groups plus the sites in the table are every `e isa InterruptException && rethrow()`
 in `src/`; `grep -rn 'isa InterruptException && rethrow()' src/` is the audit, and a hit it
@@ -745,7 +749,9 @@ that is noise at best, and at worst it compiles and prints code during teardown,
 crashed CI's test child in #772. A catch site in a background task that runs application code
 checks this first and ends quietly. The janitors do not need it: they park on a `Base.Event`, which
 no finalizer wakes (`src/middleware/janitor.jl`). A Workers callback is application code with the
-same exposure, and does not check it yet.
+same exposure: its executors' attempt loop checks it before it reads or writes the run's record
+(#807), so a run the process exits under stays `RUNNING` rather than being recorded `FAILED`
+during teardown.
 
 It reads `Base._atexit_hooks_finished`, which `Base._atexit` sets after the last hook and before
 it returns to the runtime that runs the finalizers: Base's documented order, *atexit hooks run
@@ -755,7 +761,8 @@ is a `Bool`. A Julia that renames it fails that test, not this read inside a cat
 and makes a dynamic call into Nitro at exit, which a `juliac --trim` executable would have to be
 shown to survive. Reading Base's flag needs neither.
 
-Call sites: `_run_sse_producer` (`src/response.jl`). Deliberately **not exported**.
+Call sites: `_run_sse_producer` (`src/response.jl`) and `_run_attempts!`
+(`src/Workers/queue.jl`). Deliberately **not exported**.
 """
 process_exiting()::Bool = Base._atexit_hooks_finished
 

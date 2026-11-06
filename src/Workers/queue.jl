@@ -371,6 +371,21 @@ function _run_attempts!(runtime::WorkerRuntime, task_info::TaskInfo, callback::F
             result = timeout_call(callback, task_info; timeout=options.timeout, handoff=handoff[])
             return on_complete(task_info, result)
         catch error
+            # A callback woken by the process's EXIT is not a failed run (#807). Exit runs every
+            # finalizer, live `Timer`s included, and a `Timer`'s wakes a callback parked in `sleep`
+            # with `EOFError` (#772) -- on the spawned path, the direct `timeout = 0` path and a
+            # consumer's run alike, since all three end up here. Recording that FAILED was wrong
+            # twice over: the run did not fail, the process ended under it, and the record was a
+            # store write (a database one, on PormG) while thread 1 tears the process down.
+            #
+            # So write nothing, read nothing and log nothing: checked FIRST, before the store read
+            # below. The run stays `RUNNING`, which is what a process that dies mid-run leaves anyway,
+            # and the two mechanisms built for that reclaim it -- the next start's
+            # `recover_zombie_tasks!`, or, for an `External` queue, lease expiry and its policy.
+            # Same predicate, and same reasoning, as `_run_sse_producer` (#777). `task_info` is
+            # returned as the fall-through below returns it; nothing reads it at exit.
+            process_exiting() && return task_info
+
             unwrapped = _unwrap_exception(error)
 
             # NOT dead code, however redundant it looks. `_fail_task!` below would lose
@@ -505,6 +520,12 @@ function _spawn_queue_processor(runtime::WorkerRuntime, queue::WorkerQueue, queu
                     end
                     rethrow(error)
                 end
+                # The process is exiting (#807): start nothing. A run woken by the exit returns
+                # without a record (`_run_attempts!`), which lands this processor back here with
+                # the backlog still buffered -- and claiming the next item would be a store write
+                # to `RUNNING`, plus a callback started, while thread 1 tears the process down.
+                # The item stays `PENDING`, as a crash would leave it.
+                process_exiting() && break
                 # The item has left the buffer, so its slot is free for the next submit
                 # (#324). Its OWNER's reservation lasts until the run ends.
                 _release_queue_slot!(queue)
