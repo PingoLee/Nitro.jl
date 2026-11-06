@@ -382,62 +382,33 @@ end
     end
 
     # The transport layer (#450): `NitroStreamHandler` → the spawn → `stream_handler` → this
-    # pipeline, for the listener a default `serve` builds. COMPILED, not
-    # run. Running it needs a live connection: `stream_handler` closes the write side itself
-    # (#453), and HTTP's socket-free `Stream(request)` has no connection to close. `precompile`
-    # needs only the types, and `_default_serve_listener` builds them through the same function
+    # pipeline, for the listener a default `serve` builds, compiled by `_precompile_listener`
+    # (src/core/lifecycle.jl). `_default_serve_listener` builds the types through the same function
     # `serve` does, so they are the types a default server really has (pinned by
     # test/precompilation_test.jl).
     #
-    # Measured over a socket (`ACCESS_LOG=1 bench/socket/first_request.sh`, `-t 8`): the first
-    # `/plaintext` request to a fresh default server drops from ~2.4 s to ~1.5 s. Only the
-    # DEFAULT shape benefits, and `serve`'s flags do not leave it: every framework layer is built
-    # whatever they say (#572), so `access_log` does not change the listener type, and neither
-    # does a `LifecycleMiddleware` whose `middleware` is `identity`. User middleware that wraps
-    # the handler does: that server has another listener type and compiles its chain on the
-    # first request.
+    # Measured over a socket (`ACCESS_LOG=1 bench/socket/first_request.sh`, `-t 8`): without the
+    # connection loop, the first `/plaintext` request to a fresh default server dropped from
+    # ~2.4 s to ~1.5 s; with it (#827), on `main` at ec5625c9 (Julia 1.13.2, HTTP 2.13.5,
+    # `-t 8,1`, `bench/juliac/app.jl`), from 1,462–1,469 ms to 10–12 ms. The loop costs ~0.9 s of
+    # Nitro's precompile time and ~0.7 MB of pkgimage. It is named through HTTP's public
+    # `precompile_server` since HTTP 2.15 (#868), which also covers the accept loop and the
+    # HTTP/2 stream task; #827 named the private `_serve_conn!`.
     #
-    # HTTP.jl's own connection loop is named here too (#827), by signature: the task
-    # `_serve_listener!` spawns for each connection runs `_serve_conn!(server, tracked)`, compiled
-    # for `Server{typeof(listener)}`. No socket-free call drives it, but `precompile` needs no
-    # call. Before it, nearly all of a default server's first request was that loop: on `main` at
-    # ec5625c9 (Julia 1.13.2, HTTP 2.13.5, `-t 8,1`, `bench/juliac/app.jl`), `/plaintext` took
-    # 1,462–1,469 ms, 1,455–1,462 of them the `_serve_listener!` closure. With the line it takes
-    # 10–12 ms, the closure 3–4 ms. It costs ~0.9 s of Nitro's precompile time and ~0.7 MB of
-    # pkgimage. The name is private: test/http_internals_contract_tests.jl pins it and that the
-    # spawn calls it. Like the rest of this block it covers only the DEFAULT listener type; a
-    # server with its own middleware still compiles the loop on its first request (~1.5 s).
-    #
-    # One stream type covers every HTTP/1.1 request, with a body or
-    # without: HTTP builds each `Stream` around `_stream_request_metadata(request)`, which is
-    # always a `Request{EmptyBody}`, and keeps the live body in an abstract `request_body` field.
-    # What stays cold is only the body READ for `FixedLengthBody`/`ChunkedBody`, which dispatches
-    # at runtime off that field; the workload's `internalrequest` POSTs warm the parsing above it.
+    # Only the DEFAULT shape benefits here, and `serve`'s flags do not leave it: every framework
+    # layer is built whatever they say (#572), so `access_log` does not change the listener type,
+    # and neither does a `LifecycleMiddleware` whose `middleware` is `identity`. User middleware
+    # that wraps the handler does: that server has another listener type, which the app warms in
+    # its own workload with `Nitro.precompile_server(app; …)`.
     let (listener, request_handler) = Core._default_serve_listener(ctx)
-        stream = Stream{false, Request{Core.HTTP.EmptyBody}}
-        precompile(listener, (stream,))
-        precompile(Core.HTTP._serve_conn!, (Core.HTTP.Server{typeof(listener)}, Core.HTTP._ServerConn))
-        precompile(request_handler, (stream,))
-        # What the spawn runs: a `@spawn` closure's body is not compiled with the listener.
-        precompile(Core._handle_reporting, (typeof(request_handler), stream))
-        # The write half, once per body type Nitro builds (`Types.with_response`), for the two
-        # requests the transport builds. The two streaming bodies (#551) cost ~120 ms each on a
-        # first request when cold: a streamed file (`Res.file(req, path)` over 8 MiB or with
-        # `stream = true`, and a mount's files over its threshold) and `Res.sse`'s `SSEStream`.
-        # The admission is `nothing` unless `max_concurrent_requests` holds a slot.
-        for B in (String, Vector{UInt8}, Core.HTTP.EmptyBody, Core.HTTP.BytesBody{Vector{UInt8}},
-                  Core.HTTP.BytesBody{Core.Types.RangeBytes}, Core.Types.StreamedFileBody,
-                  Core.HTTP.SSEStream),
-            R in (Core.Types.EmptyRequest, Core.Types.BytesRequest), A in (Nothing, Core._Admission)
-            precompile(Core._send_response!, (Core.HTTP.Response{B}, stream, R, A))
-        end
+        Core._precompile_listener(listener, request_handler)
     end
 
     # NOTE: a live-server round-trip (serve! + loopback HTTP.get) is still intentionally NOT
     # added. Binding a real port inside the precompile worker is the one thing in this file that
     # could hang a build rather than merely slow it; the earlier Reseau loopback deadlock (fixed in
     # HTTP 2.3.0 / Reseau 1.3.1) is why that is not hypothetical. The block above warms what a
-    # socket would have, HTTP.jl's own loop included (#827), by signature.
+    # socket would have, HTTP.jl's own loops included (#827, #868), by signature.
     #
     # (Until #242 this NOTE also claimed the live path "is specialized on the user's specific
     # handler/middleware closure types ... so the first real network request recompiles them

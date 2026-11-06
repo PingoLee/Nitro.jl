@@ -9,8 +9,9 @@
 #   SECRETS=… AUTH_HEADER=… bench/juliac/realapp/trace.sh [route-name…]   # default: every route
 #
 # Writes bench/results/realapp-trace-<stamp>/<route>.jl (the statements of that request) and
-# prints one count per route. Same env as measure.sh, plus TRACE_TIMING=1, which adds
-# --trace-compile-timing: each statement then carries its compile time, and trace_counts.jl sums it.
+# prints one count per route. Same env as measure.sh (JIT_ENTRY included: `main_tuple` for the
+# `Tuple` form, #827), plus TRACE_TIMING=1, which adds --trace-compile-timing: each statement then
+# carries its compile time, and trace_counts.jl sums it.
 set -uo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/../../.." && pwd)
@@ -53,7 +54,7 @@ for name in "${NAMES[@]}"; do
   trace="$DIR/full-$name.jl"
   ( set -a; . "$SECRETS"; set +a; cd "$DIR" && PORT=$PORT REALAPP_ROOT="$HERE" PORMG_POSTGRES_DRIVER=Postgres \
     exec "$JULIA_BIN" --startup-file=no --project="$HERE" --threads="$THREADS" --trace-compile="$trace" ${TRACE_TIMING:+--trace-compile-timing} \
-    "$HERE/main.jl" ) >"$DIR/server-$name.log" 2>&1 &
+    "$HERE/${JIT_ENTRY:-main}.jl" ) >"$DIR/server-$name.log" 2>&1 &
   pid=$!
   for _ in $(seq 1 6000); do
     [ -n "$(ss -Hltn "sport = :$PORT")" ] && break

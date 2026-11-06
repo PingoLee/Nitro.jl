@@ -629,20 +629,65 @@ request a fresh process serves pays for compiling the code it reaches. On a defa
 `serve()` with one plain route (Julia 1.13.2, `bench/juliac/app.jl`), the first request takes
 about **50 ms**, most of it the access log's first line; with `access_log = false` it is about
 10 ms. Pass your own `middleware` to `serve` and the first request costs about
-**1.5 seconds** more: HTTP.jl compiles its connection loop for each server's handler type, and
-that type changes with the middleware stack. That cost is paid once per process; every route
-your app adds then pays its own, smaller share the first time it is hit.
+**1.5 seconds** more, unless your package warms it (below): HTTP.jl compiles its connection loop
+for each server's handler type, and that type changes with the middleware stack. That cost is
+paid once per process; every route your app adds then pays its own, smaller share the first time
+it is hit.
 
 Nitro already ships what it can: its `PrecompileTools` workload (`src/precompile.jl`) runs the
 router, the serializer, the typed extractors and static and SPA mounts while the package
 precompiles. It also compiles, without running, the transport layer of a default `serve()` and
 HTTP.jl's connection loop for it, so that code is cached with Nitro itself. A default `serve()`
-means no `middleware`; flags such as the access log do not change the shape. What the workload
-cannot reach is the transport and connection loop of a server with any other middleware stack,
-and your application's handlers.
+means no `middleware`; flags such as the access log do not change the shape. What Nitro's
+workload cannot reach is the transport and connection loop of a server with any other middleware
+stack, and your application's handlers.
 
-That matters wherever a fresh process takes traffic at once: a deploy, a restart after a crash,
-an autoscaled replica. Two remedies, in order of effort:
+### Warming your own server shape
+
+When your application is a package, its own precompile workload can cache the loop for the server
+it really runs. [`Nitro.precompile_server`](@ref) takes the same keywords as `serve`, builds the
+handler `serve` would build from them, and compiles HTTP.jl's accept loop, connection loop and
+Nitro's transport for its type. It binds no socket and runs no request:
+
+```julia
+module MyApp
+
+using Nitro
+using PrecompileTools: @compile_workload
+
+const app = App(mod = @__MODULE__)
+urlpatterns(app, "", path("/health", req -> "ok"))
+
+# One set of keywords for `serve` and for the workload, so the two cannot differ.
+server_options() = (; middleware = (MyAuth(), MyAudit()), security_headers = SecurityHeaders())
+
+run(; port = 8080) = serve(app; server_options()..., host = "0.0.0.0", port)
+
+@compile_workload begin
+    Nitro.precompile_server(app; server_options()...)
+end
+
+end
+```
+
+It accepts every keyword `serve` takes and ignores the ones that do not change the handler's type
+(`host`, `port`, `secret_key`, the timeouts, the limits), so one `NamedTuple` serves both calls.
+It returns `true` when every signature compiled, and `false`, as `precompile` does, when one no
+longer applies.
+
+**The keywords must match `serve`'s.** A middleware that differs, or a flag such as
+`security_headers` given to one call and not the other, gives the workload a different type than
+the server has: nothing fails, and the first request pays the 1.5 seconds again. Building both
+calls from one function, as above, is what keeps them in step. Each middleware is constructed
+while your package precompiles, so it must not open a connection or read a secret when it is
+built; one that does belongs in an `on_startup` hook. `revise = :lazy` or `:eager` changes the
+type too and is not worth warming: with it the call compiles nothing and returns `false`.
+
+### Warming at deploy time
+
+Whatever no workload reached is compiled by the first request that needs it, which matters
+wherever a fresh process takes traffic at once: a deploy, a restart after a crash, an autoscaled replica.
+Two more remedies, in order of effort:
 
 - **Warm it before it takes traffic.** Start the new process, request your important routes
   from the same host (a health check that touches them, or a short script), and only then let

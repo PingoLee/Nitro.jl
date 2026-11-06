@@ -62,9 +62,9 @@ chain ends in a leaf for this method, that leaf is the first one `match` would r
 A leaf reached that way has no variables, because its path has none.
 
 Anything else -- a segment with no exact child, a node with no leaf for this method (`match` would
-then try the other branches), a query string, an absolute-form or `*` target -- falls through to
-upstream `gethandler` unchanged. That keeps every miss, `405` and variable route on the code path
-it had before.
+then try the other branches), a query string, a `%` anywhere (#868), an absolute-form or `*`
+target -- falls through to upstream `gethandler` unchanged. That keeps every miss, `405` and
+variable route on the code path it had before.
 
 `OriginFormMiddleware` (#341) has normally reduced the target to the canonical origin-form path the
 router will match, which is why the fast path sees nearly every request. It does not depend on
@@ -82,7 +82,15 @@ end
 # The leaf an all-exact walk of `target` reaches for `method`, or `nothing` when upstream must
 # decide. Empty segments are skipped, as upstream's `split(…; keepempty = false)` skips them.
 function _exact_leaf(root::HTTP.Handlers.Node, method::String, target::String)
-    (startswith(target, '/') && !occursin('?', target)) || return nothing
+    # A `%` anywhere goes to upstream. Since HTTP 2.14 the router stores each literal route
+    # segment percent-decoded and decodes the request's segments before matching; this walk
+    # compares the raw target. Without `%` the two are the same bytes. With it they are not:
+    # the route `/a%252F` is stored as `a%2F`, which the raw request `/a%2F` would hit here,
+    # while upstream decodes that request to `a/` and finds no route. The cost: a route whose
+    # canonical spelling keeps an escape (a non-ASCII segment, `%2F`) is resolved by upstream, not
+    # by this walk.
+    (startswith(target, '/') && !occursin('?', target) && !occursin('%', target)) ||
+        return nothing
     node = root
     last = ncodeunits(target)
     i = 2                                   # past the leading '/'

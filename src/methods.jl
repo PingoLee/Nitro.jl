@@ -433,8 +433,8 @@ Not every file in `folder` is served. These are refused:
 
 A filename that needs percent-encoding is **not** refused — it is served at its **encoded route**.
 `café.txt` mounts at `/static/caf%C3%A9.txt` and `my file.txt` at `/static/my%20file.txt`, which are
-the URLs a conforming client sends; the router compares path segments byte for byte and never
-decodes, so **no conforming client** could reach the unencoded spellings. The returned pair carries
+the URLs a conforming client sends. Nitro puts every request path in that one canonical encoding
+before routing (#351), so `caf%c3%a9.txt` and a raw `café.txt` reach the same file. The returned pair carries
 the encoded route and the raw filesystem path, so **do not re-derive one from the other** — read the
 route from `first(pair)` rather than rebuilding it from the filename.
 
@@ -993,6 +993,50 @@ function serve(app::App; async::Bool = false, secret_key = nothing, kwargs...)
         _rethrow_value_free(e)
     end
 end
+
+"""
+    Nitro.precompile_server(app::App; kwargs...) -> Bool
+    Nitro.precompile_server(; kwargs...) -> Bool
+
+Compile, without running, what a server built by `serve(app; kwargs...)` runs for each
+connection and request: HTTP.jl's accept loop, connection loop and HTTP/2 stream task (through
+`HTTP.precompile_server`), and Nitro's transport around the app's pipeline. Call it from your
+package's precompile workload with the keywords you pass to `serve`, so the package image keeps
+that code and a fresh process's first request does not compile it: about 1.5 s on Julia 1.13
+for a server with its own `middleware` (#827). Nothing is served, no socket is opened and no
+lifecycle hook is registered.
+
+Public, not exported: call it as `Nitro.precompile_server`.
+
+```julia
+server_options() = (; middleware = (MyAuth(),), security_headers = SecurityHeaders())
+run() = serve(app; server_options()..., port = 8080)
+
+@compile_workload begin
+    Nitro.precompile_server(app; server_options()...)
+end
+```
+
+The keywords that decide the server's handler type are read: `middleware`, `handler`,
+`serialize`, `catch_errors`, `show_errors`, `access_log`, `access_log_query`, `access_log_skip`
+and `security_headers`. Every other keyword `serve` takes is accepted and ignored, so one
+`NamedTuple` serves both calls. **They must match the ones given to `serve`:** with a different
+middleware stack, or a flag given to one call and not the other, the workload compiles a type no
+server runs, nothing fails, and the first request compiles the loop again.
+
+Returns `true` when every signature compiled, and `false`, as `precompile` does, when one no
+longer applies. With `revise = :lazy` or `:eager`, a development shape, nothing is compiled and
+the call returns `false`. A default `serve(app)` needs no call: Nitro's own workload warms that shape.
+The argument-less form uses the global application context.
+"""
+function precompile_server(app::App; revise::Symbol = :none, kwargs...)::Bool
+    # Refused as `serve` refuses it, so a typo is not read as a development shape.
+    revise in (:none, :lazy, :eager) ||
+        throw(ArgumentError("Invalid `revise` value :$revise. Expected one of :none, :lazy, or :eager."))
+    revise === :none || return false
+    return Nitro.Core._precompile_listener(Nitro.Core._serve_listener_for(app; kwargs...)...)
+end
+precompile_server(; kwargs...)::Bool = precompile_server(CONTEXT[]; kwargs...)
 
 """
     worker_startup(app::App; queues=String[], store=nothing, runtime=nothing, kwargs...)

@@ -1283,6 +1283,8 @@ const TABLE = [
     ("DELETE", "/a/7/c"), ("GET", "/s/**"), ("GET", "/s/exact"), ("GET", "/u/me"),
     ("GET", "/u/{name}/posts"), ("GET", "/é/ü"), ("GET", "/w/*/z"), ("GET", "/w/k/z"),
     ("POST", "/w/k"),
+    # Percent-encoded literal segments, which upstream stores decoded since HTTP 2.14 (#868).
+    ("GET", "/p/a%252F"), ("GET", "/p/%61dmin"), ("GET", "/caf%C3%A9"),
 ]
 const TARGETS = [
     "/", "*", "/a", "/a/", "//a", "/a//b", "/a/b", "/a/zz", "/a/7/c", "/a/8/c", "/a/x/c", "/any",
@@ -1292,6 +1294,9 @@ const TARGETS = [
     "/w/*/z", "/s/**", "/a/{x}", "/a/{x",
     # Malformed UTF-8: the walk slices at '/' bytes, so it must not throw where upstream does not.
     "/a/\xff", "/\xc3/b", "/a/\xe2\x82", "/\x80",
+    # Raw `%` in the target (#868): the walk compares raw bytes against decoded route segments,
+    # so `/p/a%2F` would hit the route `/p/a%252F` (stored `a%2F`) that upstream does not match.
+    "/p/a%2F", "/p/a%252F", "/p/admin", "/p/%61dmin", "/caf%C3%A9", "/café", "/p/%ZZ",
 ]
 const METHODS = ["GET", "POST", "PUT", "DELETE", "HEAD", "PATCH", "FOO"]
 

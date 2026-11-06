@@ -66,17 +66,68 @@ try
     # And the workload's `precompile` calls are not silently refused: `precompile` returns `false`
     # rather than throwing when a signature does not apply, e.g. if HTTP changes `Stream`'s
     # parameters, and the workload would then cache nothing.
-    stream = Nitro.Stream{false, Nitro.Request{Nitro.Core.HTTP.EmptyBody}}
-    @test precompile(listener, (stream,))
-    @test precompile(Nitro.Core.HTTP._serve_conn!,
-                     (Nitro.Core.HTTP.Server{typeof(listener)}, Nitro.Core.HTTP._ServerConn))
-    @test precompile(request_handler, (stream,))
-    @test precompile(Nitro.Core._handle_reporting, (typeof(request_handler), stream))
-    @test precompile(Nitro.Core._send_response!, (Nitro.Core.HTTP.Response{String}, stream,
-        Nitro.Core.Types.EmptyRequest, Nothing))
+    # `_precompile_listener` ANDs every one of them, HTTP's `precompile_server` included (#868).
+    @test Nitro.Core._precompile_listener(listener, request_handler) === true
 finally
     terminate(app)
 end
+end
+@testitem "Nitro.precompile_server warms the listener serve builds for the same keywords (#827)" tags=[:core, :network, :middleware] setup=[NitroCommon] begin
+using Test
+using Nitro
+
+# An app warms a non-default server from its own workload with `Nitro.precompile_server(app;
+# kw...)`. The cache is only used if `serve(app; kw...)` builds EXACTLY the handler type the helper
+# compiled, and a drift between `_serve_listener_for` and `serve` would fail nothing: the first
+# request would just compile the loop again. So each shape is served for real and compared.
+# Two distinct closure types; `tag` captures its argument, so the layer's type carries it.
+tag(name) = handle -> (req -> (name; handle(req)))
+audit = handle -> (req -> handle(req))
+shapes = [
+    "a Tuple of two middleware" => (; middleware = (tag("t"), audit)),
+    "a Vector, security headers and a skip hook" =>
+        (; middleware = [audit], security_headers = SecurityHeaders(),
+           access_log_skip = (req, resp) -> false),
+    "flags that do not change the type" =>
+        (; middleware = (audit,), serialize = false, access_log = false, show_errors = false),
+    # `_serve_listener` calls a custom `handler` on the pipeline, so its type is the listener's.
+    "a custom handler" => (; middleware = (audit,), handler = pipeline -> (stream -> nothing)),
+]
+for (label, kw) in shapes
+    @testset "$label" begin
+        app = App()
+        urlpatterns(app, "", path("/x", req -> "x"))
+        listener, _ = Nitro.Core._serve_listener_for(app; kw...)
+        # The keywords `serve` takes that do not shape the type are accepted and ignored, so one
+        # `NamedTuple` serves both calls.
+        @test Nitro.precompile_server(app; kw..., host = HOST, port = 1, secret_key = "ignored",
+                                      max_body_bytes = 10, shutdown_timeout = 1) === true
+        server = serve(app; kw..., host = HOST, port = get_free_port(), async = true,
+                       show_banner = false)
+        try
+            @test typeof(server.handler) === typeof(listener)
+            @test typeof(server) === Nitro.Core.HTTP.Server{typeof(listener)}
+        finally
+            terminate(app)
+        end
+    end
+end
+
+# A middleware stack is a different type from the default one: that is the whole reason the helper
+# exists, and if it ever stopped being one, Nitro's own workload would cover every app.
+app = App()
+@test typeof(first(Nitro.Core._serve_listener_for(app; middleware = (audit,)))) !==
+      typeof(first(Nitro.Core._default_serve_listener(app)))
+# And the default keywords give the default shape, which Nitro's own workload already warms.
+@test typeof(first(Nitro.Core._serve_listener_for(app))) ===
+      typeof(first(Nitro.Core._default_serve_listener(app)))
+@test_throws "`security_headers` must be a `SecurityHeaders(...)`" Nitro.precompile_server(
+    app; security_headers = ["X-A" => "b"])
+# A development shape is not warmed, and says so rather than warming the `:none` one.
+@test Nitro.precompile_server(app; middleware = (audit,), revise = :lazy) === false
+@test_throws "Invalid `revise` value :lazzy" Nitro.precompile_server(app; revise = :lazzy)
+@test Base.ispublic(Nitro, :precompile_server)
+@test !Base.isexported(Nitro, :precompile_server)
 end
 @testitem "The app-wide pipeline has one inferable type whatever the flags (#572)" tags=[:core, :middleware] begin
 using Test
