@@ -281,7 +281,8 @@ using Random
 
     @testset "libcrypto HMAC-SHA256 matches SHA.jl byte for byte (#449)" begin
         # `_hmac_sha256` signs and verifies every JWT and CSRF token. It moved from
-        # `SHA.hmac_sha256` to libcrypto's one-shot `HMAC`; hold it to SHA.jl over every key
+        # `SHA.hmac_sha256` to libcrypto (#449), and then from libcrypto's one-shot `HMAC` to
+        # RFC 2104 written out over a once-fetched digest (#837); hold it to SHA.jl over every key
         # length that matters -- empty, inside the 64-byte block, exactly one block, and longer
         # (hashed first) -- and messages from empty up, as raw bytes including NUL and non-UTF-8.
         hmac = Nitro.Crypto._hmac_sha256
@@ -294,13 +295,39 @@ using Random
             hmac(key, message) == reference(key, message) || push!(mismatches, (key_length, message_length))
         end
         @test mismatches == Tuple{Int, Int}[]
-        # RFC 4231 test case 2, independent of both implementations.
-        @test bytes2hex(hmac("Jefe", "what do ya want for nothing?")) ==
-            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+        # RFC 4231's HMAC-SHA-256 vectors, independent of both implementations. Case 5 is left out
+        # because it tests truncated output. The key lengths are 20, 4, 20, 25 and 131, so case 6
+        # and case 7 take the hash-the-key-first branch.
+        rfc4231 = [
+            (repeat("\x0b", 20), "Hi There",
+             "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"),
+            ("Jefe", "what do ya want for nothing?",
+             "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"),
+            (String(fill(0xaa, 20)), String(fill(0xdd, 50)),
+             "773ea91e36800e46854db8ebd09181a72959098b3ef8c122d9635514ced565fe"),
+            (String(UInt8.(1:25)), String(fill(0xcd, 50)),
+             "82558a389a443c0ea4cc819899f2083a85f0faa3e578f8077a2e3ff46729665b"),
+            (String(fill(0xaa, 131)), "Test Using Larger Than Block-Size Key - Hash Key First",
+             "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54"),
+            (String(fill(0xaa, 131)),
+             "This is a test using a larger than block-size key and a larger than block-size data. " *
+             "The key needs to be hashed before being used by the HMAC algorithm.",
+             "9b09ffa71b942fcb27635fbcd5b0e944bfdc63644f0713938a7f51535c3a35e2"),
+        ]
+        @test [bytes2hex(hmac(key, message)) for (key, message, _) in rfc4231] == last.(rfc4231)
+        # Concurrent MACs share the once-fetched digest and nothing else: each task holds its own
+        # context and pad, so every result must still match.
+        pairs = [(String(rand(rng, UInt8, rand(rng, 0:130))), String(rand(rng, UInt8, rand(rng, 0:300))))
+                 for _ in 1:64]
+        expected = [reference(key, message) for (key, message) in pairs]
+        concurrent = [Threads.@spawn([hmac(key, message) for _ in 1:50, (key, message) in pairs])
+                      for _ in 1:4]
+        @test all(fetch(task) == repeat(permutedims(expected), 50) for task in concurrent)
         # A view MACs exactly its own bytes, and any other string type its UTF-8 bytes.
         @test hmac("k", SubString("xxpayloadyy", 3, 9)) == reference("k", "payload")
         @test hmac(Test.GenericString("k"), Test.GenericString("payload")) == reference("k", "payload")
-        # The result is the 32-byte MAC and nothing else on the heap. Min of 5 runs (`allocs`, #511).
+        # On the heap: the 32-byte MAC and the 64-byte pad (#837), nothing else. Min of 5 runs
+        # (`allocs`, #511).
         @testset let mac = allocs(() -> hmac("k", "payload"))
             @test mac.bytes < 256
         end

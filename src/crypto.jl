@@ -195,19 +195,18 @@ function _empty_hmac_key(secret::AbstractString)
     return true
 end
 
-# HMAC-SHA256 through libcrypto's one-shot `HMAC`, for the per-request MACs: every JWT signed or
-# verified in `Auth`, and every CSRF token minted or checked (#449). It replaced
+# HMAC-SHA256 through libcrypto, for the per-request MACs: every JWT signed or verified in `Auth`,
+# every CSRF token minted or checked (#449), and both HMACs of `_hkdf_sha256`. It replaced
 # `SHA.hmac_sha256`, which takes both arguments as `Vector{UInt8}` -- so each call copied the
 # secret and the message first -- and then builds its padded keys and contexts by allocation:
 # 26 allocations / 1.5 KB per JWT. This reads the strings' bytes in place and allocates only
-# the 32-byte result, and the output is byte-identical (the test suite holds it to SHA.jl).
+# the 32-byte result and `_hmac_sha256!`'s 64-byte pad, and the output is byte-identical (the
+# test suite holds it to SHA.jl).
 #
-# No `gc_safe`, unlike `_pbkdf2_hmac_sha256` below: one HMAC over a token takes a couple of
-# microseconds (mostly the digest lookup `HMAC` repeats per call), not the ~0.1 s that makes
-# PBKDF2 worth a GC-safe transition. It is thread-safe: `HMAC` keeps
-# no state between calls and `EVP_sha256()` returns a static table. An empty key is passed as a
-# real (non-NULL) pointer of length 0, which libcrypto treats as the empty key, exactly as
-# SHA.jl does; refusing empty keys is the callers' policy (`_empty_hmac_key`), not this
+# No `gc_safe`, unlike `_pbkdf2_hmac_sha256` below: one HMAC over a token takes well under a
+# microsecond, not the ~0.1 s that makes PBKDF2 worth a GC-safe transition. An empty key is passed
+# as a real (non-NULL) pointer of length 0, which `_hmac_sha256!` reads as the empty key, exactly
+# as SHA.jl does; refusing empty keys is the callers' policy (`_empty_hmac_key`), not this
 # function's.
 function _hmac_sha256(key::Union{String, SubString{String}}, message::Union{String, SubString{String}})
     out = Vector{UInt8}(undef, 32)
@@ -218,20 +217,96 @@ end
 # Any other string type is MACed over its UTF-8 bytes.
 _hmac_sha256(key::AbstractString, message::AbstractString) = _hmac_sha256(String(key), String(message))
 
-# The libcrypto call both string methods above and `_hkdf_sha256` share: MAC `msglen` bytes at
-# `message` under `keylen` bytes at `key`, into the first 32 bytes of `out`. The caller keeps all
-# three buffers rooted.
+# SHA-256's `EVP_MD`, fetched from libcrypto's default provider once per process (#837).
+#
+# This handle is the whole reason `_hmac_sha256!` below is written out rather than calling
+# libcrypto's one-shot `HMAC()`. Under OpenSSL 3, `HMAC()` re-fetches the HMAC and SHA-256
+# implementations on every call, and a pre-fetched md does not help. Over a 189-byte JWT signing
+# input `HMAC()` took ~1.04 µs, and the same MAC written out below takes ~0.38 µs; one SHA-256 pass
+# over that input is ~0.23 µs. The legacy `EVP_sha256()` table is no better than `HMAC()`: every
+# digest init through it does an implicit fetch of its own.
+#
+# `OncePerProcess`, never a plain global, because the pointer belongs to the process that fetched
+# it. A precompile worker, or a juliac build, can run an HMAC (`src/precompile.jl` mints JWTs).
+# `OncePerProcess` resets the value when an image is serialized, so no stale pointer ships in the
+# cache. The handle holds no key material, and is never freed: it lives as long as the process,
+# like the static table it replaces.
+#
+# A fetch that fails falls back to `EVP_sha256()`, same algorithm, same output, and clears the error
+# it queued. It does not throw: a throwing initializer would leave the `OncePerProcess` failed for
+# good, and with it every MAC in the process.
+const _SHA256_MD = Base.OncePerProcess{Ptr{Cvoid}}() do
+    md = @ccall libcrypto.EVP_MD_fetch(C_NULL::Ptr{Cvoid}, "SHA256"::Cstring, C_NULL::Ptr{Cvoid})::Ptr{Cvoid}
+    md != C_NULL && return md
+    @ccall libcrypto.ERR_clear_error()::Cvoid
+    return @ccall libcrypto.EVP_sha256()::Ptr{Cvoid}
+end
+
+# SHA-256's block size: the length an HMAC key is padded (or, past it, hashed) to.
+const _SHA256_BLOCK = 64
+
+# A libcrypto return code that is not 1 means failure. The error queue is per OS thread, so it is
+# cleared first: nothing is left behind for an unrelated TLS call on the same thread.
+@noinline function _hmac_failed()
+    @ccall libcrypto.ERR_clear_error()::Cvoid
+    throw(ErrorException("libcrypto HMAC-SHA256 failed"))
+end
+_hmac_check(ret::Cint) = ret == Cint(1) || _hmac_failed()
+
+# The MAC both string methods above and `_hkdf_sha256` share: MAC `msglen` bytes at `message` under
+# `keylen` bytes at `key`, into the first 32 bytes of `out`. The caller keeps all three buffers
+# rooted. `out` may be read and written in the same call (the outer hash reads the inner digest
+# from it); `key` and `message` are only read.
+#
+# RFC 2104, over one `EVP_MD_CTX` and the once-fetched digest (`_SHA256_MD`, see there for why not
+# `HMAC()`):
+#
+#     K'   = key, zero-padded to 64 bytes   (a key longer than 64 bytes is SHA-256(key) first)
+#     HMAC = SHA-256((K' ⊻ opad) ‖ SHA-256((K' ⊻ ipad) ‖ message))
+#
+# One 64-byte pad buffer holds K' ⊻ ipad (0x36) for the inner hash, then is flipped in place to
+# K' ⊻ opad (0x5c) by XOR-ing 0x36 ⊻ 0x5c = 0x6a. Both pads are key-equivalent, so the buffer is
+# wiped with `Base.securezero!`, which the compiler cannot drop as a dead store. The context is
+# freed with `EVP_MD_CTX_free`, which wipes the digest state. Both happen in a `finally`, so a
+# throwing call leaves nothing either.
+#
+# Thread-safe: a fetched `EVP_MD` is immutable and may be shared across threads, and the context
+# and the pad are per call.
 function _hmac_sha256!(out::Vector{UInt8}, key::Ptr{UInt8}, keylen::Integer, message::Ptr{UInt8}, msglen::Integer)
     keylen <= typemax(Cint) || throw(ArgumentError("HMAC key too long"))
     length(out) >= 32 || throw(ArgumentError("HMAC-SHA256 output buffer must hold 32 bytes"))
-    md = @ccall libcrypto.EVP_sha256()::Ptr{Cvoid}
-    ret = GC.@preserve out @ccall libcrypto.HMAC(
-        md::Ptr{Cvoid}, key::Ptr{UInt8}, keylen::Cint, message::Ptr{UInt8}, msglen::Csize_t,
-        out::Ptr{UInt8}, C_NULL::Ptr{Cuint})::Ptr{UInt8}
-    if ret == C_NULL
-        # The error queue is per OS thread; leave nothing behind for an unrelated TLS call.
-        @ccall libcrypto.ERR_clear_error()::Cvoid
-        throw(ErrorException("libcrypto HMAC-SHA256 failed"))
+    md = _SHA256_MD()
+    # A `Memory`, not a `Vector`: one allocation rather than two. Allocated before the context, so
+    # nothing between `EVP_MD_CTX_new` and the `try` can throw and leak it.
+    pad = fill!(Memory{UInt8}(undef, _SHA256_BLOCK), 0x00)
+    ctx = @ccall libcrypto.EVP_MD_CTX_new()::Ptr{Cvoid}
+    ctx == C_NULL && _hmac_failed()
+    try
+        GC.@preserve out pad begin
+            if keylen > _SHA256_BLOCK
+                _hmac_check(@ccall libcrypto.EVP_Digest(key::Ptr{UInt8}, keylen::Csize_t, pad::Ptr{UInt8},
+                    C_NULL::Ptr{Cuint}, md::Ptr{Cvoid}, C_NULL::Ptr{Cvoid})::Cint)
+            else
+                unsafe_copyto!(pointer(pad), key, keylen)
+            end
+            @inbounds for i in eachindex(pad)
+                pad[i] ⊻= 0x36
+            end
+            _hmac_check(@ccall libcrypto.EVP_DigestInit_ex2(ctx::Ptr{Cvoid}, md::Ptr{Cvoid}, C_NULL::Ptr{Cvoid})::Cint)
+            _hmac_check(@ccall libcrypto.EVP_DigestUpdate(ctx::Ptr{Cvoid}, pad::Ptr{UInt8}, _SHA256_BLOCK::Csize_t)::Cint)
+            _hmac_check(@ccall libcrypto.EVP_DigestUpdate(ctx::Ptr{Cvoid}, message::Ptr{UInt8}, msglen::Csize_t)::Cint)
+            _hmac_check(@ccall libcrypto.EVP_DigestFinal_ex(ctx::Ptr{Cvoid}, out::Ptr{UInt8}, C_NULL::Ptr{Cuint})::Cint)
+            @inbounds for i in eachindex(pad)
+                pad[i] ⊻= 0x6a
+            end
+            _hmac_check(@ccall libcrypto.EVP_DigestInit_ex2(ctx::Ptr{Cvoid}, md::Ptr{Cvoid}, C_NULL::Ptr{Cvoid})::Cint)
+            _hmac_check(@ccall libcrypto.EVP_DigestUpdate(ctx::Ptr{Cvoid}, pad::Ptr{UInt8}, _SHA256_BLOCK::Csize_t)::Cint)
+            _hmac_check(@ccall libcrypto.EVP_DigestUpdate(ctx::Ptr{Cvoid}, out::Ptr{UInt8}, 32::Csize_t)::Cint)
+            _hmac_check(@ccall libcrypto.EVP_DigestFinal_ex(ctx::Ptr{Cvoid}, out::Ptr{UInt8}, C_NULL::Ptr{Cuint})::Cint)
+        end
+    finally
+        Base.securezero!(pad)
+        @ccall libcrypto.EVP_MD_CTX_free(ctx::Ptr{Cvoid})::Cvoid
     end
     return out
 end
@@ -421,9 +496,9 @@ expand it to `len` bytes bound to `info`. An empty `salt` is the RFC's all-zero 
 the key to its block size either way).
 
 Both HMACs go through libcrypto (`_hmac_sha256!`), reading `ikm` and `salt` in place, so the
-32-byte cookie key costs 9 small allocations (#545). It used to run on `SHA.hmac_sha256`, which
-copies its arguments and allocates its padded keys and contexts: 59 allocations and ~3.6 µs, two
-thirds of every encrypted cookie read.
+32-byte cookie key costs 11 small allocations: 9 (#545), plus each HMAC's 64-byte pad (#837). It
+used to run on `SHA.hmac_sha256`, which copies its arguments and allocates its padded keys and
+contexts: 59 allocations and ~3.6 µs, two thirds of every encrypted cookie read.
 """
 function _hkdf_sha256(ikm::AbstractVector{UInt8}, salt::AbstractVector{UInt8},
                       info::AbstractVector{UInt8}, len::Integer)
