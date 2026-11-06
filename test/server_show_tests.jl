@@ -21,6 +21,42 @@ function secret_middleware(secret_key::String)
     end
 end
 
+# Breadth-first over raw fields and array slots from `root`: `:found` when a `String` equal to
+# `needle` is reachable, `:absent` when the graph ran out, `:budget` after `budget` nodes.
+# Types, modules and methods are leaves: the secret lives in instance data, and those are the
+# doors into the world's method and binding tables.
+function reachable_string(root, needle::String; budget::Int = 2_000_000)
+    seen = Base.IdSet{Any}()
+    queue = Any[root]
+    head = 1
+    while head <= length(queue)
+        head > budget && return :budget
+        x = queue[head]
+        head += 1
+        if x isa String
+            x == needle && return :found
+            continue
+        end
+        x isa Union{Module, Type, Symbol, Method, Core.MethodInstance, Core.CodeInstance,
+                    Core.SimpleVector} && continue
+        x in seen && continue
+        push!(seen, x)
+        if x isa Union{Array, Base.GenericMemory}
+            isbitstype(eltype(x)) && continue
+            for i in eachindex(x)
+                isassigned(x, i) && push!(queue, x[i])
+            end
+        else
+            for i in 1:nfields(x)
+                isdefined(x, i) || continue
+                v = getfield(x, i)
+                isbits(v) || push!(queue, v)
+            end
+        end
+    end
+    return :absent
+end
+
 port = get_free_port()
 localhost = "http://$HOST:$port"
 
@@ -39,9 +75,14 @@ try
     end
 
     @testset "sanity: the secret IS reachable in the object graph" begin
-        # `dump` bypasses `show` and walks raw fields; it must find the captured secret,
-        # otherwise the non-leak assertions below would pass vacuously.
-        @test occursin(SECRET, sprint(io -> dump(io, server; maxdepth=60)))
+        # Walking raw fields bypasses `show`, and it must find the captured secret, otherwise
+        # the non-leak assertions below would pass vacuously. This used to be
+        # `dump(server; maxdepth=60)`, which also prints every type it meets: on a Julia with
+        # the task-cancellation work its output went from 73 KB to 396 MB at `maxdepth=10`, and
+        # the item hung until the watchdog killed the run (#761). The walk below treats types
+        # as leaves, so it covers the instance data alone (about 270 nodes on 1.13 and on the
+        # 1.15 nightly). Its node budget turns a miss into a named failure instead of a hang.
+        @test reachable_string(server, SECRET) === :found
     end
 
     @testset "show / display / interpolation print only the address" begin
