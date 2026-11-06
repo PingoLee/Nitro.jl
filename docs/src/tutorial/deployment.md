@@ -232,6 +232,48 @@ the benchmark's own job counter; its k = 0 baseline was 102k and 2.4 ms.
     runs yielding loops before or after `serve`. It can hold the same guard itself:
     `keepalive = Timer(typemax(Int32))`, and `close(keepalive)` when done.
 
+**With many connections, short computations starve some of them.** The knee above is about
+long handlers. Short ones cause another effect, at saturation with many clients. #618 measured
+it on the machine above (`--threads=8`): 500 keep-alive clients, one request at a time each,
+against a handler that computes for about 2 ms. Every 8 s run was measured per connection
+([#618](https://github.com/PingoLee/Nitro.jl/issues/618#issuecomment-6240980412), Julia 1.12.7):
+
+| Server | Requests/s | p50 | p99 | Slowest request | Requests from the least-served connection in 8 s |
+|---|---|---|---|---|---|
+| Nitro | 3,668 | 15 ms | 3.3 s | 8.1 s | 1 |
+| HTTP.jl `listen!` + one `Threads.@spawn` per request, no Nitro | 3,560 | 16 ms | 3.3 s | 8.1 s | 1 |
+| Go `net/http` | 5,091 | 96 ms | 161 ms | 265 ms | 75 |
+
+- **The cause is the order in which runnable tasks run.** Timestamps in the bare HTTP.jl server
+  located the wait. For the slowest 1% of requests, 99.7% of it came after the connection had
+  read the request: between the spawn and the request task's first instruction. Julia's scheduler does not run runnable tasks first in, first out.
+  A task that has waited can stay behind tasks made runnable after it for most of a run.
+  [A reduction](https://github.com/PingoLee/Nitro.jl/issues/618#issuecomment-6242851277) with
+  plain tasks and no HTTP shows the same thing on 1.12.7, 1.13.2 and 1.13.3, and on the
+  development branch. Nitro adds nothing to it: bare HTTP.jl shows the same distribution.
+  The garbage collector is not the cause either: collections took 3–5% of the time, and the
+  longest pause was 38 ms.
+- **1.13.2 has the same shape.** The p99 is 2.6 s, the slowest request is still 8.1 s, and
+  some connections still complete one request.
+- **It needs handlers that hold their thread.** On a route that computes nothing, the same 500
+  clients were served evenly, with a p99 of 18–32 ms. In the task-level reduction, handlers
+  that `sleep` 2 ms instead of computing were served evenly too, with a p99 of 9 ms. A waiting
+  task holds no thread, so no backlog builds.
+- **The thread layout does not remove it.** `8,0`, `8,1` and `6,2` all kept a slowest request
+  of 8.1 s.
+- **What to do: keep the computation off the request task.** A handler that hands its work to a
+  Workers queue and answers `202` ([CPU-Bound Jobs](@ref)) holds its thread for microseconds.
+  That is the computation-free case above. This is inferred from that case; a queue at c = 500
+  was not measured.
+- **Why `serve` does not queue requests itself.** A fixed set of tasks taking requests from one
+  first-in, first-out channel removes the tail: on the route above its slowest request took
+  192 ms, at the same throughput. Elsewhere it costs too much. On a minimal route it gave 9–23%
+  less throughput, depending on the thread layout. With handlers that wait on I/O, it serves
+  only as many requests at once as it has tasks. In the task-level reduction, 128 tasks served
+  37k requests per second where one spawn per request served 138k
+  ([#618](https://github.com/PingoLee/Nitro.jl/issues/618#issuecomment-6547617178)). The order
+  belongs in Julia's scheduler, so `serve` keeps one spawn per request.
+
 **Every app has one such handler: the login.** One `check_password` at the default cost
 computes without yielding for about 0.1 s (pbkdf2_sha256, 720,000 iterations) or 0.2 s
 (bcrypt, cost 12). The same run with k logins in flight instead of `/cpu` (Julia 1.12.7,
