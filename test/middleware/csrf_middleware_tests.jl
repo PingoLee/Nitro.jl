@@ -147,7 +147,8 @@ end
     @test CSRF._binding(req) === nothing
 
     # An app's own string type is converted, under the JIT, by `_foreign_binding` (#746), and a
-    # token minted for the session binds to it as to the `String` (#851).
+    # token minted for the session binds to it as to the `String` (#851). The trimmed image's
+    # refusal of the same value is checked in test/trimmed_branches_tests.jl (#858).
     req.context[:session_id] = Test.GenericString(SESSION_A)
     @test CSRF._binding(req) == SESSION_A
     @test CSRF._binding(req) isa String
@@ -159,42 +160,6 @@ end
     @test validate_csrf_token(post, SECRET)
     post.context[:session_id] = Test.GenericString(SESSION_B)   # another session's token
     @test !validate_csrf_token(post, SECRET)
-end
-
-# What `juliac --trim` reports as an unresolved call, pinned without a build (#851). Under the JIT
-# `_trimmed()` is the constant `false`, so inference drops the refusal before `dynamic_calls`
-# (test/setup_tests.jl) could see it. The check runs in a child with `_trimmed()` redefined to
-# `true`, as a `--trim` build redefines it (see test/juliac_internals_contract_tests.jl). There
-# the refusal is the whole body, and none of it may dispatch at run time. The types are the
-# method's own signature, which is what its caller compiles: declared `::AbstractString`,
-# `typeof(value)` inferred `Type{<:AbstractString}`, and `nameof` of that was a dynamic call.
-@testset "_foreign_binding's trimmed refusal makes no dynamic call (#851)" begin
-    script = """
-    import Nitro, Test
-    const CSRF = Nitro.Core.Middleware.CSRFMiddleware_
-    Core.eval(Nitro.Core.Types, :(_trimmed() = true))
-    f = CSRF._foreign_binding
-    sig = Tuple{only(methods(f)).sig.parameters[2:end]...}
-    dynamic = String[]
-    for (ci, _) in code_typed(f, sig; optimize = true), st in ci.code
-        st isa Expr && st.head === :call || continue
-        g = st.args[1]
-        callee = g isa GlobalRef ? getglobal(g.mod, g.name) : g isa QuoteNode ? g.value : g
-        callee isa Core.Builtin || push!(dynamic, sprint(show, st))
-    end
-    println("DYNAMIC=", isempty(dynamic) ? "none" : join(dynamic, " | "))
-    refused = try f(Test.GenericString("x")); "none" catch e; e isa ArgumentError ? e.msg : "other" end
-    println("REFUSED=", refused)
-    """
-    cmd = `$(Base.julia_cmd()) --code-coverage=none --project=$(Base.active_project()) --startup-file=no -e $script`
-    out, err = IOBuffer(), IOBuffer()
-    p = run(pipeline(ignorestatus(cmd); stdout = out, stderr = err))
-    out, err = String(take!(out)), String(take!(err))
-    @test (p.exitcode, p.termsignal) == (0, 0) || (out, last(err, 2000))
-    for line in ("DYNAMIC=none",
-                 "REFUSED=Nitro: a trimmed image binds CSRF tokens only to a String session id; got a GenericString")
-        @test occursin(line, out) || (line, out)
-    end
 end
 
 @testset "_presented_token: header, form field, JSON body" begin
