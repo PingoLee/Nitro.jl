@@ -17,7 +17,8 @@ for lives here:
 `Res.sse` is the one builder whose body is **not** materialized when it returns: it hands back a
 response whose body is an open `HTTP.SSEStream` cursor that a producer fills afterwards. That makes
 it single-use — never cache or share an SSE response — and it is why it is the only builder with a
-background task behind it. See the streaming tutorial for the shape.
+background task behind it. See the streaming tutorial for the shape. Its companion is
+[`Res.pause`](@ref pause), the wait between two events that `terminate` wakes at once.
 
 The bare names `text`, `json` and `binary` are *request body parsers*
 (`Nitro.BodyParsers`), not response builders. One name, one direction.
@@ -42,6 +43,7 @@ import JSON
 # live exception (#648, the #613 rule).
 using ..Errors: loggable, process_exiting
 using ..Constants: FILE_STREAM_THRESHOLD
+using ..Constants: REQUEST_SCOPE, NEVER_SHUTTING_DOWN, shutdown_started, _add_waiter!, _drop_waiter!
 
 function apply_headers!(target::Union{HTTP.Response,HTTP.Headers}, headers)
     for header in headers
@@ -565,9 +567,8 @@ returns, and treats a client disconnect as a normal ending rather than an error.
 function ticks(req)
     return Res.sse() do events
         for i in 1:10
-            isopen(events) || break          # the client hung up
             write(events, SSEEvent(string(i); event = "tick", id = string(i)))
-            sleep(1)
+            Res.pause(events, 1) || break    # the client hung up, or the server is stopping
         end
     end
 end
@@ -598,6 +599,7 @@ loosely: past four times `max_len` (64 MiB at the default), and never under 16 M
 2.12). So a producer that writes far faster than the client reads holds that much in memory and
 then fails. Pace the producer (as the loop above does) and check `isopen(events)` each iteration;
 that check is also how a disconnected client stops the work rather than merely stopping the writes.
+[`Res.pause`](@ref pause) makes it for you between events.
 
 # Keeping the connection alive
 
@@ -611,33 +613,22 @@ responses by default, which `X-Accel-Buffering: no` asks it not to do for this r
 A long-lived stream is **always cut at `serve(shutdown_timeout = …)`** — the graceful drain cannot
 wait out a handler that holds its connection for its whole lifetime. A producer parked in `write`
 unwinds as soon as the socket is torn down; one parked on a `sleep` or a `Channel` does not, and
-outlives `terminate` until it next wakes. Give it a shutdown signal of its own from a
-`LifecycleMiddleware`'s `on_shutdown`, and check it every tick:
+outlives `terminate` until it next wakes. Wait with [`Res.pause`](@ref pause) instead, which
+`terminate` wakes at once:
 
 ```julia
-const STOPPING = Threads.Atomic{Bool}(false)
-
-# Owns the flag and no request work: `identity` passes every request through untouched.
-stop_streams = Nitro.LifecycleMiddleware(
-    middleware  = identity,
-    on_startup  = () -> (STOPPING[] = false),
-    on_shutdown = () -> (STOPPING[] = true))
-
 function pings(req)
     return Res.sse() do events
-        while isopen(events) && !STOPPING[]
+        while Res.pause(events, 15)
             write(events, SSEEvent(""; event = "ping"))
-            sleep(15)
         end
     end
 end
-
-serve(app, middleware = [stop_streams])
 ```
 
-The producer then stops within one tick of `terminate`. Do not poll `cancel_requested(req)` from
-the producer instead: it runs on a task of its own, and that accessor reads `req.context`, which
-only the handler's task may do.
+The producer then ends with the server run that served it, not up to fifteen seconds later. Do not
+poll `cancel_requested(req)` from the producer instead: it runs on a task of its own, and that
+accessor reads `req.context`, which only the handler's task may do.
 
 A producer still parked in `sleep` when the process **exits** is woken by the exit itself: Julia
 finalizes every `Timer`, and the `sleep` then throws `EOFError`. Nitro treats that as the end of the stream, not
@@ -671,6 +662,71 @@ function sse(producer::Function; status::Int=200, headers::Vector=NO_HEADERS,
     # (src/core/transport.jl) and the janitor discipline (src/middleware/janitor.jl).
     errormonitor(Threads.@spawn _run_sse_producer(producer, events))
     return response
+end
+
+"""
+    pause(events::HTTP.SSEStream, seconds::Real) -> Bool
+
+Wait between two events of an [`sse`](@ref) stream. Parks until `seconds` pass or the server run
+that served the request starts shutting down, whichever comes first. It returns `true` if the
+producer should go on, and `false` if the stream is closed or `terminate` has begun. A producer loop
+is therefore one line:
+
+```julia
+Res.sse() do events
+    while Res.pause(events, 15)
+        write(events, SSEEvent(""; event = "ping"))
+    end
+end
+```
+
+**Shutdown wakes it at once.** `terminate(app)` wakes every `pause` parked on that app's run, so the
+producer ends with the server instead of up to one interval later, as a `sleep` would. Another
+`App` serving in the same process is not affected. A `serve` → `terminate` → `serve` cycle starts
+its new producers clean.
+
+**A client disconnect does not wake it.** Nothing signals a closed stream to a task that is not
+writing to it, so a producer notices the disconnect when the pause ends, and `pause` returns
+`false` then. Keep the interval to what you would accept as the lag for that.
+
+**It finds the run through the request**, so call it from the producer `sse` runs, or from a task
+the handler spawns. Outside a request it never stops early: it is a `sleep` that also checks
+`isopen(events)`.
+
+A pause parked when the process **exits** stays parked and reports nothing; the process ends
+around it.
+
+`seconds` must be finite and non-negative; anything else is an `ArgumentError`. `0` returns at once
+with the same answer.
+"""
+function pause(events::HTTP.SSEStream, seconds::Real)::Bool
+    s = Float64(seconds)
+    (isfinite(s) && s >= 0) ||
+        throw(ArgumentError("Res.pause: `seconds` must be finite and non-negative, got $(seconds)"))
+    # The scope is the serving run's, inherited by the producer's task (`RequestScope`).
+    signal = REQUEST_SCOPE[].shutting_down
+    (isopen(events) && !shutdown_started(signal)) || return false
+    # One `Event`, woken by whichever comes first: the timer, or `signal_shutdown!`. The shape of
+    # `_janitor` and `_backoff_wait`: park once, never poll (concurrency §3). Not autoreset, so a
+    # notify that lands before the `wait` is kept. Outside a request the signal is the shared
+    # `NEVER_SHUTTING_DOWN`, which never fires; registering there would only contend on its lock.
+    woken = Base.Event()
+    tracked = signal !== NEVER_SHUTTING_DOWN
+    timer = Timer(_ -> notify(woken), s)
+    registered = false
+    try
+        # Inside the `try`, so whatever happens after the registration (an interrupt landing in
+        # `wait`) still drops it. `false` means the run began stopping since the check above.
+        if tracked
+            registered = _add_waiter!(signal, woken)
+            registered || return false
+        end
+        wait(woken)
+    finally
+        close(timer)
+        registered && _drop_waiter!(signal, woken)
+    end
+    return isopen(events) && !shutdown_started(signal)
 end
 
 end

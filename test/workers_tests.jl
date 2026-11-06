@@ -90,6 +90,74 @@ end
 
 end
 
+# #807: a run whose callback is parked in `sleep` when the process exits must be left `RUNNING`,
+# not recorded `FAILED`. Exit runs every finalizer, live `Timer`s included, and a `Timer`'s wakes its
+# waiter with `EOFError` (#772); `_run_attempts!` used to take that as the run's failure, reading
+# the store and writing `FAILED` while thread 1 tore the process down. It now checks
+# `Errors.process_exiting()` first and writes nothing.
+#
+# The child is #777's recipe (test/sse_tests.jl, "a producer parked at exit"): a default thread kept
+# awake to run whatever the finalizers wake, and a finalizer created LAST that holds the exit open
+# with a GC-SAFE wait while the woken runs take their path, then reports each run's record.
+# `Libc.systemsleep` is GC-unsafe and would hide the wake. One run per executor path: the spawned
+# `timeout_call`, the direct `timeout = 0` call, and a queued run, plus a second queued item still
+# buffered behind it.
+#
+# Against the unpatched path the report reads `FAILED,FAILED,FAILED,…`; with the attempt loop fixed
+# but not the processor, the backlog item reads `RUNNING`, claimed during teardown. The report comes from a
+# finalizer during exit, which Julia does not promise to run, so it is optional; when it is there
+# every run must still read `RUNNING`.
+@testitem "Workers -- a run parked at process exit is left RUNNING, not FAILED (#807)" tags=[:workers, :slow] setup=[NitroCommon] begin
+    using Test
+
+    code = """
+    using Nitro, Nitro.Workers
+    const STORE = InMemoryWorkerStore()
+    const RT = WorkerRuntime(STORE; allow_undeclared_queues = true)
+    const PARKED = Threads.Atomic{Int}(0)
+    park() = (Threads.atomic_add!(PARKED, 1); sleep(3600))
+    const IDS = [
+        submit_task("spawned", park, Owner("u"); runtime = RT),
+        submit_task("direct", park, Owner("u"); options = TaskOptions(timeout = 0), runtime = RT),
+        submit_queued_task("q", "queued", park, Owner("u"); runtime = RT),
+        # Behind "queued" on the same one-processor queue: still buffered at exit.
+        submit_queued_task("q", "backlog", park, Owner("u"); runtime = RT),
+    ]
+    timedwait(() -> PARKED[] == 3, 20.0) === :ok || error("a callback never started")
+    sleep(0.2)
+    Threads.@spawn while true
+        yield()
+    end
+    const CHECK = finalizer(Ref(0)) do _
+        # `Libc.systemsleep`'s own split: `Sleep` on Windows, which has no `usleep` to load.
+        if Sys.iswindows()
+            @ccall gc_safe=true Sleep(2000::UInt32)::Cvoid
+        else
+            @ccall gc_safe=true usleep(2_000_000::Cuint)::Cint
+        end
+        statuses = map(id -> string(Nitro.Workers.get_task_info(STORE, id).status), IDS)
+        Core.println("WORKERS AT EXIT: ", join(statuses, ","))
+    end
+    println("exiting")
+    """
+    cmd = `$(Base.julia_cmd()) --code-coverage=none --startup-file=no --threads=2
+           --project=$(Base.active_project()) -e $code`
+    out, err = IOBuffer(), IOBuffer()
+    p = run(pipeline(ignorestatus(cmd); stdout = out, stderr = err))
+    stdout_text, stderr_text = String(take!(out)), String(take!(err))
+    failure = (p.exitcode, p.termsignal) == (0, 0) ? nothing :
+        "child exit $(p.exitcode), signal $(p.termsignal); stderr: $(stderr_text)"
+    @test failure === nothing
+    # The script ran to its end: the callbacks were parked when the exit began.
+    @test occursin("exiting", stdout_text)
+    @test !occursin("EOFError", stderr_text)
+    @test !occursin(r"unhandled task"i, stderr_text)
+    report = match(r"WORKERS AT EXIT: (\S+)", stdout_text)
+    # The fourth run is the queue's backlog. Once the exit-woken run ahead of it returns, its
+    # processor must not claim it (a `RUNNING` write during teardown): it stays `PENDING`.
+    @test report === nothing || report[1] == "RUNNING,RUNNING,RUNNING,PENDING"
+end
+
 @testitem "Workers" tags=[:core, :workers] setup=[NitroCommon] begin
 
 using Test

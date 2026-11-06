@@ -1046,11 +1046,12 @@ function _stop_serving!(context::App, gen::UInt64, timeout::Nullable{Real})
     try
         # First, before any hook can block: every in-flight request now reads `:shutdown` from
         # `cancel_reason(req)` (#466), so a handler that polls it winds down during the drain
-        # below instead of being force-closed at its end. Swap, then set: the pipelines of this
-        # run captured the old flag, and anything built from now on gets the fresh one.
+        # below instead of being force-closed at its end, and every `Res.pause` parked on this
+        # run returns `false` at once (#815). Swap, then signal: the pipelines of this run
+        # captured the old signal, and anything built from now on gets the fresh one.
         stopping = context.service.shutting_down[]
-        context.service.shutting_down[] = Threads.Atomic{Bool}(false)
-        stopping[] = true
+        context.service.shutting_down[] = Constants.ShutdownSignal()
+        Constants.signal_shutdown!(stopping)
         route_lf, serve_lf = lifecycle_snapshot(context)
         interrupt = _teardown!(context, route_lf, serve_lf, nothing; listener = true,
                                timeout = something(timeout, context.service.shutdown_timeout[]))

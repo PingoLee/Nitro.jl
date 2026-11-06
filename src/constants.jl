@@ -169,6 +169,85 @@ without `Any`. `Constants` loads before `App` exists (src/core.jl).
 abstract type AbstractApp end
 
 """
+    ShutdownSignal()
+
+One server run's shutdown signal: a flag `terminate` sets once, plus the waiters it wakes when it
+does (#815). It replaced a bare `Threads.Atomic{Bool}` (#466), which a reader could only poll. A
+flag answered `cancel_reason(req)`, which a handler calls between steps, but not a task that
+*parks*: an `Res.sse` producer asleep between events outlived `terminate` by up to one sleep.
+
+- [`shutdown_started`](@ref) is the flag: one atomic load, which is all `cancel_reason(req)` pays.
+- [`signal_shutdown!`](@ref) sets it and wakes every registered waiter. `terminate` calls it.
+- A parked waiter registers a `Base.Event` of its own (`_add_waiter!`), and drops it when it wakes
+  (`_drop_waiter!`). That is what `Res.pause` does.
+
+**No wake can be lost.** `signal_shutdown!` sets the flag *before* it takes the lock to notify, and
+`_add_waiter!` reads the flag *under* that lock. So a waiter either registers before the notify and
+is woken by it, or registers after the flag is set, sees it, and does not park.
+
+A waiter is registered only while it is parked, so the table holds one `Event` per task that is
+parked right now, not one per connection served. `IdDict`: an `Event` has no value equality.
+"""
+mutable struct ShutdownSignal
+    @atomic set :: Bool
+    const lock    :: ReentrantLock
+    const waiters :: IdDict{Base.Event, Nothing}
+end
+
+ShutdownSignal() = ShutdownSignal(false, ReentrantLock(), IdDict{Base.Event, Nothing}())
+
+"""
+    shutdown_started(signal::ShutdownSignal) -> Bool
+
+Whether `terminate` has started stopping the server run `signal` belongs to.
+"""
+shutdown_started(s::ShutdownSignal)::Bool = @atomic :acquire s.set
+
+"""
+    signal_shutdown!(signal::ShutdownSignal) -> Nothing
+
+Set `signal` and wake every task parked on it. Idempotent. Never throws, because it runs on
+`terminate`'s path (concurrency §4): notifying a `Base.Event` does not throw.
+"""
+function signal_shutdown!(s::ShutdownSignal)::Nothing
+    @atomic :release s.set = true
+    lock(s.lock)
+    try
+        for woken in keys(s.waiters)
+            notify(woken)
+        end
+        empty!(s.waiters)
+    finally
+        unlock(s.lock)
+    end
+    return nothing
+end
+
+# Register `woken` to be notified by `signal_shutdown!`. Returns `false`, and registers nothing, if
+# the signal is already set: the caller must not park then. See `ShutdownSignal` for why reading the
+# flag under the lock is what makes the pair race-free.
+function _add_waiter!(s::ShutdownSignal, woken::Base.Event)::Bool
+    lock(s.lock)
+    try
+        shutdown_started(s) && return false
+        s.waiters[woken] = nothing
+        return true
+    finally
+        unlock(s.lock)
+    end
+end
+
+function _drop_waiter!(s::ShutdownSignal, woken::Base.Event)::Nothing
+    lock(s.lock)
+    try
+        delete!(s.waiters, woken)
+    finally
+        unlock(s.lock)
+    end
+    return nothing
+end
+
+"""
     RequestScope(app, max_fields[, shutting_down])
 
 What the pipeline binds for one request's dynamic extent, as the single value of
@@ -179,10 +258,12 @@ What the pipeline binds for one request's dynamic extent, as the single value of
 - `max_fields` -- that app's own `service.max_fields` cell, shared rather than copied, so
   `serve(max_fields = …)` is seen by every pipeline already built. Read it through
   [`request_max_fields`](@ref).
-- `shutting_down` -- the flag `terminate` sets for the server run this pipeline was built in
-  (#466), read by `cancel_reason(req)` as `:shutdown`. Captured per pipeline, not read off the
-  service per request, so each server run keeps its own flag and the next run of the same app
-  starts with a clean one. The two-argument form uses `NEVER_SHUTTING_DOWN`, which is never set.
+- `shutting_down` -- the [`ShutdownSignal`](@ref) `terminate` sets for the server run this
+  pipeline was built in: read by `cancel_reason(req)` as `:shutdown` (#466), and waited on by
+  `Res.pause` (#815). Captured per pipeline, not read off the service per request, so each server
+  run keeps its own signal and the next run of the same app starts with a clean one. A task the
+  handler spawns inherits the scope, which is how an `Res.sse` producer finds its run's signal. The
+  two-argument form uses `NEVER_SHUTTING_DOWN`, which is never set.
 
 **Mutable only so that it is a heap object**, every field `const`. A scope stores its values in a
 `PersistentDict{ScopedValue, Any}`, so an immutable value is boxed on every insert. One instance is
@@ -194,13 +275,14 @@ mutable struct RequestScope
     # `Union{…, Nothing}` spelled out: `Nullable` lives in `Types`, which loads after this.
     const app        :: Union{AbstractApp, Nothing}
     const max_fields :: Base.RefValue{Int64}
-    const shutting_down :: Threads.Atomic{Bool}
+    const shutting_down :: ShutdownSignal
 end
 
-# The shutdown flag of a `RequestScope` that belongs to no server run: outside a request, and in a
-# scope built without one. Shared, so building such a scope allocates nothing for it. Never set
-# it; nothing would ever clear it.
-const NEVER_SHUTTING_DOWN = Threads.Atomic{Bool}(false)
+# The shutdown signal of a `RequestScope` that belongs to no server run: outside a request, and in
+# a scope built without one. Shared, so building such a scope allocates nothing for it. Never set
+# it; nothing would ever clear it. Nor wait on it: `Res.pause` checks for it by identity and parks
+# on its own timer alone, so code outside a request never contends on this one shared table.
+const NEVER_SHUTTING_DOWN = ShutdownSignal()
 
 RequestScope(app, max_fields) = RequestScope(app, max_fields, NEVER_SHUTTING_DOWN)
 

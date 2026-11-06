@@ -478,3 +478,143 @@ end
     report = match(r"SSE AT EXIT: open=(\d+)", stdout_text)
     @test report === nothing || report[1] == "0"
 end
+
+# #815: `Res.pause` is the producer's wait between events, and `terminate` wakes it. Before it, a
+# producer parked in `sleep` outlived `terminate` by up to one sleep; the only way out was an
+# application-owned flag, still a poll. The integration half would fail against a pause that only
+# sleeps: every producer here pauses for 60 s, and each must end within a few seconds of its own
+# app's `terminate`, while another `App` serving in the same process keeps its stream.
+@testitem "SSE — Res.pause ends with its own server run (#815)" tags=[:handler, :network] setup=[NitroCommon] begin
+    using Test
+    using HTTP
+    using Nitro
+
+    @testset "outside a request it is a sleep that checks the stream" begin
+        events = Res.sse().body::HTTP.SSEStream
+        t0 = time()
+        @test Res.pause(events, 0.05) === true
+        @test time() - t0 >= 0.04
+        @test Res.pause(events, 0) === true
+        close(events)
+        t0 = time()
+        @test Res.pause(events, 30) === false   # a closed stream answers at once
+        @test time() - t0 < 5
+        for bad in (-1, NaN, Inf)
+            @test_throws ArgumentError Res.pause(Res.sse().body::HTTP.SSEStream, bad)
+        end
+        # Outside a request the scope's signal is the shared never-set one, and pause must not
+        # register on it. Asserted WHILE a pause is parked: every exit path drops its waiter, so
+        # an empty table afterwards would prove nothing.
+        parked_events = Res.sse().body::HTTP.SSEStream
+        parked = Threads.@spawn Res.pause(parked_events, 2)
+        sleep(0.3)
+        @test !istaskdone(parked)
+        @test isempty(Nitro.Core.Constants.NEVER_SHUTTING_DOWN.waiters)
+        @test fetch(parked) === true
+    end
+
+    @testset "the signal: a waiter registered before the signal is woken, none after" begin
+        C = Nitro.Core.Constants
+        signal = C.ShutdownSignal()
+        woken = Base.Event()
+        @test C._add_waiter!(signal, woken)
+        @test !C.shutdown_started(signal)
+        C.signal_shutdown!(signal)
+        @test C.shutdown_started(signal)
+        @test timedwait(() -> woken.set, 1.0) === :ok
+        @test isempty(signal.waiters)
+        @test !C._add_waiter!(signal, Base.Event())   # already set: the caller must not park
+        @test isempty(signal.waiters)
+        C.signal_shutdown!(signal)                     # idempotent
+        @test C.shutdown_started(signal)
+    end
+
+    # One counter set per route. `started` counts producers, `stopped` the ones whose `finally` ran.
+    STATE = Dict(name => (started = Threads.Atomic{Int}(0), stopped = Threads.Atomic{Int}(0))
+                 for name in ("a", "b"))
+
+    function pausing(name::String)
+        st = STATE[name]
+        return Res.sse() do events
+            Threads.atomic_add!(st.started, 1)
+            try
+                write(events, SSEEvent("hello"; event = "hello"))
+                while Res.pause(events, 60)
+                    write(events, SSEEvent(""; event = "ping"))
+                end
+            finally
+                Threads.atomic_add!(st.stopped, 1)
+            end
+        end
+    end
+    pause_a(req::HTTP.Request) = pausing("a")
+    pause_b(req::HTTP.Request) = pausing("b")
+
+    # A client that reads until the server ends the stream. Bounded by `request_timeout` far past
+    # every wait here, so a regression is a failure, never a hang.
+    function listen_sse(url)
+        failure = Ref{Any}(nothing)
+        task = Threads.@spawn try
+            HTTP.get(url; sse_callback = (_, _) -> nothing, request_timeout = 120, retry = false)
+        catch err
+            failure[] = err
+        end
+        return task
+    end
+
+    function start(app)
+        port = get_free_port()
+        serve(app; host = HOST, port = port, async = true, show_banner = false,
+              show_errors = false, access_log = nothing, shutdown_timeout = 5)
+        @test timedwait(() -> Base.isopen(app.service), 10.0) === :ok
+        return "http://$HOST:$port"
+    end
+
+    app_a, app_b = App(), App()
+    urlpatterns(app_a, "", Nitro.RouteDefinition[path("/a", pause_a)])
+    urlpatterns(app_b, "", Nitro.RouteDefinition[path("/b", pause_b)])
+    url_a = start(app_a)
+    url_b = start(app_b)
+    try
+        client_a = listen_sse("$url_a/a")
+        client_b = listen_sse("$url_b/b")
+        @test timedwait(() -> STATE["a"].started[] == 1 && STATE["b"].started[] == 1, 15.0) === :ok
+
+        @testset "terminate wakes its own run's producers at once" begin
+            t0 = time()
+            stopping = Threads.@spawn terminate(app_a)
+            # Far under the 60 s pause: only the wake can end it this soon.
+            @test timedwait(() -> STATE["a"].stopped[] == 1, 10.0; pollint = 0.02) === :ok
+            @test time() - t0 < 10
+            @test timedwait(() -> istaskdone(stopping), 20.0) === :ok
+            @test timedwait(() -> istaskdone(client_a), 20.0) === :ok
+        end
+
+        @testset "another App's producer is untouched" begin
+            sleep(0.5)
+            @test STATE["b"].stopped[] == 0
+            @test !istaskdone(client_b)
+        end
+
+        @testset "the next run of the same app starts its producers clean" begin
+            url_a2 = start(app_a)
+            client_a2 = listen_sse("$url_a2/a")
+            @test timedwait(() -> STATE["a"].started[] == 2, 15.0) === :ok
+            # A pause on the previous run's (set) signal would return false at once.
+            sleep(0.5)
+            @test STATE["a"].stopped[] == 1
+            stopping = Threads.@spawn terminate(app_a)
+            @test timedwait(() -> STATE["a"].stopped[] == 2, 10.0; pollint = 0.02) === :ok
+            @test timedwait(() -> istaskdone(stopping), 20.0) === :ok
+            @test timedwait(() -> istaskdone(client_a2), 20.0) === :ok
+        end
+
+        stopping = Threads.@spawn terminate(app_b)
+        @test timedwait(() -> STATE["b"].stopped[] == 1, 10.0; pollint = 0.02) === :ok
+        @test timedwait(() -> istaskdone(stopping), 20.0) === :ok
+        @test timedwait(() -> istaskdone(client_b), 20.0) === :ok
+    finally
+        terminate(app_a)
+        terminate(app_b)
+    end
+end

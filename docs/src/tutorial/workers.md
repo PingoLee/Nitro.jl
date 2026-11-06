@@ -629,6 +629,15 @@ The third row is easy to miss: setting this same token wakes a run parked in the
 backoff, so a shutdown landing inside one ends the run as cancelled. Reaching a terminal state
 there is the useful outcome — better than a job restarting during teardown.
 
+**A run the process exits under records nothing.** That covers a callback still running when the
+drain gives up, and one with no drain at all. If Julia's exit wakes the callback (exit finalizes
+every live `Timer`, so a `sleep` throws `EOFError`), the run neither fails nor retries, and no store
+write happens while the process tears down. Its record stays `RUNNING`, as it would after a crash.
+Two things reclaim it: the next start's zombie sweep (`recover_zombies = true`) for an in-process
+queue, and lease expiry, under the queue's policy, for an `External` one. With
+`recover_zombies = false`, nothing does: run `recover_zombie_tasks!` yourself at startup. A queued
+task the process never got to stays `PENDING`; its queue was in memory, so resubmit it.
+
 The error text names the shutdown, so alerting that treats `CANCELLED` as "a person did this" can
 filter on it. That is the same string on both submit paths, and `"Cancelled by user"` now means a
 person and nothing else — see [Why a cancellation happened](@ref) below. A callback that wants to

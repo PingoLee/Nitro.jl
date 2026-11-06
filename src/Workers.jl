@@ -19,6 +19,8 @@ using ..Core.Errors: is_unrecoverable
 # (#651). A store rethrows its own database error, and on PostgreSQL that object's `.cause` holds
 # the server's DETAIL, which can quote a task row; a sink that `show`s the record would print it.
 using ..Core.Errors: loggable
+# A callback woken by the process's exit is not a failed run (#807); see `_run_attempts!`.
+using ..Core.Errors: process_exiting
 # Named jobs (#514): arguments are written through the store's JSON path and bound back with the
 # binder `Json{T}` uses, minus the request field cap: they are stored data, not a request body.
 using ..Core.Util.BodyParsers: _json_for_storage, interns_client_strings, MAX_JSON_DEPTH
