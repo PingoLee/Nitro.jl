@@ -306,7 +306,8 @@ process that keeps running, as in a REPL where `consume!` returns to the prompt,
 going keep their leases renewed until they return, and are handed back then: they finish under a
 live lease, and no other consumer starts them again meanwhile. A run that never returns keeps its
 lease for as long as that process lives. A run still going at
-exit keeps its lease until it expires, and is then re-queued or failed by its queue's policy. On
+exit is not renewed again, since the heartbeat writes nothing while the process tears down: it keeps
+the lease it last got until that expires, and is then re-queued or failed by its queue's policy. On
 Windows, terminating a process runs no shutdown code at all, so a stopped consumer's runs wait for
 their leases to expire, exactly as after a crash.
 

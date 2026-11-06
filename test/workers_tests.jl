@@ -158,6 +158,122 @@ end
     @test report === nothing || report[1] == "RUNNING,RUNNING,RUNNING,PENDING"
 end
 
+# #881: a consumer's lease heartbeat must not renew once the process is exiting. When the drain
+# times out with a run still going, the heartbeat outlives it to keep that run's lease alive
+# (#607), parked on a `Timer`. Exit finalizes that `Timer`, the heartbeat wakes with `EOFError`
+# (#772), and it used to take that as an ordinary wake and renew: a store write (a database one,
+# on PormG) while thread 1 tears the process down. It now checks `Errors.process_exiting()` after
+# every park, as the attempt loop and the queue processor do (#807).
+#
+# The child is #807's recipe, adapted in three ways:
+#
+# - `--threads=2,2`. Two interactive threads make `_heartbeat_thread()` pin the heartbeat to the
+#   second one, as a production consumer is (#636). With only one, the heartbeat is unpinned on
+#   thread 1, which is the thread running the exit, so it never wakes in time to show anything.
+# - The run parks on a `Channel`, which no finalizer wakes. It stays held, the drain (the one
+#   `consume!` registers, with a short timeout) ends with it still going, and the heartbeat's
+#   `Timer` is the only one waiting to wake at exit.
+# - The store prints a marker from inside any renewal it receives during exit. The order Julia
+#   runs exit finalizers in is not something to lean on, so there are two GC-safe holds, one
+#   created before the consumer starts and one by an `atexit` hook that runs after the drain
+#   (hooks run last-in, first-out). Between them they keep the process alive after the heartbeat
+#   wakes.
+#
+# Against the unpatched loop the child prints `RENEWED AT EXIT`. The `RENEWALS:` report proves the
+# recording store is on the heartbeat's path: the drain wakes the heartbeat once on its way out,
+# during `atexit` and not at exit. It comes from a finalizer, which Julia does not promise to run
+# at exit, so it is optional.
+@testitem "Workers -- a consumer's heartbeat does not renew during process exit (#881)" tags=[:workers, :slow] setup=[NitroCommon] begin
+    using Test
+
+    code = """
+    using Nitro, Nitro.Workers
+    const _W = Nitro.Workers
+    # An in-memory store that records renewals, and says it is visible across processes, which an
+    # External queue requires. Forwards with the contract's own arities, as the suite's
+    # `SharedStore` does.
+    struct RecordingStore <: _W.AbstractWorkerStore
+        inner::InMemoryWorkerStore
+    end
+    for (f, n) in ((:set_task!, 2), (:replace_task!, 2), (:add_watcher!, 2),
+                   (:try_transition!, 3), (:delete_task!, 1), (:try_delete_task!, 2), (:cleanup_tasks!, 1),
+                   (:get_all_tasks, 1), (:get_queue_authorizer, 0), (:set_queue_authorizer!, 1),
+                   (:get_watch_authorizer, 0), (:set_watch_authorizer!, 1), (:get_error_redactor, 0),
+                   (:set_error_redactor!, 1), (:release_claim!, 2), (:clear_records!, 0),
+                   (:list_running_task_refs, 0), (:get_task_info, 1), (:requeue_expired!, 1),
+                   (:count_external_runs, 1))
+        args = [Symbol("a", i) for i in 1:n]
+        @eval _W.\$f(s::RecordingStore, \$(args...); kw...) = _W.\$f(s.inner, \$(args...); kw...)
+    end
+    _W.task_locks(s::RecordingStore) = _W.task_locks(s.inner)
+    _W._visible_across_processes(::RecordingStore) = true
+    _W.claim_next!(s::RecordingStore, queue::String, consumer::String; kw...) =
+        _W.claim_next!(s.inner, queue, consumer; kw...)
+    const RENEWALS = Threads.Atomic{Int}(0)
+    function _W.renew_leases!(s::RecordingStore, consumer, runs; now = _W.current_time_utc(), kw...)
+        Threads.atomic_add!(RENEWALS, 1)
+        Nitro.Errors.process_exiting() && Core.println("RENEWED AT EXIT")
+        return _W.renew_leases!(s.inner, consumer, runs; now, kw...)
+    end
+
+    # `Libc.systemsleep`'s own split: `Sleep` on Windows, which has no `usleep` to load.
+    function hold()
+        if Sys.iswindows()
+            @ccall gc_safe=true Sleep(1500::UInt32)::Cvoid
+        else
+            @ccall gc_safe=true usleep(1_500_000::Cuint)::Cint
+        end
+    end
+    const EARLY = finalizer(_ -> (hold(); Core.println("RENEWALS: ", RENEWALS[])), Ref(0))
+
+    @kwdef struct Park
+        n::Int = 0
+    end
+    const PARKED = Threads.Atomic{Int}(0)
+    const NEVER = Channel{Nothing}(1)
+    park(task_info, ::Park) = (Threads.atomic_add!(PARKED, 1); take!(NEVER))
+    function setup!(app)
+        declare_queues!(app, ["heavy" => External(on_lease_expiry = :requeue)])
+        register_job!(park, app, "park", Park)
+        return app
+    end
+
+    const STORE = RecordingStore(InMemoryWorkerStore())
+    const WEB = setup!(App())
+    start!(WEB; store = STORE, cleanup_enabled = false, recover_zombies = false)
+    const C = _W._start_consumer(setup!(App()); store = STORE, queues = ["heavy" => 1], lease = 30,
+                                 poll_interval = 0.05, drain_timeout = 0.3, require_interactive = false)
+    _W._heartbeat_thread() === nothing && error("the heartbeat is not pinned; run with --threads=N,2")
+    submit_queued_task(WEB, "heavy", "parked", Job("park", Park()), Owner("u"))
+    timedwait(() -> PARKED[] == 1, 20.0) === :ok || error("the job never started")
+
+    # Registered first, so it runs after the drain's hook below.
+    const LATE = Ref{Any}(nothing)
+    atexit(() -> (LATE[] = finalizer(_ -> hold(), Ref(0))))
+    # What `consume!` registers.
+    atexit(() -> _W._drain!(C))
+    println("exiting")
+    """
+    cmd = `$(Base.julia_cmd()) --code-coverage=none --startup-file=no --threads=2,2
+           --project=$(Base.active_project()) -e $code`
+    out, err = IOBuffer(), IOBuffer()
+    p = run(pipeline(ignorestatus(cmd); stdout = out, stderr = err))
+    stdout_text, stderr_text = String(take!(out)), String(take!(err))
+    failure = (p.exitcode, p.termsignal) == (0, 0) ? nothing :
+        "child exit $(p.exitcode), signal $(p.termsignal); stderr: $(stderr_text)"
+    @test failure === nothing
+    @test occursin("exiting", stdout_text)
+    @test !occursin("EOFError", stderr_text)
+    @test !occursin(r"unhandled task"i, stderr_text)
+    # The drain timed out with the run still going, so the heartbeat outlived it.
+    @test occursin("drain timed out", stderr_text)
+    # Nothing renewed once the process was exiting.
+    @test !occursin("RENEWED AT EXIT", stdout_text)
+    report = match(r"RENEWALS: (\d+)", stdout_text)
+    # The drain's own wake renewed, so the recording store is on the heartbeat's path.
+    @test report === nothing || parse(Int, report[1]) >= 1
+end
+
 @testitem "Workers" tags=[:core, :workers] setup=[NitroCommon] begin
 
 using Test

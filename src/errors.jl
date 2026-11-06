@@ -751,7 +751,8 @@ checks this first and ends quietly. The janitors do not need it: they park on a 
 no finalizer wakes (`src/middleware/janitor.jl`). A Workers callback is application code with the
 same exposure: its executors' attempt loop checks it before it reads or writes the run's record
 (#807), so a run the process exits under stays `RUNNING` rather than being recorded `FAILED`
-during teardown.
+during teardown. A consumer's lease heartbeat checks it after every park (#881): exit wakes the
+heartbeat's `Timer` too, and a renewal then would be a store write during teardown.
 
 It reads `Base._atexit_hooks_finished`, which `Base._atexit` sets after the last hook and before
 it returns to the runtime that runs the finalizers: Base's documented order, *atexit hooks run
@@ -761,8 +762,9 @@ is a `Bool`. A Julia that renames it fails that test, not this read inside a cat
 and makes a dynamic call into Nitro at exit, which a `juliac --trim` executable would have to be
 shown to survive. Reading Base's flag needs neither.
 
-Call sites: `_run_sse_producer` (`src/response.jl`), and `_run_attempts!` and the queue
-processor in `_spawn_queue_processor` (`src/Workers/queue.jl`). Deliberately **not exported**.
+Call sites: `_run_sse_producer` (`src/response.jl`), `_run_attempts!` and the queue
+processor in `_spawn_queue_processor` (`src/Workers/queue.jl`), and `_heartbeat_loop`
+(`src/Workers/consumer.jl`). Deliberately **not exported**.
 """
 process_exiting()::Bool = Base._atexit_hooks_finished
 
