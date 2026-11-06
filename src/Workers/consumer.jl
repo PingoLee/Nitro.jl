@@ -747,6 +747,15 @@ function _heartbeat_loop(c::ConsumerHandle)
     while _keeps_beating(c)
         try
             _heartbeat_park!(c)
+            # A park the process's EXIT ended is not a wake (#881). Exit finalizes every live
+            # `Timer`, this park's included, and the wait returns with `EOFError` (#772), as it
+            # does for a `_wake_heartbeat!`. Ticking then would renew leases, a store write (a
+            # database one, on PormG) while thread 1 tears the process down. So stop, writing and
+            # closing nothing: the runs left unrenewed expire, and their queues' policies decide
+            # them, as after a crash. Same predicate as the attempt loop and the queue processor
+            # (#807). It returns rather than breaks, past the wake guard, a `Timer` that exit
+            # finalizes anyway.
+            process_exiting() && return nothing
             _keeps_beating(c) || break
             _heartbeat_tick!(c)
         catch e
