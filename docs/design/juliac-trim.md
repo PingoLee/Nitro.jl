@@ -126,6 +126,12 @@ get. `LIFECYCLE=1` gives `app.jl` a route-owned and a serve-owned lifecycle hook
 verifier also reaches the per-request task behind the listener (§3.5), but `app.jl` has one exact
 route and no middleware, so the probe stays the measure of the route path.
 
+**The trimmed-only branches are covered in CI**, so the probe is no longer the only thing that runs
+them: `test/trimmed_branches_tests.jl` redefines `_trimmed()` to `true` in a child, compares each
+behavioural branch with the JIT's answer, checks that each refusal makes no dynamic call and names
+no value, and fails on a `_trimmed()` site that `test/.helpers/trimmed_sites.jl` does not list
+([#858](https://github.com/PingoLee/Nitro.jl/issues/858)).
+
 ## 2. Cleared: the lifecycle wall (#571)
 
 | Mechanism | Errors | Fix |
@@ -1189,9 +1195,9 @@ dropped the annotation the same way. Rebuilt 2026-11-04 from `main` at `6e0022ca
 1.13.2, JuliaC 0.3.12, HTTP.jl 2.13.5 and JSON.jl 1.13.4, the probe reads **18**: the 4 rows
 are gone, no row was added, and every probe answers as under the JIT. The JIT is unchanged: its
 one caller has already checked `value isa AbstractString`, and the conversion is the same
-`String(value)`. `test/middleware/csrf_middleware_tests.jl` pins it without a build, in a child
-with `_trimmed()` redefined to `true`: under the JIT the refusal is dead code, so inference never
-looks at it.
+`String(value)`. `test/trimmed_branches_tests.jl` pins it without a build, in a child with
+`_trimmed()` redefined to `true`, with every other trimmed-only branch (#858, §1): under the JIT the
+refusal is dead code, so inference never looks at it.
 
 The 18 left are the `@with` HAMT inside Base (4, §3.5) and 14 outside `src/`.
 

@@ -77,6 +77,7 @@ const TEST_FILES = [
     "reexports_tests.jl",
     "http_internals_contract_tests.jl",
     "juliac_internals_contract_tests.jl",
+    "trimmed_branches_tests.jl",
     "precompilation_test.jl",
     "precompile_warmth_tests.jl",
     "extractor_tests.jl",
