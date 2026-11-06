@@ -272,7 +272,9 @@ against a handler that computes for about 2 ms. Every 8 s run was measured per c
   only as many requests at once as it has tasks. In the task-level reduction, 128 tasks served
   37k requests per second where one spawn per request served 138k
   ([#618](https://github.com/PingoLee/Nitro.jl/issues/618#issuecomment-6547617178)). The order
-  belongs in Julia's scheduler, so `serve` keeps one spawn per request.
+  belongs in Julia's scheduler, so `serve` keeps one spawn per request. The scheduler change is
+  proposed upstream as an opt-in first-in, first-out order
+  ([JuliaLang/julia#64722](https://github.com/JuliaLang/julia/issues/64722)).
 
 **Every app has one such handler: the login.** One `check_password` at the default cost
 computes without yielding for about 0.1 s (pbkdf2_sha256, 720,000 iterations) or 0.2 s

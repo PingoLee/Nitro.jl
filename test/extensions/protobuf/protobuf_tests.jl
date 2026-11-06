@@ -281,7 +281,9 @@ using .bounds3_pb: Mark, Choice, Grouped
         # pointer-free `T`'s ref reads assigned before any write. If the first flips to `false`,
         # upstream stopped merging first occurrences into unwritten memory and `filled` may be
         # unnecessary; if the second flips to `true`, `isassigned` is no longer a sound repeat
-        # test for the pointer types `_untracked` leaves to it.
+        # test for the pointer types `_untracked` leaves to it. Reported upstream as
+        # https://github.com/JuliaIO/ProtoBuf.jl/issues/306: if the first flips, check there
+        # whether the decode changed before removing `filled`.
         @test isassigned(Ref{Labeled}())
         @test !isassigned(Ref{Bag}())
         # `_untracked`'s predicate, both halves. `Bag` holds a `Vector`, so it is still inline
