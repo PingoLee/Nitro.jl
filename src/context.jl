@@ -471,8 +471,12 @@ function _shutdown_server(server::Server; timeout::Real)::Bool
     # The serve task's own failure is only logged by the *blocking* `startserver` path, so for
     # `async=true` this is the first and only place it gets reported. `maxlog=1` keeps a
     # repeatedly-terminated broken server from flooding.
-    _report(err, what) =
+    # A trimmed build drops the record (#846), so it writes its own line too, on every call.
+    function _report(err, what)
         @warn "Nitro: $what ran against a serve task that had already failed" exception=loggable(err) maxlog=1
+        Types._trimmed_failure(string("the serve task (seen at ", what, ")"), err)
+        return nothing
+    end
 
     # Documented opt-out of the graceful phase.
     if iszero(timeout)
@@ -495,6 +499,7 @@ function _shutdown_server(server::Server; timeout::Real)::Bool
                 _report(err, "graceful shutdown")
             else
                 @error "Nitro: graceful server shutdown failed unexpectedly" exception=(loggable(err), catch_backtrace())
+                Types._trimmed_failure("graceful server shutdown", err)  # a trimmed build drops the record (#846)
             end
         end
     end
@@ -505,6 +510,8 @@ function _shutdown_server(server::Server; timeout::Real)::Bool
           "connections. Long-lived WebSocket/SSE/STREAM handlers are the usual cause: they hold " *
           "their connection for the handler's whole lifetime, so the graceful drain has nothing " *
           "to wait for. Set `serve(shutdown_timeout = …)` or `terminate(timeout = …)` to tune this."
+    Types._trimmed_note("Nitro: the server did not drain within the shutdown timeout; force-closing " *
+                        "the remaining connections")  # a trimmed build drops the record (#846)
 
     try
         HTTP.forceclose(server)

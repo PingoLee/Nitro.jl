@@ -30,6 +30,21 @@ lines = split(out, '\n'; keepempty = false)
 # takes the trimmed branch.
 @test "FLIP=true" in lines || out
 
+# The lifecycle hooks' lines (#846). The child runs a throwing hook through each phase in both
+# runs, under a `NullLogger`: only the trimmed run writes the line, so each appears exactly once,
+# and it names the exception's type, never its message (the sentinel).
+@testset "a failed hook writes one value-free line, and only when trimmed (#846)" begin
+    errlines = split(err, '\n'; keepempty = false)
+    for phase in ("on_startup", "on_shutdown", "on_stopped")
+        want = "Nitro: LifecycleMiddleware.$phase failed: ArgumentError"
+        @test count(==(want), errlines) == 1 || last(err, 2000)
+    end
+    for line in errlines
+        startswith(line, "Nitro: ") && occursin(" failed: ", line) || continue
+        @test !occursin("S3NT1NEL", line) || line
+    end
+end
+
 @testset "no check failed, and every listed site has its checks" begin
     for line in lines
         startswith(line, "FAIL ") || startswith(line, "NOCHECK ") || continue
@@ -122,6 +137,39 @@ end
         sites = trimmed_sites(dir)
         @test [(s.func, s.line) for s in sites] == [("refusing", 10), ("branching", 13), ("Base.show", 14)]
         @test all(s -> s.file == "src/sample.jl", sites)
+    end
+end
+end
+
+@testitem "juliac: every site that writes a trimmed build's own failure line is listed (#846)" tags=[:core] begin
+using Test
+
+# A trimmed executable prints no log record (docs/design/juliac-trim.md §3.16), so the failures
+# Nitro catches and logs write one value-free line of their own beside the `@error`, through
+# `_trimmed_failure` or `_trimmed_note` (src/routeendpoint.jl). Under the JIT those calls fold
+# away, so nothing in a test process would notice one going missing. This pins where they are.
+
+include(joinpath(@__DIR__, ".helpers", "trimmed_sites.jl"))
+
+root = dirname(@__DIR__)
+found = Dict{Tuple{Symbol, String, String}, Int}()
+for callee in (:_trimmed_failure, :_trimmed_note), s in trimmed_sites(root; callee)
+    key = (callee, s.file, s.func)
+    found[key] = get(found, key, 0) + 1
+end
+
+@testset "every call is listed, with its count" begin
+    for (key, n) in found
+        @test get(TRIMMED_FAILURE_SITES, key, 0) == n ||
+              "$(key[2]): $(key[3]) holds $n call(s) to $(key[1]); list it in TRIMMED_FAILURE_SITES"
+    end
+end
+
+@testset "every listed site still writes its line" begin
+    for (key, n) in TRIMMED_FAILURE_SITES
+        @test get(found, key, 0) == n ||
+              "$(key[2]): $(key[3]) no longer holds $n call(s) to $(key[1]): a trimmed build goes " *
+              "silent there; restore the call, or remove the entry on purpose"
     end
 end
 end

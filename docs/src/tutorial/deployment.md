@@ -712,7 +712,7 @@ Julia can compile an application into a standalone executable with `juliac` (on 
 [JuliaC.jl](https://github.com/JuliaLang/JuliaC.jl) app), and
 `--trim` drops every method the program cannot reach. Nitro is working towards `--trim=safe`, but
 it does not build a Nitro app cleanly today. What is left, and how it is measured, is recorded in
-`docs/design/juliac-trim.md` in the repository. This section covers the one rule that holds
+`docs/design/juliac-trim.md` in the repository. This section covers the rules that hold
 whatever the build reports.
 
 **A fatal error in a juliac executable prints its raw fields.** Under the JIT, an exception that
@@ -768,6 +768,7 @@ image cannot dispatch the logging machinery or `showerror` on an arbitrary excep
 untrimmed one would print what `showerror` prints, values included. `startup_failure_text` calls
 neither. It gives the type's name only (`nameof`), never `typeof(e)` itself, because a type can
 carry a value as a parameter.
+
 The routes are registered at top level, so under `juliac` they run while the image is built and
 `main` only serves. Keep the whole life of the server inside the `try`: with `serve(app; async =
 true)`, a later `wait` on the server rethrows what the server task raised, and outside the `try`
@@ -776,3 +777,20 @@ that is printed raw.
 How `serve` knows it runs in an executable: both juliac build scripts define `Main._main`, the C
 entry point that calls your `main`. Do not define a global `_main` in `Main` yourself, or `serve`
 treats a JIT session as an executable too, and replaces the exceptions that leave it there.
+
+**A trimmed executable prints no log records at all**, Nitro's or your own. Under `--trim`, JuliaC
+compiles every `@debug`, `@info`, `@warn` and `@error` out of the image, and installing a logger
+does not bring them back. Where Nitro catches a failure that would otherwise go unseen, it writes
+one line to `Core.stderr` beside the record, naming the exception's type and nothing else. That
+covers a lifecycle hook that throws, `pormg_nitro_pools` failing to close a pool, the shutdown
+drain and its force-close, a listener that fails to close, and a blocking `serve` whose server task
+dies. A failed `on_stopped`, for example, prints:
+
+```
+Nitro: LifecycleMiddleware.on_stopped failed: ArgumentError
+```
+
+These lines follow the build, not `Main._main`: an untrimmed executable keeps its log records and
+writes none of them. A failure your own code must report in a trimmed build has to be written to
+`Core.stderr` the same way. A request that fails is still answered with its `500`, but in a trimmed
+build the server side writes no line for it yet.
