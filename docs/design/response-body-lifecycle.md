@@ -482,8 +482,27 @@ validated a string's escapes only when it materialized the string. This predated
 Nitro's floor is `JSON = "1.12.1"`, not `1.12.0`: 1.12.0 parsed a document with many 2000+-digit
 integers in time proportional to the whole document per integer, which 1.12.1 fixes
 ([#523](https://github.com/JuliaIO/JSON.jl/pull/523)). A request body is
-client input, so that is a floor, not a preference. The `write_dict_*` and `echo_*_served` rows
-have not been re-measured on 1.12.1.
+client input, so that is a floor, not a preference.
+
+**Re-measured on the release Nitro floors at (#578).** `bench/suite/json.jl`'s rows on JSON.jl
+1.13.4 (StructUtils 2.11.1), Julia 1.13.2, one thread, BenchmarkTools minima. Two interleaved
+rounds, the second reversed, under `bench/socket/quiet.sh` with no foreign julia. The allocation
+counts were identical in both rounds; the times agreed within 1%. The earlier columns are #578's
+runs on Julia 1.12.7, so only their allocation counts compare directly.
+
+| allocations / min time | 1.11.0 | 1.11.0 + the #512 method | 1.13.4 |
+|---|---|---|---|
+| `write_dict_small` | 22 / 0.59 µs | 13 / 0.33 µs | **12 / 0.27 µs** |
+| `write_dict_10kb` | 2,524 / 107–113 µs | 271 / 54–55 µs | **20 / 38.6–38.8 µs** |
+| `write_struct_10kb` (control) | 773 / 45–46 µs | 773 / 45 µs | 772 / 41.1–41.2 µs |
+| `echo_small_served` | 49 / 1.87–1.89 µs | 40 / 1.57–1.59 µs | **36 / 1.39–1.40 µs** |
+| `echo_10kb_served` | 5,047 / 180–183 µs | 2,794 / 128–130 µs | **2,540 / 86.5–86.6 µs** |
+
+The fix holds, and the releases after it went further: a 250-row parsed `Object` now writes in 20
+allocations, against 271 with #512's method alone, and fewer than the struct control's 772. The
+control moved by one allocation, across a Julia version change as well as a JSON.jl one; which of
+the two moved it was not checked. No Nitro `src/` change
+was needed: `getjson` returns an `Object`, so the handler path took the improvement as it shipped.
 
 ## 4. Reference facts
 
