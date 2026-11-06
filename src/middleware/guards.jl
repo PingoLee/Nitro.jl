@@ -204,10 +204,11 @@ function _login_denial(redirect_url::Nullable{String}, denied)
 end
 
 """
-    login_required(; redirect_url = "/login", session_key = "user_id", denied = nothing)
+    login_required(; redirect_url::Nullable{String} = nothing, session_key::String = "user_id", denied = nothing)
 
 Guard that admits an authenticated request and otherwise answers `302` with
-`Location: redirect_url`. It is a factory, so call it: `GuardMiddleware(login_required())`.
+`Location: redirect_url`. With neither `redirect_url` nor `denied` given, it redirects to
+`"/login"`. It is a factory, so call it: `GuardMiddleware(login_required())`.
 
 Pass `denied` — a factory `(req, reason) -> HTTP.Response`, called with `:login_required` — to
 answer something other than a redirect, e.g. a JSON `401`. It replaces the redirect, so passing
