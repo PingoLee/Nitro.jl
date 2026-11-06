@@ -649,8 +649,10 @@ surviving segment is refused, with an `ArgumentError` naming it, when it is eith
 - **not a legal URL path segment** ([`_first_unroutable`](@ref)) — anything outside RFC 3986 `pchar`.
   A conforming client percent-encodes these characters before sending, and when this rule was
   written the router compared raw path segments, so the registered route and the request could never
-  meet. Since HTTP 2.14 the router decodes both sides (#868), so the refusal is now the one rule,
-  judged like a filename, more than a dead-mount guard. Write the prefix pre-encoded
+  meet. Since #351 they do meet: registration and `OriginFormMiddleware` put the route and the
+  request path in one canonical spelling, so a raw `café` prefix would register as `caf%C3%A9` and
+  match. The refusal is now a policy, the one rule, judged like a filename, rather than a dead-mount
+  guard; whether to keep it is #874. Write the prefix pre-encoded
   (`"my%20static"`, `"caf%C3%A9"`) and it mounts and serves.
 
   Be precise about what this costs, because the two halves differ. `" "`, `"?"` and control
