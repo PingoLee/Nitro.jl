@@ -177,7 +177,9 @@ this table. Treat *When to read* as a hard prerequisite: the non-consuming respo
 
 `.github/scripts/docs_lint.jl` (run in CI) keeps this page, `AGENTS.md`, the area rule files and
 the public skills honest: every backtick path and local link must resolve, every `§` pointer must
-hit a real heading, and the sets of rule files, skills and discovery stubs are pinned.
+hit a real heading, and the sets of rule files, skills and discovery stubs are pinned. It also
+holds the guard factories' and the auth middleware's documented keyword signatures, in the usage
+reference and in each docstring, to the methods in `src/` (`SIGNATURE_CHECKS`).
 
 ## Architecture
 
@@ -293,7 +295,8 @@ julia --project=. test/runtests.jl --in-process test/sessionstores_tests.jl
 # run id, which the log prints; pass that seed here to reproduce its order.
 julia --project=. test/runtests.jl --shuffle 1234
 
-# Agent-docs reference lint (paths, links, symbols, § anchors, public skill/rule sets, stubs)
+# Agent-docs reference lint (paths, links, symbols, § anchors, public skill/rule sets, stubs,
+# guard/auth keyword signatures)
 julia .github/scripts/docs_lint.jl
 
 # Smoke test — loads, routes and serves using NOTHING test-only (Nitro + HTTP + stdlib).
