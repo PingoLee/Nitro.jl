@@ -477,9 +477,9 @@ const CANCEL_PROBE_INTERVAL_NS = UInt64(10_000_000)
 mutable struct _CancelState
     @atomic reason        :: Symbol
     @atomic next_probe_ns :: UInt64
-    # The flag of the server run that is handling this request (`RequestScope`), captured on the
-    # first call: the run's flag, not whatever scope a later call happens to run in.
-    const shutting_down   :: Threads.Atomic{Bool}
+    # The signal of the server run that is handling this request (`RequestScope`), captured on
+    # the first call: the run's signal, not whatever scope a later call happens to run in.
+    const shutting_down   :: Constants.ShutdownSignal
     # `nothing` for a request with no socket of its own (`internalrequest`).
     const stream          :: Union{Nothing, HTTP.Stream}
 end
@@ -559,7 +559,7 @@ function cancel_reason(req::HTTP.Request)::Symbol
     state = _cancel_state(req)
     reason = @atomic state.reason
     reason === :none || return reason
-    state.shutting_down[] && return _settle_cancel!(state, :shutdown)
+    Constants.shutdown_started(state.shutting_down) && return _settle_cancel!(state, :shutdown)
     stream = state.stream
     stream === nothing && return :none
     now = time_ns()

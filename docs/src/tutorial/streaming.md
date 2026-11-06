@@ -24,9 +24,8 @@ using Nitro
 function ticks(req)
     return Res.sse() do events
         for i in 1:10
-            isopen(events) || break            # the client hung up
             write(events, SSEEvent(string(i); event = "tick", id = string(i)))
-            sleep(1)
+            Res.pause(events, 1) || break      # the client hung up, or the server is stopping
         end
     end
 end
@@ -115,8 +114,10 @@ the default), and never under 16 MiB, the next `write` closes the stream and thr
 it does once the client has gone. So a producer that writes much faster than the client reads holds
 that much in memory and then fails. Two habits avoid it:
 
-- give the producer a natural cadence (a `sleep`, a poll interval, or waiting on a `Channel`);
-- check `isopen(events)` each iteration.
+- give the producer a natural cadence (a [`Res.pause`](@ref), a poll interval, or waiting on a
+  `Channel`);
+- check `isopen(events)` each iteration. `Res.pause` checks it for you: it returns `false` once the
+  stream is closed.
 
 That check is also how a disconnected client stops the *work* rather than merely stopping the
 writes. A disconnect closes the stream from underneath the producer, so a loop that tests
@@ -146,35 +147,35 @@ A handler that holds its connection for its whole lifetime is **always cut at**
 `serve(shutdown_timeout = …)`: the graceful drain has nothing to wait out, so it reaches its
 timeout and force-closes. A producer parked in `write` unwinds the moment the socket is torn down.
 One parked on a `sleep`, a `Channel` or an `Event` does not, and outlives `terminate` until it next
-wakes. Give it a shutdown signal of its own from a `LifecycleMiddleware`'s `on_shutdown`, which
-runs *before* the drain begins, and check it every tick:
+wakes. So wait between events with [`Res.pause`](@ref), which `terminate` wakes at once:
 
 ```julia
-const STOPPING = Threads.Atomic{Bool}(false)
-
-# Owns the flag and no request work: `identity` passes every request through untouched.
-stop_streams = Nitro.LifecycleMiddleware(
-    middleware  = identity,
-    on_startup  = () -> (STOPPING[] = false),
-    on_shutdown = () -> (STOPPING[] = true))
-
 function pings(req)
     return Res.sse() do events
-        while isopen(events) && !STOPPING[]
+        while Res.pause(events, 15)
             write(events, SSEEvent(""; event = "ping"))
-            sleep(15)
         end
     end
 end
 
 app = App(mod = @__MODULE__)
 urlpatterns(app, "", [path("/pings", pings)])
-serve(app, middleware = [stop_streams])
+serve(app)
 ```
 
-The producer then stops within one tick of `terminate`. Polling `cancel_requested(req)` from the
-producer is not a substitute: the producer runs on a task of its own, and that accessor reads
-`req.context`, which only the handler's task may do.
+`Res.pause(events, 15)` parks for fifteen seconds. It returns `true` to go on, and `false` once
+the stream is closed or the server run that served the request begins to stop. A producer looping
+on it ends with the server, not up to one interval later. It belongs to that run only: a second
+`App` serving in the same process keeps its streams, and the next `serve` of the same app starts
+its producers clean. A client that disconnects mid-pause is noticed when the pause ends, so pick
+the interval with that lag in mind.
+
+A producer that waits on something else — a `Channel` of updates, say — still needs a way out at
+shutdown. Close the channel from a `LifecycleMiddleware`'s `on_shutdown`, which runs *before* the
+drain begins.
+
+Polling `cancel_requested(req)` from the producer is not a substitute: the producer runs on a task
+of its own, and that accessor reads `req.context`, which only the handler's task may do.
 
 A producer still parked in `sleep` when the process *exits* is woken by the exit itself. Julia
 finalizes every `Timer`, and the `sleep` then throws `EOFError`. Nitro treats that as the end of the stream,

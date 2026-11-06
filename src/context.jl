@@ -8,7 +8,7 @@ using ..Types
 # so it is named explicitly here rather than widened onto `Core`'s reexport surface.
 using ..Types: CopyOnWriteDict, RouteMiddleware, RouteChainRecord, NamedRoute, NitroRouter, nitro_router,
     MissResponse, miss_response, LifecycleEntry
-using ..Constants: SHUTDOWN_TIMEOUT_SECONDS, DEFAULT_MAX_FIELDS, AbstractApp
+using ..Constants: SHUTDOWN_TIMEOUT_SECONDS, DEFAULT_MAX_FIELDS, AbstractApp, ShutdownSignal
 # The serve task, a shutdown and a Revise hook log what they caught as `loggable(e)`, never `e`:
 # each logs whatever reached it, and the rule holds everywhere in `src/` (#658).
 using ..Errors: loggable
@@ -247,14 +247,15 @@ end
     extensions            :: Dict{Symbol, Any}      = Dict{Symbol, Any}()
     extensions_lock       :: ReentrantLock          = ReentrantLock()
     shutdown_timeout      :: Base.RefValue{Float64} = Ref{Float64}(SHUTDOWN_TIMEOUT_SECONDS)
-    # The current server run's shutdown flag (#466), which `cancel_reason(req)` reads as
-    # `:shutdown`. A handler that polls it can finish inside `shutdown_timeout` instead of being
-    # force-closed. It is a flag, not a registry of in-flight requests, so nothing is written per
-    # request. Each pipeline captures the flag current when it is built (`_app_context_seed`).
-    # `terminate` swaps in a fresh one and only then sets the old one. So the run it stops
-    # drains with its own flag set, and the next run builds on the clean one. (A `serve` can no
-    # longer start during that drain, #812; the swap keeps the two runs' flags apart regardless.)
-    shutting_down         :: Base.RefValue{Threads.Atomic{Bool}} = Ref(Threads.Atomic{Bool}(false))
+    # The current server run's shutdown signal: `cancel_reason(req)` reads it as `:shutdown`
+    # (#466), and `Res.pause` wakes on it (#815). A handler that polls it can finish inside
+    # `shutdown_timeout` instead of being force-closed. It is a flag plus the tasks parked on it
+    # right now, not a registry of in-flight requests, so nothing is written per request. Each
+    # pipeline captures the signal current when it is built (`_app_context_seed`). `terminate`
+    # swaps in a fresh one and only then signals the old one. So the run it stops drains with its
+    # own signal set, and the next run builds on the clean one. (A `serve` can no longer start
+    # during that drain, #812; the swap keeps the two runs' signals apart regardless.)
+    shutting_down         :: Base.RefValue{ShutdownSignal} = Ref(ShutdownSignal())
     # Where this App is in its server lifecycle (#812): `PHASE_IDLE`, `PHASE_STARTING`,
     # `PHASE_SERVING` or `PHASE_STOPPING`. `isopen(service)` answers a narrower question, whether a
     # listener is open, and `terminate` closes the listener when its drain STARTS, so a guard on

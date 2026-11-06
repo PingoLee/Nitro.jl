@@ -3,7 +3,7 @@ using Test
 using HTTP
 using Nitro
 using Base.ScopedValues: @with
-using Nitro.Core.Constants: REQUEST_SCOPE, RequestScope
+using Nitro.Core.Constants: REQUEST_SCOPE, RequestScope, ShutdownSignal, signal_shutdown!
 using Nitro.Core: REQUEST_CANCEL_STATE_KEY
 
 @testset "one function for a request and a worker run" begin
@@ -36,16 +36,18 @@ end
 end
 
 @testset "the run's flag: read through the scope, kept once read, sticky" begin
-    flag = Threads.Atomic{Bool}(false)
+    # The run's signal is a `ShutdownSignal` since #815 (a bare `Atomic{Bool}` before).
+    flag = ShutdownSignal()
     scope = RequestScope(nothing, Ref{Int64}(0), flag)
     req = HTTP.Request("GET", "/")
     @test (@with REQUEST_SCOPE => scope cancel_reason(req)) === :none
-    flag[] = true
+    signal_shutdown!(flag)
     # Read from OUTSIDE the scope, as a task the handler spawned with `_spawn_detached` would:
     # the flag was captured with the state, on the first call.
     @test cancel_reason(req) === :shutdown
     @test cancel_requested(req)
-    flag[] = false
+    # A signal has no reset; clear the field by hand to show the REASON does not follow it.
+    @atomic flag.set = false
     @test cancel_reason(req) === :shutdown          # a reason never resets
 end
 
