@@ -761,8 +761,8 @@ is a `Bool`. A Julia that renames it fails that test, not this read inside a cat
 and makes a dynamic call into Nitro at exit, which a `juliac --trim` executable would have to be
 shown to survive. Reading Base's flag needs neither.
 
-Call sites: `_run_sse_producer` (`src/response.jl`) and `_run_attempts!`
-(`src/Workers/queue.jl`). Deliberately **not exported**.
+Call sites: `_run_sse_producer` (`src/response.jl`), and `_run_attempts!` and the queue
+processor in `_spawn_queue_processor` (`src/Workers/queue.jl`). Deliberately **not exported**.
 """
 process_exiting()::Bool = Base._atexit_hooks_finished
 
