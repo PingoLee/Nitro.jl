@@ -100,6 +100,62 @@ function _normalize_audience(value)
     return [string(value)]
 end
 
+# The `iss` and `aud` checks run on every verified token, against a claim read out of a
+# `Dict{String, Any}`, so the claim is `Any` at the call site. Written the obvious way -- `==` on
+# that `Any`, and `_normalize_audience` on both sides followed by a generator -- they cost ~0.3 µs
+# and all 6 of `validate_claims`' allocations per token (#837: 0.38 → 0.10 µs, 6 → 0 allocations,
+# on a service claim set). Both helpers below take the shape JSON.jl parses a standard claim
+# into, a `String` or a `Vector{Any}` of them, compared against a `String` or `SubString{String}`,
+# without a dynamic call or an allocation. Any other shape takes the original expression
+# unchanged, so what is accepted does not move.
+
+# The string types the fast paths below compare against.
+const _PlainString = Union{String, SubString{String}}
+
+# `token_issuer == issuer`. A `String` test first makes `==` static (no other JSON value equals a
+# string); any other claim, or another `issuer` type, keeps the generic comparison.
+function _issuer_matches(@nospecialize(token_issuer), issuer)::Bool
+    issuer isa _PlainString && token_issuer isa String && return token_issuer == issuer
+    return _issuer_matches_other(token_issuer, issuer)
+end
+
+@noinline _issuer_matches_other(@nospecialize(token_issuer), @nospecialize(issuer))::Bool =
+    token_issuer == issuer
+
+# Whether the token's `aud` claim names one of the expected audiences:
+# `any(item in actual for item in expected)` over the two `_normalize_audience` lists, which is
+# still the definition, and still what decides every shape the fast path below does not take.
+#
+# The fast path is limited to the two string types whose `==` compares content, the comparison
+# `String(audience)` made: another `AbstractString` may define `==` its own way.
+function _audience_matches(audience, @nospecialize(claim))::Bool
+    if audience isa _PlainString
+        claim isa String && return claim == audience
+        if claim isa Vector{Any}
+            matched = _string_audience_in(audience, claim)
+            matched === nothing || return matched
+        end
+    end
+    return _audience_matches_other(audience, claim)
+end
+
+# `audience` among the claim's items when every item is a `String`, and `nothing` when one is not:
+# a non-string item matches through its `string` form, which only the general path computes.
+function _string_audience_in(audience::_PlainString, claim::Vector{Any})::Union{Bool, Nothing}
+    matched = false
+    for item in claim
+        item isa String || return nothing
+        matched |= item == audience
+    end
+    return matched
+end
+
+@noinline function _audience_matches_other(@nospecialize(audience), @nospecialize(claim))::Bool
+    expected = _normalize_audience(audience)
+    actual = _normalize_audience(claim)
+    return any(item in actual for item in expected)
+end
+
 function validate_claims(claims::AbstractDict; exp_timeout::Union{Int, Nothing}=DEFAULT_JWT_MAX_AGE_SECONDS, iat_skew::Int=30, issuer=nothing, audience=nothing, require_exp::Bool=false, required_claims::Union{AbstractVector{<:AbstractString}, Nothing}=nothing, now_ts::Int=_current_timestamp())
     exp = _claim_value(claims, "exp", nothing)
     if exp === nothing
@@ -128,14 +184,11 @@ function validate_claims(claims::AbstractDict; exp_timeout::Union{Int, Nothing}=
     end
 
     if issuer !== nothing
-        token_issuer = _claim_value(claims, "iss", nothing)
-        token_issuer == issuer || throw(AuthError("Invalid JWT issuer"))
+        _issuer_matches(_claim_value(claims, "iss", nothing), issuer) || throw(AuthError("Invalid JWT issuer"))
     end
 
     if audience !== nothing
-        expected = _normalize_audience(audience)
-        actual = _normalize_audience(_claim_value(claims, "aud", nothing))
-        any(item in actual for item in expected) || throw(AuthError("Invalid JWT audience"))
+        _audience_matches(audience, _claim_value(claims, "aud", nothing)) || throw(AuthError("Invalid JWT audience"))
     end
 
     if required_claims !== nothing
