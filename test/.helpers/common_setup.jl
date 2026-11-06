@@ -23,7 +23,7 @@ include("test_utils.jl")
 using .TestUtils
 
 # Helper to trigger extensions
-# Usage: trigger_extension("OpenSSL")
+# Usage: trigger_extension("Mustache")
 function trigger_extension(pkg_name::String)
     eval(Meta.parse("using $pkg_name"))
     println("Triggered extension for $pkg_name")

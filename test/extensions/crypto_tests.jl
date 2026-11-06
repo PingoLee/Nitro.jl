@@ -1,5 +1,4 @@
 @testitem "Crypto extension" tags=[:extension, :security] setup=[NitroCommon] begin
-using OpenSSL
 using SHA
 using Base64
 using Random
@@ -12,7 +11,6 @@ using Random
     purpose = "crypto-test"
 
     @testset "Basic Encrypt/Decrypt" begin
-        # extension should be loaded since we imported OpenSSL in this test
         encrypted = Nitro.Crypto.encrypt_payload(secret, payload; purpose)
 
         @test encrypted != payload

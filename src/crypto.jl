@@ -1,6 +1,5 @@
 module Crypto
 
-using OpenSSL
 using OpenSSL_jll: libcrypto
 using UUIDs
 using Dates
@@ -525,21 +524,99 @@ function _read_int64_be(bytes::AbstractVector{UInt8}, offset::Int)
     return x
 end
 
-# GCM associated data goes through `EVP_CipherUpdate` with a NULL output buffer, after the key
-# and iv are set and before any plaintext. `OpenSSL.cipher_update` always passes an output
-# buffer, so it cannot express this; the argument types mirror its own `ccall`.
-function _gcm_aad!(ctx::OpenSSL.EvpCipherContext, aad::Vector{UInt8})
-    outlen = Ref{Int32}(0)
-    ret = GC.@preserve aad outlen ccall((:EVP_CipherUpdate, libcrypto), Cint,
-        (OpenSSL.EvpCipherContext, Ptr{UInt8}, Ptr{Int32}, Ptr{UInt8}, Cint),
-        ctx, C_NULL, outlen, aad, length(aad))
-    ret == 1 || throw(CookieError("Cipher failed: could not bind the token's purpose"))
-    return nothing
+# ── AES-256-GCM over libcrypto (#867) ───────────────────────────────────────────
+#
+# The token cipher, owned here rather than taken from OpenSSL.jl's wrapper. Three reasons:
+# the wrapper's `EvpCipherContext` is freed by a finalizer, so the native context -- which holds
+# the AES key schedule derived from the cookie key -- lived until some later GC, one per token;
+# OpenSSL.jl's `__init__` was a `juliac --trim` row on every Julia version, for a package Nitro
+# used only for this; and the token path depended on the exact sizing behaviour of wrapper calls
+# that have changed under us before. What is here is the EVP sequence the wrapper ran, in order,
+# so a token sealed before opens after and the reverse (the golden vectors in
+# `test/cookies_tests.jl` hold both directions byte for byte).
+#
+# Every failing libcrypto return in the cipher below clears the thread's error queue before
+# throwing, as `_hmac_sha256!` does: the queue is per OS thread, and an entry left behind would
+# surface in an unrelated TLS call on the same thread. (A tag mismatch leaves none on OpenSSL 3;
+# an init or update failure does.)
+
+const EVP_CTRL_GCM_GET_TAG = Cint(0x10)
+const EVP_CTRL_GCM_SET_TAG = Cint(0x11)
+const GCM_KEY_BYTES = 32
+const GCM_IV_BYTES = 12
+const GCM_TAG_BYTES = 16
+
+# Where a cipher context comes from and goes back to. The default is libcrypto's own pair; the
+# type parameter lets a test count the two calls (#867) without a hook or a global on the token
+# path, and keeps the call static for `juliac --trim`.
+struct LibcryptoCipherCtx end
+_ctx_new(::LibcryptoCipherCtx) = @ccall libcrypto.EVP_CIPHER_CTX_new()::Ptr{Cvoid}
+# `EVP_CIPHER_CTX_free` resets the context first, which cleanses the key schedule.
+_ctx_free(::LibcryptoCipherCtx, ctx::Ptr{Cvoid}) = @ccall libcrypto.EVP_CIPHER_CTX_free(ctx::Ptr{Cvoid})::Cvoid
+
+function _libcrypto_failure(msg::String)
+    @ccall libcrypto.ERR_clear_error()::Cvoid
+    return CookieError(msg)
+end
+
+# Run `f(ctx)` on a fresh cipher context and free it when `f` returns or throws -- whatever it
+# throws, an `is_unrecoverable` error included. Never a finalizer: the context carries key
+# material, and its lifetime is this call.
+function _with_cipher_ctx(f::F, alloc::A = LibcryptoCipherCtx()) where {F, A}
+    ctx = _ctx_new(alloc)
+    ctx == C_NULL && throw(_libcrypto_failure("Cipher failed: could not allocate a context"))
+    try
+        return f(ctx)
+    finally
+        _ctx_free(alloc, ctx)
+    end
 end
 
 # `EVP_aes_256_gcm()` returns libcrypto's static table directly; `EVP_get_cipherbyname` looked the
-# same table up by name, through a read-locked name map, on every token (#545).
-_gcm_cipher() = OpenSSL.EvpCipher(@ccall libcrypto.EVP_aes_256_gcm()::Ptr{Cvoid})
+# same table up by name, through a read-locked name map, on every token (#545). The default iv
+# length of GCM is 12 bytes, the token's, so no `EVP_CTRL_GCM_SET_IVLEN` is needed.
+function _gcm_init!(ctx::Ptr{Cvoid}, key::Ptr{UInt8}, iv::Ptr{UInt8}, encrypt::Bool, failure::String)
+    cipher = @ccall libcrypto.EVP_aes_256_gcm()::Ptr{Cvoid}
+    ret = if encrypt
+        @ccall libcrypto.EVP_EncryptInit_ex(ctx::Ptr{Cvoid}, cipher::Ptr{Cvoid}, C_NULL::Ptr{Cvoid},
+                                            key::Ptr{UInt8}, iv::Ptr{UInt8})::Cint
+    else
+        @ccall libcrypto.EVP_DecryptInit_ex(ctx::Ptr{Cvoid}, cipher::Ptr{Cvoid}, C_NULL::Ptr{Cvoid},
+                                            key::Ptr{UInt8}, iv::Ptr{UInt8})::Cint
+    end
+    ret == 1 || throw(_libcrypto_failure(failure))
+    return nothing
+end
+
+# One `EVP_CipherUpdate` of `n` bytes from `input` to `output`, which returns how many bytes it
+# wrote. A NULL `output` feeds associated data. GCM is a stream mode: an update writes exactly
+# what it reads, so the caller sizes `output` to the input and checks the count.
+function _gcm_update!(ctx::Ptr{Cvoid}, output::Ptr{UInt8}, input::Ptr{UInt8}, n::Int, failure::String)
+    n <= typemax(Cint) || throw(_libcrypto_failure(failure))
+    written = Ref{Cint}(0)
+    ret = @ccall libcrypto.EVP_CipherUpdate(ctx::Ptr{Cvoid}, output::Ptr{UInt8}, written::Ref{Cint},
+                                            input::Ptr{UInt8}, n::Cint)::Cint
+    ret == 1 || throw(_libcrypto_failure(failure))
+    return Int(written[])
+end
+
+function _gcm_tag!(ctx::Ptr{Cvoid}, op::Cint, tag::Ptr{UInt8}, failure::String)
+    ret = @ccall libcrypto.EVP_CIPHER_CTX_ctrl(ctx::Ptr{Cvoid}, op::Cint, GCM_TAG_BYTES::Cint,
+                                               tag::Ptr{UInt8})::Cint
+    ret == 1 || throw(_libcrypto_failure(failure))
+    return nothing
+end
+
+# `EVP_CipherFinal_ex`; for GCM it writes nothing, and on decryption it is the tag check. The
+# 16-byte scratch is what the wrapper passed; GCM leaves it untouched.
+function _gcm_final!(ctx::Ptr{Cvoid}, failure::String)
+    scratch = Ref{NTuple{16, UInt8}}()
+    written = Ref{Cint}(0)
+    ret = @ccall libcrypto.EVP_CipherFinal_ex(ctx::Ptr{Cvoid}, scratch::Ref{NTuple{16, UInt8}},
+                                              written::Ref{Cint})::Cint
+    (ret == 1 && written[] == 0) || throw(_libcrypto_failure(failure))
+    return nothing
+end
 
 """
     encrypt_payload(secret, payload; purpose, expires = nothing, now = Dates.now(UTC)) -> String
@@ -574,23 +651,56 @@ end
 # The token's bytes, `0x01 ‖ iv ‖ ciphertext ‖ tag`, for a given key and iv. Split from
 # `encrypt_payload` so the golden vectors in `test/cookies_tests.jl` can seal under a fixed iv
 # (#867); `encrypt_payload` is the only caller that mints a token.
+#
+# The token is written in place: the ciphertext straight into its slot, the tag into the last 16
+# bytes. `alloc` is the cipher context's source (`_with_cipher_ctx`).
 function _seal_token(key::Vector{UInt8}, iv::Vector{UInt8}, purpose::AbstractString,
-                     plaintext::Vector{UInt8})
-    ctx = OpenSSL.EvpCipherContext()
-    OpenSSL.encrypt_init(ctx, _gcm_cipher(), key, iv)
-    _gcm_aad!(ctx, _token_aad(purpose))
-    ciphertext = OpenSSL.cipher_update(ctx, plaintext)
-    final_part = OpenSSL.cipher_final(ctx)
+                     plaintext::Vector{UInt8}, alloc = LibcryptoCipherCtx())
+    length(key) == GCM_KEY_BYTES || throw(ArgumentError("an AES-256-GCM key is 32 bytes, got $(length(key))"))
+    length(iv) == GCM_IV_BYTES || throw(ArgumentError("a token iv is 12 bytes, got $(length(iv))"))
+    aad = _token_aad(purpose)
+    n = length(plaintext)
+    token = Vector{UInt8}(undef, 1 + GCM_IV_BYTES + n + GCM_TAG_BYTES)
+    token[1] = TOKEN_VERSION
+    copyto!(token, 2, iv, 1, GCM_IV_BYTES)
+    GC.@preserve key iv aad plaintext token _with_cipher_ctx(alloc) do ctx
+        _gcm_init!(ctx, pointer(key), pointer(iv), true, "Encryption failed")
+        _gcm_update!(ctx, Ptr{UInt8}(C_NULL), pointer(aad), length(aad),
+                     "Cipher failed: could not bind the token's purpose")
+        written = _gcm_update!(ctx, pointer(token, 2 + GCM_IV_BYTES), pointer(plaintext), n,
+                               "Encryption failed")
+        written == n || throw(_libcrypto_failure("Encryption failed"))
+        _gcm_final!(ctx, "Encryption failed")
+        # A silent failure here would emit an undefined tag and an unopenable token.
+        _gcm_tag!(ctx, EVP_CTRL_GCM_GET_TAG, pointer(token, length(token) - GCM_TAG_BYTES + 1),
+                  "Encryption failed: could not read authentication tag")
+    end
+    return token
+end
 
-    tag = Vector{UInt8}(undef, 16)
-    # EVP_CTRL_GCM_GET_TAG (0x10) returns 1 on success. A silent failure here
-    # would emit an all-undefined tag and produce undecryptable ciphertext.
-    ret = ccall((:EVP_CIPHER_CTX_ctrl, libcrypto), Cint,
-          (OpenSSL.EvpCipherContext, Cint, Cint, Ptr{UInt8}),
-          ctx, 0x10, 16, tag)
-    ret == 1 || throw(CookieError("Encryption failed: could not read authentication tag"))
-
-    return vcat(TOKEN_VERSION, iv, ciphertext, final_part, tag)
+# The payload bytes (`iat ‖ exp ‖ value`) of `data`, a whole decoded token whose length and
+# version the caller has checked. Throws a `CookieError` for every failure, the tag check above
+# all, which covers the purpose. Reads the iv, ciphertext and tag where they sit in `data`.
+function _open_token(key::Vector{UInt8}, data::Vector{UInt8}, purpose::AbstractString,
+                     alloc = LibcryptoCipherCtx())
+    length(key) == GCM_KEY_BYTES || throw(ArgumentError("an AES-256-GCM key is 32 bytes, got $(length(key))"))
+    length(data) >= MIN_TOKEN_BYTES || throw(CookieError("Payload too short"))
+    aad = _token_aad(purpose)
+    n = length(data) - 1 - GCM_IV_BYTES - GCM_TAG_BYTES
+    plaintext = Vector{UInt8}(undef, n)
+    GC.@preserve key data aad plaintext _with_cipher_ctx(alloc) do ctx
+        _gcm_init!(ctx, pointer(key), pointer(data, 2), false, "Decryption failed")
+        _gcm_update!(ctx, Ptr{UInt8}(C_NULL), pointer(aad), length(aad),
+                     "Cipher failed: could not bind the token's purpose")
+        written = _gcm_update!(ctx, pointer(plaintext), pointer(data, 2 + GCM_IV_BYTES), n,
+                               "Decryption failed")
+        written == n || throw(_libcrypto_failure("Decryption failed"))
+        # A failure here means the tag was refused outright; do not go on to the final check.
+        _gcm_tag!(ctx, EVP_CTRL_GCM_SET_TAG, pointer(data, length(data) - GCM_TAG_BYTES + 1),
+                  "Decryption failed: integrity check failed")
+        _gcm_final!(ctx, "Decryption failed: integrity check failed")
+    end
+    return plaintext
 end
 
 """
@@ -622,31 +732,8 @@ function decrypt_payload(secret, token::AbstractString; purpose::AbstractString,
     length(data) < MIN_TOKEN_BYTES && throw(CookieError("Payload too short"))
     data[1] == TOKEN_VERSION || throw(CookieError("Unsupported token version"))
 
-    iv = data[2:13]
-    tag = data[end-15:end]
-    ciphertext = data[14:end-16]
-
     plaintext = try
-        ctx = OpenSSL.EvpCipherContext()
-        OpenSSL.decrypt_init(ctx, _gcm_cipher(), key, iv)
-        _gcm_aad!(ctx, _token_aad(purpose))
-        opened = OpenSSL.cipher_update(ctx, ciphertext)
-
-        # EVP_CTRL_GCM_SET_TAG (0x11) returns 1 on success; a failure means the
-        # tag was rejected outright, so abort rather than continue to final.
-        set_tag = ccall((:EVP_CIPHER_CTX_ctrl, libcrypto), Cint,
-              (OpenSSL.EvpCipherContext, Cint, Cint, Ptr{UInt8}),
-              ctx, 0x11, 16, tag)
-        set_tag == 1 || throw(CookieError("Decryption failed: integrity check failed"))
-
-        final_res = Vector{UInt8}(undef, 16)
-        outlen = Ref{Cint}(0)
-        # EVP_DecryptFinal_ex returns 1 on success -- the tag check, which covers the purpose.
-        ret = ccall((:EVP_DecryptFinal_ex, libcrypto), Cint,
-                    (OpenSSL.EvpCipherContext, Ptr{UInt8}, Ptr{Cint}),
-                    ctx, final_res, outlen)
-        ret == 1 || throw(CookieError("Decryption failed: integrity check failed"))
-        vcat(opened, final_res[1:outlen[]])
+        _open_token(key, data, purpose)
     catch e
         (e isa CookieError || is_unrecoverable(e)) && rethrow()
         # Don't surface the underlying exception detail to callers (it can reach

@@ -5,7 +5,6 @@ using Nitro.Types
 using HTTP
 using Test
 using Dates
-using OpenSSL
 using SHA
 
 # Access Cookies module from Nitro to avoid ambiguity
@@ -1498,7 +1497,6 @@ using Nitro.Types: CookieConfig, LazyRequest, Param
 using HTTP
 using Test
 using Dates
-using OpenSSL
 using SHA
 using Base64
 const Cookies = Nitro.Cookies
@@ -1585,19 +1583,32 @@ end
     flipped = copy(bytes); flipped[end - 20] ⊻= 0x01
 
     # The pre-#309 format, built the way the old `encrypt_payload` built it: iv ‖ ct ‖ tag
-    # under sha256(secret), no version byte, no associated data.
-    legacy = let iv = Crypto.secure_random_bytes(12),
-                 cipher = OpenSSL.EvpCipher(ccall((:EVP_get_cipherbyname, OpenSSL.libcrypto),
-                                                  Ptr{Cvoid}, (Cstring,), "AES-256-GCM")),
-                 ctx = OpenSSL.EvpCipherContext()
-        OpenSSL.encrypt_init(ctx, cipher, SHA.sha256(key), iv)
-        ct = OpenSSL.cipher_update(ctx, Vector{UInt8}("value"))
-        fin = OpenSSL.cipher_final(ctx)
-        tag = Vector{UInt8}(undef, 16)
-        ccall((:EVP_CIPHER_CTX_ctrl, OpenSSL.libcrypto), Cint,
-              (OpenSSL.EvpCipherContext, Cint, Cint, Ptr{UInt8}), ctx, 0x10, 16, tag)
-        Crypto.base64url_encode(vcat(iv, ct, fin, tag))
+    # under sha256(secret), no version byte, no associated data. Straight libcrypto calls, so the
+    # construction does not go through the code under test (#867). The value is long enough, and
+    # the iv's first byte is the version byte, so the token gets past the length and version checks
+    # and is refused where it must be: by the tag.
+    legacy = let iv = (b = Crypto.secure_random_bytes(12); b[1] = Crypto.TOKEN_VERSION; b),
+                 plain = Vector{UInt8}("value" ^ 7), ct = Vector{UInt8}(undef, length(plain)),
+                 tag = Vector{UInt8}(undef, 16), scratch = Vector{UInt8}(undef, 16), n = Ref{Cint}(0),
+                 cipher = ccall((:EVP_get_cipherbyname, Crypto.libcrypto), Ptr{Cvoid}, (Cstring,), "AES-256-GCM"),
+                 ctx = ccall((:EVP_CIPHER_CTX_new, Crypto.libcrypto), Ptr{Cvoid}, ())
+        try
+            @test ccall((:EVP_EncryptInit_ex, Crypto.libcrypto), Cint, (Ptr{Cvoid}, Ptr{Cvoid}, Ptr{Cvoid}, Ptr{UInt8}, Ptr{UInt8}),
+                        ctx, cipher, C_NULL, SHA.sha256(key), iv) == 1
+            @test ccall((:EVP_EncryptUpdate, Crypto.libcrypto), Cint, (Ptr{Cvoid}, Ptr{UInt8}, Ref{Cint}, Ptr{UInt8}, Cint),
+                        ctx, ct, n, plain, length(plain)) == 1 && n[] == length(plain)
+            @test ccall((:EVP_EncryptFinal_ex, Crypto.libcrypto), Cint, (Ptr{Cvoid}, Ptr{UInt8}, Ref{Cint}),
+                        ctx, scratch, n) == 1 && n[] == 0
+            @test ccall((:EVP_CIPHER_CTX_ctrl, Crypto.libcrypto), Cint, (Ptr{Cvoid}, Cint, Cint, Ptr{UInt8}),
+                        ctx, 0x10, 16, tag) == 1
+        finally
+            ccall((:EVP_CIPHER_CTX_free, Crypto.libcrypto), Cvoid, (Ptr{Cvoid},), ctx)
+        end
+        Crypto.base64url_encode(vcat(iv, ct, tag))
     end
+    # It reaches the cipher, rather than being refused as too short.
+    legacy_err = try Crypto.decrypt_payload(key, legacy; purpose = "c"); nothing catch e; e end
+    @test legacy_err isa Nitro.CookieError && occursin("integrity check failed", legacy_err.msg)
 
     for (label, token) in ("other key" => token_of(Cookies.set_cookie!(HTTP.Response(200), "c", "value"; secret_key = other_key), "c"),
                            "version byte" => Crypto.base64url_encode(wrong_version),
@@ -1791,6 +1802,82 @@ end
                                                                    purpose, now = t0)
         end
     end
+end
+
+# The native cipher context holds the AES key schedule, so it is freed when the call that made it
+# returns or throws, never by a finalizer. A counting allocator over libcrypto's own pair sees
+# every `EVP_CIPHER_CTX_new` and `EVP_CIPHER_CTX_free`.
+mutable struct CountingCtx
+    news::Int
+    frees::Int
+end
+CountingCtx() = CountingCtx(0, 0)
+Crypto._ctx_new(c::CountingCtx) = (c.news += 1; Crypto._ctx_new(Crypto.LibcryptoCipherCtx()))
+Crypto._ctx_free(c::CountingCtx, ctx::Ptr{Cvoid}) = (c.frees += 1; Crypto._ctx_free(Crypto.LibcryptoCipherCtx(), ctx))
+mutable struct NullCtx
+    frees::Int
+end
+NullCtx() = NullCtx(0)
+Crypto._ctx_new(::NullCtx) = Ptr{Cvoid}(C_NULL)
+Crypto._ctx_free(c::NullCtx, ::Ptr{Cvoid}) = (c.frees += 1; nothing)
+
+@testset "the cipher context is freed on every path" begin
+    # Whatever the body throws -- a token failure, a bug, an interrupt -- it propagates unchanged
+    # and the context is freed exactly once.
+    for thrown in (Nitro.CookieError("x"), ErrorException("bug"), InterruptException())
+        alloc = CountingCtx()
+        caught = try
+            Crypto._with_cipher_ctx(ctx -> throw(thrown), alloc); nothing
+        catch e
+            e
+        end
+        @test caught === thrown
+        @test (alloc.news, alloc.frees) == (1, 1)
+    end
+
+    # A context libcrypto cannot allocate: a CookieError before the body runs, and nothing freed.
+    null_alloc = NullCtx()
+    ran = Ref(false)
+    @test_throws Nitro.CookieError Crypto._with_cipher_ctx(ctx -> (ran[] = true), null_alloc)
+    @test !ran[]
+    @test null_alloc.frees == 0
+
+    secret, purpose, payload, expires, seed, token = VECTORS[2]
+    key = Crypto._cookie_key(Nitro.SecretString(secret))
+    data = Crypto.base64url_decode(token)
+
+    # The real seal and open, through the same allocator: success...
+    alloc = CountingCtx()
+    @test Crypto.base64url_encode(Crypto._seal_token(key, iv_of(seed), purpose,
+                                                     plaintext_of(payload, expires), alloc)) == token
+    @test Crypto._open_token(key, data, purpose, alloc) == plaintext_of(payload, expires)
+    @test (alloc.news, alloc.frees) == (2, 2)
+
+    # ...and the failures an attacker can trigger, which throw from inside the context's lifetime.
+    flipped = copy(data); flipped[end] ⊻= 0x01
+    for (bad_data, bad_purpose) in ((flipped, purpose), (data, "auth_token"))
+        alloc = CountingCtx()
+        @test_throws Nitro.CookieError Crypto._open_token(key, bad_data, bad_purpose, alloc)
+        @test (alloc.news, alloc.frees) == (1, 1)
+    end
+    other_key = Crypto._cookie_key(Nitro.SecretString(secret_b))
+    alloc = CountingCtx()
+    @test_throws Nitro.CookieError Crypto._open_token(other_key, data, purpose, alloc)
+    @test (alloc.news, alloc.frees) == (1, 1)
+end
+
+@testset "the token cipher is Nitro's own, over OpenSSL_jll" begin
+    source = read(joinpath(pkgdir(Nitro), "src", "crypto.jl"), String)
+    # No OpenSSL.jl: no import, and no `OpenSSL.<name>` (its wrapper types and functions; the
+    # prose "OpenSSL.jl" is not a reference). Booleans, so a failure does not print the file.
+    imports_openssl = occursin(r"^\s*(using|import)\s+OpenSSL\b(?!_jll)"m, source)
+    names_openssl = occursin(r"\bOpenSSL\.(?!jl\b)\w", source)
+    @test !imports_openssl
+    @test !names_openssl
+    # No finalizer anywhere in the module: every native context is freed by its caller.
+    has_finalizer = occursin("finalizer(", source)
+    @test !has_finalizer
+    @test nameof(which(Crypto, :libcrypto)) === :OpenSSL_jll
 end
 end
 
