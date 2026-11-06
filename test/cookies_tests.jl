@@ -2296,7 +2296,9 @@ end
                  keyed = allocs(() -> Crypto.decrypt_payload(k, t; purpose = "auth_token", now = at)),
                  per_call = allocs(() -> Crypto.decrypt_payload(s, t; purpose = "auth_token", now = at)),
                  read = allocs(() -> Cookies.get_cookie(req, "auth_token"; encrypted = true, config = cfg))
-        @test derive.count <= 12
+        # 11 measured (#837: each of the derivation's two HMACs allocates a 64-byte pad), plus the
+        # same 3 of headroom the bound had at 9.
+        @test derive.count <= 14
         @test keyed.count <= 32
         @test read.count <= 35
         @test per_call.count >= keyed.count + 5

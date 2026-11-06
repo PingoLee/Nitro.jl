@@ -679,6 +679,70 @@ end
     end
 end
 
+@testset "iss and aud checks: what they accept, and their cost (#837)" begin
+    # `validate_claims` takes a String / Vector{Any}-of-String `iss`/`aud` without a dynamic call
+    # or an allocation, and hands every other shape to the original expression. These rows pin
+    # what that expression accepts -- each is the answer it gave before the fast path existed --
+    # so the fast path cannot change it.
+    accepts(claims; kw...) = try
+        Nitro.Auth.validate_claims(Dict{String, Any}(claims...); kw...)
+        true
+    catch err
+        err isa Nitro.Auth.AuthError || rethrow()
+        false
+    end
+    base = ["exp" => NOW_TS + 60]
+    aud_rows = [
+        # (claim aud,                 audience,                     accepted)
+        ("api",                       "api",                        true),
+        ("api",                       "web",                        false),
+        ("api",                       SubString("xapix", 2, 4),     true),
+        (Any["web", "api"],           "api",                        true),
+        (Any["web", "admin"],         "api",                        false),
+        (Any[],                       "api",                        false),
+        (Any["web", 7],               "7",                          true),   # non-string item: its `string`
+        (Any["web", 7],               "api",                        false),
+        (Any[7, "api"],               "api",                        true),
+        (7,                           "7",                          true),   # scalar non-string claim
+        (nothing,                     "api",                        false),
+        ("api",                       ["web", "api"],               true),   # several expected
+        (Any["x", "api"],             ("web", "api"),               true),
+        ("api",                       Set(["api"]),                 true),
+        ("api",                       String[],                     false),  # nothing expected: refused
+    ]
+    for (claim, audience, accepted) in aud_rows
+        claims = claim === nothing ? base : [base; "aud" => claim]
+        @test (claim, audience, accepts(claims; audience)) == (claim, audience, accepted)
+    end
+    # A missing `aud` claim is refused like any other mismatch.
+    @test !accepts(base; audience = "api")
+
+    iss_rows = [
+        ("https://issuer.example", "https://issuer.example",                 true),
+        ("https://issuer.example", "https://other.example",                  false),
+        ("https://issuer.example", SubString("xhttps://issuer.examplex", 2, 23), true),
+        (7,                        "7",                                      false),  # `==`, not `string`
+        (7,                        7,                                        true),
+        (nothing,                  "https://issuer.example",                 false),
+    ]
+    for (claim, issuer, accepted) in iss_rows
+        claims = claim === nothing ? base : [base; "iss" => claim]
+        @test (claim, issuer, accepts(claims; issuer)) == (claim, issuer, accepted)
+    end
+
+    # The cost: a decoded service token's claims, checked against a String issuer and audience,
+    # and against an audience list in the token. No allocation at all; before #837 the two checks
+    # were all 6 of `validate_claims`' allocations.
+    service = Dict{String, Any}("iss" => "https://issuer.example", "aud" => "api", "sub" => "svc",
+                                "exp" => NOW_TS + 60, "iat" => NOW_TS)
+    listed = merge(service, Dict{String, Any}("aud" => Any["web", "api"]))
+    check(claims) = Nitro.Auth.validate_claims(claims; issuer = "https://issuer.example", audience = "api")
+    @testset let scalar = allocs(() -> check(service)), list = allocs(() -> check(listed))
+        @test scalar.count == 0
+        @test list.count == 0
+    end
+end
+
 # A `dicttype` whose constructor throws, in a parser handed to `_jwt_segment_json`: it runs inside
 # that function's `try`, which is
 # the only way left to reach that block with something other than an `ArgumentError` now that
