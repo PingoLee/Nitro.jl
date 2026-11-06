@@ -1,6 +1,7 @@
 module Crypto
 
 using OpenSSL
+using OpenSSL_jll: libcrypto
 using UUIDs
 using Dates
 using Dates: DateTime
@@ -24,7 +25,7 @@ function secure_random_bytes(n::Int)
     n >= 0 || throw(ArgumentError("n must be non-negative, got $n"))
     buf = Vector{UInt8}(undef, n)
     n == 0 && return buf
-    ret = ccall((:RAND_bytes, OpenSSL.libcrypto), Cint, (Ptr{UInt8}, Cint), buf, n)
+    ret = ccall((:RAND_bytes, libcrypto), Cint, (Ptr{UInt8}, Cint), buf, n)
     ret == 1 || throw(ErrorException("RAND_bytes failed to produce secure random data (code $ret)"))
     return buf
 end
@@ -224,13 +225,13 @@ _hmac_sha256(key::AbstractString, message::AbstractString) = _hmac_sha256(String
 function _hmac_sha256!(out::Vector{UInt8}, key::Ptr{UInt8}, keylen::Integer, message::Ptr{UInt8}, msglen::Integer)
     keylen <= typemax(Cint) || throw(ArgumentError("HMAC key too long"))
     length(out) >= 32 || throw(ArgumentError("HMAC-SHA256 output buffer must hold 32 bytes"))
-    md = @ccall OpenSSL.libcrypto.EVP_sha256()::Ptr{Cvoid}
-    ret = GC.@preserve out @ccall OpenSSL.libcrypto.HMAC(
+    md = @ccall libcrypto.EVP_sha256()::Ptr{Cvoid}
+    ret = GC.@preserve out @ccall libcrypto.HMAC(
         md::Ptr{Cvoid}, key::Ptr{UInt8}, keylen::Cint, message::Ptr{UInt8}, msglen::Csize_t,
         out::Ptr{UInt8}, C_NULL::Ptr{Cuint})::Ptr{UInt8}
     if ret == C_NULL
         # The error queue is per OS thread; leave nothing behind for an unrelated TLS call.
-        @ccall OpenSSL.libcrypto.ERR_clear_error()::Cvoid
+        @ccall libcrypto.ERR_clear_error()::Cvoid
         throw(ErrorException("libcrypto HMAC-SHA256 failed"))
     end
     return out
@@ -260,13 +261,13 @@ function _pbkdf2_hmac_sha256(password::AbstractString, salt::AbstractString, ite
     (sizeof(pass) <= typemax(Cint) && sizeof(saltstr) <= typemax(Cint)) ||
         throw(ArgumentError("PBKDF2 password or salt too long"))
     out = Vector{UInt8}(undef, key_length)
-    md = @ccall OpenSSL.libcrypto.EVP_sha256()::Ptr{Cvoid}
-    ret = @ccall gc_safe = true OpenSSL.libcrypto.PKCS5_PBKDF2_HMAC(
+    md = @ccall libcrypto.EVP_sha256()::Ptr{Cvoid}
+    ret = @ccall gc_safe = true libcrypto.PKCS5_PBKDF2_HMAC(
         pass::Ptr{UInt8}, sizeof(pass)::Cint, saltstr::Ptr{UInt8}, sizeof(saltstr)::Cint,
         iterations::Cint, md::Ptr{Cvoid}, key_length::Cint, out::Ptr{UInt8})::Cint
     if ret != 1
         # The error queue is per OS thread; leave nothing behind for an unrelated TLS call.
-        @ccall OpenSSL.libcrypto.ERR_clear_error()::Cvoid
+        @ccall libcrypto.ERR_clear_error()::Cvoid
         throw(ErrorException("PKCS5_PBKDF2_HMAC failed (code $ret)"))
     end
     return out
@@ -529,7 +530,7 @@ end
 # buffer, so it cannot express this; the argument types mirror its own `ccall`.
 function _gcm_aad!(ctx::OpenSSL.EvpCipherContext, aad::Vector{UInt8})
     outlen = Ref{Int32}(0)
-    ret = GC.@preserve aad outlen ccall((:EVP_CipherUpdate, OpenSSL.libcrypto), Cint,
+    ret = GC.@preserve aad outlen ccall((:EVP_CipherUpdate, libcrypto), Cint,
         (OpenSSL.EvpCipherContext, Ptr{UInt8}, Ptr{Int32}, Ptr{UInt8}, Cint),
         ctx, C_NULL, outlen, aad, length(aad))
     ret == 1 || throw(CookieError("Cipher failed: could not bind the token's purpose"))
@@ -538,7 +539,7 @@ end
 
 # `EVP_aes_256_gcm()` returns libcrypto's static table directly; `EVP_get_cipherbyname` looked the
 # same table up by name, through a read-locked name map, on every token (#545).
-_gcm_cipher() = OpenSSL.EvpCipher(@ccall OpenSSL.libcrypto.EVP_aes_256_gcm()::Ptr{Cvoid})
+_gcm_cipher() = OpenSSL.EvpCipher(@ccall libcrypto.EVP_aes_256_gcm()::Ptr{Cvoid})
 
 """
     encrypt_payload(secret, payload; purpose, expires = nothing, now = Dates.now(UTC)) -> String
@@ -584,7 +585,7 @@ function _seal_token(key::Vector{UInt8}, iv::Vector{UInt8}, purpose::AbstractStr
     tag = Vector{UInt8}(undef, 16)
     # EVP_CTRL_GCM_GET_TAG (0x10) returns 1 on success. A silent failure here
     # would emit an all-undefined tag and produce undecryptable ciphertext.
-    ret = ccall((:EVP_CIPHER_CTX_ctrl, OpenSSL.libcrypto), Cint,
+    ret = ccall((:EVP_CIPHER_CTX_ctrl, libcrypto), Cint,
           (OpenSSL.EvpCipherContext, Cint, Cint, Ptr{UInt8}),
           ctx, 0x10, 16, tag)
     ret == 1 || throw(CookieError("Encryption failed: could not read authentication tag"))
@@ -633,7 +634,7 @@ function decrypt_payload(secret, token::AbstractString; purpose::AbstractString,
 
         # EVP_CTRL_GCM_SET_TAG (0x11) returns 1 on success; a failure means the
         # tag was rejected outright, so abort rather than continue to final.
-        set_tag = ccall((:EVP_CIPHER_CTX_ctrl, OpenSSL.libcrypto), Cint,
+        set_tag = ccall((:EVP_CIPHER_CTX_ctrl, libcrypto), Cint,
               (OpenSSL.EvpCipherContext, Cint, Cint, Ptr{UInt8}),
               ctx, 0x11, 16, tag)
         set_tag == 1 || throw(CookieError("Decryption failed: integrity check failed"))
@@ -641,7 +642,7 @@ function decrypt_payload(secret, token::AbstractString; purpose::AbstractString,
         final_res = Vector{UInt8}(undef, 16)
         outlen = Ref{Cint}(0)
         # EVP_DecryptFinal_ex returns 1 on success -- the tag check, which covers the purpose.
-        ret = ccall((:EVP_DecryptFinal_ex, OpenSSL.libcrypto), Cint,
+        ret = ccall((:EVP_DecryptFinal_ex, libcrypto), Cint,
                     (OpenSSL.EvpCipherContext, Ptr{UInt8}, Ptr{Cint}),
                     ctx, final_res, outlen)
         ret == 1 || throw(CookieError("Decryption failed: integrity check failed"))
