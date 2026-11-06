@@ -12,7 +12,7 @@ using DataStructures: CircularDeque
 using ..Util
 using ..Util: BoundedLRU, _count_one, _locked
 using ..Errors: ValidationError, StoreInterfaceError, ValidatorFault, SessionStoreFault,
-    implements_contract_method, store_contract_error, is_unrecoverable, loggable
+    implements_contract_method, store_contract_error, is_unrecoverable, loggable, LoggedException
 using ..Crypto: SecretString, CookieKey, _cookie_secret
 
 export Server, Nullable, Context,
@@ -1329,6 +1329,7 @@ function startup(lf::LifecycleMiddleware)::Union{Nothing,InterruptException}
         # `loggable`, never the hook's exception (#651): the worker hook's boot sweep rethrows a
         # store's database error, whose `.cause` can quote a task row. Same in `shutdown` below.
         @error "Error in LifecycleMiddleware.on_startup: " exception=(loggable(error), catch_backtrace())
+        _trimmed_failure("LifecycleMiddleware.on_startup", error)  # a trimmed build drops the record (#846)
     end
     # NOT the hook's value. The docstring has always said it is discarded, but this frame used to
     # return it anyway — `_janitor`'s `on_startup` hands back a `Task`, which leaked through here
@@ -1361,6 +1362,7 @@ function shutdown(lf::LifecycleMiddleware)::Union{Nothing,InterruptException}
     catch error
         error isa InterruptException && return _report_interrupt(error, "on_shutdown")
         @error "Error in LifecycleMiddleware.on_shutdown: " exception=(loggable(error), catch_backtrace())
+        _trimmed_failure("LifecycleMiddleware.on_shutdown", error)  # a trimmed build drops the record (#846)
     end
     return nothing  # not the hook's value — see `startup`
 end
@@ -1383,6 +1385,7 @@ function stopped(lf::LifecycleMiddleware)::Union{Nothing,InterruptException}
     catch error
         error isa InterruptException && return _report_interrupt(error, "on_stopped")
         @error "Error in LifecycleMiddleware.on_stopped: " exception=(loggable(error), catch_backtrace())
+        _trimmed_failure("LifecycleMiddleware.on_stopped", error)  # a trimmed build drops the record (#846)
     end
     return nothing  # not the hook's value — see `startup`
 end

@@ -1995,6 +1995,8 @@ function pormg_nitro_pools(; keys::AbstractVector{<:AbstractString}, drain_secon
             catch e
                 e isa InterruptException && rethrow()
                 @error "pormg_nitro_pools: could not close the pool" key exception=(loggable(e), catch_backtrace())
+                # A trimmed build drops the record (#846); its line names `e`'s type and nothing else.
+                Nitro.Core.Types._trimmed_failure("pormg_nitro_pools: closing a pool", e)
             end
         end
         return nothing

@@ -45,6 +45,8 @@ const TRIMMED_SITES = Dict{Tuple{String, String}, Any}(
     ("src/routeendpoint.jl", "_with_unlisted_body") => :B,
     ("src/routerhof.jl", "register_route_lifecycle!") => :B,
     ("src/routerhof.jl", "register_serve_lifecycle!") => :B,
+    ("src/routeendpoint.jl", "_trimmed_note") => :B,
+    ("src/routeendpoint.jl", "_trimmed_failure") => :B,
 
     # ── Exempt ──────────────────────────────────────────────────────────────────────────────
     ("src/context.jl", "ServerHandle") => (:exempt,
@@ -85,12 +87,33 @@ const TRIMMED_SITE_COUNTS = Dict{Tuple{String, String}, Int}(
     ("src/core/lifecycle.jl", "serve") => 2,    # the Revise refusal, then the branch it folds away
 )
 
+# Where a trimmed build writes its own line because it drops the log record (#846): each call to
+# `_trimmed_failure` or `_trimmed_note` in `src/` and `ext/`, by file and function, with how many
+# that function holds. A trimmed executable prints no `@error` (docs/design/juliac-trim.md §3.16),
+# so a site that loses its call goes silent there, and nothing else would notice. A new call is
+# added here on purpose, with the site it reports.
+const TRIMMED_FAILURE_SITES = Dict{Tuple{Symbol, String, String}, Int}(
+    (:_trimmed_failure, "src/types.jl", "startup") => 1,                    # on_startup threw
+    (:_trimmed_failure, "src/types.jl", "shutdown") => 1,                   # on_shutdown threw
+    (:_trimmed_failure, "src/types.jl", "stopped") => 1,                    # on_stopped threw
+    (:_trimmed_failure, "ext/NitroPormGExt.jl", "pormg_nitro_pools") => 1,  # a pool's close threw
+    (:_trimmed_failure, "src/context.jl", "_shutdown_server") => 1,         # the graceful drain threw
+    (:_trimmed_note, "src/context.jl", "_shutdown_server") => 1,            # the drain timed out
+    (:_trimmed_failure, "src/context.jl", "_report") => 1,                  # the serve task had died
+    (:_trimmed_failure, "src/core/lifecycle.jl", "_close_deferring_interrupt") => 1,  # the force-close threw
+    (:_trimmed_note, "src/core/lifecycle.jl", "_close_deferring_interrupt") => 1,     # a second interrupt there
+    (:_trimmed_failure, "src/core/lifecycle.jl", "_drop_listener!") => 1,   # an abandoned listener's close threw
+    (:_trimmed_failure, "src/core/lifecycle.jl", "startserver") => 1,       # the blocking serve wait threw
+    (:_trimmed_note, "src/routeendpoint.jl", "_trimmed_failure") => 1,      # the helper itself
+)
+
 """
-    trimmed_sites(root) -> Vector{NamedTuple}
+    trimmed_sites(root; callee = :_trimmed) -> Vector{NamedTuple}
 
 Every call to `_trimmed()` (bare or qualified) in the `.jl` files under `root/src` and
-`root/ext`, as `(; file, func, line)`. `file` is relative to `root`, with `/`; `func` is the name of
-the function definition it sits in, as written (`"Base.isopen"`), or `"<toplevel>"`. The files are
+`root/ext`, or to `callee` when it is given (`TRIMMED_FAILURE_SITES` scans for the line helpers),
+as `(; file, func, line)`. `file` is relative to `root`, with `/`; `func` is the name of the
+function definition it sits in, as written (`"Base.isopen"`), or `"<toplevel>"`. The files are
 parsed, so a comment or a docstring never counts. Neither does a quoted expression: that is where
 `_trimmed()` is redefined, not where it is read. `line` is the last line marker before the call,
 which for a short-form definition spanning lines is the definition's first line.
@@ -99,7 +122,7 @@ What it cannot see, none of which `src/` does today: a site in code built from a
 (`Core.eval(M, quote … end)`, `@eval :(…)`), one a macro expands to, and `_trimmed` passed as a
 value rather than called.
 """
-function trimmed_sites(root::AbstractString)
+function trimmed_sites(root::AbstractString; callee::Symbol = :_trimmed)
     found = NamedTuple{(:file, :func, :line), Tuple{String, String, Int}}[]
     for dir in ("src", "ext")
         isdir(joinpath(root, dir)) || continue
@@ -108,15 +131,15 @@ function trimmed_sites(root::AbstractString)
             full = joinpath(path, name)
             file = replace(relpath(full, root), '\\' => '/')
             _walk_trimmed!(found, file, Meta.parseall(read(full, String); filename = file),
-                           "<toplevel>", Ref(0))
+                           "<toplevel>", Ref(0), callee)
         end
     end
     return found
 end
 
-_is_trimmed_ref(x) = x === :_trimmed ||
-    (x isa Expr && x.head === :. && length(x.args) == 2 && x.args[2] == QuoteNode(:_trimmed)) ||
-    (x isa GlobalRef && x.name === :_trimmed)
+_is_trimmed_ref(x, callee::Symbol = :_trimmed) = x === callee ||
+    (x isa Expr && x.head === :. && length(x.args) == 2 && x.args[2] == QuoteNode(callee)) ||
+    (x isa GlobalRef && x.name === callee)
 
 # The name a definition's signature gives, as written, or `nothing` when `ex` is not a call shape.
 function _signature_name(sig)
@@ -132,26 +155,26 @@ function _signature_name(sig)
     return string(f)
 end
 
-function _walk_trimmed!(found, file, ex, func, line::Ref{Int})
+function _walk_trimmed!(found, file, ex, func, line::Ref{Int}, callee::Symbol = :_trimmed)
     if ex isa LineNumberNode
         line[] = ex.line
         return
     end
     ex isa Expr || return
     ex.head === :quote && return
-    if ex.head === :call && _is_trimmed_ref(ex.args[1])
+    if ex.head === :call && _is_trimmed_ref(ex.args[1], callee)
         push!(found, (; file, func, line = line[]))
     end
     if ex.head in (:function, :(=)) && length(ex.args) == 2
         name = _signature_name(ex.args[1])
         if name !== nothing && (ex.head === :function || _is_call_signature(ex.args[1]))
             # The signature is not a use; only the body is walked, under the new name.
-            _walk_trimmed!(found, file, ex.args[2], name, line)
+            _walk_trimmed!(found, file, ex.args[2], name, line, callee)
             return
         end
     end
     for a in ex.args
-        _walk_trimmed!(found, file, a, func, line)
+        _walk_trimmed!(found, file, a, func, line, callee)
     end
 end
 

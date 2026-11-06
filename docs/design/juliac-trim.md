@@ -1482,6 +1482,76 @@ the golden vectors in `test/cookies_tests.jl`, and refuses a tampered one. After
 verifies with 0 errors on both versions and its executable passes all four checks. On `main` it
 passes them too, with the 3 rows above.
 
+### 3.16 Log records in a trimmed executable (#846)
+
+**A trimmed executable prints no log record, and no logger can change that.** When `--trim` is set,
+JuliaC's build script patches Base after the user code is loaded (`juliac-buildscript.jl`, which
+includes `juliac-trim-base.jl` only under `--trim`; JuliaC 0.3.12, and the same on JuliaC `main`).
+One patch makes `Base.CoreLogging.current_logger_for_env` return `nothing`. Every logging macro
+tests that value before it does anything else (`logging.jl`, Julia 1.13.2), so once it is inlined
+the whole record folds away: `@error` builds no message, evaluates no keyword and calls no logger.
+Under `with_logger(SimpleLogger(Core.stderr))` it prints nothing either. The same file stubs
+`reinit_stdio`, so `Base.stderr` is the build process's stream with a null handle, as `stdout` is
+(§3, the banner). A write to it would fail too, but the macro never gets that far. Calling a Base
+logger's `handle_message` directly misses as well (`ConsoleLogger` at `haskey`, the `SimpleLogger`
+constructor). **The verifier shows none of it**: it verifies the world from before the patches, and
+reports no row at an `@error` site.
+
+What reaches the terminal in a trimmed build is what is written to `Core.stdout` or `Core.stderr`
+directly, through calls the image compiled. Nitro's banner (`_with_stdout`) and an executable's
+start-up failure (`startup_failure_text`) already worked that way. A failure that was caught and
+logged was silent. The clearest case was the pools probe (`bench/juliac/pools/`, #813):
+- the extension's `on_stopped` misses at `close_pool!`, catches the miss and logs it;
+- stderr stays at 0 bytes, `terminate` returns normally, and the pool stays open.
+
+**What Nitro does about it.** A site that catches a failure and logs it also calls
+`_trimmed_failure(site, e)` (src/routeendpoint.jl) beside its `@error`, never instead of it. In a
+trimmed image that writes one line to `Core.stderr`:
+
+```
+Nitro: <site> failed: <the exception's type name>
+```
+
+Under the JIT `_trimmed()` folds the call away, and the record goes to the logger as before.
+`_trimmed_note(text)` is the same for a fixed line with no exception: the drain timeout, and a
+second interrupt during the force-close.
+
+- **The line carries the type name only** (#749, #750, #752). The exceptions these sites see
+  mostly come out of a hook or a store, whose messages can quote a value, so even an
+  `ArgumentError`'s message is left out. `_value_free` would have kept it. A
+  `TaskFailedException` is named by what failed the task: the serve task's failure reaches its
+  sites as one, and its own name would only repeat the site.
+- **The sites** are where a failure is otherwise silent and the process goes on as if nothing
+  happened:
+  - the three lifecycle phases (`startup`, `shutdown`, `stopped` in src/types.jl);
+  - `pormg_nitro_pools`' per-key close (ext/NitroPormGExt.jl);
+  - the graceful drain's unexpected failure, its timeout, and a serve task found dead at shutdown
+    (`_shutdown_server`, src/context.jl);
+  - the force-close after an interrupted drain and a second interrupt during it, an abandoned
+    listener's close, and the blocking serve wait's failure (src/core/lifecycle.jl). A blocking
+    serve whose accept loop dies writes two lines: the wait's, then the teardown's.
+
+  `TRIMMED_FAILURE_SITES` (test/.helpers/trimmed_sites.jl) pins them, and
+  `test/trimmed_branches_tests.jl` fails when a site loses its call.
+- **Still silent:** the per-request error boundary (`handlerequest`'s `ERROR:`, `_not_a_response`,
+  the two route refusals in src/core/pipeline.jl). Its line would be per request and needs a flood
+  guard, so it is #883's. So is `_lifecycle_call`'s `EndpointFailure`, a failure in Nitro's own
+  hook runner rather than in a hook. Third-party and app records are dropped regardless: getting
+  those back would need JuliaC to route its patched logging path to `Core.stderr`, or offer an
+  opt-out, and then #307's secret-safe `show` would have to govern every record in the process.
+
+Built 2026-11-06 with JuliaC 0.3.12, Julia 1.13.2, `--trim=unsafe-warn`, `JULIA_CPU_TARGET=native`,
+PormG at the pinned `5531c68c`, from `main` at `d5dde82b` and the change on top of it:
+
+| `PROJECT=bench/juliac/pools ENTRY=pools POOLS=1` | `main` | after |
+|---|--:|--:|
+| verifier | 136 | 136 |
+| stdout | #813's lines (`terminate ok`, `slots_after 0`, `close_pool_direct threw MethodError`) | identical |
+| stderr | 0 bytes | `Nitro: pormg_nitro_pools: closing a pool failed: MethodError` (61 bytes) |
+| `ENTRY=app` verifier | 6 | 6 |
+
+The line adds no verifier row.
+
 ## 4. The decision: `--trim=safe` is a target
 
 **The question was:** is `--trim=safe` a product target for Nitro, or a ratchet that only keeps

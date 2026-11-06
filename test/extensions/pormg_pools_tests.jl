@@ -122,3 +122,34 @@ finally
 end
 
 end
+
+# A trimmed executable prints no log record (docs/design/juliac-trim.md §3.16), so a pool whose
+# close throws would leave the process with no word of it. The hook writes one value-free line to
+# `Core.stderr` beside its `@error` (#846). Under the JIT that branch folds away, so a child redefines
+# `_trimmed()` to `true` and runs the hook: see test/.helpers/trimmed_pools_child.jl.
+@testitem "PormG pools: a close that throws writes one value-free line in a trimmed build (#846)" tags=[:extension, :pormg] begin
+
+using Test
+
+child = joinpath(dirname(@__DIR__), ".helpers", "trimmed_pools_child.jl")
+cmd = `$(Base.julia_cmd()) --code-coverage=none --project=$(Base.active_project()) --startup-file=no $child`
+out, err = IOBuffer(), IOBuffer()
+p = run(pipeline(ignorestatus(cmd); stdout = out, stderr = err))
+out, err = String(take!(out)), String(take!(err))
+lines = split(out, '\n'; keepempty = false)
+
+@test (p.exitcode, p.termsignal) == (0, 0) || (last(out, 2000), last(err, 2000))
+@test "DONE" in lines || last(out, 2000)
+# The line did not stop the loop: the key listed before the gone one was still closed.
+@test "CLOSED=true" in lines || out
+
+nitro = filter(startswith("Nitro: "), split(err, '\n'; keepempty = false))
+@test length(nitro) == 1 || err
+line = isempty(nitro) ? "" : only(nitro)
+# The type name and nothing after it: no key, no path, no message.
+@test occursin(r"^Nitro: pormg_nitro_pools: closing a pool failed: [A-Za-z_][A-Za-z0-9_]*$", line) || line
+@test !occursin("nitro_pools_846", err) || err
+dir = something(findfirst(startswith("DIR="), lines), 0)
+dir == 0 || @test !occursin(lines[dir][5:end], err) || err
+
+end

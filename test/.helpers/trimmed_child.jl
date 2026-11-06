@@ -375,6 +375,38 @@ case!(RE, "_with_unlisted_body", "a response body Nitro does not build",
 dynamic!(RE, "_with_unlisted_body", T._with_unlisted_body,
          typeof(SH._with_security_headers), HTTP.Response, Vector{Pair{String, String}})
 
+# The lines a trimmed build writes where a failure is logged (#846). The trimmed run answers the
+# line it wrote to `Core.stderr`, the JIT `nothing`. The line names the exception's type only, not
+# an `ArgumentError`'s message and not a field: both carry the sentinel here.
+case!(RE, "_trimmed_failure", "a hook's ArgumentError",
+      () -> T._trimmed_failure("a site", ArgumentError(SENTINEL)),
+      :fallback, "Nitro: a site failed: ArgumentError", nothing)
+case!(RE, "_trimmed_failure", "an exception with a secret field",
+      () -> T._trimmed_failure("a site", TrimSentinel(SENTINEL)),
+      :fallback, "Nitro: a site failed: TrimSentinel", nothing)
+case!(RE, "_trimmed_failure", "a failed task, named by what failed it",
+      () -> T._trimmed_failure("a site", TaskFailedException(
+          (t = Task(() -> throw(TrimSentinel(SENTINEL))); schedule(t); try wait(t) catch end; t))),
+      :fallback, "Nitro: a site failed: TrimSentinel", nothing)
+dynamic!(RE, "_trimmed_failure", T._trimmed_failure, String, Any)
+case!(RE, "_trimmed_note", "a fixed line", () -> T._trimmed_note("Nitro: a note"),
+      :fallback, "Nitro: a note", nothing)
+dynamic!(RE, "_trimmed_note", T._trimmed_note, String)
+
+# A throwing hook through each lifecycle phase, run once per phase of this child, its records sent
+# to a `NullLogger`. Only the trimmed run writes the hooks' lines; the parent counts them on stderr.
+throwing_lifecycle() = Nitro.Core.LifecycleMiddleware(middleware = h -> h,
+    on_startup = () -> throw(ArgumentError(SENTINEL)),
+    on_shutdown = () -> throw(ArgumentError(SENTINEL)),
+    on_stopped = () -> throw(ArgumentError(SENTINEL)))
+function failed_hooks()
+    lf = throwing_lifecycle()
+    Base.CoreLogging.with_logger(Base.CoreLogging.NullLogger()) do
+        T.startup(lf); T.shutdown(lf); T.stopped(lf)
+    end
+    return nothing
+end
+
 const RF = "src/routerhof.jl"
 sentinel_lifecycle() = Nitro.Core.LifecycleMiddleware(middleware = h -> h, on_startup = () -> SENTINEL)
 case!(RF, "register_route_lifecycle!", "route middleware with hooks, registered at run time",
@@ -437,10 +469,12 @@ end
 @assert T._trimmed() === false
 jit = [outcome(c[3]) for c in CASES]
 flip_before = Auth._validator_takes_request(one_arg, true)
+failed_hooks()
 
 Core.eval(T, :(_trimmed() = true))
 
 flip_after = Auth._validator_takes_request(one_arg, true)
+failed_hooks()
 println("FLIP=", T._trimmed() === true && flip_before === false && flip_after === true)
 
 for (i, (key, name, thunk, expect)) in enumerate(CASES)

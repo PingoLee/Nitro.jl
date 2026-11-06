@@ -911,8 +911,11 @@ function _close_deferring_interrupt(service, timeout::Real,
             if forced isa InterruptException
                 @warn "Nitro: a second interrupt during the force-close — the server handle may \
                        still be set and the listener may still be open. Check before re-serving."
+                Types._trimmed_note("Nitro: a second interrupt during the force-close; the listener " *
+                                    "may still be open")  # a trimmed build drops the record (#846)
             else
                 @error "Nitro: force-close after an interrupted drain failed" exception=(loggable(forced), catch_backtrace())
+                Types._trimmed_failure("force-close after an interrupted drain", forced)  # #846
             end
         end
         return something(interrupt, e)
@@ -1106,8 +1109,10 @@ function _drop_listener!(ctx::App, server::Server)
         # Never rethrown: the caller unwinds the hooks next, and whatever it carries is what
         # `serve` reports. Shutdown code never throws (concurrency §4); a second interrupt is
         # dropped here, like the shutdown paths' (#185).
-        e isa InterruptException ||
+        if !(e isa InterruptException)
             @error "Nitro: closing a listener whose start was abandoned failed" exception=(loggable(e), catch_backtrace())
+            Types._trimmed_failure("closing a listener whose start was abandoned", e)  # #846
+        end
     end
     handle = ctx.service.server[]
     !isnothing(handle) && handle.server === server && (ctx.service.server[] = nothing)
@@ -1214,7 +1219,10 @@ function startserver(ctx::App; host, port, show_banner=false, async=false, kwarg
             # This run's own server, whose type is concrete here, rather than through the handle.
             wait(server)
         catch error
-            !isa(error, InterruptException) && @error "ERROR: " exception=(loggable(error), catch_backtrace())
+            if !isa(error, InterruptException)
+                @error "ERROR: " exception=(loggable(error), catch_backtrace())
+                Types._trimmed_failure("the serve task", error)  # a trimmed build drops the record (#846)
+            end
         finally
             _with_stdout(out -> println(out))
             # Ctrl-C out of the blocking wait is THE documented way to stop a blocking `serve` —

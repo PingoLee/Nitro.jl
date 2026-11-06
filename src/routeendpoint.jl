@@ -46,9 +46,56 @@ is redefined to `true`, so
 inference folds [`RouteEndpoint`](@ref)'s branch either way and each build compiles one of its
 two calls. The JIT never sees the `ccall`; the verifier never sees the dynamic call. The startup
 banner reads it too (`_with_stdout`, `_stdout_color` in src/core/lifecycle.jl), for the two calls a
-trimmed build cannot make there.
+trimmed build cannot make there, and so do `_trimmed_note` and `_trimmed_failure`,
+the lines a trimmed build writes where a failure is logged (#846).
 """
 _trimmed() = false
+
+"""
+    _trimmed_note(text::String) -> Union{Nothing, String}
+
+In a trimmed image, write `text` as one line to `Core.stderr` and return it; elsewhere, return
+`nothing` and write nothing. `text` is a fixed line of Nitro's own: it carries no value.
+
+A trimmed executable prints no log record. Under `--trim`, JuliaC redefines
+`Base.CoreLogging.current_logger_for_env` to return `nothing` once the app is loaded, so every
+logging macro compiles to a no-op whatever logger is installed, and `Base.stderr` is the build
+process's stream, never initialized (docs/design/juliac-trim.md §3.16). What reaches the terminal
+there is what is written to `Core.stderr` directly. So a site that catches a failure and logs it
+calls this, or `_trimmed_failure`, **beside** its `@error` or `@warn`, never instead of it:
+under the JIT `_trimmed()` folds the call away and the record goes to the logger as before.
+"""
+function _trimmed_note(text::String)::Union{Nothing, String}
+    _trimmed() || return nothing
+    println(Core.stderr, text)
+    return text
+end
+
+"""
+    _trimmed_failure(site::String, e) -> Union{Nothing, String}
+
+In a trimmed image, write `Nitro: <site> failed: <type>` to `Core.stderr` and return it, where
+`<type>` is the name of `e`'s type and nothing else; elsewhere, return `nothing`. See
+`_trimmed_note` for why, and for where it is called.
+
+The line is value-free whatever `e` is (#749, #750, #752): it names the type only, never a field
+and never a message. Most of the failures it reports come out of a hook or a store, whose messages
+can quote a value; even an `ArgumentError`'s text is left out, which `_value_free` would keep.
+`site` is a fixed string at each caller.
+
+A `TaskFailedException` is named by what failed the task, one level down: the serve task's
+failure reaches its sites as one, and its own name would say only what the site already says. A
+`LoggedException` is named by the type it stands for.
+"""
+function _trimmed_failure(site::String, @nospecialize(e))::Union{Nothing, String}
+    _trimmed() || return nothing
+    return _trimmed_note(string("Nitro: ", site, " failed: ", _failure_type(e)))
+end
+
+function _failure_type(@nospecialize(e))::Symbol
+    e isa TaskFailedException && (e = e.task.exception)
+    return e isa LoggedException ? e.type : nameof(typeof(e))
+end
 
 # The two concrete requests `stream_handler` builds (src/core/transport.jl).
 const EmptyRequest = HTTP.Request{HTTP.EmptyBody}
