@@ -1511,9 +1511,12 @@ buy is a startup and deployment win:
     A process that runs requests through the pipeline and exits takes 1.5–2 ms less.
   - **It does not apply to `--trim=no`.** The archive's codegen is a stub, so an untrimmed
     image segfaults at start-up.
-  - **The served app's size, listen and RSS rows wait** until the trimmed app starts on Julia
-    1.14 and later. Two keyword calls verify on 1.13 but not there: `CookieConfig(; …)` in
-    `serve`, and the request constructor in `_http_stream_request`.
+  - **The served app's size, listen and RSS rows are not measured yet.** When #730 measured,
+    the trimmed app did not start on Julia 1.14 or later: `CookieConfig(; …)` in `serve` and the
+    request constructor in `_http_stream_request` verified on 1.13 but not there. #860 made both
+    static (§3.12, [#856](https://github.com/PingoLee/Nitro.jl/issues/856)), and the trimmed app
+    now starts on 1.14 and answers `GET /plaintext` with 200, so those rows can be taken with
+    `--static-runtime` on 1.14.
 
 The order:
 
