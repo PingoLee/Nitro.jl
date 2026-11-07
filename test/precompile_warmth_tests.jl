@@ -178,7 +178,8 @@ using Test
 # compiling the closure inferred `internalrequest` over the ABSTRACT `HTTP.Request`. The typed
 # pipeline (#572) made that inference walk every layer, 1.7 ms before and 75–140 ms after. The two
 # shapes were measuring their caller. The probe now captures through `let`, which the other
-# shapes' literals already amounted to. That caller cost is no longer measured here; it is #737.
+# shapes' literals already amounted to. That caller cost is no longer measured here, and since
+# #737 an abstract caller does not pay it: test/internalrequest_inference_tests.jl pins that.
 # `multipart` read 1.6–3.9x through all of it, under the general 8x. Julia 1.13.2, CI's flags:
 #
 #               warm (`let` capture)   abstract caller (#736)            cold (before #242)
@@ -246,8 +247,8 @@ using Test
 # A shape's ratio is `(shape_s - caller_s + baseline caller_s) / baseline_s`: its own request,
 # plus the thunk compile the baseline paid. Where the two thunk compiles are the same size,
 # which is nearly always, the ratio is the old sum's, so the limits keep their calibration. A thunk-compile step no longer reaches the ratio. A cold shape still does,
-# because its compiles are in the request half (`internalrequest` is inferred only as far as
-# `setupmiddleware(...)`, typed `::Function`; see the probe).
+# because its compiles are in the request half (a caller's inference stops at `internalrequest`'s
+# call into the pipeline, #737; see the probe).
 #
 # Dividing own time by own time was the other option, and it is wrong for this test.
 # Subtracting a constant from both sides inflates every ratio above 1. On the 306 shape
