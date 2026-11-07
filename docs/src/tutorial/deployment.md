@@ -792,5 +792,20 @@ Nitro: LifecycleMiddleware.on_stopped failed: ArgumentError
 
 These lines follow the build, not `Main._main`: an untrimmed executable keeps its log records and
 writes none of them. A failure your own code must report in a trimmed build has to be written to
-`Core.stderr` the same way. A request that fails is still answered with its `500`, but in a trimmed
-build the server side writes no line for it yet.
+`Core.stderr` the same way.
+
+A request that fails is still answered with its `500`, and in a trimmed build the server also
+writes a line for it (unless `serve(…; show_errors = false)`; a 400, 403, 415 or 503 writes none,
+as it writes no `@error`), but **once per exception type and route**, not once per request:
+otherwise a client that can make a route fail could fill the terminal. The line names the type and the route's
+registered pattern, in the router's `{id}` spelling, never the request's target, a header, the body
+or the exception's message:
+
+```
+Nitro: a request failed: KeyError on route /items/{id}
+```
+
+A route that later fails with another exception type gets a line of its own. After 256 distinct
+type and route pairs, the server writes one last line saying that further failures are not listed,
+and stays silent from then on. Treat a line as a reason to reproduce the failure under the JIT, where
+the full record, backtrace included, still goes to the logger.

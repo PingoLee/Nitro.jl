@@ -1533,12 +1533,11 @@ second interrupt during the force-close.
 
   `TRIMMED_FAILURE_SITES` (test/.helpers/trimmed_sites.jl) pins them, and
   `test/trimmed_branches_tests.jl` fails when a site loses its call.
-- **Still silent:** the per-request error boundary (`handlerequest`'s `ERROR:`, `_not_a_response`,
-  the two route refusals in src/core/pipeline.jl). Its line would be per request and needs a flood
-  guard, so it is #883's. So is `_lifecycle_call`'s `EndpointFailure`, a failure in Nitro's own
-  hook runner rather than in a hook. Third-party and app records are dropped regardless: getting
-  those back would need JuliaC to route its patched logging path to `Core.stderr`, or offer an
-  opt-out, and then #307's secret-safe `show` would have to govern every record in the process.
+- **The request path** writes through a memo instead, once per (type, route): see *The request
+  path's line* below (#883).
+- **Still silent:** third-party and app records, which are dropped regardless. Getting those back
+  would need JuliaC to route its patched logging path to `Core.stderr`, or offer an opt-out, and
+  then #307's secret-safe `show` would have to govern every record in the process.
 
 Built 2026-11-06 with JuliaC 0.3.12, Julia 1.13.2, `--trim=unsafe-warn`, `JULIA_CPU_TARGET=native`,
 PormG at the pinned `5531c68c`, from `main` at `d5dde82b` and the change on top of it:
@@ -1551,6 +1550,88 @@ PormG at the pinned `5531c68c`, from `main` at `d5dde82b` and the change on top 
 | `ENTRY=app` verifier | 6 | 6 |
 
 The line adds no verifier row.
+
+**The request path's line (#883).** The error boundary answers a failed request with its `500`, so
+the client sees the failure, but in a trimmed build the operator saw nothing. Its line is per
+request. One line for every failure would let a client that can make a route fail fill the
+terminal, the flood #18 removed from the `ValidationError` branch. So these sites write through
+`_request_failure_line` (src/routeendpoint.jl), a memo rather than a rate limit:
+
+- **Each (exception type, route pattern) pair is written once per process.** The pairs are kept in
+  one `Set{Tuple{Symbol,String}}` under a lock: the line is decided under the lock and written after
+  it. There is no clock and no timer task, nothing a trimmed image has to resolve at run time, and
+  nothing that runs while no request fails.
+- **The set holds at most 256 pairs.** The next new pair writes one final line instead,
+  `Nitro: further request-path failures are not listed (the line limit is reached)`, and nothing
+  is written after it.
+- **The line is** `Nitro: <site>: <type> on route <pattern>`, or `… with no route`. Each piece is a
+  literal, a type name (`_failure_type`: one level under a `TaskFailedException`, `.type` for a
+  `LoggedException`), or the route's registered pattern as the router stores it. That is the
+  `{id}` spelling: `path("/items/<int:id>")` is stored as `/items/{id}`, and the converter's name is
+  not recovered at the catch. The line **never** carries the request's target or method, a header,
+  the body, an exception's message, or a backtrace.
+
+| Site | The route at that point |
+|---|---|
+| `handlerequest`'s `ERROR:` (src/utilities/misc.jl), `Nitro: a request failed: …` | Through `Serializer`: a handler threw, so the router terminal has written `:route` (`leaf.path`). Through `ErrorBoundary`: a route middleware threw, so the pattern is in the `RouteResolution` stash `compose` wrote before the chain ran; or a global middleware threw before `compose`, so there is no route |
+| `_not_a_response` (src/routerhof.jl), `Nitro: a middleware returned a non-response: <the value's type>` | the same lookup (`_failure_route`): none on a 404/405 or before `compose` |
+| `_route_rerouted` (src/core/pipeline.jl), `refused a rerouted request: different_route_middleware` | `res.route`, the registered pattern whose chain ran, where the rewriting middleware is declared |
+| `_refuse_foreign_leaf` (src/core/pipeline.jl), `refused a route handler not registered through path(): unregistered_leaf` | the foreign leaf's stored path from `_gethandler`, never the target |
+
+`handlerequest` sits in `Util`, which is included before `Types`, so it calls the memo through a
+forward declaration (`_trimmed_request_failure`, as src/core.jl's accessor stubs work). It reaches
+the request through a `request` keyword, which `Serializer` and `ErrorBoundary` pass.
+
+**`_lifecycle_call`'s `EndpointFailure`.** In a trimmed build a hook is called through
+`_lifecycle_call`, which turns whatever escapes Nitro's own hook runner into an `EndpointFailure`,
+so that nothing unwinds through the foreign frame. Traced with the trimmed-branch child: the entry
+is built after the flip, so it carries its `@cfunction` shim, and the runner is replaced for one
+concrete middleware type. `_run_lifecycle` throws the error again, as itself. It leaves the
+broadcast, which skips the hooks after it, and then `_teardown!` or `_startup_hooks`, and so
+`terminate` or `serve`. Nothing on that way wrote a line. `_run_lifecycle` now writes
+`Nitro: the <phase> hook runner failed: <type>` before the rethrow: one line per entry and phase,
+a count the app's registrations bound, so no memo. An interrupt writes no line, as in
+`handlerequest`.
+
+#846's mechanism comment reported that `terminate` printed `ok` after such a miss inside
+`stopped`'s catch. That does not reproduce. The case was rebuilt as a trimmed executable that
+serves with two serve-owned hooks and calls `terminate` inside a `try`, the way the pools probe
+does. Its `stopped` catch refers to `Errors._value_free` where `Errors` is unbound, which is #846's
+miss.
+- `terminate` throws `UndefVarError`.
+- The second hook's `on_stopped` never runs.
+- stderr holds only the runner's line.
+
+`_teardown!` has not changed since #846's base (`0f72a4aa`), so why that scratch printed `ok` is
+not known. Whether one runner's failure should skip the rest of its phase is #892.
+
+Built 2026-11-07 with JuliaC 0.3.12, Julia 1.13.2, `--trim=unsafe-warn`, `JULIA_CPU_TARGET=native`,
+from `main` at `cccd14be` and the change on top of it:
+
+| | `main` | after |
+|---|--:|--:|
+| `ENTRY=app` verifier | 6 | 6 |
+| `ENTRY=probe` verifier | 15 | 15 |
+| probe output | 23 lines, stderr 0 bytes | identical |
+| `bench/juliac/smoke.sh` on the app | | serves `/plaintext` |
+
+A scratch app whose handlers throw was built from the change and served:
+- `/a` was requested five times with `ArgumentError`, then twice with `KeyError`;
+- `/b` was requested three times with `ArgumentError`;
+- one request missed with a 404.
+The sentinel was in the targets, in a header and in every exception's message. stderr held exactly
+three lines, none for the 404, and no sentinel:
+
+```
+Nitro: a request failed: ArgumentError on route /a
+Nitro: a request failed: KeyError on route /a
+Nitro: a request failed: ArgumentError on route /b
+```
+
+The lines add no verifier row. A handler that can only throw infers to `Union{}`, and a trimmed
+image then misses in the invoker before the handler runs: the verifier reports the unresolved call,
+and the line names `MethodError` instead of the handler's own exception. The scratch app's first
+build was written that way.
 
 ## 4. The decision: `--trim=safe` is a target
 
