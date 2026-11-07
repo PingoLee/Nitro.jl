@@ -100,6 +100,7 @@ const TEST_FILES = [
     "middleware_cache_race_tests.jl",
     "custommiddleware_tests.jl",
     "route_endpoint_tests.jl",
+    "internalrequest_inference_tests.jl",
     "response_type_tests.jl",
     "json_value_tests.jl",
     "appcontext_tests.jl",

@@ -21,6 +21,12 @@ end
 
 tagged(tag) = handler -> (req::HTTP.Request -> Res.send(tag * "|" * text(handler(req))))
 
+# A handler type and a middleware type of this item's own, for the #726 testset below.
+struct Issue726Handler <: Function end
+(::Issue726Handler)(req::HTTP.Request) = Res.send("726")
+struct Issue726Layer <: Function end
+(::Issue726Layer)(handler) = req -> handler(req)
+
 @testset "every leaf path() registers is an endpoint" begin
     app = App()
     urlpatterns(app, "",
@@ -53,6 +59,34 @@ end
     @test length(T.ENDPOINT_EXPORTS) == before
     @test e(HTTP.Request("GET", "/")) == "direct"
     @test RouteEndpoint(e) === e                    # never wrapped twice
+end
+
+@testset "registering a route infers nothing for its handler's type on the export path (#726)" begin
+    # The export a `--trim` build makes is gated on a run-time read, so inference walks it anyway.
+    # Specialized on the handler, every route inferred the lock, the `get!` and two `_export_thunk`s
+    # for its own type: ~50 ms a route under the JIT, which never runs them. A method instance
+    # whose signature names the handler's type is that inference having happened.
+    mentions(@nospecialize(t), H) =
+        t === H || (t isa DataType && any(p -> mentions(p, H), t.parameters))
+    named(f, H) = [mi for m in methods(f) for mi in Base.specializations(m)
+                   if mi isa Core.MethodInstance && mentions(mi.specTypes, H)]
+    # A handler type no other item has seen, behind route middleware so its chain registers too.
+    app = App()
+    urlpatterns(app, "", path("/726", Issue726Handler(); method = "GET", middleware = [tagged("m")]))
+    @test text(Nitro.Core.internalrequest(app, HTTP.Request("GET", "/726"))) == "m|726"
+    H = Issue726Handler
+    for f in (T._export_thunk, T._export_endpoint, T._endpoint_symbol, T.leaf_endpoint)
+        @test isempty(named(f, H))
+    end
+    @test isempty([mi for mi in named(RouteEndpoint, H) if length(mi.specTypes.parameters) == 2])
+    # A route's lifecycle middleware takes the same export path (`route_lifecycle_entry`).
+    lf = Nitro.Core.LifecycleMiddleware(middleware = Issue726Layer(), on_startup = () -> nothing)
+    urlpatterns(app, "", path("/726lf", Issue726Handler(); method = "GET", middleware = [lf]))
+    @test lf in [e.mw for e in app.service.route_lifecycle]
+    @test text(Nitro.Core.internalrequest(app, HTTP.Request("GET", "/726lf"))) == "726"
+    for f in (T._lifecycle_symbol, T._export_lifecycle_thunk)
+        @test isempty(named(f, Issue726Layer))
+    end
 end
 
 @testset "a matched request continues into its own pipeline's handler" begin
