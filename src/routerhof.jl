@@ -11,7 +11,8 @@ using ..Types: Nullable, LifecycleMiddleware, CopyOnWriteDict, snapshot,
                 RouteMiddleware, NO_ROUTE_MIDDLEWARE, DeclaredMethodHandler,
                 ChainCache, cached_chain, cache_chain!,
                 RouteEndpoint, RouteNext, RouteChainRecord, PipelineHandler, PipelineRoutes,
-                call_chain, LifecycleEntry, route_lifecycle_entry, serve_lifecycle_entry, _trimmed
+                call_chain, LifecycleEntry, route_lifecycle_entry, serve_lifecycle_entry, _trimmed,
+                _trimmed_request_failure
 
 export router, compose, genkey, process_middleware, HOFRouter, OuterRouter, InnerRouter
 
@@ -781,12 +782,16 @@ end
 
 # The record names the value's type and the route's declared pattern (`nothing` when no route
 # matched): never the value, which is the handler's own data, and never the request's method or
-# target, which the client chose (#613).
+# target, which the client chose (#613). A trimmed build drops the record, so it writes its own
+# line, once per (type, route) (#883): the value's type name, and the pattern `_failure_route`
+# reads (the router's `:route`, else the stash `compose` wrote before a route chain ran, else none:
+# a global layer before `compose`, or a request that missed every route).
 @noinline function _not_a_response(@nospecialize(value), req::HTTP.Request)::HTTP.Response
     _response_started(req) && return HTTP.Response(200)
     @error("A middleware returned a value that is not an HTTP.Response; answering 500. Every " *
            "middleware returns a response, and under `serialize = false` so does every handler.",
            type = typeof(value), route = get(req.context, :route, nothing))
+    _trimmed_request_failure("a middleware returned a non-response", value, req)
     return Res.json(("message" => "500: Internal Server Error"), status = 500)
 end
 

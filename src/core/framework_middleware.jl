@@ -333,7 +333,7 @@ end
 
 function (s::Types.Serializer)(req::HTTP.Request)
     s.enabled || return s.handle(req)
-    return handlerequest(s.catch_errors; show_errors = s.show_errors) do
+    return handlerequest(s.catch_errors; show_errors = s.show_errors, request = req) do
         _formatted_response(s.handle, req)
     end
 end
@@ -392,7 +392,7 @@ function ErrorBoundary(catch_errors::Bool; show_errors::Bool, enabled::Bool=true
                 return handle(req)
             catch e
                 e isa InterruptException && rethrow()
-                return handlerequest(rethrow, catch_errors; show_errors)
+                return handlerequest(rethrow, catch_errors; show_errors, request = req)
             end
         end
     end

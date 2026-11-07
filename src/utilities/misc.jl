@@ -69,7 +69,10 @@ function _error_response(@nospecialize(error))
     return handle_error(nothing)
 end
 
-function handlerequest(getresponse::Function, catch_errors::Bool; show_errors::Bool = true)
+# `request` is the request being answered, when the caller has one: it names the route in the line a
+# trimmed build writes for an `ERROR:` (#883). It is read only in that branch.
+function handlerequest(getresponse::Function, catch_errors::Bool; show_errors::Bool = true,
+                       request::Union{Nothing,HTTP.Request} = nothing)
     if !catch_errors
         return getresponse()
     else
@@ -144,6 +147,10 @@ function handlerequest(getresponse::Function, catch_errors::Bool; show_errors::B
                 # session store with `SessionStoreFault` (#612). Never "improve" this line by logging
                 # `current_exceptions()`, a cause chain, or the original exception.
                 @error "ERROR: " exception=(loggable(error), catch_backtrace())
+                # A trimmed build drops that record (#846), so it writes one value-free line of its
+                # own: the exception's type name and the route's registered pattern, once per pair
+                # in the process (#883). One line per request would let a client flood the terminal.
+                _trimmed_request_failure("a request failed", error, request)
             end
             return _error_response(error)
         end

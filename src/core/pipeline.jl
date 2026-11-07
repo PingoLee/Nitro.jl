@@ -155,6 +155,9 @@ function _route_rerouted(r::HTTP.Router, misses::Types.MissResponses, req::HTTP.
     (needs === nothing || needs === ran) && return _route_call(req, handler, route, params, fmt)
 
     @error "A group-, router- or route-level middleware rerouted the request to a route with different middleware; refusing it. Rewrite req.method/req.target in global middleware (serve(app; middleware = [...])) instead, so the route is chosen after the rewrite." from = "$(res.mw_method) $(res.route)" to = "$(mw_method) $(route)"
+    # A trimmed build drops the record (#883): one line per route, named by `res.route`, the
+    # registered pattern whose chain ran, which is where the rewriting middleware is declared.
+    Types._request_failure_line("refused a rerouted request", :different_route_middleware, res.route)
     return Res.json(("message" => "500: Internal Server Error"), status = 500)
 end
 
@@ -246,6 +249,9 @@ end
 # Out of line, so the log record and the response it builds stay out of every matched request's code.
 @noinline function _refuse_foreign_leaf(req::HTTP.Request, route::String)
     @error "Refusing a route handler that was not registered through Nitro. Declare routes with path() and urlpatterns()." route = route method = req.method
+    # A trimmed build drops the record (#883): one line per route. `route` is the leaf's stored
+    # path from `_gethandler` (`leaf.path`), never the request's target.
+    Types._request_failure_line("refused a route handler not registered through path()", :unregistered_leaf, route)
     return Res.json(("message" => "500: Internal Server Error"), status = 500)
 end
 

@@ -111,6 +111,11 @@ const TRIMMED_FAILURE_SITES = Dict{Tuple{Symbol, String, String}, Int}(
     # The request path's memo (#883): a pair's line, and the final line once the cap is reached.
     (:_trimmed_note, "src/routeendpoint.jl", "_request_failure_line") => 2,
     (:_request_failure_line, "src/routeendpoint.jl", "Util._trimmed_request_failure") => 1,
+    # The request path's error boundary (#883), each once per (type, route).
+    (:_trimmed_request_failure, "src/utilities/misc.jl", "handlerequest") => 1,          # an ERROR: (500)
+    (:_trimmed_request_failure, "src/routerhof.jl", "_not_a_response") => 1,            # a non-response
+    (:_request_failure_line, "src/core/pipeline.jl", "_route_rerouted") => 1,           # a refused reroute
+    (:_request_failure_line, "src/core/pipeline.jl", "_refuse_foreign_leaf") => 1,      # a foreign leaf
 )
 
 """

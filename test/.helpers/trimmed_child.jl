@@ -437,6 +437,37 @@ function request_failures()
     return nothing
 end
 
+# The four sites of the error boundary (#883), each driven directly with a pair of its own. None of
+# them reaches a route's endpoint, so nothing `ccall`s a thunk this process never exported. Their
+# `@error` records go to a `NullLogger`; the trimmed run's lines are counted by the parent.
+function rerouted_refusal()
+    r = T.nitro_router()
+    HTTP.register!(r, "GET", "/site/new", identity)
+    source = T.CopyOnWriteDict{T.RouteMiddleware}()
+    T.publish!(source, RH.genkey("GET", "/site/new"), (Function[identity], nothing))
+    res = T.RouteResolution(r, "GET", "/site/old", identity, "/site/old", Dict{String,String}(),
+                            "GET", Dict{String,T.RouteMiddleware}(), source)
+    req = HTTP.Request("GET", "/site/new?q=" * SENTINEL)
+    return Nitro.Core._route_rerouted(r, T.MissResponses(HTTP.Response(404), HTTP.Response(405)), req, res)
+end
+function boundary_sites()
+    statuses = Int[]
+    Base.CoreLogging.with_logger(Base.CoreLogging.NullLogger()) do
+        for _ in 1:3
+            # handlerequest's `ERROR:`: a handler threw on a matched route, and a request with none.
+            push!(statuses, U.handlerequest(() -> throw(TrimSentinel(SENTINEL)), true;
+                                            request = memo_request("/site/handler")).status)
+            push!(statuses, U.handlerequest(() -> throw(TrimSentinel(SENTINEL)), true;
+                                            request = memo_request(nothing)).status)
+            push!(statuses, RH._not_a_response(TrimBody(SENTINEL), memo_request("/site/value")).status)
+            push!(statuses, Nitro.Core._refuse_foreign_leaf(memo_request(nothing), "/site/foreign").status)
+            push!(statuses, rerouted_refusal().status)
+        end
+    end
+    println("SITES_500=", all(==(500), statuses))
+    return nothing
+end
+
 # After the flip, last of all the request-path lines: fill the set to its cap, then check that the
 # next new pair writes the final line once and that nothing is written after it.
 function past_the_cap()
@@ -536,12 +567,14 @@ jit = [outcome(c[3]) for c in CASES]
 flip_before = Auth._validator_takes_request(one_arg, true)
 failed_hooks()
 request_failures()
+boundary_sites()
 
 Core.eval(T, :(_trimmed() = true))
 
 flip_after = Auth._validator_takes_request(one_arg, true)
 failed_hooks()
 request_failures()
+boundary_sites()
 println("FLIP=", T._trimmed() === true && flip_before === false && flip_after === true)
 
 for (i, (key, name, thunk, expect)) in enumerate(CASES)

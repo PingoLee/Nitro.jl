@@ -69,6 +69,20 @@ end
     @test "RESET=true" in lines || out
 end
 
+# The four sites of the error boundary (#883), each run three times before the flip and three
+# after: one line per pair, by the trimmed run only, and every site still answers its 500.
+@testset "the error boundary's sites each write their line once (#883)" begin
+    errlines = split(err, '\n'; keepempty = false)
+    for want in ("Nitro: a request failed: TrimSentinel on route /site/handler",
+                 "Nitro: a request failed: TrimSentinel with no route",
+                 "Nitro: a middleware returned a non-response: TrimBody on route /site/value",
+                 "Nitro: refused a route handler not registered through path(): unregistered_leaf on route /site/foreign",
+                 "Nitro: refused a rerouted request: different_route_middleware on route /site/old")
+        @test count(==(want), errlines) == 1 || last(err, 2000)
+    end
+    @test "SITES_500=true" in lines || out
+end
+
 @testset "no check failed, and every listed site has its checks" begin
     for line in lines
         startswith(line, "FAIL ") || startswith(line, "NOCHECK ") || continue
@@ -197,4 +211,43 @@ end
               "silent there; restore the call, or remove the entry on purpose"
     end
 end
+end
+
+@testitem "juliac: the route a request failure is named by, through a real pipeline (#883)" tags=[:core] setup=[NitroCommon] begin
+using Test
+using HTTP
+using Nitro
+import Nitro: App, path
+
+# The trimmed child drives the boundary sites with a hand-set `:route` or a hand-built stash, since
+# it cannot run a request with `_trimmed()` true. This pins, under the JIT, that a real pipeline
+# writes what `_failure_route` reads at each position the error boundary can be reached from: the
+# registered pattern (the router's `{id}` spelling), never the target, and nothing before `compose`
+# or on a miss.
+const T = Nitro.Core.Types
+seen = Dict{String, Any}()
+record(key) = handle -> function (req::HTTP.Request)
+    seen[key * " before"] = T._failure_route(req)
+    res = handle(req)
+    seen[key * " after"] = T._failure_route(req)
+    return res
+end
+item(req::HTTP.Request, id::Int) = (seen["handler"] = T._failure_route(req); Res.send("ok"))
+
+app = App()
+urlpatterns(app, "", path("/items/<int:id>", item; middleware = [record("route")]))
+
+r = internalrequest(app, HTTP.Request("GET", "/items/7?q=S3NT1NEL"); middleware = [record("global")])
+@test r.status == 200
+@test seen["handler"] == "/items/{id}"          # the terminal's `:route`, as a handler failure sees it
+@test seen["route before"] == "/items/{id}"     # the stash, before the terminal ran
+@test seen["route after"] == "/items/{id}"
+@test seen["global before"] === nothing         # a global layer, before `compose`
+@test seen["global after"] == "/items/{id}"
+
+empty!(seen)
+r = internalrequest(app, HTTP.Request("GET", "/S3NT1NEL"); middleware = [record("global")])
+@test r.status == 404
+@test seen["global before"] === nothing
+@test seen["global after"] === nothing          # a miss: no route, and never the target
 end
