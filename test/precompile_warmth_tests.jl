@@ -187,9 +187,14 @@ using Test
 #
 # CI has no warm `multipart` reading yet. `formdata`, the same ~0.015 s request, reads 0.24–0.52x
 # there, so 1.2 is ~2.3x above that proxy and ~1.57x below the lowest CI #736 reading (1.35x below
-# the local one). The false-pass margin is thinner than the 1.53x above because of the
-# denominator: #735 moved `dict_int` from 0.034 s to 0.065 s on a local trace, so every ratio
-# reads low until it is faster again. `files_ext` shares the path and keeps its 3.5. What 1.2
+# the local one). Those margins were read while #735 had moved `dict_int` from 0.034 s to
+# 0.065 s on a local trace, so every ratio read low. Re-measured for #740 (2026-11-06, Julia
+# 1.13.2, CI's flags, five fresh processes), `dict_int` reads 0.025 s locally, below its pre-#735
+# value, with `FormattedLeaf` still on every route: dropping it under the JIT saved only 1.5 ms
+# and cost 2-7% per warm request, so it stayed. A faster denominator reads every ratio higher, so
+# the margins above are optimistic on the flake side until CI's `warmth:` lines re-read them (a
+# local suite run the same day: `multipart` 0.52x, `formdata` 0.52x, against `dict_int` 0.045 s
+# at the default `-O2`). `files_ext` shares the path and keeps its 3.5. What 1.2
 # catches is the multipart path losing ~60 ms or more of its precompile coverage, or the probe
 # going back to an untyped capture.
 #
