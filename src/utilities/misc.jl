@@ -14,6 +14,12 @@ export recursive_merge, parseparam, parsebody, parseparam_checked,
 
 ### Request helper functions ###
 
+# The line a trimmed build writes for `handlerequest`'s `ERROR:` branch, once per (type, route)
+# (#883). Declared here and defined in src/routeendpoint.jl, beside `_trimmed_failure`: its body
+# reads `_trimmed()`, which lives in `Types`, and `Types` is included after this module. A forward
+# declaration, as src/core.jl's accessor stubs are.
+function _trimmed_request_failure end
+
 
 function handle_error(::ValidationError)
     return Res.json(("message" => "400: Bad Request"), status = 400)

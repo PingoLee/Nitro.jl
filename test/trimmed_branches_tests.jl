@@ -40,9 +40,33 @@ lines = split(out, '\n'; keepempty = false)
         @test count(==(want), errlines) == 1 || last(err, 2000)
     end
     for line in errlines
-        startswith(line, "Nitro: ") && occursin(" failed: ", line) || continue
+        startswith(line, "Nitro: ") || continue
         @test !occursin("S3NT1NEL", line) || line
     end
+end
+
+# The request path's line (#883). The child runs the same failures before and after the flip:
+# five on one route, one on a second route, and a second type on the first route twice. Each pair
+# is written exactly once, and only by the trimmed run. It names the route's pattern; the target,
+# which carries the sentinel, never appears (checked above, for every `Nitro: ` line).
+@testset "a request failure writes one line per (type, route), and only when trimmed (#883)" begin
+    errlines = split(err, '\n'; keepempty = false)
+    for want in ("Nitro: a request failed: ArgumentError on route /memo/a",
+                 "Nitro: a request failed: ArgumentError on route /memo/b",
+                 "Nitro: a request failed: TrimSentinel on route /memo/a")
+        @test count(==(want), errlines) == 1 || last(err, 2000)
+    end
+    # Past the cap: the final line once, and no request-path line after it.
+    final = "Nitro: further request-path failures are not listed (the line limit is reached)"
+    @test count(==(final), errlines) == 1 || last(err, 2000)
+    i = findfirst(==(final), errlines)
+    if i !== nothing
+        later = filter(l -> occursin(r" (on route |with no route)", l), errlines[i+1:end])
+        @test isempty(later) || later
+    end
+    @test "CAP_FINAL=true" in lines || out
+    @test "CAP_SILENT=true" in lines || out
+    @test "RESET=true" in lines || out
 end
 
 @testset "no check failed, and every listed site has its checks" begin
@@ -153,7 +177,8 @@ include(joinpath(@__DIR__, ".helpers", "trimmed_sites.jl"))
 
 root = dirname(@__DIR__)
 found = Dict{Tuple{Symbol, String, String}, Int}()
-for callee in (:_trimmed_failure, :_trimmed_note), s in trimmed_sites(root; callee)
+for callee in (:_trimmed_failure, :_trimmed_note, :_trimmed_request_failure, :_request_failure_line),
+        s in trimmed_sites(root; callee)
     key = (callee, s.file, s.func)
     found[key] = get(found, key, 0) + 1
 end

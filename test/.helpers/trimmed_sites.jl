@@ -47,6 +47,8 @@ const TRIMMED_SITES = Dict{Tuple{String, String}, Any}(
     ("src/routerhof.jl", "register_serve_lifecycle!") => :B,
     ("src/routeendpoint.jl", "_trimmed_note") => :B,
     ("src/routeendpoint.jl", "_trimmed_failure") => :B,
+    ("src/routeendpoint.jl", "_request_failure_line") => :B,
+    ("src/routeendpoint.jl", "Util._trimmed_request_failure") => :B,
 
     # ── Exempt ──────────────────────────────────────────────────────────────────────────────
     ("src/context.jl", "ServerHandle") => (:exempt,
@@ -88,10 +90,11 @@ const TRIMMED_SITE_COUNTS = Dict{Tuple{String, String}, Int}(
 )
 
 # Where a trimmed build writes its own line because it drops the log record (#846): each call to
-# `_trimmed_failure` or `_trimmed_note` in `src/` and `ext/`, by file and function, with how many
-# that function holds. A trimmed executable prints no `@error` (docs/design/juliac-trim.md §3.16),
-# so a site that loses its call goes silent there, and nothing else would notice. A new call is
-# added here on purpose, with the site it reports.
+# `_trimmed_failure`, `_trimmed_note`, or the request path's once-per-(type, route) writers
+# `_trimmed_request_failure` and `_request_failure_line` (#883) in `src/` and `ext/`, by file and
+# function, with how many that function holds. A trimmed executable prints no `@error`
+# (docs/design/juliac-trim.md §3.16), so a site that loses its call goes silent there, and nothing
+# else would notice. A new call is added here on purpose, with the site it reports.
 const TRIMMED_FAILURE_SITES = Dict{Tuple{Symbol, String, String}, Int}(
     (:_trimmed_failure, "src/types.jl", "startup") => 1,                    # on_startup threw
     (:_trimmed_failure, "src/types.jl", "shutdown") => 1,                   # on_shutdown threw
@@ -105,6 +108,9 @@ const TRIMMED_FAILURE_SITES = Dict{Tuple{Symbol, String, String}, Int}(
     (:_trimmed_failure, "src/core/lifecycle.jl", "_drop_listener!") => 1,   # an abandoned listener's close threw
     (:_trimmed_failure, "src/core/lifecycle.jl", "startserver") => 1,       # the blocking serve wait threw
     (:_trimmed_note, "src/routeendpoint.jl", "_trimmed_failure") => 1,      # the helper itself
+    # The request path's memo (#883): a pair's line, and the final line once the cap is reached.
+    (:_trimmed_note, "src/routeendpoint.jl", "_request_failure_line") => 2,
+    (:_request_failure_line, "src/routeendpoint.jl", "Util._trimmed_request_failure") => 1,
 )
 
 """

@@ -67,7 +67,9 @@ under the JIT `_trimmed()` folds the call away and the record goes to the logger
 """
 function _trimmed_note(text::String)::Union{Nothing, String}
     _trimmed() || return nothing
-    println(Core.stderr, text)
+    # One write, line and newline together: `println` makes two, and two threads failing at once
+    # (the request path, #883) could interleave them.
+    print(Core.stderr, string(text, '\n'))
     return text
 end
 
@@ -95,6 +97,121 @@ end
 function _failure_type(@nospecialize(e))::Symbol
     e isa TaskFailedException && (e = e.task.exception)
     return e isa LoggedException ? e.type : nameof(typeof(e))
+end
+
+# ── The request path's line, once per (type, route) (#883) ──────────────────────────────────────
+#
+# The error boundary's failures are per request, so a bare `_trimmed_failure` there would write one
+# line per request, and a client that can make a route fail could fill the terminal with them (the
+# flood #18 removed from the `ValidationError` branch). The guard is a memo: each (type, route
+# pattern) pair is written once per process, and after `_REQUEST_FAILURE_CAP` pairs one final line
+# says the list stops there. No clock and no timer: nothing a trimmed image would have to resolve
+# at run time, and nothing that runs when no request fails.
+
+const _REQUEST_FAILURE_CAP = 256
+
+const _REQUEST_FAILURES_FULL =
+    "Nitro: further request-path failures are not listed (the line limit is reached)"
+
+mutable struct RequestFailureMemo
+    const seen :: Set{Tuple{Symbol,String}}
+    const lock :: ReentrantLock
+    full       :: Bool          # the final line was written
+end
+
+const REQUEST_FAILURES = RequestFailureMemo(Set{Tuple{Symbol,String}}(), ReentrantLock(), false)
+
+# Emptied when the module loads. Under `juliac` a route's registration flips `_trimmed()` while
+# the image is built, so a request that fails at build time (a top-level warm-up through
+# `internalrequest`) records its pair, and the image would carry it: the same failure at run time
+# would then write no line.
+function _reset_request_failures!()
+    memo = REQUEST_FAILURES
+    lock(memo.lock)
+    try
+        empty!(memo.seen)
+        memo.full = false
+    finally
+        unlock(memo.lock)
+    end
+    return nothing
+end
+__init__() = _reset_request_failures!()
+
+"""
+    _request_failure_line(site::String, kind::Symbol, route) -> Union{Nothing, String}
+
+In a trimmed image, write `Nitro: <site>: <kind> on route <route>` (or `… with no route` when
+`route` is `nothing`) to `Core.stderr` the first time the pair `(kind, route)` is seen, and return
+the line; return `nothing` for a pair already written, and everywhere under the JIT (#883).
+
+The pairs are kept in one process-wide set. Once it holds `_REQUEST_FAILURE_CAP` (256) pairs, the
+next new pair writes `_REQUEST_FAILURES_FULL` instead, once, and nothing is written after it.
+
+Called from the request path's error boundary, beside each site's `@error`, never instead of it
+(see `_trimmed_note`). What the line carries is fixed by its callers: `site` is a literal, `kind`
+is a type name (`_failure_type`) or a literal `Symbol`, and `route` is the route's registered
+pattern as the router stores it (`/items/{id}` for `path("/items/<int:id>")`) or `nothing`. Never
+the request's target, method, headers, body, or an exception's message or backtrace.
+"""
+function _request_failure_line(site::String, kind::Symbol,
+                               route::Union{Nothing,String})::Union{Nothing,String}
+    _trimmed() || return nothing
+    memo = REQUEST_FAILURES
+    key = (kind, route === nothing ? "" : route)    # a registered pattern is never ""
+    write = 0                                        # 1: the pair's line; 2: the final line
+    # Decided under the lock, written outside it. An explicit lock/unlock rather than `lock(f, l)`:
+    # no closure on the path, and none of the `lock(f, l)` forms a trimmed build reports (#861).
+    lock(memo.lock)
+    try
+        if !(key in memo.seen)
+            if length(memo.seen) < _REQUEST_FAILURE_CAP
+                push!(memo.seen, key)
+                write = 1
+            elseif !memo.full
+                memo.full = true
+                write = 2
+            end
+        end
+    finally
+        unlock(memo.lock)
+    end
+    write == 0 && return nothing
+    write == 2 && return _trimmed_note(_REQUEST_FAILURES_FULL)
+    line = route === nothing ? string("Nitro: ", site, ": ", kind, " with no route") :
+                               string("Nitro: ", site, ": ", kind, " on route ", route)
+    return _trimmed_note(line)
+end
+
+"""
+    _trimmed_request_failure(site::String, e, req) -> Union{Nothing, String}
+
+`_request_failure_line` for a failure `e` on request `req`: `e` is named by
+`_failure_type`, and the route by `_failure_route(req)`. In a trimmed image only; under the JIT it
+returns `nothing` before it reads either.
+
+Declared in `Util` (src/utilities/misc.jl), where `handlerequest` calls it: `Util` is included
+before `Types`, and the body needs `_trimmed()`, which is defined here.
+"""
+function Util._trimmed_request_failure(site::String, @nospecialize(e),
+                                       req::Union{Nothing,HTTP.Request})::Union{Nothing,String}
+    _trimmed() || return nothing
+    return _request_failure_line(site, _failure_type(e), _failure_route(req))
+end
+
+# The registered pattern of the route `req` was matched to, or `nothing`. Both places it is read
+# from are written by Nitro, never from the request: `:route` is what the router terminal stores
+# before the leaf runs (`_route_call`, `_dispatch_resolved`; the router's `leaf.path`), and the
+# stash is what `compose` writes before a route's middleware chain runs, so a route middleware
+# that throws still names its route. Neither exists for a request that missed every route or
+# failed in global middleware before `compose`.
+function _failure_route(req::Union{Nothing,HTTP.Request})::Union{Nothing,String}
+    req === nothing && return nothing
+    route = get(req.context, :route, nothing)
+    route isa String && return route
+    res = get(req.context, ROUTE_RESOLUTION_KEY, nothing)
+    res isa RouteResolution && return res.route
+    return nothing
 end
 
 # The two concrete requests `stream_handler` builds (src/core/transport.jl).

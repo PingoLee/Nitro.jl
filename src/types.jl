@@ -10,7 +10,7 @@ using Dates
 using Base: @kwdef
 using DataStructures: CircularDeque
 using ..Util
-using ..Util: BoundedLRU, _count_one, _locked
+using ..Util: BoundedLRU, _count_one, _locked, _trimmed_request_failure
 using ..Errors: ValidationError, StoreInterfaceError, ValidatorFault, SessionStoreFault,
     implements_contract_method, store_contract_error, is_unrecoverable, loggable, LoggedException
 using ..Crypto: SecretString, CookieKey, _cookie_secret
