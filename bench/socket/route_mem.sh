@@ -14,6 +14,11 @@
 #   *_warm      `/mem` again
 #   pkgimage    the size of the Nitro package image the server loaded
 #
+# SMAPS=1 also writes, at rest, the server's resident memory per mapping (`/proc/<pid>/smaps`, Rss
+# summed by mapping name: a file path, `[heap]`, `[stack]`, or `[anon]` for an unnamed one, which
+# is where thread stacks and malloc arenas land) to route_mem-<stamp>-smaps.tsv. That breaks down
+# the RSS `/mem` does not account for: outside the GC heap, the JIT and Nitro's image (#728).
+#
 # Every build is served by THIS checkout's server.jl and route_table.jl; ROOTS only picks the bench
 # env, and so the Nitro, each server loads.
 #
@@ -43,6 +48,9 @@ OUT="$ROOT/bench/results"; mkdir -p "$OUT"
 STAMP="$(date +%Y%m%d-%H%M%S)"
 RESULT="$OUT/route_mem-$STAMP.tsv"
 printf 'build\troutes\trepeat\tlisten_s\trss_rest_mib\tlive_rest_mib\tjit_rest_mib\trouter_kib\tmiddleware_kib\tchains_kib\tapp_kib\trss_warm_mib\tlive_warm_mib\tjit_warm_mib\tpkgimage_mib\n' > "$RESULT"
+SMAPS="${SMAPS:-0}"
+SMAPS_OUT="$OUT/route_mem-$STAMP-smaps.tsv"
+if [ "$SMAPS" = 1 ]; then printf 'build\troutes\trepeat\tmapping\trss_kib\n' > "$SMAPS_OUT"; fi
 echo "route_mem.sh: $("${JULIA_CMD[@]}" --version), --threads=$THREADS, CPUs $SERVER_CPUS, counts [$COUNTS] x $REPEATS"
 echo "governor: $(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || echo unknown)"
 
@@ -87,6 +95,13 @@ for rep in $(seq 1 "$REPEATS"); do
       spid="$(listener_pid "$PORT")"
       rss_rest=$(kib "$spid" VmRSS)
       mem_rest=$(curl -fsS "http://127.0.0.1:$PORT/mem")
+      if [ "$SMAPS" = 1 ]; then
+        awk -v b="$build" -v n="$n" -v r="$rep" '
+          /^[0-9a-f]+-[0-9a-f]+ / { name = (NF >= 6) ? $6 : "[anon]"; for (i = 7; i <= NF; i++) name = name " " $i; next }
+          $1 == "Rss:" { rss[name] += $2 }
+          END { for (k in rss) if (rss[k] > 0) printf "%s\t%s\t%s\t%s\t%d\n", b, n, r, k, rss[k] }' \
+          "/proc/$spid/smaps" >> "$SMAPS_OUT"
+      fi
       curl -fsS -K "$(warm_config "$n")" || echo "route_mem.sh: a warm-up request failed ($build N=$n)" >&2
       rss_warm=$(kib "$spid" VmRSS)
       mem_warm=$(curl -fsS "http://127.0.0.1:$PORT/mem")
@@ -107,3 +122,4 @@ for rep in $(seq 1 "$REPEATS"); do
   done
 done
 echo "results: $RESULT"
+if [ "$SMAPS" = 1 ]; then echo "smaps: $SMAPS_OUT"; fi
