@@ -150,8 +150,19 @@ end
 
 # The symbol stem for `C`, exporting it on first sight. Only a `--trim` build exports: that is
 # the build that runs this file's registration at build time and keeps only what it roots.
-function _endpoint_symbol(::Type{C})::String where {C}
+#
+# The export is behind an inference barrier (#726). The `trim` test is a run-time read, so
+# inference cannot fold the export away: every handler and chain type inferred the lock closure,
+# the `get!` and both `_export_thunk`s for itself, about 50 ms per route under the JIT, which
+# never runs them. `@nospecialize` alone does not stop it, because `C` arrives as a constant and
+# inference propagates it. Behind the barrier `_export_endpoint` is inferred once, for `Type`. The
+# `--trim` build that runs it runs it while it builds, where the dynamic call is fine.
+function _endpoint_symbol(@nospecialize(C::Type))::String
     Base.JLOptions().trim == 0 && return ""
+    return _export_endpoint(Base.inferencebarrier(C)::Type)
+end
+
+@noinline function _export_endpoint(@nospecialize(C::Type))::String
     return lock(ENDPOINT_EXPORTS_LOCK) do
         get!(ENDPOINT_EXPORTS, C) do
             _flip_trimmed!()
@@ -163,9 +174,12 @@ function _endpoint_symbol(::Type{C})::String where {C}
     end
 end
 
-function RouteEndpoint(obj::C) where {C}
+# Neither this nor `leaf_endpoint` specializes on the handler or chain it wraps (#726): a route's
+# closure type is deep, and inferring even these few lines for it took several milliseconds per
+# route. The one call that does need the type, `FormattedLeaf(obj)`, dispatches on it at run time.
+function RouteEndpoint(@nospecialize(obj))
     obj isa RouteEndpoint && return obj
-    return RouteEndpoint(obj, _endpoint_symbol(C), nothing, C_NULL, C_NULL)
+    return RouteEndpoint(obj, _endpoint_symbol(typeof(obj)), nothing, C_NULL, C_NULL)
 end
 
 """
@@ -188,9 +202,9 @@ The endpoint `registerhandler` puts on the router for `handler`: the handler its
 for `serialize = false`, and in `formatted` the same handler through [`FormattedLeaf`](@ref), which
 the serializer calls instead ([`call_formatted`](@ref)). A trimmed image exports a thunk for each.
 """
-function leaf_endpoint(obj::C) where {C}
+function leaf_endpoint(@nospecialize(obj))
     obj isa RouteEndpoint && return obj
-    return RouteEndpoint(obj, _endpoint_symbol(C), RouteEndpoint(FormattedLeaf(obj)), C_NULL, C_NULL)
+    return RouteEndpoint(obj, _endpoint_symbol(typeof(obj)), RouteEndpoint(FormattedLeaf(obj)), C_NULL, C_NULL)
 end
 
 function (e::RouteEndpoint)(req::HTTP.Request)
@@ -421,9 +435,13 @@ register while the image is built, it exports a thunk for `mw`'s type on first s
 `RouteEndpoint` does for a chain; otherwise it has no pointer.
 """
 function route_lifecycle_entry(mw::LifecycleMiddleware)
-    L = typeof(mw)
     Base.JLOptions().trim == 0 && return LifecycleEntry(mw, "", C_NULL, C_NULL)
-    sym = lock(ENDPOINT_EXPORTS_LOCK) do
+    return LifecycleEntry(mw, _lifecycle_symbol(Base.inferencebarrier(typeof(mw))::Type), C_NULL, C_NULL)
+end
+
+# Behind an inference barrier for the reason `_endpoint_symbol`'s export is (#726).
+@noinline function _lifecycle_symbol(@nospecialize(L::Type))::String
+    return lock(ENDPOINT_EXPORTS_LOCK) do
         get!(LIFECYCLE_EXPORTS, L) do
             _flip_trimmed!()
             # Not `sym`: assigning the outer name inside these closures would box it (#364).
@@ -432,7 +450,6 @@ function route_lifecycle_entry(mw::LifecycleMiddleware)
             stem
         end
     end
-    return LifecycleEntry(mw, sym, C_NULL, C_NULL)
 end
 
 """
