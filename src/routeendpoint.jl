@@ -601,9 +601,23 @@ function _run_lifecycle(e::LifecycleEntry, phase::Cint)::Union{Nothing,Interrupt
         ccall(_lifecycle_fptr!(e), Cvoid, (Any, Cint, Any), e.mw, phase, out)
         out[]
     end
-    result isa EndpointFailure && throw(result.err)
+    if result isa EndpointFailure
+        # Nitro's own hook runner failed, past the catch around the hook (#883). The exception is
+        # thrown again here, as itself, and leaves the broadcast and then `serve` or `terminate`.
+        # Nothing on that way writes a line a trimmed build keeps, so this one does. It names the
+        # phase and the exception's type. That is one line per entry and phase, a count the app's
+        # own registrations bound, so it needs no memo.
+        # An interrupt is not a failure: the broadcast defers and re-raises it, and `handlerequest`
+        # writes no line for one either.
+        result.err isa InterruptException || _trimmed_failure(_runner_site(phase), result.err)
+        throw(result.err)
+    end
     return result::Union{Nothing,InterruptException}
 end
+
+_runner_site(phase::Cint)::String =
+    phase == _PHASE_STARTUP ? "the on_startup hook runner" :
+    phase == _PHASE_STOPPED ? "the on_stopped hook runner" : "the on_shutdown hook runner"
 
 # The hook runner for a phase, called directly: the JIT's whole path, and the far side of a trimmed
 # build's foreign call.

@@ -468,6 +468,26 @@ function boundary_sites()
     return nothing
 end
 
+# Nitro's own hook runner failing past the catch around the hook (#883): the shape of #846's miss
+# inside `stopped`'s catch. The runners are replaced for two concrete middleware types only. Each
+# entry is built inside the run, so after the flip it carries the `@cfunction` shim and the call
+# goes through `_lifecycle_call`'s `EndpointFailure`. The exception still leaves the broadcast as
+# itself; in the trimmed run `_run_lifecycle` also writes a line, which the parent counts.
+struct RunnerBoom <: Function end
+(::RunnerBoom)() = nothing
+const RUNNER_STOP = Nitro.Core.LifecycleMiddleware(middleware = identity, on_stopped = RunnerBoom())
+const RUNNER_START = Nitro.Core.LifecycleMiddleware(middleware = identity, on_startup = RunnerBoom())
+T.stopped(::typeof(RUNNER_STOP)) = throw(TrimSentinel(SENTINEL))
+T.startup(::typeof(RUNNER_START)) = throw(TrimSentinel(SENTINEL))
+function runner_failures()
+    stop = outcome(() -> Nitro.Core._teardown!(Nitro.Core.App(), T.LifecycleEntry[],
+        [T.serve_lifecycle_entry(RUNNER_STOP)], nothing; listener = false, timeout = 0))
+    start = outcome(() -> Nitro.Core._startup_hooks(T.LifecycleEntry[], [T.serve_lifecycle_entry(RUNNER_START)]))
+    println("RUNNER_RAISES_", T._trimmed() ? "TRIMMED" : "JIT", "=",
+            stop[1:2] == (:error, "TrimSentinel") && start[1:2] == (:error, "TrimSentinel"))
+    return nothing
+end
+
 # After the flip, last of all the request-path lines: fill the set to its cap, then check that the
 # next new pair writes the final line once and that nothing is written after it.
 function past_the_cap()
@@ -568,6 +588,7 @@ flip_before = Auth._validator_takes_request(one_arg, true)
 failed_hooks()
 request_failures()
 boundary_sites()
+runner_failures()
 
 Core.eval(T, :(_trimmed() = true))
 
@@ -575,6 +596,7 @@ flip_after = Auth._validator_takes_request(one_arg, true)
 failed_hooks()
 request_failures()
 boundary_sites()
+runner_failures()
 println("FLIP=", T._trimmed() === true && flip_before === false && flip_after === true)
 
 for (i, (key, name, thunk, expect)) in enumerate(CASES)

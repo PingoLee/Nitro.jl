@@ -116,6 +116,7 @@ const TRIMMED_FAILURE_SITES = Dict{Tuple{Symbol, String, String}, Int}(
     (:_trimmed_request_failure, "src/routerhof.jl", "_not_a_response") => 1,            # a non-response
     (:_request_failure_line, "src/core/pipeline.jl", "_route_rerouted") => 1,           # a refused reroute
     (:_request_failure_line, "src/core/pipeline.jl", "_refuse_foreign_leaf") => 1,      # a foreign leaf
+    (:_trimmed_failure, "src/routeendpoint.jl", "_run_lifecycle") => 1,   # Nitro's hook runner threw (#883)
 )
 
 """
