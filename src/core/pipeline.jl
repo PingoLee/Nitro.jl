@@ -507,11 +507,25 @@ function internalrequest(ctx::App, req::HTTP.Request; middleware::Union{Tuple,Ve
     # outer one back, so that when the chain continues, its `RouteNext` goes on into ITS pipeline,
     # with its settings, and its terminal checks the route the chain was chosen for (#718).
     outer = get(req.context, Types.ROUTE_RESOLUTION_KEY, nothing)
-    outer === nothing &&
-        return req |> setupmiddleware(ctx; middleware, serialize, catch_errors, security_headers)
+    pipeline = setupmiddleware(ctx; middleware, serialize, catch_errors, security_headers)
+    outer === nothing && return _run_pipeline(pipeline, req)
     try
-        return req |> setupmiddleware(ctx; middleware, serialize, catch_errors, security_headers)
+        return _run_pipeline(pipeline, req)
     finally
         req.context[Types.ROUTE_RESOLUTION_KEY] = outer
     end
 end
+
+# The pipeline's call (#737). The pipeline's type is fully known (#572), so a caller whose request
+# is inferred as the abstract `HTTP.Request`, such as a closure over a global or a struct field,
+# inferred every layer for that abstract type the first time it compiled: 75-170 ms, where the
+# same call on a concrete request reuses what `serve` already compiled.
+#
+# So the two request types the transport builds keep a direct call, and any other goes through an
+# inference barrier. Inference over the abstract type sees these three methods: the two concrete
+# ones are what a served app has already compiled, and the third stops at one dynamic call. A
+# barrier on every call made `internalrequest` ~8% slower on a concrete request. The `--trim`
+# image does not reach this: `serve`'s path calls the pipeline directly.
+_run_pipeline(pipeline, req::Types.EmptyRequest) = pipeline(req)::HTTP.Response
+_run_pipeline(pipeline, req::Types.BytesRequest) = pipeline(req)::HTTP.Response
+_run_pipeline(pipeline, req::HTTP.Request) = (Base.inferencebarrier(pipeline)(req))::HTTP.Response

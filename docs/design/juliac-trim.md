@@ -1639,7 +1639,27 @@ Two rules come with the target:
 - **The JIT build is the one users run today, so it must not pay for the target.** A change made
   for `--trim` that costs the JIT request path more than the noise, such as a `FunctionWrapper`
   trampoline per request where a function barrier would do (§3.2), has to justify that cost with
-  a measurement (`bench/socket/run.sh`, interleaved with `main`).
+  a measurement (`bench/socket/run.sh`, interleaved with `main`). What §3.2's route boundary
+  costs the JIT build, measured:
+  - **Resident memory: about 15 MiB, fixed**
+    ([#728](https://github.com/PingoLee/Nitro.jl/issues/728)). Against its parent, #718's merge
+    sits 14–16 MiB higher at rest with no routes. With routes it is lower: about 50 KiB per route
+    less from 0 to 1000 routes, because the router keeps less live heap and less compiled code.
+    The fixed part is all in anonymous mappings (`bench/socket/route_mem.sh` with `SMAPS=1`, four
+    starts per side, alternating): +15.4 MiB of `[anon]`, −1.0 MiB of `[heap]`, +0.3 MiB in
+    Nitro's package image and nothing in any other mapping, while the live GC heap and the JIT's
+    code are no larger. That is memory the allocator kept after start-up, not a structure the
+    boundary holds, so it is accepted as the boundary's price.
+  - **Registration: about 70 ms per route of inference, removed**
+    ([#726](https://github.com/PingoLee/Nitro.jl/issues/726)). The export a `--trim` build makes
+    at registration is gated on a run-time read, so the JIT inferred it for every handler and
+    chain type anyway, along with the endpoint constructors over each route's closure type: 1000
+    routes took 72 s to register. With the export behind an inference barrier and the
+    constructors unspecialized they take 0.27 s (`bench/regcost.jl`). The trimmed build is
+    unaffected: it registers at top level, while it builds, where the calls the barrier makes
+    dynamic are fine (verifier counts and the probe's output unchanged). Registering a route from
+    inside a trimmed image's `main` was already unsupported (`RouteEndpoint`'s docstring); it
+    would now show as verifier rows rather than as a failure at the call.
 - **Every wall cleared is re-measured with `bench/juliac/build.sh unsafe-warn`, counted by first
   frame in `src/`**, so this record's §3 stays the live backlog. Once the minimal app passes
   `--trim=safe`, the trimmed exe's first request, resident memory and throughput against the JIT

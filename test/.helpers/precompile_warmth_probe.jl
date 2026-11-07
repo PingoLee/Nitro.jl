@@ -103,9 +103,10 @@ end
 # from the request (#710). The test charges every shape the BASELINE's `caller`, not its own, so
 # a step in this compile cannot fail a shape while a cold path in the request still can.
 # `caller` is `go`, `hit`, the `HTTP.Request` constructor and the inference of
-# `internalrequest`, the same work for every shape. The shape's own compiles stay in `request`: `internalrequest` hands the request to
-# `setupmiddleware(...)`, which is typed `::Function`, and inference stops there, so the router,
-# the route endpoint and the handler compile only when the request reaches them.
+# `internalrequest`, the same work for every shape. The shape's own compiles stay in `request`:
+# `internalrequest` calls the pipeline through `_run_pipeline` (src/core/pipeline.jl), which a
+# caller's inference does not see past (#737), so the router, the route endpoint and the handler
+# compile only when the request reaches them.
 #
 # A full collection first (#710). Loading Nitro and registering the routes allocate enough that
 # the process's first collection is due about now, and wherever it lands it costs ~35-45 ms at
