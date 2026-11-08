@@ -461,35 +461,58 @@ function payload(req::HTTP.Request)::Dict{String, Any}
     return request_input(req)
 end
 
-# ── Cooperative cancellation (#466) ─────────────────────────────────────────────────────────────
+# ── Cooperative cancellation (#466, #661, #662) ─────────────────────────────────────────────────
 
 const REQUEST_CANCEL_STATE_KEY = :__nitro_request_cancel_state
 
 # How often `cancel_reason(req)` may ask the kernel whether the client is still there. Between two
-# probes a check is a lookup in `req.context`, a clock read and two atomic loads, so a handler can
+# probes a check is a lookup in `req.context`, a clock read and a few atomic loads, so a handler can
 # poll it in a hot loop.
 # 10 ms is well under any client's patience and well over a `recv` syscall's cost.
 const CANCEL_PROBE_INTERVAL_NS = UInt64(10_000_000)
 
-# Per request, created on the first `cancel_reason`/`cancel_requested` call and never before, so a
-# handler that never asks pays nothing. Every field is atomic or `const`, but reaching it means a
-# lookup in `req.context`, an unsynchronized `Dict`: hence "call it from the handler's task".
+# Per request. Created on the first `cancel_reason`/`cancel_requested`/`cancel_token` call, or by
+# `stream_handler` before the body read when `serve(handler_timeout = …)` is set (#661), and never
+# otherwise: a handler that never asks, on a server without a deadline, pays nothing.
+#
+# Every field is atomic or `const`. Reaching the state through `req` means a lookup in
+# `req.context`, an unsynchronized `Dict`: hence "call `cancel_reason(req)` from the handler's
+# task". Holding the state itself (`cancel_token(req)`, #662) needs no such lookup, so any task
+# may read it.
 mutable struct _CancelState
+    # The first cause, or `:none`. Written only by `_settle_cancel!`, a CAS: first cause wins.
     @atomic reason        :: Symbol
     @atomic next_probe_ns :: UInt64
-    # The signal of the server run that is handling this request (`RequestScope`), captured on
-    # the first call: the run's signal, not whatever scope a later call happens to run in.
+    # The handler's deadline as a `time_ns()` value, `0` for none (#661). Written when the state is
+    # created and once more, to `0`, when the handler returns (`_disarm_deadline!`): the deadline
+    # bounds the handler, not what outlives it (a streamed body's producer, a spawned task).
+    @atomic deadline_ns   :: UInt64
+    # Set by `internalrequest` once its pipeline has returned: the end of a request with no stream.
+    # A served request's end is its stream's `write_closed`, which HTTP sets when the response is
+    # written (`_ended`), so the served path writes nothing here.
+    @atomic ended         :: Bool
+    # The signal of the server run that is handling this request (`RequestScope`), captured when
+    # the state is created: the run's signal, not whatever scope a later call happens to run in.
     const shutting_down   :: Constants.ShutdownSignal
     # `nothing` for a request with no socket of its own (`internalrequest`).
     const stream          :: Union{Nothing, HTTP.Stream}
 end
 
+_CancelState(shutting_down::Constants.ShutdownSignal, stream::Union{Nothing, HTTP.Stream},
+             deadline_ns::UInt64 = zero(UInt64)) =
+    _CancelState(:none, zero(UInt64), deadline_ns, false, shutting_down, stream)
+
+# Not `request_cache!`: `internalrequest` clears a finished run's state from a reused request by
+# storing `nothing` under the key (`RequestContext` has no `delete!`), and anything but a state
+# there means "none yet".
 function _cancel_state(req::HTTP.Request)::_CancelState
-    return request_cache!(req, REQUEST_CANCEL_STATE_KEY) do
-        stream = Base.get(req.context, :stream, nothing)
-        _CancelState(:none, zero(UInt64), Constants.REQUEST_SCOPE[].shutting_down,
-                     stream isa HTTP.Stream ? stream : nothing)
-    end::_CancelState
+    ctx = req.context
+    existing = Base.get(ctx, REQUEST_CANCEL_STATE_KEY, nothing)
+    existing isa _CancelState && return existing
+    stream = Base.get(ctx, :stream, nothing)
+    state = _CancelState(Constants.REQUEST_SCOPE[].shutting_down, stream isa HTTP.Stream ? stream : nothing)
+    ctx[REQUEST_CANCEL_STATE_KEY] = state
+    return state
 end
 
 # First cause wins, as for a worker run: a client that left before the deploy stays
@@ -497,6 +520,76 @@ end
 function _settle_cancel!(state::_CancelState, reason::Symbol)::Symbol
     @atomicreplace state.reason :none => reason
     return @atomic state.reason
+end
+
+# Whether the request is over: its response written (served), or its pipeline returned
+# (`internalrequest`).
+#
+# A WebSocket is NOT over at its `101`: HTTP.jl closes the stream's write side before it calls the
+# handler (`WebSockets.upgrade`), and the handler then runs for the socket's whole life. Reading
+# `write_closed` alone made every WebSocket handler "ended" from its first frame: blind to
+# `:shutdown`, and its token `:completed` while it ran. A WebSocket request ends when
+# `_upgrade_websocket!` returns, which sets `ended`.
+function _ended(state::_CancelState)::Bool
+    (@atomic state.ended) && return true
+    stream = state.stream
+    stream === nothing && return false
+    (@atomic :acquire stream.write_closed) || return false
+    return !_upgraded(stream)
+end
+
+# Whether the stream was handed to a WebSocket. Read only once `write_closed` has been observed
+# with acquire: HTTP.jl assigns `stream.response` before its release store of `write_closed`, and
+# does not assign it again, so the read is ordered and cannot race.
+_upgraded(stream::HTTP.Stream)::Bool = (resp = stream.response; resp !== nothing && resp.status == 101)
+
+# A request whose stream became a WebSocket (#661): its handler is the socket's loop, which
+# `handler_timeout` does not bound. Go's `http.TimeoutHandler` likewise refuses to be hijacked.
+function _websocket(state::_CancelState)::Bool
+    stream = state.stream
+    return stream !== nothing && (@atomic :acquire stream.write_closed) && _upgraded(stream)
+end
+
+# `internalrequest`'s end of the request (#662), for a token a task still holds.
+_mark_ended!(state::_CancelState) = (@atomic state.ended = true; nothing)
+
+# The handler has returned (#661): no `:timeout` from here on. Returns the deadline it disarmed,
+# `0` if there was none, so the caller can tell a late return.
+_disarm_deadline!(state::_CancelState)::UInt64 = @atomicswap state.deadline_ns = zero(UInt64)
+
+# The request's own view: its causes, never `:completed`. `cancel_reason(req)` reads it, and so does
+# a Workers run linked with `submit_task(…; parent = cancel_token(req))`.
+#
+# Once the request has ended nothing new settles, so a cause is reported only if it came before
+# the response, which is what makes the token's `:completed` exact. The end gate re-reads the
+# reason rather than answering `:none`: a cause the handler settled between this call's first load
+# and the end is ordered before the stream's `write_closed` release, so the acquire in `_ended`
+# makes it visible here, and a token never reads `:completed` and then a cause. One window is left:
+# a check that passed the gate just before the end can settle `:shutdown` just after it.
+#
+# In order: the run's shutdown, the deadline, then the throttled probe, which shares the deadline's
+# clock read. "First cause wins" is the first cause a CHECK observes, in that order: nothing
+# watches between checks.
+function _request_reason(state::_CancelState)::Symbol
+    reason = @atomic state.reason
+    reason === :none || return reason
+    _ended(state) && return @atomic state.reason
+    Constants.shutdown_started(state.shutting_down) && return _settle_cancel!(state, :shutdown)
+    deadline = @atomic state.deadline_ns
+    stream = state.stream
+    deadline == zero(UInt64) && stream === nothing && return :none
+    now = time_ns()
+    if deadline != zero(UInt64) && now >= deadline && !_websocket(state)
+        return _settle_cancel!(state, :timeout)
+    end
+    stream === nothing && return :none
+    # A CAS claims the interval, so several tasks polling one token (the handler, the tasks it
+    # spawned, a linked run) make one probe per interval between them, not one each.
+    armed = @atomic state.next_probe_ns
+    now < armed && return :none
+    (@atomicreplace state.next_probe_ns armed => now + CANCEL_PROBE_INTERVAL_NS).success || return :none
+    _peer_gone(stream) && return _settle_cancel!(state, :client_disconnected)
+    return :none
 end
 
 """
@@ -508,6 +601,7 @@ Why the server would like this request's handler to stop, or `:none`:
 |---|---|
 | `:client_disconnected` | The client closed or reset the connection; nobody will read the response |
 | `:shutdown` | `terminate` has begun: the server is draining, and will force-close what is left after `shutdown_timeout` |
+| `:timeout` | The handler ran past `serve(handler_timeout = …)`, counted from the end of the request head |
 
 Nitro cannot stop a handler: Julia tasks cannot be killed, and throwing into a running one is
 unsafe (#127). This is the cooperative alternative. A handler that runs long checks it, and
@@ -518,8 +612,8 @@ function export_report(req)
     rows = Row[]
     for page in 1:npages
         if cancel_requested(req)
-            # A deploy: the client is still there, so tell it to retry.
-            cancel_reason(req) === :shutdown && return Res.status(503)
+            # A deploy, or the deadline: the client is still there, so tell it to retry.
+            cancel_reason(req) in (:shutdown, :timeout) && return Res.status(503)
             # The client left: nobody reads this status, but the access log records it.
             return Res.status(499)
         end
@@ -529,12 +623,14 @@ function export_report(req)
 end
 ```
 
-**The first cause wins**, and a reason never resets.
+**The first cause a check observes wins**, and a reason never resets. Nothing watches between
+checks: one check looks at the shutdown, then the deadline, then the client, so a client that left
+before the deadline but was never checked in between reads `:timeout`.
 
 **Cheap enough to poll in a loop.** Whether the client is still there is asked of the kernel
 (a non-blocking peek at the socket) at most once every 10 ms. Between probes, a check is a lookup
-in `req.context`, a clock read and two atomic loads, and allocates nothing. Nothing runs for a
-handler that never asks.
+in `req.context`, a clock read and a few atomic loads, and allocates nothing. Nothing runs for a
+handler that never asks, and the deadline adds no timer: a check compares the clock with it.
 
 **What it cannot see:**
 - A client that half-closes its side (`shutdown(SHUT_WR)`) after sending reads as disconnected.
@@ -542,38 +638,98 @@ handler that never asks.
 - A pipelined next request on the same connection, already sent, hides a later disconnect.
 - A connection that died without a FIN or a reset (a cable pulled) looks alive until the kernel
   gives up on it.
-- `internalrequest` has no connection, so only `:shutdown` can fire.
+- `internalrequest` has no connection and no deadline, so only `:shutdown` can fire.
+- A WebSocket handler, once its `101` is sent, sees `:shutdown` only: the socket is the handler's
+  own to read, so the probe leaves it alone, and the deadline does not bound a socket's loop. The
+  handler learns the client left when a read or a write on the socket fails.
 
-Once the response is written, the client is no longer probed: the connection may already be
-carrying the next request.
+**Once the response is written, nothing new is reported:** the connection may already be carrying
+the next request, and the handler is done. A cause that came before the response still reads.
+The request's own view never says that the request completed; a task that needs to know holds
+[`cancel_token(req)`](@ref cancel_token), whose reason turns `:completed`.
 
 **Call it from the handler's own task.** Every check reads `req.context`, as the other
 per-request accessors do, and `req.context` is not safe to read while another task writes to it:
-another accessor's first call, or `setsession!`, does. Do not poll `req` from a task you spawn
-while the handler goes on using it.
+another accessor's first call, or `setsession!`, does. A task you spawn takes
+[`cancel_token(req)`](@ref cancel_token) instead.
 
 The same function answers for a background job: `cancel_reason(task_info::TaskInfo)` reports
 why a worker run was asked to stop. See `Nitro.Workers.cancel_reason`.
 """
-function cancel_reason(req::HTTP.Request)::Symbol
-    state = _cancel_state(req)
-    reason = @atomic state.reason
-    reason === :none || return reason
-    Constants.shutdown_started(state.shutting_down) && return _settle_cancel!(state, :shutdown)
-    stream = state.stream
-    stream === nothing && return :none
-    now = time_ns()
-    now < (@atomic state.next_probe_ns) && return :none
-    @atomic state.next_probe_ns = now + CANCEL_PROBE_INTERVAL_NS
-    _peer_gone(stream) && return _settle_cancel!(state, :client_disconnected)
-    return :none
-end
+cancel_reason(req::HTTP.Request)::Symbol = _request_reason(_cancel_state(req))
 
 """
     cancel_requested(req::HTTP.Request) -> Bool
 
-`true` once the client has disconnected or the server has begun shutting down: exactly
-`cancel_reason(req) !== :none`. See `cancel_reason(req)` for what each cause means, what the
-check costs, and what it cannot see.
+`true` once the client has disconnected, the server has begun shutting down, or the handler's
+deadline has passed: exactly `cancel_reason(req) !== :none`. See `cancel_reason(req)` for what
+each cause means, what the check costs, and what it cannot see.
 """
 cancel_requested(req::HTTP.Request)::Bool = cancel_reason(req) !== :none
+
+"""
+    cancel_token(req::HTTP.Request)
+
+The request's cancellation token, for a task the handler spawns or a background job it submits.
+Read it with the same two functions, `cancel_requested(token)` and `cancel_reason(token)`. The
+token is opaque: those two functions are its whole interface.
+
+```julia
+function search(req)
+    token = cancel_token(req)
+    shards = [Threads.@spawn search_shard(s, token) for s in SHARDS]
+    return Res.json(reduce(vcat, fetch.(shards)))
+end
+
+function search_shard(shard, token)
+    hits = Hit[]
+    for page in pages(shard)
+        cancel_requested(token) && break      # the client left, a deploy, or the deadline
+        append!(hits, page)
+    end
+    return hits
+end
+```
+
+**Any task may hold it.** `cancel_reason(req)` reads `req.context`, which only the handler's own
+task may touch. The token is a value of its own, every field atomic or constant, so a spawned task
+polls it while the handler goes on using the request.
+
+**It reports the request's causes, then `:completed`.** It reads what `cancel_reason(req)` reads
+(`:client_disconnected`, `:shutdown`, `:timeout`) and, once the response has been written with
+none of them, `:completed`: nobody waits for this work any more. A cause that came first keeps
+reading. `cancel_reason(req)` itself never says `:completed`. Go cancels a request's context when
+the handler returns, and that is Go's best-known footgun: work meant to outlive the request must
+remember not to take that context (`context.WithoutCancel` exists for it). ASP.NET Core's
+`RequestAborted` fires on a disconnect only. Nitro keeps the handler's own view to the causes and
+puts the completion signal on the token, which only code that asked for it holds.
+
+**A Workers run can be linked to it.** `submit_task(…; parent = cancel_token(req))` cancels the run
+with the request's cause (`:client_disconnected`, `:timeout`, `:shutdown`), never with `:completed`:
+a job submitted by a handler that then returns keeps running. See `Nitro.Workers.submit_task`.
+
+Creating the token costs what the first `cancel_reason(req)` call costs; a request whose handler
+never asks for one pays nothing.
+"""
+cancel_token(req::HTTP.Request)::_CancelState = _cancel_state(req)
+
+"""
+    cancel_reason(token) -> Symbol
+
+Why the request behind `token`, from [`cancel_token`](@ref), would like its work to stop: one of
+`cancel_reason(req)`'s causes, `:completed` once the response was written with none of them, or
+`:none`. Safe to call from any task.
+"""
+function cancel_reason(token::_CancelState)::Symbol
+    reason = _request_reason(token)
+    reason === :none || return reason
+    return _ended(token) ? :completed : :none
+end
+
+"""
+    cancel_requested(token) -> Bool
+
+Exactly `cancel_reason(token) !== :none`, for a token from [`cancel_token`](@ref). Safe to call
+from any task.
+"""
+cancel_requested(token::_CancelState)::Bool = cancel_reason(token) !== :none

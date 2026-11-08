@@ -46,12 +46,17 @@ Nitro.Principal
 
 A handler cannot be stopped from outside: Julia tasks cannot be killed. One that runs long asks
 instead whether to stop, the same way a background job does. `cancel_requested(req)` turns `true`
-when the client disconnects or `terminate` begins the shutdown drain, and `cancel_reason(req)`
-says which. [Long-Running Handlers](@ref) has the pattern and what it costs.
+when the client disconnects, `terminate` begins the shutdown drain, or the handler runs past
+`serve(handler_timeout = …)`, and `cancel_reason(req)` says which. A task the handler spawns, or a
+background job it submits, holds `cancel_token(req)` instead. [Long-Running Handlers](@ref) has the
+pattern and what it costs.
 
 ```@docs
 cancel_reason(::Nitro.Request)
 cancel_requested(::Nitro.Request)
+cancel_token
+cancel_reason(::Nitro.Core._CancelState)
+cancel_requested(::Nitro.Core._CancelState)
 ```
 
 ## Request Body Parsers

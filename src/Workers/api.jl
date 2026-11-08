@@ -994,7 +994,11 @@ end
 # `run_id` is POSITIONAL and REQUIRED, never a defaulted keyword: the unfenced call must not be
 # the shorter one to write (#48, #108). It is the identity `_register_or_watch!` minted for this
 # run, and it is the only thing that makes the read below this run's own.
-function _execute_task_async(runtime::WorkerRuntime, task_key::String, callback::Function, options::TaskOptions, run_id::UUID)
+#
+# `parent` is the request the run is linked to (`submit_task(…; parent)`, #662), set on the claimed
+# run object before the callback starts, so every check the run makes sees it.
+function _execute_task_async(runtime::WorkerRuntime, task_key::String, callback::Function, options::TaskOptions, run_id::UUID,
+                             parent::Union{Nothing, _CancelState} = nothing)
     # `_spawn_detached`, not `Threads.@spawn`: the run must not inherit the submitter's dynamic
     # scope, or `_claim_run!` below writes on the submitter's open PormG transaction (#209).
     task = _spawn_detached() do
@@ -1024,6 +1028,8 @@ function _execute_task_async(runtime::WorkerRuntime, task_key::String, callback:
             rethrow()
         end
         task_info === nothing && (_release_run!(runtime, run_id); return nothing)
+        # Before the start claim, so the callback's first check already sees the request (#662).
+        parent === nothing || (@atomic task_info.parent = parent)
         handoff = Ref(_RunHandoff(() -> _release_run!(runtime, run_id)))
 
         # Starting is a CLAIMED transition, not an unconditional write. `set_task!` has no
@@ -1090,8 +1096,8 @@ end
 
 """
     submit_task(task_key, callback, owner::Owner; scope=:user, watchers=Owner[],
-                options=TaskOptions(), runtime=default_runtime())
-    submit_task(app, task_key, callback_or_job, owner::Owner; scope, watchers, options, key, runtime)
+                options=TaskOptions(), runtime=default_runtime(), parent=nothing)
+    submit_task(app, task_key, callback_or_job, owner::Owner; scope, watchers, options, key, runtime, parent)
 
 Run `callback` on its own task and return the id it was stored under.
 
@@ -1132,17 +1138,48 @@ want to hand out, do not grant it — there is no read-only grant today.
 Re-running a *finished* key replaces the record and resets its watchers, so grants must be
 passed again on each such resubmission. Granting an identity that is already a watcher —
 including the owner — is a no-op.
+
+# Linking a run to the request that submitted it
+
+`parent = cancel_token(req)` makes the run stop with the request
+([#662](https://github.com/PingoLee/Nitro.jl/issues/662)): once the client disconnects, the
+handler's `serve(handler_timeout = …)` passes, or `terminate` begins, the run's
+[`cancel_reason`](@ref cancel_reason(::TaskInfo)) reads that cause (`:client_disconnected`,
+`:timeout`, `:shutdown`) at its next check, and a run that stops at a [`checkpoint!`](@ref) is
+recorded `CANCELLED`. It is the shape for a handler that waits on a job it submitted:
+
+```julia
+function report(req)
+    id = submit_task(app, "report", task_info -> build_report(task_info), Owner(user_id(req));
+                     parent = cancel_token(req))
+    return Res.json(wait_for_result(app, id))       # the client leaving stops the job too
+end
+```
+
+**A request's completion never cancels a linked run.** A handler that submits a job and returns
+`202` leaves it running, which is what such a handler means. Go's request context is cancelled when
+the handler returns, so Go code must remember to detach work meant to outlive it
+(`context.WithoutCancel`); here that is the default, and only a cause that came **before** the
+response reaches the run.
+
+The link is checked, not pushed: it is read where the run already checks its token, so a callback
+that never checks never stops, as with every other cause. Joining a run already in flight under the
+same key (see above) does not link it. A run every watcher shares (a `:global` key, or one with
+`watchers`) stops with its submitter's request, and the others then read it `CANCELLED`: link only a
+run whose result belongs to that request.
 """
-function submit_task(task_key::AbstractString, callback::Function, owner::Owner; scope::Symbol=:user, watchers::AbstractVector{Owner}=Owner[], options::TaskOptions=TaskOptions(), runtime::WorkerRuntime=default_runtime())
-    return _submit_task(runtime, task_key, _ClosureRun(callback), owner, scope, watchers, options)
+function submit_task(task_key::AbstractString, callback::Function, owner::Owner; scope::Symbol=:user, watchers::AbstractVector{Owner}=Owner[], options::TaskOptions=TaskOptions(), runtime::WorkerRuntime=default_runtime(),
+                     parent::Union{Nothing, _CancelState}=nothing)
+    return _submit_task(runtime, task_key, _ClosureRun(callback), owner, scope, watchers, options, parent)
 end
 
 # A named job has no registry without its App (#514), so only the App-first form takes one.
 submit_task(::AbstractString, ::Job, ::Owner; kwargs...) = _throw_job_needs_app("submit_task")
 
-function submit_task(ctx::App, task_key::AbstractString, job::Job, owner::Owner; scope::Symbol=:user, watchers::AbstractVector{Owner}=Owner[], options::TaskOptions=TaskOptions(), key::Symbol=DEFAULT_EXTENSION_KEY, runtime::Union{Nothing, WorkerRuntime}=nothing)
+function submit_task(ctx::App, task_key::AbstractString, job::Job, owner::Owner; scope::Symbol=:user, watchers::AbstractVector{Owner}=Owner[], options::TaskOptions=TaskOptions(), key::Symbol=DEFAULT_EXTENSION_KEY, runtime::Union{Nothing, WorkerRuntime}=nothing,
+                     parent::Union{Nothing, _CancelState}=nothing)
     resolved = _resolve_runtime(ctx; key, runtime)
-    return _submit_task(resolved, task_key, _PendingJob(_job_registry(ctx), job), owner, scope, watchers, options)
+    return _submit_task(resolved, task_key, _PendingJob(_job_registry(ctx), job), owner, scope, watchers, options, parent)
 end
 
 # The body of both `submit_task` forms. `work` is resolved by `_prepare_run` AFTER the authorizer
@@ -1150,7 +1187,8 @@ end
 # a named job's encoding (#514) costs nothing until the submit is allowed. It runs before the
 # record is written, so a refused job writes nothing and reserves nothing.
 function _submit_task(runtime::WorkerRuntime, task_key::AbstractString, work, owner::Owner,
-                      scope::Symbol, watchers::AbstractVector{Owner}, options::TaskOptions)
+                      scope::Symbol, watchers::AbstractVector{Owner}, options::TaskOptions,
+                      parent::Union{Nothing, _CancelState})
     _authorize_queue!(runtime.store, DEFAULT_QUEUE_NAME, owner)
 
     key = scoped_task_key(task_key, owner; scope)
@@ -1165,7 +1203,7 @@ function _submit_task(runtime::WorkerRuntime, task_key::AbstractString, work, ow
     run_id = _register_or_watch!(runtime, key, owner; grants=watchers, job_name, job_args)
     if run_id !== nothing
         try
-            _execute_task_async(runtime, key, callback, options, run_id)
+            _execute_task_async(runtime, key, callback, options, run_id, parent)
         catch
             _release_run!(runtime, run_id)   # no run was spawned to give the reservation back
             rethrow()
@@ -1174,8 +1212,9 @@ function _submit_task(runtime::WorkerRuntime, task_key::AbstractString, work, ow
     return key
 end
 
-function submit_task(ctx::App, task_key::AbstractString, callback::Function, owner::Owner; scope::Symbol=:user, watchers::AbstractVector{Owner}=Owner[], options::TaskOptions=TaskOptions(), key::Symbol=DEFAULT_EXTENSION_KEY, runtime::Union{Nothing, WorkerRuntime}=nothing)
-    return submit_task(task_key, callback, owner; scope, watchers, options, runtime=_resolve_runtime(ctx; key, runtime))
+function submit_task(ctx::App, task_key::AbstractString, callback::Function, owner::Owner; scope::Symbol=:user, watchers::AbstractVector{Owner}=Owner[], options::TaskOptions=TaskOptions(), key::Symbol=DEFAULT_EXTENSION_KEY, runtime::Union{Nothing, WorkerRuntime}=nothing,
+                     parent::Union{Nothing, _CancelState}=nothing)
+    return submit_task(task_key, callback, owner; scope, watchers, options, runtime=_resolve_runtime(ctx; key, runtime), parent)
 end
 
 """

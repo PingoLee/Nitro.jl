@@ -57,6 +57,9 @@ function with_session end
 # `using Nitro, Nitro.Workers` binds one function rather than two that must be qualified.
 function cancel_requested end
 function cancel_reason end
+# The request's token, for a task the handler spawns or a Workers run it submits (#662). Defined
+# with the request methods in `core/request.jl`.
+function cancel_token end
 # Not an accessor, and not exported: the WebSocket branch of `select_handler` (src/handlers.jl)
 # calls it, and its body lives in core/transport.jl with the rest of the stream handling (#374).
 function _upgrade_websocket! end
@@ -73,7 +76,7 @@ export serve, terminate,
     internalrequest, staticfiles, dynamicfiles, spafiles,
     getparams, getquery, getjson, getform, getfiles, getpost,
     getsession, setsession!, getuser, getprincipal, getip, setip!, getpeerip, getcontext, payload, route_missed,
-    cancel_requested, cancel_reason
+    cancel_requested, cancel_reason, cancel_token
 
 # ── Implementation ──────────────────────────────────────────────────────────────
 # Split out of this file by responsibility (#32), which left it the thin

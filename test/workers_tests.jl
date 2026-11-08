@@ -1811,7 +1811,9 @@ end
 
         # Pinned exactly, not iterated. The loop below walks `CANCEL_REASONS` itself, so dropping
         # a member would silently shrink what it tests and stay green.
-        @test Nitro.Workers.CANCEL_REASONS === (:user, :timeout, :superseded, :shutdown, :lease_lost)
+        # `:client_disconnected` is a linked request's cause (`submit_task(…; parent)`, #662).
+        @test Nitro.Workers.CANCEL_REASONS ===
+              (:user, :timeout, :superseded, :shutdown, :lease_lost, :client_disconnected)
 
         for reason in Nitro.Workers.CANCEL_REASONS
             fresh = Nitro.Workers.TaskInfo("u::k")
@@ -6130,6 +6132,121 @@ finally
     # A missed cancel leaves the callback counting until its own bound; wait it out, so no
     # spinning task outlives this item.
     timedwait(() -> !running(probe), 15.0)
+    reset_runtime!(rt)
+end
+
+end
+
+# #662: a run submitted with `parent = cancel_token(req)` stops with the request. The handler
+# submits two runs, one linked and one not, and parks until the linked one ends: it never polls
+# `req`, so the disconnect is found by the linked run's own `checkpoint!`, through the request's
+# probe, on the run's task. The unlinked run is the control: the same disconnect leaves it running.
+@testitem "Workers -- a run linked to its request stops when the client leaves (#662)" tags=[:workers, :network] setup=[NitroCommon] begin
+
+using Test
+using HTTP
+using Nitro
+using Nitro.Workers
+using Sockets
+
+mutable struct LinkProbe
+    @atomic count::Int
+    @atomic ended::Symbol           # :running, then :cancelled, :returned or :threw
+    @atomic info::Union{Nothing, TaskInfo}
+end
+LinkProbe() = LinkProbe(0, :running, nothing)
+
+function burn!(probe::LinkProbe, task_info::TaskInfo)
+    @atomic probe.info = task_info
+    deadline = time_ns() + 15_000_000_000      # a missed cancel ends here, not in the watchdog
+    try
+        while time_ns() < deadline
+            stop = time_ns() + 1_000_000
+            while time_ns() < stop
+                @atomic probe.count += 1
+            end
+            checkpoint!(task_info)
+        end
+        @atomic probe.ended = :returned
+        return :returned
+    catch err
+        @atomic probe.ended = err isa TaskCancelledError ? :cancelled : :threw
+        rethrow()
+    end
+end
+
+running(probe) = (@atomic probe.ended) === :running
+
+rt = WorkerRuntime(InMemoryWorkerStore())
+linked, unlinked = LinkProbe(), LinkProbe()
+ids = Channel{Tuple{String, String}}(1)
+function handler(req)
+    a = submit_task("linked", info -> burn!(linked, info), Owner("u"); runtime = rt,
+                    parent = cancel_token(req))
+    b = submit_task("unlinked", info -> burn!(unlinked, info), Owner("u"); runtime = rt)
+    put!(ids, (a, b))
+    timedwait(() -> !running(linked), 20.0)
+    return Res.send("done")
+end
+
+# Submits a linked run and answers at once: the request completes, and the run must keep going.
+outlives = LinkProbe()
+outlives_id = Channel{String}(1)
+function submit_and_return(req)
+    put!(outlives_id, submit_task("outlives", info -> burn!(outlives, info), Owner("u");
+                                  runtime = rt, parent = cancel_token(req)))
+    return Res.send("accepted")
+end
+
+app = App()
+urlpatterns(app, "", path("/report", handler), path("/accept", submit_and_return))
+port = get_free_port()
+try
+    serve(app; host = HOST, port, async = true, show_banner = false, access_log = nothing)
+    @test timedwait(() -> isopen(app.service), 10.0) === :ok
+    sock = Sockets.connect(HOST, port)
+    write(sock, "GET /report HTTP/1.1\r\nHost: x\r\n\r\n")
+    @test timedwait(() -> isready(ids), 30.0) === :ok
+    a, b = take!(ids)
+    # Both running (the first run compiles the callback, at `-O0` on CI), then the client leaves.
+    @test timedwait(() -> (@atomic linked.count) > 0 && (@atomic unlinked.count) > 0, 30.0) === :ok
+    close(sock)
+
+    @test timedwait(() -> !running(linked), 10.0) === :ok
+    @test (@atomic linked.ended) === :cancelled
+    info = @atomic linked.info
+    @test info !== nothing && cancel_reason(info) === :client_disconnected
+    @test timedwait(() -> get_task_status(a, Owner("u"); runtime = rt)[:status] == "CANCELLED", 10.0) === :ok
+    status = get_task_status(a, Owner("u"); runtime = rt)
+    @test get(status, :error, nothing) == "Cancelled: the client of its request disconnected"
+
+    # The control: no parent, so the disconnect is not its business.
+    c0 = @atomic unlinked.count
+    @test timedwait(() -> (@atomic unlinked.count) > c0, 5.0) === :ok
+    @test running(unlinked)
+    u = @atomic unlinked.info
+    @test u !== nothing && cancel_reason(u) === :none
+    @test !haskey(cancel_task(b, Owner("u"); runtime = rt), :error)
+    @test timedwait(() -> !running(unlinked), 10.0) === :ok
+    @test u !== nothing && cancel_reason(u) === :user
+
+    # A request that COMPLETES cancels nothing: the run outlives the response.
+    @test HTTP.get("http://$HOST:$port/accept"; status_exception = false).status == 200
+    @test timedwait(() -> isready(outlives_id), 10.0) === :ok
+    oid = take!(outlives_id)
+    @test timedwait(() -> (@atomic outlives.count) > 0, 30.0) === :ok
+    o = @atomic outlives.info
+    # The parent's own token reads `:completed` by now; the run must not adopt it.
+    @test o !== nothing && timedwait(() -> cancel_reason((@atomic o.parent)) === :completed, 5.0) === :ok
+    c1 = @atomic outlives.count
+    @test timedwait(() -> (@atomic outlives.count) > c1, 5.0) === :ok
+    @test running(outlives)
+    @test o !== nothing && cancel_reason(o) === :none
+    @test !haskey(cancel_task(oid, Owner("u"); runtime = rt), :error)
+    @test timedwait(() -> !running(outlives), 10.0) === :ok
+finally
+    timedwait(() -> !running(linked) && !running(unlinked) && !running(outlives), 20.0)
+    terminate(app)
     reset_runtime!(rt)
 end
 

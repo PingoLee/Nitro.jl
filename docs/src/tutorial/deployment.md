@@ -368,14 +368,15 @@ says why, when:
   response.
 - **`:shutdown`**: `terminate` has begun. The server is draining and will force-close whatever is
   still running after `shutdown_timeout`.
+- **`:timeout`**: the handler ran past `serve(handler_timeout = …)`. Off by default.
 
 ```julia
 function export_report(req)
     rows = Row[]
     for page in 1:npages
         if cancel_requested(req)
-            # A deploy: the client is still there, so tell it to retry.
-            cancel_reason(req) === :shutdown && return Res.status(503)
+            # A deploy, or the deadline: the client is still there, so tell it to retry.
+            cancel_reason(req) in (:shutdown, :timeout) && return Res.status(503)
             # The client left: nobody reads this status, but the access log records it.
             return Res.status(499)
         end
@@ -397,6 +398,50 @@ probe never runs on the interactive thread.
 **A check is not a yield.** It answers a question and gives up no thread. A loop that computes
 still holds its thread until it returns ([Handlers that compute](@ref)). Check where you would
 yield, or call both.
+
+**A deadline for handlers.** `serve(app; handler_timeout = 30)` gives every handler 30 seconds,
+counted from the moment the request's head has been read, before its body is read: the body's end
+is a moment the client chooses, and a client trickling its body must not push the deadline out.
+`read_timeout` bounds that body read on its own; the four socket timeouts (`read_header_timeout`,
+`read_timeout`, `idle_timeout`, `write_timeout`) bound the connection and never the handler, which is
+what this one does. Past it, `cancel_reason(req)` reads `:timeout`. Nothing is thrown: a handler
+that never checks runs to the end, and a handler that returns late still has its response written,
+with a `@debug` record naming the route and the overrun. Go's `http.TimeoutHandler` answers `503` on
+the handler's behalf instead; in Nitro that would be a second task writing a response the handler
+is still producing. Unset, the deadline costs nothing per request: no clock read, no timer, nothing
+written to the request. **The first cause a check observes wins**, and a reason never resets: a
+`terminate` after the handler saw `:timeout` still reads `:timeout`. Nothing watches between checks,
+and one check looks at the shutdown, then the deadline, then the client, so a client that left
+before the deadline but was not checked in between reads `:timeout`. A WebSocket handler is not
+bounded by the deadline once its `101` is sent: it is the socket's loop, not a request.
+
+**Work the handler hands off.** `cancel_reason(req)` reads the request's context, which only the
+handler's own task may touch. A task the handler spawns takes the request's token instead,
+`cancel_token(req)`, and reads it with the same two functions from any task:
+
+```julia
+function search(req)
+    token = cancel_token(req)
+    parts = [Threads.@spawn search_shard(s, token) for s in shards]
+    return Res.json(reduce(vcat, fetch.(parts)))
+end
+
+search_shard(shard, token) =
+    [hit for page in pages(shard) if !cancel_requested(token) for hit in page]
+```
+
+The token reads the request's causes and one more: `:completed`, once the response has been written
+with none of them, which tells a task still running that nobody waits for its answer.
+`cancel_reason(req)` never says `:completed`: once the response is written it reports nothing new.
+That split is deliberate. Go cancels a request's context when the handler returns, and it is Go's
+best-known footgun: work meant to outlive the request has to remember not to take that context
+(`context.WithoutCancel`). ASP.NET Core's `RequestAborted` fires on a disconnect only. Nitro keeps
+the request's own view to the causes and puts the completion signal on the token, which only code
+that asked for it holds.
+
+A background job can be linked the same way, with `submit_task(…; parent = cancel_token(req))`: it
+stops with the request's cause, never with its completion. See
+[Stopping a job with the request that started it](@ref).
 
 **What it cannot see:**
 - A client that sends its request and then half-closes its side (`shutdown(SHUT_WR)`) reads as

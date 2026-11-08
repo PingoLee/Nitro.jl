@@ -77,8 +77,9 @@ export  # The application handle
         getparams, getquery, getjson, getform, getfiles, getpost,
         getsession, setsession!, getuser, getprincipal, getip, setip!, getpeerip, getcontext, payload, getexternalurl,
         route_missed,
-        # Cooperative cancellation (#466): one function, with methods for a request and a worker run
-        cancel_requested, cancel_reason,
+        # Cooperative cancellation (#466): one function, with methods for a request and a worker run;
+        # `cancel_token` hands the request's token to another task (#662)
+        cancel_requested, cancel_reason, cancel_token,
         formdata, multipart,
         # Environment resolution (#55) -- reports the env, never gates on it
         current_env,

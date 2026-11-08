@@ -208,6 +208,18 @@ is explicit introspection, not accidental disclosure.)
   `STREAM` handler is not a WebSocket and keeps its request slot, and so does a handshake that
   carried a request body, which stays reachable for the socket's life. Throws with a custom
   `handler`.
+- `handler_timeout=nothing`: seconds a request's handler may run before `cancel_reason(req)` reads
+  **`:timeout`** (#661). `nothing` means no deadline, and then nothing about it runs per request:
+  no clock read, no timer, nothing written to the request. The clock starts when the request's
+  head has been read, before its body is read, so a client trickling its body cannot push the
+  handler's deadline out; `read_timeout` bounds that body read on its own. It **asks** the handler
+  to stop, as the other causes do: nothing is thrown into it, and a handler that never checks runs
+  to the end. A handler that returns after its deadline still has its response written, and a
+  `@debug` record names the route and the overrun. The four timeouts below bound the socket; this
+  is the one that bounds the handler. A task the handler spawns sees it through
+  `cancel_token(req)`, and a background job through `submit_task(…; parent = cancel_token(req))`.
+  Throws with a custom `handler`, and is not applied to `internalrequest`, nor to a WebSocket
+  handler once its `101` is sent: that handler is the socket's loop, not a request.
 - `reuseaddr`: forwarded to `HTTP.listen!`. Defaults to `true` on Linux/macOS, where it
   allows rebinding a port still in `TIME_WAIT`, and to **`false` on Windows**, where
   `SO_REUSEADDR` instead lets a second process bind a port another is actively listening

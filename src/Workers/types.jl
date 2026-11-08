@@ -264,6 +264,12 @@ mutable struct TaskInfo
     # re-reads the token; the canceller sets the token, then reads the waker. At least one of them
     # sees the other, so a cancel cannot fall between the two and leave the backoff asleep.
     @atomic cancel_waker::Union{Nothing, Base.Event}
+    # The request this run was linked to with `submit_task(…; parent = cancel_token(req))` (#662), or
+    # `nothing`. Set once, on the run object the callback receives, before the callback starts
+    # (`_execute_task_async`); `cancel_reason` reads it. Process-local like the token, never
+    # persisted, never copied by `set_task!` or `_successor_run`: it names a request in THIS
+    # process, and a successor run is a claim, which only an external queue makes.
+    @atomic parent::Union{Nothing, _CancelState}
 
     function TaskInfo(id::String; queue_name::Union{Nothing, String}=nothing, external::Bool=false,
                       job_name::Union{Nothing, String}=nothing, job_args::Union{Nothing, String}=nothing)
@@ -287,6 +293,7 @@ mutable struct TaskInfo
             job_name,
             job_args,
             :none,
+            nothing,
             nothing,
         )
     end
@@ -385,15 +392,20 @@ end
 """
     CANCEL_REASONS
 
-The five things that can request a cancellation, as the symbols [`cancel_reason`](@ref cancel_reason(::TaskInfo)) reports.
+The six things that can request a cancellation, as the symbols [`cancel_reason`](@ref cancel_reason(::TaskInfo)) reports.
 
 | Reason | Who set it | What it already did to the record |
 |---|---|---|
 | `:user` | `cancel_task` | claimed `CANCELLED` **before** setting the token |
-| `:timeout` | an expired `TaskOptions(timeout=…)` | nothing yet — it throws [`TaskTimeoutError`](@ref), which is terminal `FAILED` |
+| `:timeout` | an expired `TaskOptions(timeout=…)`; or the deadline of the request the run is linked to (`submit_task(…; parent)`, #662) | nothing yet. Its own deadline throws [`TaskTimeoutError`](@ref), which is terminal `FAILED`; a request's deadline is the request's cause, below |
 | `:superseded` | re-running a key whose predecessor is still executing | replaced the record, so the predecessor's `run_id` fence now fails |
-| `:shutdown` | a teardown drain ([`shutdown!`](@ref), #176), or a consumer process's drain (#514) | **nothing** — a terminal write there would race the run's own, the #88/#108 failure mode. On a consumer the run is **handed back** to the queue, not recorded |
+| `:shutdown` | a teardown drain ([`shutdown!`](@ref), #176), or a consumer process's drain (#514); or `terminate` draining the server of the request the run is linked to | **nothing** — a terminal write there would race the run's own, the #88/#108 failure mode. On a consumer the run is **handed back** to the queue, not recorded |
 | `:lease_lost` | a consumer process's heartbeat, finding its lease taken back and the same submission re-queued or re-claimed (#514) | taken the run back: another run of it will happen. The run is handed back, which loses its fence and writes nothing |
+| `:client_disconnected` | the client of the request the run is linked to left before its response was written (`submit_task(…; parent)`, #662) | **nothing**: the run writes its own `CANCELLED` when it stops |
+
+A request's cause reaches a linked run when the run next checks its token (`cancel_requested`,
+[`checkpoint!`](@ref)): it is polled, not pushed, so a run parked in its retry backoff sees it when
+the backoff ends. A request's completion never cancels a linked run.
 
 That last column is why the reason exists. Most causes have already decided the record by the
 time the callback notices, so only a drain leaves the run to write its own terminal state — and
@@ -401,7 +413,7 @@ before #183 it wrote `"Cancelled by user"` for a shutdown no user asked for. A j
 queue reads `:lease_lost` as *stop, and assume the run will happen again*, never as a person's
 cancel: a cancel a person asked for always reads `:user`. See [`cancel_reason`](@ref cancel_reason(::TaskInfo)).
 """
-const CANCEL_REASONS = (:user, :timeout, :superseded, :shutdown, :lease_lost)
+const CANCEL_REASONS = (:user, :timeout, :superseded, :shutdown, :lease_lost, :client_disconnected)
 
 # The ONLY write path into the token. Deliberately not exported and not public: workers §6 keeps
 # `cancel_task` the authorized route into a cancellation, because it is the one that performs the
@@ -437,6 +449,7 @@ function _cancel_message(reason::Symbol)
     reason === :superseded && return "Cancelled by a re-run of this task key"
     reason === :shutdown && return "Cancelled by worker shutdown"
     reason === :lease_lost && return "Cancelled: the consumer lost its lease on this run"
+    reason === :client_disconnected && return "Cancelled: the client of its request disconnected"
     return "Cancelled"
 end
 
@@ -463,7 +476,7 @@ end
 `true` once cancellation has been requested for **this run**, in **this process**.
 
 Poll it from any long-running callback. It is the whole of Nitro's cancellation mechanism, and
-four things set it — see [`CANCEL_REASONS`](@ref). None of them can stop a callback that never
+the causes in [`CANCEL_REASONS`](@ref) set it. None of them can stop a callback that never
 looks ([#127](https://github.com/PingoLee/Nitro.jl/issues/127)).
 
 ```julia
@@ -496,7 +509,7 @@ be inferred from the status.
 replaced the `Bool` field with `@atomic cancel_reason::Symbol`; the accessor is unchanged in
 name and meaning, the field is gone.
 """
-cancel_requested(task_info::TaskInfo) = (@atomic task_info.cancel_reason) !== :none
+cancel_requested(task_info::TaskInfo) = cancel_reason(task_info) !== :none
 
 """
     cancel_reason(task_info::TaskInfo) -> Symbol
@@ -504,7 +517,9 @@ cancel_requested(task_info::TaskInfo) = (@atomic task_info.cancel_reason) !== :n
 *Why* this run was asked to stop — one of [`CANCEL_REASONS`](@ref) — or `:none` if it was not.
 
 `cancel_requested(t)` is exactly `cancel_reason(t) !== :none`; this is the same token read for
-its cause instead of its truth value, so polling either costs one atomic load.
+its cause instead of its truth value, so polling either costs two atomic loads (the token, and
+whether the run has a `parent`), plus, for a run linked to an open request, that request's check:
+a clock read and at most one socket peek every 10 ms.
 
 Use it to make a callback react differently to a deploy than to a person:
 
@@ -526,10 +541,26 @@ end, Owner("user-1"))
 
 It is process-local, exactly like the flag: a cancel issued on another node sets nothing here, so
 a cross-process callback reads `:none` and must poll the record. And it says nothing about what
-was *stored* — three of the four causes have already written the record, or will never write a
+was *stored* — most causes have already written the record, or will never write a
 cancellation at all. [`shutdown!`](@ref) has the table.
+
+**A run linked to a request** (`submit_task(…; parent = cancel_token(req))`, #662) also reads the
+request's cause, `:client_disconnected`, `:timeout` or `:shutdown`, as its own: the first time a
+check finds one, it is set on the run's token, first cause wins. The check runs the request's own
+(throttled) disconnect probe, on the run's task. A request that completed cancels nothing: a job
+submitted by a handler that then returns keeps running.
 """
-cancel_reason(task_info::TaskInfo) = @atomic task_info.cancel_reason
+function cancel_reason(task_info::TaskInfo)::Symbol
+    reason = @atomic task_info.cancel_reason
+    reason === :none || return reason
+    parent = @atomic task_info.parent
+    parent === nothing && return :none
+    # The request's view, never the token's `:completed` (see `submit_task`'s `parent`).
+    inherited = _request_reason(parent)
+    inherited === :none && return :none
+    _request_cancel!(task_info, inherited)
+    return @atomic task_info.cancel_reason
+end
 
 """
     TaskTimeoutError(timeout)
@@ -595,8 +626,8 @@ a worker run, measured on Julia 1.12), so a call per millisecond of work costs a
 **It is the task API's `yield()` plus the cancellation check, in one call.** After the yield it
 reads the same token [`cancel_requested`](@ref cancel_requested(::TaskInfo)) does, so it honours every cause in
 [`CANCEL_REASONS`](@ref): a `cancel_task`, an expired `TaskOptions(timeout=…)`, a re-run of the key,
-and a teardown drain. The throw unwinds the callback, and the executor records the run as the
-cancellation it was. A callback that would rather finish its current unit of work first can still
+a teardown drain, and the cause of a linked request (`submit_task(…; parent)`). The throw unwinds
+the callback, and the executor records the run as the cancellation it was. A callback that would rather finish its current unit of work first can still
 poll `cancel_requested` itself and return; the two compose.
 
 **What it does not do:**
