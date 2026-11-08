@@ -40,6 +40,12 @@ on:
   workflow_dispatch:
   schedule:
     - cron: '23 5 * * 1'   # Mondays, 05:23 UTC
+  # TEMPORARY, removed before review: workflow_dispatch runs only a file already on main, so the
+  # pre-merge runs (this branch and the positive control) are triggered by push.
+  push:
+    branches:
+      - ci/863-trim-count
+      - scratch/863-rise
 permissions:
   contents: read
 jobs:
