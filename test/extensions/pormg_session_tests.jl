@@ -481,10 +481,11 @@ end
 
 # -- A stand-in PormG connection, for `pormg_nitro_session` ---------------
 #
-# `PormG.connection(key=k)` is just `config[k].connections` (`PormG/src/Configuration.jl`),
-# `config` is a `Dict{String,PormGSettings}` and `PormGSettings` is an ABSTRACT type
-# (`PormG/src/Kernel.jl`), so an entry registered under a test-only key is enough to run
-# `pormg_nitro_session` end to end with nothing behind it.
+# `PormG.connection(key=k)` is just `config[k].connections` (`PormG/src/Configuration.jl`), and
+# `Settings.connections` takes any pool, so a real `Settings` around a fake pool, registered under a
+# test-only key, is enough to run `pormg_nitro_session` end to end with nothing behind it. Since
+# PormG #1622 `config` holds `Configuration.Settings` only: a settings type of the test's own no
+# longer fits in it.
 #
 # `FakeSessionPool <: PormG.PormGSQLite` on purpose rather than a bare struct: subtyping means
 # `_ensure_session_table!` runs PormG's REAL `create_table`/`create_index` against the REAL
@@ -495,9 +496,9 @@ struct FakeSessionPool <: PormG.PormGSQLite
     sql::Vector{String}
 end
 
-struct FakeSessionSettings <: PormG.PormGSettings
-    connections::FakeSessionPool
-end
+# `db_def_folder = key`: the default folder is "db" for every key, and the test keys stay distinct.
+fake_session_settings(conn::FakeSessionPool, key::String) =
+    PormG.Configuration.Settings(connections = conn, db_def_folder = key)
 
 PormG.ConnectionPool.fetch(c::FakeSessionPool, sql::String; kwargs...) =
     (push!(c.sql, sql); nothing)
@@ -1095,7 +1096,7 @@ end
         key = "nitro-test-session-cap"
         haskey(PormG.config, key) && error("test-only PormG connection key is already registered: $key")
         conn = FakeSessionPool(String[])
-        PormG.config[key] = FakeSessionSettings(conn)
+        PormG.config[key] = fake_session_settings(conn, key)
         try
             @test_throws ArgumentError pormg_nitro_session(db_key=key, max_sessions=0)
             @test isempty(conn.sql)
@@ -1236,7 +1237,7 @@ end
     (haskey(PormG.config, key)) &&
         error("test-only PormG connection key is already registered: $key")
     conn = FakeSessionPool(String[])
-    PormG.config[key] = FakeSessionSettings(conn)
+    PormG.config[key] = fake_session_settings(conn, key)
     try
         bound = getproperty(PormGExt, :session_model)(key)
         unbound = getproperty(PormGExt, :session_model)(key)
@@ -1349,7 +1350,7 @@ end
     # clobbers and deletes a real `PormG.config` entry turns one failure into a broken process.
     haskey(PormG.config, key) && error("test-only PormG connection key is already registered: $key")
     conn = FakeSessionPool(String[])
-    PormG.config[key] = FakeSessionSettings(conn)
+    PormG.config[key] = fake_session_settings(conn, key)
     try
         store = pormg_nitro_session(db_key=key)
 
@@ -1519,10 +1520,9 @@ using SQLite
 using Nitro.Types: get_session, set_session!, session_store_full
 
 key = "nitro_session_real_567"
-PormG.register_connection(key, joinpath(mktempdir(), "sessions.sqlite"); adapter = "SQLite", env = "test")
+PormG.register_connection(key, joinpath(mktempdir(), "sessions.sqlite"); adapter = "SQLite", env = "test",
+                          change_data = true, change_db = true)
 try
-    PormG.config[key].change_data = true
-    PormG.config[key].change_db = true
     ext = Base.get_extension(Nitro, :NitroPormGExt)
     store = Nitro.pormg_nitro_session(db_key = key, max_sessions = 3)
     rows() = ext._session_objects(store).count()
@@ -1583,7 +1583,8 @@ try
     @test session_key in asked
     @test haskey(PormG.config, session_key)
     @test store.db_key == session_key
-    # The store queries the key it resolved: a write and a read through it round-trip.
+    # The store queries the key it resolved: a write and a read through it round-trip. Each
+    # factory ran on a read-only key; only the session key is made writable, and only now.
     PormG.config[session_key].change_data = true
     set_session!(store, "resolved-1", Dict{String,Any}("v" => 1); ttl = 60)
     @test get_session(store, "resolved-1") == Dict{String,Any}("v" => 1)

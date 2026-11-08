@@ -116,7 +116,7 @@ which PormG ships for a host library binding its own models. It is migration-neu
 
 **Why bind at all, when `.db(key)` already routes the query.** Because every store query
 starts with `model.objects`, and PormG resolves that property by the model *before* `.db()`
-is ever reached: `Base.getproperty(::Model_Type, :objects)` calls
+is ever reached: `Base.getproperty(::ModelType, :objects)` calls
 `Models.ensure_model_initialized(model)` first. Its fast path is a set `connect_key` that names
 a loaded connection. An unbound model misses it and runs the self-heal path on **every**
 session and task query — scanning `REGISTERED_MODULES` and `Base.loaded_modules`, and, for any
