@@ -568,8 +568,9 @@ function Base.showerror(io::IO, e::StoreInterfaceError)
                 "`, which its store contract requires.")
     print(io, "Define a method `", name, "(::", e.store_type, ", ...)`. ",
               "The full contract is in the docstring of the abstract store type ",
-              "(`?AbstractWorkerStore` or `?AbstractSessionStore`); ",
-              "`missing_store_methods` / `missing_session_methods` list everything a type is ",
+              "(`?AbstractWorkerStore`, `?AbstractSessionStore` or `?AbstractRefreshTokenStore`); ",
+              "`missing_store_methods` / `missing_session_methods` / `missing_refresh_store_methods` ",
+              "list everything a type is ",
               "still missing; `missing_claim_methods` lists the worker store's optional claim ",
               "capability, which only a store backing an external queue needs.")
 end

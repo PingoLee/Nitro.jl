@@ -509,6 +509,165 @@ function missing_session_methods(S::Type{<:AbstractSessionStore})
     return names
 end
 
+# ── Refresh-token store contract (#231) ─────────────────────────────────────────
+
+"""
+    AbstractRefreshTokenStore
+
+The storage contract behind `Nitro.Auth`'s refresh-token rotation (`issue_refresh_token`,
+`rotate_refresh_token`, `revoke_refresh_token`). `MemoryRefreshTokenStore` ships in `Nitro.Auth`;
+an application may add its own.
+
+**Data access only**, like [`AbstractSessionStore`](@ref) and the worker store: a store records,
+consumes, revokes and prunes, and never decides anything. When to rotate, that a stale token coming
+back revokes its whole family, and which error a refusal raises are all the rotation functions'
+policy, so every store gets the same rules.
+
+A store holds one row per **family**: the chain of tokens one sign-in produced through rotation.
+The row keeps the family's **current** token, its `jti` (the token's unique id), its subject and its
+expiry. Each token carries its family id as a signed claim, so any token of a family that comes back
+is checked against that row. If it is not the current one, it was rotated away already, and two
+parties hold the lineage. That is a reuse, and it stays detectable for as long as the family lives,
+however many refreshes other clients make.
+
+# Required
+
+| Method | Contract |
+|---|---|
+| `record_refresh_token!(store, record::RefreshTokenRecord; new_family::Bool)` | Make `record` its family's current token. With `new_family = true` the family must be **absent**, and is created. With `false` it must be **present, with no current token** (one `consume_refresh_token!` just took it). Returns `true`, or `false` with no write otherwise |
+| `consume_refresh_token!(store, family::String, jti::String; at::Int)` | **One atomic step**: if `jti` is the family's current token and has not expired, clear the current token and return the [`RefreshTokenRecord`](@ref); otherwise return a [`RefreshTokenMiss`](@ref): `:unknown` (no such family), `:reused` (`jti` is not the current token), `:expired` |
+| `revoke_refresh_family!(store, family::String)` | Remove the family, idempotently. Afterwards its tokens are `:unknown` and nothing can be recorded into it |
+| `prune_refresh_tokens!(store; at::Int)` | Drop families whose every token has expired by `at` |
+
+`at` is Unix seconds, UTC.
+
+`consume_refresh_token!` is the compare-and-swap that rotation stands on. If the check and the
+clear are two steps (a read, then an `UPDATE`), two concurrent rotations of one token can both pass
+the check, and both callers get a fresh token. Make it one step: one lock hold in memory, an
+`UPDATE … SET current_jti = NULL WHERE family = \$1 AND current_jti = \$2 AND expires_at > \$3
+RETURNING …` in SQL. The expiry belongs in the condition: rotation does not check it again, and
+`decode_jwt` admits a token for 30 seconds past its `exp`. When the update touches no row, read
+the family once more to tell `:unknown` (no row), `:reused` (another `current_jti`) and `:expired`
+apart.
+
+A family must outlive its current token's predecessors: keep it until the **latest** `expires_at`
+of any token it was given, not the current one's, so an old token is still recognized as a reuse.
+
+A store that loses a family (eviction, a missing row) must **fail closed**. Its tokens read as
+`:unknown`, never as live, and a record into it is refused.
+
+[`missing_refresh_store_methods`](@ref) lists what a type still owes:
+
+```julia
+@test isempty(missing_refresh_store_methods(MyRefreshStore))
+```
+"""
+abstract type AbstractRefreshTokenStore end
+
+"""
+    RefreshTokenRecord(jti, family, subject, expires_at::Int)
+
+A family's current refresh token as an [`AbstractRefreshTokenStore`](@ref) records it: its unique
+id `jti`, its `family`, the `subject` it was issued to, and the instant it expires (`exp`, Unix
+seconds, UTC).
+
+Its `show` prints neither the `jti` nor the family: a jti names a live credential, so it stays out
+of logs, like the token itself.
+"""
+struct RefreshTokenRecord
+    jti::String
+    family::String
+    subject::String
+    expires_at::Int
+end
+
+Base.show(io::IO, r::RefreshTokenRecord) =
+    print(io, "RefreshTokenRecord(<redacted>; expires_at = ", r.expires_at, ")")
+
+"""
+The reasons [`consume_refresh_token!`](@ref) can refuse a token.
+"""
+const REFRESH_MISS_REASONS = (:unknown, :reused, :expired)
+
+"""
+    RefreshTokenMiss(reason::Symbol)
+
+Why [`consume_refresh_token!`](@ref) did not hand back a record:
+
+- `:unknown`: the store has no such family: it was never issued here, or it was revoked, pruned
+  or evicted;
+- `:reused`: the family is live, but the token is not its current one. It was rotated away
+  already, so it has been presented twice;
+- `:expired`: the current token's `expires_at` has passed.
+
+It carries no family: the caller already holds it, signed, in the token it presented.
+"""
+struct RefreshTokenMiss
+    reason::Symbol
+
+    function RefreshTokenMiss(reason::Symbol)
+        reason in REFRESH_MISS_REASONS || throw(ArgumentError(
+            "RefreshTokenMiss: reason must be one of $(REFRESH_MISS_REASONS), got :$reason"))
+        return new(reason)
+    end
+end
+
+# The fallbacks pass ONLY the store to `store_contract_error`, never the jti, the family or the
+# record: the `MethodError` it raises for a near-miss signature renders its arguments, and a jti
+# names a live credential.
+
+"""
+    record_refresh_token!(store, record::RefreshTokenRecord; new_family::Bool) -> Bool
+
+Make `record` its family's current token. See [`AbstractRefreshTokenStore`](@ref).
+"""
+@noinline record_refresh_token!(store::AbstractRefreshTokenStore, record; new_family::Bool) =
+    store_contract_error(record_refresh_token!, AbstractRefreshTokenStore, 1, store)
+
+"""
+    consume_refresh_token!(store, family::String, jti::String; at::Int) -> Union{RefreshTokenRecord, RefreshTokenMiss}
+
+Atomically take the family's current token if it is `jti`, or say why not. See
+[`AbstractRefreshTokenStore`](@ref).
+"""
+@noinline consume_refresh_token!(store::AbstractRefreshTokenStore, family, jti; at::Int) =
+    store_contract_error(consume_refresh_token!, AbstractRefreshTokenStore, 1, store)
+
+"""
+    revoke_refresh_family!(store, family::String) -> Nothing
+
+Revoke every token in `family`, past and future. See [`AbstractRefreshTokenStore`](@ref).
+"""
+@noinline revoke_refresh_family!(store::AbstractRefreshTokenStore, family) =
+    store_contract_error(revoke_refresh_family!, AbstractRefreshTokenStore, 1, store)
+
+"""
+    prune_refresh_tokens!(store; at::Int) -> Nothing
+
+Drop the families whose every token has expired by `at`. See [`AbstractRefreshTokenStore`](@ref).
+"""
+@noinline prune_refresh_tokens!(store::AbstractRefreshTokenStore; at::Int) =
+    store_contract_error(prune_refresh_tokens!, AbstractRefreshTokenStore, 1, store)
+
+const REFRESH_STORE_INTERFACE = (record_refresh_token!, consume_refresh_token!,
+                                 revoke_refresh_family!, prune_refresh_tokens!)
+
+"""
+    missing_refresh_store_methods(S::Type{<:AbstractRefreshTokenStore}) -> Vector{Symbol}
+
+The [`AbstractRefreshTokenStore`](@ref) methods `S` has not implemented. Empty means `S` is
+conforming. All four are required.
+"""
+function missing_refresh_store_methods(S::Type{<:AbstractRefreshTokenStore})
+    names = Symbol[]
+    for f in REFRESH_STORE_INTERFACE
+        if !implements_contract_method(f, S, AbstractRefreshTokenStore, 1)
+            push!(names, nameof(f))
+        end
+    end
+    return names
+end
+
 """
 Normalize a cookie `Domain`: trimmed, lowercased, and only `[A-Za-z0-9.-]`. The ONE domain
 validator (#329): `CookieConfig`, `format_cookie`, `set_cookie!(domain = …)` and
