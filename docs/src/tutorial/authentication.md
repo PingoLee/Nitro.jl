@@ -11,16 +11,17 @@ split follows RFC 6750.
 
     Nitro.Auth is the **resource-server** half of a token system. It verifies an access
     token's signature and claims, builds a `Principal` from them, and authorizes routes on
-    that principal. **Refresh-token lifecycles, rotation, revocation and denylisting are
-    your application's** — Nitro ships no refresh endpoint, no `jti`, and no revocation
-    store, and `encode_jwt` is a signing primitive rather than a token service.
+    that principal. `encode_jwt` is a signing primitive rather than a token service, and Nitro
+    ships no login or refresh **endpoint**: the flow is your application's.
 
-    That split is deliberate and follows Spring, whose declarative model this page's guards
-    already mirror: token *validation* lives in Spring Security, while refresh issuance and
-    rotation live in Spring Authorization Server — a separate project, because rotation with
-    reuse detection needs server-side state that a stateless verifier must not pretend to
-    have. §4's *[Token lifetime and renewal](#Token-lifetime-and-renewal)* shows the two
-    routes Nitro supports for keeping a user signed in past one token's lifetime.
+    That split follows Spring, whose declarative model this page's guards already mirror:
+    token *validation* lives in Spring Security, while refresh issuance and rotation live in
+    Spring Authorization Server — a separate project, because rotation with reuse detection
+    needs server-side state that a stateless verifier must not pretend to have. Nitro keeps
+    that state **opt-in**: a refresh-token store with rotation and reuse detection, which your
+    refresh handler calls and nothing else depends on. §4's
+    *[Token lifetime and renewal](#Token-lifetime-and-renewal)* shows the routes Nitro
+    supports for keeping a user signed in past one token's lifetime.
 
 ## 1. Pick your model
 
@@ -608,9 +609,9 @@ Lower-level pieces (`encode_jwt`, `decode_jwt`, claim validation for
 
 A token lives exactly as long as its `exp` says, or — with no `exp` — until
 `iat + exp_timeout` (15 minutes by default). After that the validator throws and the request
-is a 401. **Nitro never re-issues a token**, and it cannot: verifying a signature says
-nothing about whether the subject is still entitled to a new one. Two routes keep a user
-signed in past that point, and both already exist.
+is a 401. **Verifying a token never re-issues one**: a valid signature says nothing about
+whether the subject is still entitled to a new one. Three routes keep a user signed in past
+that point.
 
 **A browser app: make the session the long-lived thing, not the token.** `SessionMiddleware`
 and a session store are what Nitro ships for this, with `regenerate_session!` /
@@ -618,9 +619,129 @@ and a session store are what Nitro ships for this, with `regenerate_session!` /
 [Sessions & Auth](sessions_and_auth.md). A cookie-borne session is renewed by the store,
 so there is no second token to rotate.
 
-**An API or SPA that needs a refresh endpoint: your application owns it.** Mint two tokens
-that differ by a claim, and let an ordinary guard keep the long-lived one away from your
-ordinary routes:
+#### An API or SPA: rotating refresh tokens
+
+Give the client a short-lived **access** token and a long-lived **refresh** token, and spend
+the refresh token on every use. `Nitro.Auth` keeps the server-side state that needs:
+
+- **A store** with one row per **family**, the chain of tokens one sign-in produced, holding that
+  family's current token (its `jti`). `MemoryRefreshTokenStore` ships in core, and
+  `AbstractRefreshTokenStore` is the contract for your own.
+- **Rotation.** `rotate_refresh_token` spends the presented token and issues the next one in
+  the same family. A captured token stops working the next time the real client refreshes.
+- **Reuse detection.** Every token carries its family id, signed. A token of a live family that
+  is not the family's current one was rotated away already, so two parties hold the lineage. The
+  server cannot tell the thief from the client, so it **revokes the whole family**.
+  Both are signed out, and the real user signs in again. This is the rule the OAuth 2.0
+  Security BCP specifies
+  ([RFC 9700 §4.14.2](https://www.rfc-editor.org/rfc/rfc9700#section-4.14.2)), on top of the
+  refresh grant of [RFC 6749 §6](https://www.rfc-editor.org/rfc/rfc6749#section-6), and Auth0
+  ships it as *refresh token rotation with automatic reuse detection*.
+
+```julia
+using Nitro, Nitro.Auth
+
+const ACCESS_SECRET  = SecretString(ENV["ACCESS_JWT_SECRET"])
+const REFRESH_SECRET = SecretString(ENV["REFRESH_JWT_SECRET"])   # a DIFFERENT key
+const refresh_store  = MemoryRefreshTokenStore()
+
+struct Credentials;    email::String; password::String; end
+struct RefreshRequest; refresh_token::String; end
+
+function login(req, body::Json{Credentials})
+    driver = authenticate_driver(body.payload)   # your lookup and `check_password`
+    driver === nothing && return Res.status(401)
+    refresh = issue_refresh_token(refresh_store, string(driver.id); secret = REFRESH_SECRET,
+                                  claims = Dict("role" => driver.role))
+    access  = encode_jwt(Dict("sub" => string(driver.id), "role" => driver.role,
+                              "token_use" => "access"), ACCESS_SECRET; expires_in = 900)
+    return Res.json(Dict("access_token" => access, "refresh_token" => refresh))
+end
+
+function refresh(req, body::Json{RefreshRequest})
+    rotation = rotate_refresh_token(refresh_store, body.payload.refresh_token;
+                                    secret = REFRESH_SECRET)
+    # The claims are the ones given at sign-in. Look the driver up again, so a disabled or
+    # demoted account does not get a fresh access token with yesterday's role.
+    driver = find_driver(rotation.access_claims["sub"])
+    (driver === nothing || !driver.active) && return Res.status(401)
+    claims = merge(rotation.access_claims, Dict("role" => driver.role))
+    # Nitro hands back the claims; signing the access token stays yours.
+    access = encode_jwt(claims, ACCESS_SECRET; expires_in = 900)
+    return Res.json(Dict("access_token" => access, "refresh_token" => rotation.refresh_token))
+end
+
+function logout(req, body::Json{RefreshRequest})
+    revoke_refresh_token(refresh_store, body.payload.refresh_token; secret = REFRESH_SECRET)
+    return Res.status(204)
+end
+
+app = App(mod = @__MODULE__)
+urlpatterns(app, "/auth",
+    path("/login",   login,   method = "POST"),
+    path("/refresh", refresh, method = "POST"),
+    path("/logout",  logout,  method = "POST"),
+)
+serve(app; middleware = [RefreshTokenPruner(refresh_store)])
+```
+
+What each piece does, and what it leaves to you:
+
+- **`issue_refresh_token`** mints the first token of a new family at sign-in. It is a JWT
+  carrying `sub`, a random `jti`, the family id `fam`, `token_use = "refresh"`, `iat`, `exp`
+  (14 days by default, `ttl` in seconds) and your `claims`. Those claims are carried into every
+  rotated token and into the access claims, unchanged, which is why the handler above looks the
+  driver up again.
+- **`rotate_refresh_token`** verifies the token with `decode_jwt` (signature and `exp`, plus
+  `issuer`/`audience` when you pass them), atomically takes it as its family's current token,
+  and records the next one. It returns a `RefreshRotation`: `access_claims` for you to sign, and
+  the new `refresh_token`. Each rotation starts a fresh `ttl`, so `ttl` bounds **inactivity**.
+  There is no absolute lifetime for a family yet: an absolute cap is the handler's to enforce,
+  for example through a sign-in time you keep on the user.
+- **A refusal throws `RefreshTokenError(reason)`**: `:invalid` (did not verify), `:unknown` (no
+  live family: signed out, revoked or expired), `:revoked` (the family was revoked while this
+  rotation was under way), `:reused` (its family was just
+  revoked) or `:expired`. Uncaught, it is a fixed
+  `401` with no detail, logged at `@debug` with the reason only. Catch it to answer in your own
+  shape (OAuth's `{"error": "invalid_grant"}` is the usual one), or to record a `:reused` as a
+  security event. The error never carries the token or its `jti`, and nothing on the refresh
+  path logs one.
+- **`revoke_refresh_token`** is sign-out: it revokes the token's family. Revoking one token and
+  revoking its family are the same call, because a family has at most one live token.
+- **`RefreshTokenPruner`** removes expired families in the background. Expired tokens are
+  refused whether or not it runs; it keeps the store's bound for live sign-ins.
+
+!!! warning "A client must serialize its refreshes"
+
+    Concurrent use of one refresh token **is** reuse. Two tabs that refresh with the same token
+    at once revoke their own family, and the user is signed out. Share one in-flight refresh
+    per client: a single pending promise in an SPA, a mutex in a mobile app. For the same
+    reason, a client that loses the response to a successful refresh has lost its only
+    current token: its retry with the old one is a reuse, and the user signs in again.
+
+**Sign refresh tokens with a different key from access tokens.** Then your access-token
+validator refuses a refresh token by its signature, and no guard has to remember to. If you
+share one key, the `token_use` claim is the discriminator, and every ordinary route needs the
+guard:
+
+```julia
+GuardMiddleware(claim_required("token_use", "access"))
+```
+
+`MemoryRefreshTokenStore` lives in one process: a restart signs every client out, and a second
+process cannot see the first's tokens. It holds one row per family, at most `max_tokens`
+(100,000 by default). A refresh rewrites its family's row and a sign-out removes it, so the bound
+counts concurrent sign-ins, never refreshes, and reuse detection lasts as long as a family does.
+Eviction **fails closed**: every token of an evicted family is refused, never accepted. Put a
+`RateLimiter` on the refresh route as well. Behind more than one process, implement
+`AbstractRefreshTokenStore` on your database. Its docstring is the contract, and the rule that
+matters most is that `consume_refresh_token!` checks and clears the current token in **one**
+atomic step.
+
+#### Without a store: two tokens and a guard
+
+If you do not need rotation, mint two tokens that differ by a claim, and let an ordinary guard
+keep the long-lived one away from your ordinary routes:
 
 ```julia
 # At login: a short access token, and a long-lived one marked for one purpose only.
@@ -643,18 +764,11 @@ GuardMiddleware(claim_required("token_use", "access"))
 `typ`: `encode_jwt` already writes a JOSE header `typ: "JWT"`, and a payload claim of the
 same name reads as that header to anyone debugging a token.
 
-What the recipe above does **not** give you, and what your `refresh_handler` still owns:
-
-- **Rotation** — issuing a new refresh token with each use, so a captured one has a bounded life.
-- **Reuse detection** — recognizing that an already-spent refresh token came back, which is the
-  signal that it was stolen, and invalidating the whole family when it does. This is the part
-  that needs a store; [RFC 6749 §6](https://www.rfc-editor.org/rfc/rfc6749#section-6) and the
-  OAuth 2.0 Security BCP describe the shape.
-- **Revocation** — the same limit §2's *Revocation and the struct-user path* describes: Nitro
-  cannot revoke a signed token it did not issue, so a fresh lookup in your `user_validator` is
-  what makes a demotion take effect inside the token's TTL.
-
-Short access-token lifetimes are what keep all three from being urgent.
+What this recipe does **not** give you is exactly what the store above adds: rotation, reuse
+detection and revocation. A stolen refresh token works until its `exp`. And as §2's
+*Revocation and the struct-user path* describes, a demotion takes effect inside a token's TTL
+only through a fresh lookup in your `user_validator`. Short lifetimes are what keep that from
+being urgent.
 
 ## 5. Service & capability tokens
 
