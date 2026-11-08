@@ -122,6 +122,10 @@ jobs:
               fail=1; continue
             fi
             total=$(awk '$2 == "total" { t = $1 } END { print t }' "$R/frames-$entry.txt")
+            if ! [[ "$total" =~ ^[0-9]+$ ]]; then
+              verdicts+=("$entry: frames.jl printed no total (pinned $pin); see its output below")
+              fail=1; continue
+            fi
             if [ "$total" = "$pin" ]; then
               verdicts+=("$entry: $total (pinned $pin)")
             else
