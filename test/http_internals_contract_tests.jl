@@ -540,6 +540,14 @@ end
     @test isdefined(HTTP, :_set_read_deadline!)
     @test hasmethod(HTTP._set_read_deadline!, Tuple{HTTP.TCP.Conn, Int64})
     @test hasmethod(HTTP._set_read_deadline!, Tuple{HTTP.TLS.Conn, Int64})
+    # #894: `_SWALLOW_SKIP_ABOVE_BYTES` is Nitro's 2 MiB plus HTTP's after-response drain budget,
+    # 1 MiB for 500 ms (JuliaWeb/HTTP.jl#1494). HTTP keeps that budget as literals in
+    # `_drain_before_close!`, with no name to pin, so its source is read: a bump that moves it fails
+    # here, and the skip line in src/core/transport.jl is then re-derived rather than left stale.
+    @test isdefined(HTTP, :_drain_before_close!)
+    drain_src = read(joinpath(pkgdir(HTTP), "src", "http_server.jl"), String)
+    @test occursin("while drained < 1024 * 1024", drain_src)
+    @test occursin("_deadline_after(Int64(500_000_000))", drain_src)
 end
 
 @testset "connection-loop surface (src/core/lifecycle.jl `_precompile_listener`, #827, #868)" begin

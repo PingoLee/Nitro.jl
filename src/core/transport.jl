@@ -654,7 +654,39 @@ _release_response_body!(_) = nothing
 # `lingering_close`; Go's `net/http` drains on close for the same reason. The budget is what keeps
 # it a courtesy rather than a second denial-of-service vector — past it, a client sending gigabytes
 # has already declared its intent, and eating an RST is the correct outcome for it.
+#
+# What it covers, measured (#780, Linux loopback): since HTTP.jl 2.12 HTTP drains an unread body
+# itself AFTER the response, up to 1 MiB for 500 ms (JuliaWeb/HTTP.jl#1494), so this swallow, which
+# reads BEFORE the response, earns its place only for a client that writes its whole body before
+# reading, with a body between the two budgets: past HTTP's 1 MiB at full speed, or sent over longer
+# than its 500 ms, but within this 2 MiB and 5 s. Without it those cells ended in a reset; with it,
+# a clean 413. What it skips: an `Expect: 100-continue` client, which has sent nothing (reading
+# would invite the body), and a declared length past `_SWALLOW_SKIP_ABOVE_BYTES`, whose close is
+# usually a reset however much this reads (#894). A chunked body declares no length and keeps the
+# swallow.
 const _MAX_SWALLOW_BYTES = 2 * 1024 * 1024
+
+# ...and the declared length past which reading it buys too little to hold the refusal open
+# (#894). Nitro reads at most `_MAX_SWALLOW_BYTES` before answering; HTTP.jl then drains at most
+# 1 MiB more after it (a literal in its `_drain_before_close!`, JuliaWeb/HTTP.jl#1494;
+# test/http_internals_contract_tests.jl watches that literal). A client that writes a body
+# declaring more than the two together before it reads has bytes unread at the close, so the close
+# is usually a reset whatever the swallow did. #780 measured 4 MiB on Linux loopback, where `main`
+# read for up to 4.2 s per refusal when the body was sent over 8 s. At full speed, the raw
+# write-then-read client's write still failed on a reset in 7 of 10 runs across the 413 and the
+# 503, and with `HTTP.request` the machine's reset counter moved in 4 of 10, against 10 of 10 for
+# both with no swallow. Presumably the kernel's receive buffer absorbed the rest in the runs that
+# closed cleanly. Those clean closes are what skipping gives up, in exchange for answering at once
+# and not holding the refusal open; a client that gets a reset
+# can still read its status on Linux, though not reliably on Windows. 4 MiB is the only size
+# measured above this line, and the line itself is the arithmetic of the two budgets. The
+# comparison is on a client's claim, and that is safe in this direction only: a claim can make the
+# refusal read nothing, never more than the byte budget and the deadline above already bound.
+const _SWALLOW_SKIP_ABOVE_BYTES = _MAX_SWALLOW_BYTES + 1024 * 1024
+
+# Whether a refused request with this declared length is swallowed at all. `-1` (chunked) and `0`
+# are both under the line, so they keep the swallow.
+_swallow_declared(declared::Int64)::Bool = declared <= _SWALLOW_SKIP_ABOVE_BYTES
 
 # ...and how long to spend on it (#298). The byte budget bounds how much a refusal reads, not how
 # long it waits: a client that declares a body and then sends it slowly, or never, held the refusal
@@ -785,7 +817,13 @@ function _send_rejection!(stream::HTTP.Stream, resp::HTTP.Response, drain::Bool)
     # keeps the two in legal order, and in every reachable combination the continue is either a
     # no-op (no `Expect` header, or already sent during the read) or skipped entirely (`drain`
     # is false precisely when the client is still waiting for it).
-    if drain
+    #
+    # A declared length past `_SWALLOW_SKIP_ABOVE_BYTES` skips it (#894): past both drain budgets
+    # the close is usually a reset however much this reads. The head's length is the whole body
+    # here: the 503 has read nothing, the declared-length 413 has read nothing, and the 413 found
+    # while reading is always chunked (`-1`), because a fixed-length body over the limit is refused
+    # by the declared-length check first.
+    if drain && _swallow_declared(Int64(stream.message.content_length))
         _bound_swallow!(stream)
         _swallow_request_body!(stream, _MAX_SWALLOW_BYTES)
     end

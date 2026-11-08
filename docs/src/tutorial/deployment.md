@@ -523,6 +523,17 @@ slot for the whole transfer. Only a response with no length — `Res.sse` — gi
 it starts streaming, because it has no end the server controls and can stay open for hours. A
 `STREAM` handler holds its slot for its whole lifetime, so leave room for those in the number.
 
+A request whose body is over `max_body_bytes` gives its slot back as soon as it is refused, so it
+holds no slot while Nitro discards the rest of its body. Before answering `413`, Nitro
+reads and discards up to 2 MiB of the rest of that body, for at most 5 seconds. A connection
+closed with data still unread is reset, and a reset can cost the client the `413` it was sent.
+Reading first lets a client that sends its whole body before reading the response get its
+status. HTTP.jl reads up to 1 MiB more after the response. A body that declares more than about
+3 MiB, past both of those, is answered at once with nothing read: such a client usually gets a
+reset whatever is read first, and reading it would only hold the refusal open. So is a client
+that sent `Expect: 100-continue` and is still waiting for permission to send its body.
+Behind a proxy that enforces its own body limit, none of this reaches Nitro.
+
 A **WebSocket** holds its slot for its whole lifetime too, unless you give WebSockets a budget of
 their own. A few hundred idle chat or notification sockets would otherwise fill the cap while using
 almost no memory, and every ordinary request would get a `503`:

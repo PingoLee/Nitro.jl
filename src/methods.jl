@@ -186,7 +186,8 @@ is explicit introspection, not accidental disclosure.)
   once it starts streaming. A `STREAM` handler holds its slot for its whole lifetime, and so does
   a WebSocket unless `max_upgraded_connections` is set. A request refused **413** over
   `max_body_bytes` gives its slot back as soon as it is refused, before Nitro reads and discards
-  the rest of its body and writes the `413`.
+  any of the rest of its body (up to 2 MiB, none when it declares more than about 3 MiB) and
+  writes the `413`.
 
   The slot bounds how many, not for how long. With `read_timeout` unset, a client that sends a
   head and then trickles its body holds a slot as long as it likes, and without `write_timeout`
