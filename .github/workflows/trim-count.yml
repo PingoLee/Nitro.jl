@@ -1,0 +1,167 @@
+name: Trim count
+# The `juliac --trim` verifier count, made visible (#863). The trimmed builds are not in the `test`
+# matrix, so their count could rise unseen: §3.9 of docs/design/juliac-trim.md pinned the minimal
+# app at 4, #840 raised it to 8, and four merges went by before #861 bisected it. This job builds
+# `bench/juliac/app.jl` and `bench/juliac/probe.jl` the way §1 of that doc measures them, prints
+# `frames.jl`'s rows and the probe's answers into the job summary, and compares each total with the
+# pin.
+#
+# THE PIN lives in the doc, not here: the `<!-- pinned: app=N probe=M -->` comment under §3's pin
+# paragraph. A PR that clears a wall already edits that paragraph; it moves the comment with it,
+# and this job follows. No marker, or more than one, is a red run: a deleted pin must be noticed.
+#
+# A RISE OR A FALL IS NEVER RED. The count is a ratchet, not a gate: #840 was right to merge, and
+# what this job asks for is the §3 edit, not a revert. A count that differs from the pin is a line
+# in the summary and a `::warning::` annotation. That is done with no failing branch in the
+# comparison rather than `continue-on-error`, because `continue-on-error` would also swallow the
+# failures that MUST be red:
+#   * the marker missing (the first step, before any build time is spent);
+#   * JuliaC or a dependency breaking the build (the build steps exit with the frontend's code);
+#   * the probe answering a request unexpectedly (it exits 1; a wrong answer is a stronger signal
+#     than a verifier row);
+#   * a log with no `Trim verify finished` line: a truncated or unverified build has no count.
+#
+# Not on `pull_request`, so no PR waits on it: a rise shows at the next weekly run, or when someone
+# runs it by hand (Actions -> Trim count -> Run workflow, on any branch that carries this file).
+# Julia 1.13 only, the CI series (#526); the 1.14 counts in §3 stay a local measurement. It does not
+# run `--trim=safe`, which stops at the first row (§4: `safe` is a target, not a gate), and it times
+# nothing: the count is deterministic per build and toolchain, a shared runner's timing is not
+# (#744).
+#
+# The bench environment's manifest is gitignored, so every run resolves it fresh within Nitro's
+# `[compat]`, and JuliaC is whatever `Pkg.Apps.add` installs that day. A dependency or a frontend
+# release can therefore move the count with no Nitro commit; the summary records the resolved
+# manifest and the frontend's version so such a move can be told apart from one in `src/`.
+#
+# Hardened like `ci.yml`'s jobs, because it builds and EXECUTES code (Nitro's own, and whatever
+# the fresh resolve fetches): `contents: read`, `persist-credentials: false`, no token or secret in
+# any step's environment. Nothing here writes to the repository.
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '23 5 * * 1'   # Mondays, 05:23 UTC
+permissions:
+  contents: read
+jobs:
+  count:
+    name: juliac verifier count (Julia 1.13)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    defaults:
+      run:
+        # An explicit `bash` runs with `-eo pipefail`; the implicit default has no pipefail, and the
+        # probe step's `| tee` would then hide the probe's exit code.
+        shell: bash
+    env:
+      # `build.sh` defaults to juliaup's `julia +1.13`. The runner has setup-julia's `julia`, which
+      # is already 1.13. JuliaC's binary stays at build.sh's default, `~/.julia/bin/juliac`, which is
+      # where `Pkg.Apps.add` puts it.
+      JULIA: julia
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false   # same reason as ci.yml's `test` job (#21)
+      - name: Read the pin from docs/design/juliac-trim.md §3
+        id: pin
+        run: |
+          doc=docs/design/juliac-trim.md
+          marks=$(grep -oE '<!-- pinned: app=[0-9]+ probe=[0-9]+ -->' "$doc" || true)
+          n=$(printf '%s' "$marks" | grep -c . || true)
+          if [ "$n" != 1 ]; then
+            echo "::error file=$doc::expected exactly one '<!-- pinned: app=N probe=M -->' marker under §3's pin paragraph, found $n"
+            exit 1
+          fi
+          echo "app=$(sed -E 's/.*app=([0-9]+).*/\1/' <<< "$marks")" >> "$GITHUB_OUTPUT"
+          echo "probe=$(sed -E 's/.*probe=([0-9]+).*/\1/' <<< "$marks")" >> "$GITHUB_OUTPUT"
+          echo "pinned: $marks"
+      - uses: julia-actions/setup-julia@da908477b5db94c10ffce8cfea9f2b3b9d5db687 # v3.0.3
+        with:
+          version: '~1.13.0-0'
+      - uses: julia-actions/cache@9353db09a0f2bbbdec6f41791918c75d37391b36 # v3.5.0
+        with:
+          include-matrix: 'false'
+          delete-old-caches: 'false'   # no `actions: write`, same as ci.yml's `test` job
+          cache-name: julia-cache;workflow=${{ github.workflow }};job=${{ github.job }}
+      - name: Install the JuliaC frontend
+        run: julia --startup-file=no -e 'using Pkg; Pkg.Apps.add("JuliaC")'
+      - name: Build the minimal app (--trim=unsafe-warn)
+        run: bench/juliac/build.sh unsafe-warn
+      - name: Build the probe (--trim=unsafe-warn)
+        run: ENTRY=probe bench/juliac/build.sh unsafe-warn
+      - name: Run the probe
+        run: bench/juliac/out/nitro-probe-unsafe-warn | tee bench/results/probe.out
+      - name: Compare with the pin
+        if: always() && steps.pin.outcome == 'success'
+        env:
+          PIN_APP: ${{ steps.pin.outputs.app }}
+          PIN_PROBE: ${{ steps.pin.outputs.probe }}
+        run: |
+          set +e
+          R=bench/results
+          mkdir -p "$R"
+          fail=0
+          verdicts=()
+          for entry in app probe; do
+            if [ "$entry" = app ]; then pin=$PIN_APP; else pin=$PIN_PROBE; fi
+            log=$(ls -t "$R"/juliac-*-"$entry"-unsafe-warn.log 2> /dev/null | head -n 1)
+            if [ -z "$log" ]; then
+              verdicts+=("$entry: no build log (pinned $pin); see the build step")
+              fail=1; continue
+            fi
+            julia --startup-file=no bench/juliac/frames.jl "$log" > "$R/frames-$entry.txt" 2>&1
+            if ! grep -q '^Trim verify finished' "$log"; then
+              verdicts+=("$entry: no \`Trim verify finished\` line in the log (pinned $pin): a truncated or unverified build, so no count")
+              fail=1; continue
+            fi
+            total=$(awk '$2 == "total" { t = $1 } END { print t }' "$R/frames-$entry.txt")
+            if ! [[ "$total" =~ ^[0-9]+$ ]]; then
+              verdicts+=("$entry: frames.jl printed no total (pinned $pin); see its output below")
+              fail=1; continue
+            fi
+            if [ "$total" = "$pin" ]; then
+              verdicts+=("$entry: $total (pinned $pin)")
+            else
+              if [ "$total" -gt "$pin" ]; then dir=RISE; else dir=FALL; fi
+              verdicts+=("$entry: $total (pinned $pin) — $dir: see the rows below and update docs/design/juliac-trim.md §3 (the pin paragraph and its marker)")
+              echo "::warning title=juliac trim count $dir::$entry: $total (pinned $pin); update docs/design/juliac-trim.md §3 and its pinned marker"
+            fi
+          done
+          applog=$(ls -t "$R"/juliac-*-app-unsafe-warn.log 2> /dev/null | head -n 1)
+          {
+            echo "## juliac \`--trim=unsafe-warn\` verifier count"
+            echo
+            echo "\`$(git rev-parse --short HEAD)\` on \`$GITHUB_REF_NAME\`; pin read from \`docs/design/juliac-trim.md\` §3."
+            if [ -n "$applog" ]; then
+              echo
+              echo '```text'
+              grep -E '^(julia|frontend|cpu): ' "$applog"
+              echo '```'
+            fi
+            echo
+            for v in "${verdicts[@]}"; do echo "- **$v**"; done
+            for entry in app probe; do
+              echo
+              echo "### \`frames.jl\`, $entry"
+              echo
+              echo '```text'
+              if [ -f "$R/frames-$entry.txt" ]; then cat "$R/frames-$entry.txt"; else echo "(no log)"; fi
+              echo '```'
+            done
+            echo
+            echo "### Probe output"
+            echo
+            echo '```text'
+            if [ -f "$R/probe.out" ]; then cat "$R/probe.out"; else echo "(the probe did not run)"; fi
+            echo '```'
+            echo
+            echo "<details><summary>Bench environment, resolved this run</summary>"
+            echo
+            echo '```text'
+            julia --startup-file=no --project=bench/juliac -e 'using Pkg; Pkg.status(; mode = PKGMODE_MANIFEST)' 2>&1
+            echo '```'
+            echo
+            echo "</details>"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          exit "$fail"
