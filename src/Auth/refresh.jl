@@ -316,10 +316,16 @@ function _verify_refresh(token::AbstractString, secret, issuer,
     return (claims, family, jti, subject)
 end
 
-# A store's answer to `consume_refresh_token!` as a record, or the refusal it means.
+# A store's answer to `consume_refresh_token!` as a record, or the refusal it means. The one place
+# the family rule lives: `:reused` revokes the family BEFORE the error leaves, so by the time the
+# caller sees it, the legitimate client's current token is dead too (RFC 9700 §4.14.2). The family
+# is the token's own signed `fam`, so no store answer can leave it out.
 function _admit(store::AbstractRefreshTokenStore, outcome, family::String,
                 subject::String)::RefreshTokenRecord
-    outcome isa RefreshTokenMiss && throw(RefreshTokenError(outcome.reason))
+    if outcome isa RefreshTokenMiss
+        outcome.reason === :reused && revoke_refresh_family!(store, family)
+        throw(RefreshTokenError(outcome.reason))
+    end
     outcome isa RefreshTokenRecord || throw(ArgumentError(
         "consume_refresh_token! must return a RefreshTokenRecord or a RefreshTokenMiss, got a $(typeof(outcome))"))
     # The signed `sub` and the stored subject must agree. They can only disagree if the store is
@@ -383,4 +389,22 @@ function rotate_refresh_token(store::AbstractRefreshTokenStore, token::AbstractS
     access_claims["sub"] = subject
     access_claims["token_use"] = "access"
     return RefreshRotation(access_claims, next)
+end
+
+"""
+    revoke_refresh_token(store, token; secret, issuer = nothing, audience = nothing) -> Nothing
+
+Sign-out: verify the refresh `token` and revoke its whole family (its signed `fam`), so neither it
+nor any token rotated from it can be used again. Revoking one token and revoking its family are the
+same call, because under rotation a family holds at most one live token.
+
+It is idempotent. A token of a family that is already gone, or one that was rotated away, still
+signs its family out and returns normally, since holding any token of the family is enough to end
+it. A token that does not verify throws [`RefreshTokenError`](@ref)`(:invalid)`.
+"""
+function revoke_refresh_token(store::AbstractRefreshTokenStore, token::AbstractString; secret,
+                              issuer = nothing, audience = nothing)::Nothing
+    _, family, _, _ = _verify_refresh(token, secret, issuer, audience)
+    revoke_refresh_family!(store, family)
+    return nothing
 end

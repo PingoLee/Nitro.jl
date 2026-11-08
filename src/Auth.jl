@@ -43,7 +43,7 @@ export AuthError,
     RefreshTokenRecord, RefreshTokenMiss, RefreshTokenError, RefreshRotation,
     record_refresh_token!, consume_refresh_token!, revoke_refresh_family!, prune_refresh_tokens!,
     missing_refresh_store_methods,
-    issue_refresh_token, rotate_refresh_token
+    issue_refresh_token, rotate_refresh_token, revoke_refresh_token
 
 struct AuthError <: Exception
     msg::String

@@ -236,3 +236,164 @@ end
     # None of those refusals took the real token.
     @test rotate_refresh_token(store, token; secret) isa RefreshRotation
 end
+
+# ── Reuse detection ─────────────────────────────────────────────────────────────────────────
+
+@testitem "refresh tokens: a replayed token revokes its whole family (#231)" tags=[:auth, :core] setup=[NitroCommon] begin
+    using Test
+    using Nitro.Auth
+
+    reason(f) = try; f(); nothing; catch e; e isa RefreshTokenError ? e.reason : rethrow(); end
+
+    secret = jwtkey("refresh")
+    store = MemoryRefreshTokenStore()
+    first = issue_refresh_token(store, "42"; secret)
+    second = rotate_refresh_token(store, first; secret).refresh_token
+    third = rotate_refresh_token(store, second; secret).refresh_token
+
+    # An unrelated sign-in of the same subject is a different family and is not touched.
+    other = issue_refresh_token(store, "42"; secret)
+
+    # The attacker replays a spent token: refused as a reuse...
+    @test reason(() -> rotate_refresh_token(store, first; secret)) === :reused
+    # ...and the legitimate client's CURRENT token is now dead too (RFC 9700 §4.14.2).
+    @test reason(() -> rotate_refresh_token(store, third; secret)) === :unknown
+    # A further replay is not another breach: the family is simply gone.
+    @test reason(() -> rotate_refresh_token(store, second; secret)) === :unknown
+
+    @test rotate_refresh_token(store, other; secret) isa RefreshRotation
+
+    # The case reuse detection exists for: the thief rotates the stolen token at once, and the real
+    # client comes back with it much later, after any amount of unrelated refresh traffic. Its old
+    # token is still recognized, and the thief's lineage dies with it.
+    busy = MemoryRefreshTokenStore(max_tokens = 2)
+    stolen = issue_refresh_token(busy, "42"; secret)
+    thief = rotate_refresh_token(busy, stolen; secret).refresh_token
+    bystander = issue_refresh_token(busy, "7"; secret)
+    for _ in 1:50
+        bystander = rotate_refresh_token(busy, bystander; secret).refresh_token
+    end
+    @test reason(() -> rotate_refresh_token(busy, stolen; secret)) === :reused
+    @test reason(() -> rotate_refresh_token(busy, thief; secret)) === :unknown
+    @test rotate_refresh_token(busy, bystander; secret) isa RefreshRotation
+
+    # Sign-out is the same store call: revoking one token revokes its family.
+    store2 = MemoryRefreshTokenStore()
+    a = issue_refresh_token(store2, "7"; secret)
+    b = rotate_refresh_token(store2, a; secret).refresh_token
+    @test revoke_refresh_token(store2, b; secret) === nothing
+    @test reason(() -> rotate_refresh_token(store2, b; secret)) === :unknown
+    # It is idempotent: again, through a rotated-away token, or against a store that never saw it.
+    @test revoke_refresh_token(store2, a; secret) === nothing
+    @test revoke_refresh_token(store2, b; secret) === nothing
+    @test revoke_refresh_token(MemoryRefreshTokenStore(), b; secret) === nothing
+    # A token that does not verify signs nobody out.
+    @test reason(() -> revoke_refresh_token(store2, "not-a-jwt"; secret)) === :invalid
+end
+
+@testitem "refresh tokens: concurrent rotations of one token are a reuse (#231)" tags=[:auth, :core] setup=[NitroCommon] begin
+    using Test
+    using Nitro.Auth
+
+    # Concurrent use IS reuse (Auth0, no leeway interval). At most one rotation returns a token, at
+    # least one caller is told `:reused`, and whatever token was returned is dead afterwards because
+    # the loser revoked the family. The winner's own `record!` may even lose that race and report
+    # `:revoked`, and later losers find the family gone (`:unknown`): that is the revoke-vs-rotate
+    # guard working, not a lost update. The store-level CAS (exactly one consume) is pinned by the
+    # `MemoryRefreshTokenStore` item.
+    secret = jwtkey("refresh")
+    store = MemoryRefreshTokenStore()
+    token = issue_refresh_token(store, "42"; secret)
+    attempt() = try
+        rotate_refresh_token(store, token; secret)
+    catch e
+        e isa RefreshTokenError || rethrow()
+        e.reason
+    end
+    results = fetch.([Threads.@spawn attempt() for _ in 1:16])
+    winners = filter(r -> r isa RefreshRotation, results)
+    @test length(winners) <= 1
+    @test count(==(:reused), results) >= 1
+    @test all(r -> r isa RefreshRotation || r in (:reused, :revoked, :unknown), results)
+    for w in winners
+        err = try; rotate_refresh_token(store, w.refresh_token; secret); nothing; catch e; e; end
+        @test err isa RefreshTokenError && err.reason === :unknown
+    end
+end
+
+@testitem "refresh tokens: a family revoked mid-rotation refuses the new token (#231)" tags=[:auth, :core] setup=[NitroCommon] begin
+    using Test
+    using Nitro.Auth
+
+    # The revoke-vs-rotate guard, deterministically: a store whose consume is followed at once by
+    # a revocation of the same family -- what a concurrent reuse does, without the race. The
+    # rotation must not hand out a token the store will never honour.
+    struct RevokingStore <: AbstractRefreshTokenStore
+        inner::MemoryRefreshTokenStore
+    end
+    Nitro.Auth.record_refresh_token!(s::RevokingStore, r::RefreshTokenRecord; new_family::Bool) =
+        record_refresh_token!(s.inner, r; new_family)
+    function Nitro.Auth.consume_refresh_token!(s::RevokingStore, family::String, jti::String; at::Int)
+        outcome = consume_refresh_token!(s.inner, family, jti; at)
+        outcome isa RefreshTokenRecord && revoke_refresh_family!(s.inner, family)
+        return outcome
+    end
+    Nitro.Auth.revoke_refresh_family!(s::RevokingStore, family::String) = revoke_refresh_family!(s.inner, family)
+    Nitro.Auth.prune_refresh_tokens!(s::RevokingStore; at::Int) = prune_refresh_tokens!(s.inner; at)
+    @test isempty(missing_refresh_store_methods(RevokingStore))
+
+    secret = jwtkey("refresh")
+    store = RevokingStore(MemoryRefreshTokenStore())
+    token = issue_refresh_token(store, "42"; secret)
+    err = try; rotate_refresh_token(store, token; secret); nothing; catch e; e; end
+    @test err isa RefreshTokenError && err.reason === :revoked
+    # Nothing came back to life in the store.
+    @test isempty(store.inner.families)
+end
+
+@testitem "refresh tokens: nothing logs or renders a token, jti or family (#231)" tags=[:auth, :core] setup=[NitroCommon] begin
+    using Test
+    using HTTP
+    using JSON
+    using Nitro.Auth
+
+    secret = jwtkey("refresh")
+    store = MemoryRefreshTokenStore()
+    token = issue_refresh_token(store, "42"; secret)
+    claims = decode_jwt(token, secret)
+    jti, family = claims["jti"], claims["fam"]
+    rotation = rotate_refresh_token(store, token; secret)
+    sentinels = (token, jti, family, rotation.refresh_token, secret)
+    clean(text) = !any(s -> occursin(s, text), sentinels)
+
+    record = RefreshTokenRecord(jti, family, "42", 0)
+    @test clean(repr(record)) && clean(sprint(show, MIME"text/plain"(), record))
+    @test clean(repr(rotation))
+    @test clean(repr(store))
+    err = RefreshTokenError(:reused)
+    @test clean(sprint(showerror, err)) && clean(repr(err)) && clean(JSON.json(err))
+
+    # Uncaught from a handler: a 401 with a fixed body, logged at @debug with the reason only. The
+    # replay goes through the request path, so the family is revoked there too.
+    app = App()
+    urlpatterns(app, "",
+        path("/auth/refresh", req -> begin
+            presented = HTTP.header(req, "X-Refresh", "")
+            r = rotate_refresh_token(store, presented; secret)
+            Res.json(Dict("refresh_token" => r.refresh_token))
+        end; method = "POST"))
+    logger = Test.TestLogger(min_level = Base.CoreLogging.Debug)
+    response = Base.CoreLogging.with_logger(logger) do
+        internalrequest(app, HTTP.Request("POST", "/auth/refresh", ["X-Refresh" => token]))
+    end
+    @test response.status == 401
+    body = String(response.body)
+    @test occursin("401", body) && clean(body)
+    records = lock(() -> copy(logger.logs), logger.lock)
+    @test any(l -> occursin("refresh token", string(l.message)) && get(l.kwargs, :reason, nothing) === :reused, records)
+    @test all(l -> clean(string(l.message)) && clean(string(l.kwargs)), records)
+    @test !any(l -> l.level >= Base.CoreLogging.Warn, records)
+
+    refused = try; rotate_refresh_token(store, rotation.refresh_token; secret); nothing; catch e; e; end
+    @test refused isa RefreshTokenError && refused.reason === :unknown
+end
