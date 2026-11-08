@@ -149,8 +149,11 @@ trim mistake**, and that includes a `Symbol`. Type the value, then `print` it.
 `cccd14be` with Julia 1.13.2, JuliaC 0.3.12, `--trim=unsafe-warn` and `JULIA_CPU_TARGET=native`
 (§1). The probe answers every request as expected, and the app serves `/plaintext` and `/missing`.
 #867 set both numbers (§3.15). #880, #884, #886 and #889 merged after it without moving either.
-A change that moves either total updates this paragraph in the same PR. On 1.14 alpha2, measured
+A change that moves either total updates this paragraph in the same PR. The weekly `Trim count`
+workflow (`.github/workflows/trim-count.yml`, #863) reads the two totals from the `pinned:` comment
+under this paragraph, so that comment moves with the numbers. On 1.14 alpha2, measured
 locally and outside CI, the app reads 0 and the probe 11 (§3.15).
+<!-- pinned: app=6 probe=15 -->
 
 How the count got here:
 - **The minimal app:** 40 on Julia 1.12.7. On 1.13: 96, then 87 after §3.6, 59 after the start-up
