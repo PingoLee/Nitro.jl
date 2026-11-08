@@ -143,7 +143,22 @@ no value, and fails on a `_trimmed()` site that `test/.helpers/trimmed_sites.jl`
 The lesson that generalizes: **`repr`/`string` of an un-inferred value is the most expensive single
 trim mistake**, and that includes a `Symbol`. Type the value, then `print` it.
 
-## 3. Remaining (40 errors on the minimal app on Julia 1.12.7; on 1.13, 96, then 87 after §3.6, 59 after the start-up walls, 27 after §3.7, 11 after §3.8 and 4 on HTTP 2.13, §3.9, then 8 since #840, §3.13; the probe 22 after §3.11, 18 after #851; on 1.14, the app 5 and the probe 20, §3.12, then 3 and 18, §3.13; on 1.14 alpha2, 2 and 18, then 2 and 14 with no row in `src/`, §3.14; without OpenSSL.jl, the app 6 and the probe 15 on 1.13, the app 0 and the probe 11 on 1.14 alpha2, §3.15)
+## 3. Remaining
+
+**The pin, on Julia 1.13: the minimal app 6, the probe 15.** Rebuilt 2026-11-07 from `main` at
+`cccd14be` with Julia 1.13.2, JuliaC 0.3.12, `--trim=unsafe-warn` and `JULIA_CPU_TARGET=native`
+(§1). The probe answers every request as expected, and the app serves `/plaintext` and `/missing`.
+#867 set both numbers (§3.15). #880, #884, #886 and #889 merged after it without moving either.
+A change that moves either total updates this paragraph in the same PR. On 1.14 alpha2, measured
+locally and outside CI, the app reads 0 and the probe 11 (§3.15).
+
+How the count got here:
+- **The minimal app:** 40 on Julia 1.12.7. On 1.13: 96, then 87 after §3.6, 59 after the start-up
+  walls, 27 after §3.7, 11 after §3.8, 4 on HTTP 2.13 (§3.9), 8 after #840 (§3.13), and 6 without
+  OpenSSL.jl (§3.15).
+- **The probe:** 22 after §3.11, 18 after #851, and 15 without OpenSSL.jl (§3.15).
+- **Julia 1.14, app and probe:** 5 and 20 (§3.12), then 3 and 18 (§3.13). On 1.14 alpha2: 2 and
+  18, then 2 and 14 with no row in `src/` (§3.14), then 0 and 11 (§3.15).
 
 Measured 2026-10-22 on Julia 1.12.7, before and after #572. Each error is printed twice, so 20
 sites. `main` before #572 had **22**: the 20 below plus `CookieKey`'s, which arrived with a later
@@ -1581,12 +1596,19 @@ buy is a startup and deployment win:
   - **`RouteEndpoint` works with it.** JuliaC links with `-Wl,--export-dynamic`, so every
     `nitro_route_endpoint_*` thunk stays in `.dynsym` through `--gc-sections`, and `jl_dlsym`
     finds it at run time.
-  - **It does not give one file yet.** On the minimal app, the exe grows from 8.8 to 14.4 MB and
-    drops `libjulia*`. It still NEEDs `libunwind`, `libzstd`, `libatomic` and `libstdc++`, and
-    loads OpenSSL, so the bundle keeps 22 files of 24. Its stack is executable (`GNU_STACK RWE`).
-    A process that runs requests through the pipeline and exits takes 1.5–2 ms less.
-  - **It does not apply to `--trim=no`.** The archive's codegen is a stub, so an untrimmed
-    image segfaults at start-up.
+  - **It does not give one file yet, and it does not apply to `--trim=no`.** The minimal app,
+    `--trim=unsafe-warn`, `--bundle`d, on the 1.15 nightly. The last column is #730's realistic app,
+    built with `--trim=no`:
+
+    | JuliaC link | Julia | exe | bundle | NEEDED, beyond libc and libm | `nitro_route_endpoint_*` in `.dynsym` | `GNU_STACK` | with `--trim=no` |
+    |---|---|--:|---|---|--:|---|---|
+    | default (dynamic) | ≥ 1.13 | 8.8 MB | 24 files, 82.7 MB | `libjulia`, `libjulia-internal` | 4 | `RW` | starts |
+    | `--static-runtime` | **≥ 1.14 only** (`libjulia-internal.a`) | 14.4 MB | 22 files, 83.3 MB | `libunwind`, `libzstd`, `libatomic`, `libstdc++`; OpenSSL is still loaded | 4, kept by `--export-dynamic` | `RWE` | segfaults at start-up (the archive's codegen is a stub) |
+
+    - The executable stack comes from one member of `libjulia-internal.a` that has no
+      `.note.GNU-stack` note.
+    - On the probe, both builds keep all 72 endpoint symbols, and their output is identical.
+    - A process that runs requests through the pipeline and exits takes 1.5–2 ms less.
   - **The served app's size, listen and RSS rows are not measured yet.** When #730 measured,
     the trimmed app did not start on Julia 1.14 or later: `CookieConfig(; …)` in `serve` and the
     request constructor in `_http_stream_request` verified on 1.13 but not there. #860 made both
