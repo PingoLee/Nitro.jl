@@ -597,12 +597,19 @@ struct FlakyReadQuerySet
     inner::MockTaskQuerySet
     fail_next::Ref{Int}
     fail_ids::Set{String}
+    # #791: the next N reads raise `OperationalError`, PormG's transient class, which the store's
+    # `with_read_retry` retries; `fail_next` raises a plain error, which it does not. `reads` counts
+    # every guarded read, so a test can tell one read from a read and its retry.
+    blips::Ref{Int}
+    reads::Ref{Int}
 end
 
 function _flaky_guard(qs::FlakyReadQuerySet)
     inner = getfield(qs, :inner)
     fail_next = getfield(qs, :fail_next)
     fail_ids = getfield(qs, :fail_ids)
+    blips = getfield(qs, :blips)
+    reads = getfield(qs, :reads)
 
     # Under the database lock, for two reasons. `fail_ids` is mutated by the test task while the
     # queue processor is live (see `fail_id!` below), so the membership test races it. And the
@@ -611,6 +618,12 @@ function _flaky_guard(qs::FlakyReadQuerySet)
     # follows, not a nested one: the guard models a failed connection, which is its own event
     # and not part of the read it precedes.
     lock(getfield(inner, :mdb).lock) do
+        reads[] += 1
+        if blips[] > 0
+            blips[] -= 1
+            throw(PormG.OperationalError("sqlite", ErrorException("simulated dropped connection");
+                                         message = "database is locked"))
+        end
         # Targeted: fail only reads filtered to a specific task id, so a test can
         # break one row's read without disturbing the writes around it.
         id = Base.get(getfield(inner, :filters), "id", nothing)
@@ -632,12 +645,15 @@ function Base.getproperty(qs::FlakyReadQuerySet, name::Symbol)
     fail_next = getfield(qs, :fail_next)
     fail_ids = getfield(qs, :fail_ids)
 
+    blips = getfield(qs, :blips)
+    reads = getfield(qs, :reads)
+
     if name === :db
-        return (key::String) -> FlakyReadQuerySet(inner.db(key), fail_next, fail_ids)
+        return (key::String) -> FlakyReadQuerySet(inner.db(key), fail_next, fail_ids, blips, reads)
     elseif name in (:filter, :values, :order_by, :limit, :select_for_update)
         # Every chaining builder is re-wrapped. Falling through to `inner` would hand back the bare
         # queryset, and the `.list()` after a projection or a page would bypass the guard.
-        return (args...; kw...) -> FlakyReadQuerySet(getproperty(inner, name)(args...; kw...), fail_next, fail_ids)
+        return (args...; kw...) -> FlakyReadQuerySet(getproperty(inner, name)(args...; kw...), fail_next, fail_ids, blips, reads)
     elseif name === :first
         return function()
             _flaky_guard(qs)
@@ -659,10 +675,13 @@ struct FlakyReadModel
     # point. `fail_ids` is the opposite case and has helpers below.
     fail_next::Ref{Int}
     fail_ids::Set{String}
+    # The two #791 knobs, `FlakyReadQuerySet`'s; set by the test task while nothing is in flight.
+    blips::Ref{Int}
+    reads::Ref{Int}
 end
 
 FlakyReadModel(db_keys::String...) =
-    FlakyReadModel(MockDB(db_keys...), Ref(0), Set{String}())
+    FlakyReadModel(MockDB(db_keys...), Ref(0), Set{String}(), Ref(0), Ref(0))
 
 # The test-side writers to `fail_ids`. Guarding only the READ in `_flaky_guard` would be a
 # no-op: these fire either side of a `timedwait` with a queued task in flight, so the `Set` is
@@ -678,6 +697,8 @@ function Base.getproperty(m::FlakyReadModel, name::Symbol)
             MockTaskQuerySet(getfield(m, :mdb), nothing, Dict{String,Any}()),
             getfield(m, :fail_next),
             getfield(m, :fail_ids),
+            getfield(m, :blips),
+            getfield(m, :reads),
         )
     elseif name === :_table
         return getfield(m, :mdb).tables["db"]
@@ -1836,6 +1857,48 @@ else
 
             # The failure was transient, so the next sweep recovers it.
             @test recover_zombie_tasks!(; runtime=rt_f) == 1
+        end
+
+        @testset "a transient read failure is retried; inside a transaction it is not (#791)" begin
+            flaky = FlakyReadModel()
+            store_r = RealPormGWorkerStore(model = flaky)
+            t = TaskInfo("alice::blip")
+            replace_task!(store_r, t.id, t)
+            quietly(f) = Base.CoreLogging.with_logger(f, Base.CoreLogging.NullLogger())
+
+            # One dropped connection, then the read succeeds: the row is found, not lost to a blip.
+            # Unpatched, the `OperationalError` was rethrown out of the read.
+            flaky.reads[] = 0; flaky.blips[] = 1
+            got = quietly(() -> get_task_info(store_r, t.id))
+            @test got isa TaskInfo && got.id == t.id
+            @test flaky.reads[] == 2
+
+            # Every attempt fails: the last error is logged and rethrown, as any failed read is.
+            retries = getproperty(PormGExt, :_READ_RETRY_ATTEMPTS)
+            flaky.reads[] = 0; flaky.blips[] = 1 + retries
+            @test_throws PormG.OperationalError quietly(() -> get_task_info(store_r, t.id))
+            @test flaky.reads[] == 1 + retries
+
+            # Not PormG's transient class: read once, never retried.
+            flaky.reads[] = 0; flaky.fail_next[] = 1
+            @test_throws "simulated transient database read failure" quietly(() -> get_task_info(store_r, t.id))
+            @test flaky.reads[] == 1
+
+            # Inside an application's open transaction (#209): once, unretried, and the error
+            # propagates as itself, not as PormG's `TransactionError`, so the application's block
+            # rolls back and it retries the block.
+            flaky.reads[] = 0; flaky.blips[] = 1
+            PormG.with_tx_context(FakeTaskPool(String[]), nothing) do
+                @test_throws PormG.OperationalError quietly(() -> get_task_info(store_r, t.id))
+            end
+            @test flaky.reads[] == 1
+            flaky.blips[] = 0
+
+            # The authorization read before it retries the same way: a blip there must not fail a
+            # status poll that the full read would have survived.
+            flaky.reads[] = 0; flaky.blips[] = 1
+            @test quietly(() -> getproperty(PormGExt, :_may_read_durable)(store_r, Owner("bob"), t.id)) == false
+            @test flaky.reads[] == 2
         end
 
         # Walk a paged listing to the end, the way the public docstring tells an app to.

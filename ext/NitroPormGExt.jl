@@ -341,12 +341,42 @@ function _db_fault(e)
     return (exception_type = nameof(typeof(e)),)
 end
 
+"""
+    _read_retrying(f)
+
+Run the read `f` through `PormG.with_read_retry` (#791): retried up to `_READ_RETRY_ATTEMPTS` more
+times, `_READ_RETRY_BACKOFF` seconds apart, when it raises `OperationalError`, the class PormG
+reserves for a transient failure (a dropped connection the pool has already recovered, a deadlock,
+SQLite's `database is locked`). Any other error, and a cancelled statement, propagates on the first
+raise. Each retry logs the error's type, SQLSTATE and PormG's value-free message, never the
+exception, so the warning cannot quote a statement's values (PormG #1675; Nitro's `_db_fault` rule).
+
+`inside_transaction = :run_once`: a session or task read can run inside an application's own
+`run_in_transaction` block (#209), and the store cannot know whether one is open. There the read runs
+once, unretried and without raising `TransactionError`: a lost connection loses the whole
+transaction, so the application retries its block, not one statement in it (PormG #1443).
+
+Only reads go through this: each is a single `SELECT`, safe to run twice. Writes never retry here.
+The bound is small because a session read is on the request path: at most two retries and 0.1 s of
+waiting before the last error propagates.
+"""
+_read_retrying(f) = PormG.with_read_retry(f; attempts = _READ_RETRY_ATTEMPTS,
+    backoff = _READ_RETRY_BACKOFF, inside_transaction = :run_once)
+
+const _READ_RETRY_ATTEMPTS = 2
+const _READ_RETRY_BACKOFF = 0.05
+
 function Base.get(store::PormGSessionStore, session_id::String, default)
     # Both catches below follow #254: an interrupt, a stack overflow or an out-of-memory is not
     # "no session" -- reported as one, it would log the visitor out and carry on in a process
     # that may be corrupted. They propagate; everything else still reads as `default`.
+    #
+    # The read is retried on a transient failure first (`_read_retrying`, #791), so a dropped
+    # connection does not log the visitor out. The catch stays: the retry covers `OperationalError`
+    # only, and any failure it does not recover (a permanent one, or the last transient one) must
+    # still read as no session rather than throw into the request.
     result = try
-        _session_objects(store).filter("session_key" => session_id).first()
+        _read_retrying(() -> _session_objects(store).filter("session_key" => session_id).first())
     catch e
         is_unrecoverable(e) && rethrow()
         @warn "PormGSessionStore: failed to read session" _db_fault(e)...
@@ -999,8 +1029,11 @@ function get_task_info(store::PormGWorkerStore, task_id::String)
     # longer raises a message that quotes a stored blob (see `_parse_stored_json`), so this is a
     # second guarantee and not the only one. The caller gets the whole exception from the
     # rethrow, and that exception is value-free for the same reason.
+    #
+    # The read is retried on a transient failure first (`_read_retrying`, #791). What it does not
+    # recover is logged and rethrown here as before.
     try
-        result = _task_objects(store).filter("id" => task_id).first()
+        result = _read_retrying(() -> _task_objects(store).filter("id" => task_id).first())
         if isnothing(result)
             return nothing
         end
@@ -1019,7 +1052,8 @@ _may_read_durable(::PormGWorkerStore, ::System, ::String) = true
 function _may_read_durable(store::PormGWorkerStore, authority::Owner, task_id::String)
     _owns(authority, task_id) && return true
     row = try
-        _task_objects(store).filter("id" => task_id).values("watchers").first()
+        # Retried on a transient failure like `get_task_info`, the read it precedes (#791).
+        _read_retrying(() -> _task_objects(store).filter("id" => task_id).values("watchers").first())
     catch e
         @warn "PormGWorkerStore: failed to read task" task_id exception_type=typeof(e)
         rethrow()

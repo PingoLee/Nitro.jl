@@ -242,6 +242,10 @@ function Base.getproperty(qs::MockQuerySet, name::Symbol)
         end
     elseif name === :first
         return function()
+            # `:before_first` runs before every `.first()`, and may throw: a failed connection,
+            # its own event before the read (#791's retry tests).
+            before = get(getfield(qs, :mdb).hooks, :before_first, nothing)
+            before === nothing || before()
             row = lock(_mock_lock(qs)) do
                 matched = _matching_keys_locked(qs)
                 isempty(matched) ? nothing : _as_db_row(_selected_table(qs)[first(matched)])
@@ -876,6 +880,73 @@ end
             # `src/middleware/session_middleware.jl`, which would otherwise take a database
             # blip as a reason to stop pruning. Nothing covered this before.
             @test cleanup_expired_sessions!(failing) === nothing
+        end
+    end
+
+    @testset "a transient read failure is retried, not read as a logout (#791)" begin
+        # PormG's transient class, which `with_read_retry` retries. The driver cause carries a
+        # sentinel that must never reach a log line: PormG logs the error's type, SQLSTATE and
+        # value-free message, never the exception (#1675), and the store adds the id nowhere.
+        blip() = PormG.OperationalError("sqlite", ErrorException("leak-sentinel-cause");
+                                        message = "database is locked")
+        m = MockModel()
+        s = RealPormGSessionStore(model = m)
+        set_session!(s, "sess-blip-id", Dict{String,Any}("user_id" => 1); ttl = 3600)
+        hooks = getfield(m, :mdb).hooks
+        calls = Ref(0)
+        logger = Test.TestLogger(min_level = Base.CoreLogging.Warn)
+        try
+            # One failure, then success: the visitor stays signed in. Unpatched, this read was
+            # swallowed into "no session".
+            hooks[:before_first] = () -> (calls[] += 1; calls[] == 1 && throw(blip()); nothing)
+            Base.CoreLogging.with_logger(logger) do
+                @test get_session(s, "sess-blip-id") == Dict{String,Any}("user_id" => 1)
+            end
+            @test calls[] == 2
+            text = lock(logger.lock) do
+                join((string(r.message, " ", r.kwargs) for r in logger.logs), "\n")
+            end
+            @test occursin("with_read_retry", text)             # the retry did log
+            @test !occursin("leak-sentinel-cause", text)
+            @test !occursin("sess-blip-id", text)
+
+            # Every attempt fails: one read and two retries, then the swallow still reads it as no
+            # session rather than throwing into the request.
+            calls[] = 0
+            hooks[:before_first] = () -> (calls[] += 1; throw(blip()))
+            Base.CoreLogging.with_logger(Base.CoreLogging.NullLogger()) do
+                @test get_session(s, "sess-blip-id") === nothing
+            end
+            @test calls[] == 1 + getproperty(PormGExt, :_READ_RETRY_ATTEMPTS)
+
+            # Not `OperationalError`: not retried, read once, swallowed as before.
+            calls[] = 0
+            hooks[:before_first] = () -> (calls[] += 1; error("mock persistence failure"))
+            Base.CoreLogging.with_logger(Base.CoreLogging.NullLogger()) do
+                @test get_session(s, "sess-blip-id") === nothing
+            end
+            @test calls[] == 1
+
+            # Inside an application's open transaction (#209) the read runs once, unretried and
+            # without PormG's `TransactionError`: the application retries its block, not this
+            # statement. A transient failure there still reads as no session, through the swallow.
+            calls[] = 0
+            hooks[:before_first] = () -> (calls[] += 1; throw(blip()))
+            PormG.with_tx_context(FakeSessionPool(String[]), nothing) do
+                Base.CoreLogging.with_logger(Base.CoreLogging.NullLogger()) do
+                    @test get_session(s, "sess-blip-id") === nothing
+                end
+            end
+            @test calls[] == 1
+            # And a healthy read inside one simply runs.
+            calls[] = 0
+            hooks[:before_first] = () -> (calls[] += 1; nothing)
+            PormG.with_tx_context(FakeSessionPool(String[]), nothing) do
+                @test get_session(s, "sess-blip-id") == Dict{String,Any}("user_id" => 1)
+            end
+            @test calls[] == 1
+        finally
+            delete!(hooks, :before_first)
         end
     end
 
