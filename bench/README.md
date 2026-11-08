@@ -28,7 +28,8 @@ bench/
 │   └── aggregate.jl    # the /aggregate kernel alone, plain and yielding every 2 ms, at N = 10^3..10^7 (#590)
 ├── socket/             # real-socket load: server.jl (Nitro vs bare HTTP.jl), run.sh, contention.sh, stall.sh, wake.sh,
 │   │                   #   slow_stream.sh, fairness.sh, quiet.sh (oha, curl, go/fairness), probe_report.jl,
-│   │                   #   deadlines.sh with deadlines.jl and deadlines_peer.jl (Reseau alone, #782)
+│   │                   #   deadlines.sh with deadlines.jl and deadlines_peer.jl (Reseau alone, #782),
+│   │                   #   swallow.jl (what a refused 413/503 client receives, and the slot it holds, #780)
 │   ├── go/             # the Go net/http reference server run.sh's `go` mode builds; `go test -bench Aggregate`;
 │   │                   #   fairness/, the per-connection client fairness.sh drives; db.go, its pgx routes (#589)
 │   └── db/             # the database routes (#589): PormG env, world.jl, seed.jl, env.sh (DB=…), smoke.sh
@@ -133,6 +134,8 @@ bench/socket/slow_stream.sh 3 8s                     # /plaintext while K capped
 bench/socket/fairness.sh "nitro bare_spawn go" 3 8s  # how evenly C connections are served (#590)
 PROBE=1 bench/socket/fairness.sh "nitro bare_spawn bare_pool" 3 8s  # ... and where a slow request waited (#618)
 julia bench/socket/probe_report.jl bench/results/fairness-<stamp>-raw  # the PROBE=1 run's segment tables
+SERVERS="a=/wt/a b=/wt/b" julia --project=. --threads=2 bench/socket/swallow.jl matrix  # 413/503 outcome per client (#780)
+julia --project=. --threads=2 bench/socket/swallow.jl control0   # what a reset looks like to each client
 ```
 
 - `server.jl` serves `/plaintext`, `/json`, `/health`, `/cpu` and `/lag` in one of these `MODE`s:
