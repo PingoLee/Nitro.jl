@@ -1086,9 +1086,8 @@ end
 
 @testset "Graceful worker drain (#176)" begin
     # Every callback below PARKS -- on the cancellation token via `timedwait`, or on a
-    # `Base.Event` the test releases. None of them spins. #143 records that a CPU-bound spin
-    # probe wedged the test worker (ReTestItems' then) into its 600s timeout on roughly half of `-t 2` runs
-    # once the full suite is around it, and a drain needs no spinning to be observable.
+    # `Base.Event` the test releases. None of them spins: a drain needs no spinning to be
+    # observable. Cancelling a callback that IS executing is the #143 item, after this one.
     #
     # Elapsed-time bounds are deliberately loose. The first `@warn` on the expiry path compiles
     # inside the measured region and can cost a second on its own, so timing is only ever used
@@ -3954,22 +3953,10 @@ end
     end
 end
 
-# NOT HERE: the probe #127 asked for -- "submit a CPU-bound callback, wait until it is provably
-# running, then cancel, at -t 2". It was written, and it wedged the ReTestItems worker into a
-# 600s timeout on roughly half of -t 2 runs. Recorded so the next attempt does not rediscover it:
-#
-#   * Nitro is not the stall. Tracing every branch of the worker path showed it reached
-#     `_invoke_task_callback` EVERY time and stopped before the callback's first statement.
-#     `body-claim-FAILED` never appeared once, so the claimed start (#142) is not implicated.
-#   * The same scenario runs 25/25 clean standalone at -t 2. It needs the full suite around it.
-#   * Disabling only this testset: 6/6 clean at -t 2. The swap itself is stable.
-#   * Three fixes were tried and NONE worked: `GC.safepoint()` in the spin, replacing the spin
-#     with allocating work, and pre-compiling the callback on the test task before submitting.
-#
-# So the gap is real and is written down rather than papered over: nothing here cancels a task
-# that is genuinely executing on another thread. Every cancel test above uses a `sleep` loop,
-# and a task in `sleep` is PARKED -- which is exactly the weak probe that let the first attempt
-# at #30 ship a process abort. Tracked in #143, with the full trace evidence.
+# The probe #127 asked for -- cancel a CPU-bound callback while it is provably executing on another
+# thread -- is its own item, "Workers -- cancel reaches a callback executing on another thread
+# (#143)", after this one. The cancel tests in this item never show the callback running while
+# the cancel lands.
 
 @testset "queue introspection is an admin surface (#87)" begin
     store = InMemoryWorkerStore()
@@ -6035,6 +6022,115 @@ end
     finally
         reset_runtime!(rt)
     end
+end
+
+end
+
+# #143: the probe #127 asked for -- cancel a CPU-bound callback while it is provably EXECUTING on
+# another thread, not parked. The other cancel tests cancel a callback parked in `sleep` or on an
+# `Event` -- the weak probe that let #30's first attempt ship a process abort, since a parked task
+# is on no thread when the cancel lands -- or a `checkpoint!`ing one (#513) without showing that it
+# is running while the cancel lands: their test task parks in `wait_for` meanwhile.
+#
+# "Executing" is shown by a counter, not inferred. The callback never sleeps: it counts in bursts
+# of about 1 ms and calls `checkpoint!` (#513) between them, the framework's own yield point, which
+# is also where it sees the flag. With two default threads, the test task then holds its own thread
+# WITHOUT yielding and watches the counter move: the callback can only be running on the other
+# one. The spin keeps a `GC.safepoint()` per pass, or a collection started on any thread would wait
+# for the spinner (#143's first hypothesis about the old stall). At `-t 1` there is no second default
+# thread, so that block does not run; the cancel path is still exercised.
+#
+# The cancel is the flag `cancel_task` sets (#127); nothing is injected. The record reads
+# `CANCELLED` before the callback notices -- `cancel_task` claims it first -- so the record proves
+# nothing on its own. What proves the cancel was SEEN is the callback's own exit through
+# `TaskCancelledError` within a bound, with `cancel_reason` reading `:user`. The callback carries
+# a 10 s wall-clock bound of its own, so with the flag broken the item fails by timeout and ends,
+# rather than hanging into the watchdog.
+#
+# Why it can live in the shared process now. The first version of this probe wedged the
+# ReTestItems worker on about half of `-t 2` full-suite runs, stalled inside
+# `_invoke_task_callback` before the callback's first statement, and only with the whole suite
+# around it (#143). This one ran clean in ten of ten full-suite runs at `--threads=2 -O0` under
+# Nitro's own runner (#754: one watched child, a per-item timeout that names the item it kills).
+# Several things changed since, and nothing here separates them: the runner; the Julia floor (1.13,
+# #526); `timeout_call`'s wait, which parks on an `Event` instead of polling (#371); and the probe's
+# shape -- bounded bursts through `checkpoint!` (#513), where the old one spun. A wedge now is a
+# regression, and the watchdog names this item instead of waiting 600 s.
+@testitem "Workers -- cancel reaches a callback executing on another thread (#143)" tags=[:workers, :slow] setup=[NitroCommon] begin
+
+using Test
+using Nitro
+using Nitro.Workers
+
+mutable struct ExecProbe
+    @atomic count::Int
+    @atomic thread::Int
+    @atomic ended::Symbol           # :running, then :cancelled, :returned or :threw
+    @atomic info::Union{Nothing, TaskInfo}
+end
+ExecProbe() = ExecProbe(0, 0, :running, nothing)
+
+const BOUND_NS = 10_000_000_000      # the callback's own bound: a missed cancel ends here
+const BURST_NS = 1_000_000           # one burst of work between checkpoints
+
+function burn!(probe::ExecProbe, task_info::TaskInfo)
+    @atomic probe.info = task_info
+    deadline = time_ns() + BOUND_NS
+    try
+        while time_ns() < deadline
+            # Before the burst, not after: a task cannot move threads mid-burst, so every count
+            # the test sees was made on the thread this names. Written after, it can still name
+            # the thread a `checkpoint!` just moved the callback off.
+            @atomic probe.thread = Threads.threadid()
+            stop = time_ns() + BURST_NS
+            while time_ns() < stop
+                @atomic probe.count += 1
+            end
+            checkpoint!(task_info)
+        end
+        @atomic probe.ended = :returned
+        return :returned
+    catch err
+        @atomic probe.ended = err isa TaskCancelledError ? :cancelled : :threw
+        rethrow()
+    end
+end
+
+running(probe) = (@atomic probe.ended) === :running
+
+rt = WorkerRuntime(InMemoryWorkerStore())
+probe = ExecProbe()
+try
+    id = submit_task("burn", task_info -> burn!(probe, task_info), Owner("u"); runtime = rt)
+    # Generous: the first run compiles the callback, at `-O0` on CI.
+    @test timedwait(() -> (@atomic probe.count) > 0, 30.0) === :ok
+
+    if Threads.nthreads(:default) >= 2
+        c0 = @atomic probe.count
+        stop = time_ns() + 2_000_000_000
+        moved = false
+        while time_ns() < stop
+            if (@atomic probe.count) > c0
+                moved = true
+                break
+            end
+            GC.safepoint()
+        end
+        @test moved
+        @test (@atomic probe.thread) != Threads.threadid()
+    end
+
+    @test !haskey(cancel_task(id, Owner("u"); runtime = rt), :error)
+    @test timedwait(() -> !running(probe), 5.0) === :ok
+    @test (@atomic probe.ended) === :cancelled
+    info = @atomic probe.info
+    @test info !== nothing && cancel_reason(info) === :user
+    @test get_task_status(id, Owner("u"); runtime = rt)[:status] == "CANCELLED"
+finally
+    # A missed cancel leaves the callback counting until its own bound; wait it out, so no
+    # spinning task outlives this item.
+    timedwait(() -> !running(probe), 15.0)
+    reset_runtime!(rt)
 end
 
 end
