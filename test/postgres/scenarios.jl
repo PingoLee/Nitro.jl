@@ -95,6 +95,108 @@ store = nothing
 @testset "PostgreSQL race suite ($PG_DRIVER)" begin
 
 # ---------------------------------------------------------------------------------------------
+@testset "fresh boot: each table created once, and two instances racing on it (#791)" begin
+    # The factories create a missing table through `PormG.Migrations.ensure_table!(…; force = true)`:
+    # an existence check, then PormG's migration advisory lock, the check again under it, and the
+    # DDL in a transaction. `change_db` is left at `register_connection`'s default, false, PormG's
+    # production posture, which `force` creates through. Separate keys on this one database stand
+    # for separate instances: separate pools, contending on the one lock key as processes would.
+    # The upgrade scenario below is the other half: a table that already exists.
+    ext = Base.get_extension(Nitro, :NitroPormGExt)
+    sql(admin, "DROP TABLE IF EXISTS nitro_task")
+    sql(admin, "DROP TABLE IF EXISTS nitro_session")
+    sql(admin, "DROP TABLE IF EXISTS nitro_ddl_log")
+    sql(admin, "CREATE TABLE nitro_ddl_log (tag text NOT NULL, object text)")
+    sql(admin, """
+        CREATE OR REPLACE FUNCTION nitro_log_ddl() RETURNS event_trigger LANGUAGE plpgsql AS \$\$
+        DECLARE r record;
+        BEGIN
+          FOR r IN SELECT * FROM pg_event_trigger_ddl_commands() LOOP
+            INSERT INTO nitro_ddl_log VALUES (r.command_tag, r.object_identity);
+          END LOOP;
+        END \$\$""")
+    sql(admin, "DROP EVENT TRIGGER IF EXISTS nitro_ddl_log")
+    sql(admin, "CREATE EVENT TRIGGER nitro_ddl_log ON ddl_command_end EXECUTE FUNCTION nitro_log_ddl()")
+    # The warm-up instance, then the two that race and the lock holder: each on a fresh key, so no
+    # pool in the race reuses a backend from the warm-up, whose last statement could already be a poll.
+    warm = "nitro_pg_fresh_warm"
+    instances = ("nitro_pg_fresh_a", "nitro_pg_fresh_b")
+    holder_key = "nitro_pg_fresh_holder"
+    fresh_keys = (warm, instances..., holder_key)
+    for k in fresh_keys
+        PormG.register_connection(k, CONNINFO; adapter = "PostgreSQL", env = "test", change_data = true)
+    end
+    created(table) = scalar(admin, "SELECT count(*) FROM nitro_ddl_log WHERE tag = 'CREATE TABLE' " *
+                                   "AND object = current_schema() || '.' || \$1", [table])
+    named_indexes(table) = Set(String.(column(admin, """
+        SELECT indexname FROM pg_indexes
+         WHERE schemaname = current_schema() AND tablename = \$1 AND indexname NOT LIKE '%_pkey'""",
+        [table])))
+    release = Channel{Nothing}(1)
+    holder = nothing
+    try
+        @test all(k -> !PormG.config[k].change_db, fresh_keys)
+
+        # One instance boots both stores on an empty database: what the model creates.
+        worker = Nitro.pormg_nitro_worker(db_key = warm)
+        sessions = Nitro.pormg_nitro_session(db_key = warm)
+        @test created("nitro_task") == 1
+        @test created("nitro_session") == 1
+        # The one-column names PormG derives for `db_index` (#1341) are the old fixed ones, and the
+        # composite ones come from the model's `Index` meta: a fresh database and an upgraded one
+        # hold the same indexes.
+        @test named_indexes("nitro_task") == Set(["nitro_task_started_at_idx", "nitro_task_completed_at_idx",
+                                                  "nitro_task_claim_idx", "nitro_task_lease_idx"])
+        @test named_indexes("nitro_session") == Set(["nitro_session_expires_at_idx"])
+        claim = scalar(admin, "SELECT indexdef FROM pg_indexes WHERE indexname = 'nitro_task_claim_idx'")
+        @test occursin("(queue_name, status, external, created_at)", claim)
+        put_task!(worker, "fresh::one")
+        @test get_task_info(worker, "fresh::one") !== nothing
+        Nitro.Types.set_session!(sessions, "fresh-session", Dict{String,Any}("v" => 1); ttl = 60)
+        @test Nitro.Types.get_session(sessions, "fresh-session") == Dict{String,Any}("v" => 1)
+
+        # Two instances racing on a missing table, forced to overlap. A third session holds the
+        # migration lock; both boots pass the check outside it, find no table and poll for the
+        # lock (PormG's default `:poll`, so each one's last statement is `pg_try_advisory_lock`).
+        # Once all three show that, the holder lets go. Whichever boot gets the lock first creates
+        # the table; the other one's `:exists` can then only come from the check repeated under the
+        # lock, since both had already passed the one outside it. The code above is warm, so neither
+        # boot is still compiling when the hold starts.
+        sql(admin, "DROP TABLE nitro_task")
+        sql(admin, "DELETE FROM nitro_ddl_log")
+        polling() = scalar(admin, "SELECT count(*) FROM pg_stat_activity " *
+                                  "WHERE datname = current_database() AND query LIKE 'SELECT pg_try_advisory_lock(%'")
+        before = polling()   # a pooled backend whose LAST statement was a poll, from the boot above
+        holder = Threads.@spawn PormG.AdvisoryLock.with_advisory_lock(holder_key,
+                PormG.Migrations.MIGRATION_LOCK_KEY; wait = true) do
+            take!(release)
+        end
+        held = timedwait(() -> polling() >= before + 1, 20.0; pollint = 0.05)
+        @test held === :ok
+        boots = [Threads.@spawn(ext._ensure_task_table!(k, ext.task_model(k))) for k in instances]
+        # The holder and both boots. Bounded well inside `ensure_table!`'s 30 s lock wait.
+        overlapped = timedwait(() -> polling() >= before + 3, 20.0; pollint = 0.05)
+        @test overlapped === :ok
+        put!(release, nothing)
+        fetch(holder)
+        outcomes = sort!(Symbol[fetch(t) for t in boots])
+        @test outcomes == [:created, :exists]
+        @test created("nitro_task") == 1
+        @test named_indexes("nitro_task") == Set(["nitro_task_started_at_idx", "nitro_task_completed_at_idx",
+                                                  "nitro_task_claim_idx", "nitro_task_lease_idx"])
+    finally
+        isready(release) || put!(release, nothing)   # never leave the holder parked on the lock
+        holder === nothing || try fetch(holder) catch end
+        foreach(PormG.Configuration.unregister_connection, fresh_keys)
+        sql(admin, "DROP EVENT TRIGGER IF EXISTS nitro_ddl_log")
+        sql(admin, "DROP TABLE IF EXISTS nitro_ddl_log")
+        # The upgrade scenario creates its own, older `nitro_task`.
+        sql(admin, "DROP TABLE IF EXISTS nitro_task")
+        sql(admin, "DROP TABLE IF EXISTS nitro_session")
+    end
+end
+
+# ---------------------------------------------------------------------------------------------
 @testset "upgrade boot: a pre-#514 nitro_task table gains the claim and job columns" begin
     # The table as it stood before #514: no claim columns, no job columns.
     sql(admin, """

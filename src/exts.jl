@@ -26,9 +26,15 @@ function pdf end
     pormg_nitro_session(; db_key="db", max_sessions=nothing) -> PormGSessionStore
 
 One-call setup for PormG-backed sessions: creates the `nitro_session` table and its expiry
-index if they do not already exist (`IF NOT EXISTS`), and returns a ready-to-use
-`PormGSessionStore`. Sessions are stored as JSON with a fixed-point expiry timestamp; there
-is no sliding expiry.
+index if they do not already exist, and returns a ready-to-use `PormGSessionStore`. Sessions are
+stored as JSON with a fixed-point expiry timestamp; there is no sliding expiry.
+
+The table is created through `PormG.Migrations.ensure_table!(…; force = true)` (#791): in one
+transaction, on PostgreSQL under PormG's migration advisory lock (two instances booting together
+create it once), and whatever the connection's `change_db` says. The table is Nitro's own, kept out
+of the application's migrations, so `change_db: false`, PormG's production posture, does not stop
+it. Call this outside any transaction on that connection: inside one it raises PormG's
+`TransactionError` before touching the database.
 
 Each row also records when the session was created (`created_at`), which
 `SessionMiddleware(absolute_max_age = …)` measures a session's absolute lifetime from (#362). On a
@@ -140,7 +146,10 @@ function sync_pormg_env! end
     pormg_nitro_worker(; db_key="db") -> PormGWorkerStore
 
 One-call setup for PormG-backed workers: creates the `nitro_task` table and **four** indexes if
-they do not already exist (`IF NOT EXISTS`), and returns a ready-to-use `PormGWorkerStore`.
+they do not already exist, and returns a ready-to-use `PormGWorkerStore`. A missing table is
+created the way `pormg_nitro_session` creates its own: through PormG's `ensure_table!`, whatever
+`change_db` says, and never inside an open transaction on that connection, where it raises
+`TransactionError`.
 
 Table setup is not purely additive. On a table created by an older Nitro, bootstrapping adds the
 columns it lacks with `ALTER TABLE … ADD COLUMN`: `run_id` ([#108](https://github.com/PingoLee/Nitro.jl/issues/108))

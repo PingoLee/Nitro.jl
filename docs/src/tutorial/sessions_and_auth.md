@@ -105,8 +105,11 @@ serve(app; middleware=[
 
 ### PormG-Backed (production)
 
-`pormg_nitro_session()` creates the `nitro_session` table with `IF NOT EXISTS`,
-sets up the expiry index, and returns a ready-to-use store.
+`pormg_nitro_session()` creates the `nitro_session` table and its expiry index when they are
+missing, brings a table an older Nitro created up to date, and returns a ready-to-use store. The
+table is created whatever the connection's `change_db` says: it is Nitro's own, outside your
+migrations. Call it outside any transaction on that connection: inside one it raises PormG's
+`TransactionError`, whether or not the table exists.
 
 ```julia
 using Nitro, PormG

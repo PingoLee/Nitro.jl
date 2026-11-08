@@ -22,13 +22,13 @@ end
 
 const PG_DB_KEY = "nitro_pg_race"
 
-# The store under test. A dynamic connection is read-only until writes are enabled; `change_db`
-# lets `pormg_nitro_worker` create and upgrade the task table.
+# The store under test. A dynamic connection is read-only until writes are enabled. `change_db`
+# stays false, PormG's production posture: `pormg_nitro_worker` creates and upgrades its own table
+# whatever it says (`ensure_table!(…; force = true)`, #791).
 function pg_register!()
     haskey(PormG.config, PG_DB_KEY) && return nothing
-    PormG.register_connection(PG_DB_KEY, CONNINFO; adapter = "PostgreSQL", env = "test")
-    PormG.config[PG_DB_KEY].change_data = true
-    PormG.config[PG_DB_KEY].change_db = true
+    PormG.register_connection(PG_DB_KEY, CONNINFO; adapter = "PostgreSQL", env = "test",
+                              change_data = true)
     return nothing
 end
 
