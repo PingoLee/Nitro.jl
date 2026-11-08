@@ -184,7 +184,10 @@ is explicit introspection, not accidental disclosure.)
   written to the socket — including a streamed `Res.file`, which is sent in chunks but holds its
   slot until the last one is written. A response with no length (`Res.sse`) gives the slot back
   once it starts streaming. A `STREAM` handler holds its slot for its whole lifetime, and so does
-  a WebSocket unless `max_upgraded_connections` is set.
+  a WebSocket unless `max_upgraded_connections` is set. A request refused **413** over
+  `max_body_bytes` gives its slot back as soon as it is refused, before Nitro reads and discards
+  any of the rest of its body (up to 2 MiB, none when it declares more than about 3 MiB) and
+  writes the `413`.
 
   The slot bounds how many, not for how long. With `read_timeout` unset, a client that sends a
   head and then trickles its body holds a slot as long as it likes, and without `write_timeout`

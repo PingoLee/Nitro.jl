@@ -654,16 +654,58 @@ _release_response_body!(_) = nothing
 # `lingering_close`; Go's `net/http` drains on close for the same reason. The budget is what keeps
 # it a courtesy rather than a second denial-of-service vector — past it, a client sending gigabytes
 # has already declared its intent, and eating an RST is the correct outcome for it.
+#
+# What it covers, measured (#780, Linux loopback): since HTTP.jl 2.12 HTTP drains an unread body
+# itself AFTER the response, up to 1 MiB for 500 ms (JuliaWeb/HTTP.jl#1494), so this swallow, which
+# reads BEFORE the response, earns its place only for a client that writes its whole body before
+# reading, with a body between the two budgets: past HTTP's 1 MiB at full speed, or sent over longer
+# than its 500 ms, but within this 2 MiB and 5 s. Without it those cells ended in a reset; with it,
+# a clean 413. What it skips: an `Expect: 100-continue` client, which has sent nothing (reading
+# would invite the body), and a declared length past `_SWALLOW_SKIP_ABOVE_BYTES`, whose close is
+# usually a reset however much this reads (#894). A chunked body declares no length and keeps the
+# swallow.
 const _MAX_SWALLOW_BYTES = 2 * 1024 * 1024
+
+# ...and the declared length past which reading it buys too little to hold the refusal open
+# (#894). Nitro reads at most `_MAX_SWALLOW_BYTES` before answering; HTTP.jl then drains at most
+# 1 MiB more after it (a literal in its `_drain_before_close!`, JuliaWeb/HTTP.jl#1494;
+# test/http_internals_contract_tests.jl watches that literal). A client that writes a body
+# declaring more than the two together before it reads has bytes unread at the close, so the close
+# is usually a reset whatever the swallow did. #780 measured 4 MiB on Linux loopback, where `main`
+# read for up to 4.2 s per refusal when the body was sent over 8 s. At full speed, the raw
+# write-then-read client's write still failed on a reset in 7 of 10 runs across the 413 and the
+# 503, and with `HTTP.request` the machine's reset counter moved in 4 of 10, against 10 of 10 for
+# both with no swallow. Presumably the kernel's receive buffer absorbed the rest in the runs that
+# closed cleanly. Those clean closes are what skipping gives up, in exchange for answering at once
+# and not holding the refusal open; a client that gets a reset
+# can still read its status on Linux, though not reliably on Windows. 4 MiB is the only size
+# measured above this line, and the line itself is the arithmetic of the two budgets. The
+# comparison is on a client's claim, and that is safe in this direction only: a claim can make the
+# refusal read nothing, never more than the byte budget and the deadline above already bound.
+const _SWALLOW_SKIP_ABOVE_BYTES = _MAX_SWALLOW_BYTES + 1024 * 1024
+
+# Whether a refused request with this declared length is swallowed at all. `-1` (chunked) and `0`
+# are both under the line, so they keep the swallow.
+_swallow_declared(declared::Int64)::Bool = declared <= _SWALLOW_SKIP_ABOVE_BYTES
 
 # ...and how long to spend on it (#298). The byte budget bounds how much a refusal reads, not how
 # long it waits: a client that declares a body and then sends it slowly, or never, held the refusal
 # open for as long as it liked, since no deadline is armed once the head has been parsed (#316).
-# For a 413 that also held a `max_concurrent_requests` slot. Five seconds is nginx's
-# `lingering_timeout` default, its name for this same wait. Past it the close goes ahead, and a
-# client with unread data in flight eats an RST, as it does past the byte budget. (Since HTTP.jl
-# 2.12, JuliaWeb/HTTP.jl#1494, HTTP half-closes first and drains up to 1 MiB for 500 ms more.)
+# Five seconds is nginx's `lingering_timeout` default, its name for this same wait. Past it the
+# close goes ahead, and a client with unread data in flight eats an RST, as it does past the byte
+# budget. (Since HTTP.jl 2.12, JuliaWeb/HTTP.jl#1494, HTTP half-closes first and drains up to 1 MiB
+# for 500 ms more.) A 413 used to hold its `max_concurrent_requests` slot for this whole wait, before
+# authentication; it gives the slot back before the swallow now (#894, see `stream_handler`).
 const _SWALLOW_TIMEOUT_NS = Int64(5_000_000_000)
+
+# ...and how much to read at a time (#894). The swallow keeps nothing, but each read holds memory
+# while it waits: this scratch, and the `nb` bytes HTTP's `_server_readbytes!` allocates on every
+# call. At `_STREAM_CHUNK_BYTES` that was about 128 KiB per stalled refusal for up to five seconds.
+# The `max_concurrent_requests` slot bounded how many refusals did that at once until #894 gave the
+# 413's slot back before the swallow; since then only the connection count bounds them, as on a
+# server with no cap. 16 KiB is HTTP.jl's own after-response drain buffer: about 32 KiB per refusal,
+# and 128 reads for a whole 2 MiB budget, which costs nothing measurable.
+const _SWALLOW_READ_BYTES = 16 * 1024
 
 # Arm that bound before swallowing. HTTP/1.1 only: an HTTP/2 connection's read deadline belongs to
 # its frame loop, which re-arms it before every frame and multiplexes other streams, so setting it
@@ -692,7 +734,7 @@ function _bound_swallow!(stream::HTTP.Stream)::Nothing
 end
 
 function _swallow_request_body!(stream::HTTP.Stream, budget::Int)
-    scratch = Vector{UInt8}(undef, min(budget, _STREAM_CHUNK_BYTES))
+    scratch = Vector{UInt8}(undef, min(budget, _SWALLOW_READ_BYTES))
     spent = 0
     try
         while spent < budget
@@ -775,7 +817,13 @@ function _send_rejection!(stream::HTTP.Stream, resp::HTTP.Response, drain::Bool)
     # keeps the two in legal order, and in every reachable combination the continue is either a
     # no-op (no `Expect` header, or already sent during the read) or skipped entirely (`drain`
     # is false precisely when the client is still waiting for it).
-    if drain
+    #
+    # A declared length past `_SWALLOW_SKIP_ABOVE_BYTES` skips it (#894): past both drain budgets
+    # the close is usually a reset however much this reads. The head's length is the whole body
+    # here: the 503 has read nothing, the declared-length 413 has read nothing, and the 413 found
+    # while reading is always chunked (`-1`), because a fixed-length body over the limit is refused
+    # by the declared-length check first.
+    if drain && _swallow_declared(Int64(stream.message.content_length))
         _bound_swallow!(stream)
         _swallow_request_body!(stream, _MAX_SWALLOW_BYTES)
     end
@@ -1081,9 +1129,10 @@ end
 # configured, so an uncapped server's request path is exactly what it was.
 #
 # `held` is whether this request still holds a `max_concurrent_requests` slot. It is released from
-# up to three places — the early SSE release, a WebSocket's switch to its own budget, and the
-# outer `finally` — and `_release_request_slot!` makes that exactly-once by construction rather
-# than by the order they happen to run in. Nitro's own path runs all three on one task; the CAS is
+# up to four places — a refused 413 before its swallow (#894), the early SSE release, a WebSocket's
+# switch to its own budget, and the outer `finally` — and `_release_request_slot!` makes that
+# exactly-once by construction rather than by the order they happen to run in. Nitro's own path
+# runs all of them on one task; the CAS is
 # what keeps a middleware that runs the handler on another task and gives up on it (a timeout
 # pattern) from releasing twice and letting the cap drift upward.
 mutable struct _Admission
@@ -1197,6 +1246,11 @@ _handoff_copy(resp::HTTP.Response)::HTTP.Response = own_response_headers(resp)
 # slot for its lifetime, as before: released from both, it would be bounded by neither. A
 # handshake that carried a body keeps its request slot too — the body stays live with the socket.
 #
+# A request refused 413 over `max_body_bytes` holds its slot only up to the refusal: through the
+# declared-length check, or through the body read that found the overflow. It gives the slot back
+# before the pre-response swallow, which keeps no body and may wait up to `_SWALLOW_TIMEOUT_NS`
+# (#894).
+#
 # What the permit does NOT bound is time. With `read_timeout` unset (the default, #316), a client
 # that sends a head and then trickles its body holds a slot as long as it likes, and without
 # `write_timeout` so does one that stops reading its response. Behind a buffering proxy neither
@@ -1209,8 +1263,9 @@ function stream_handler(middleware::Function; max_body_bytes::Int64 = DEFAULT_MA
     upgraded  = Threads.Atomic{Int64}(0)
     capped = max_concurrent_requests > 0 || max_upgraded_connections > 0
     return function(stream::HTTP.Stream)
-        # The request slot is released exactly once — early for a streaming body, at a WebSocket's
-        # switch to its own budget, or by the outer `finally` — through `_release_request_slot!`.
+        # The request slot is released exactly once — before a 413's swallow, early for a streaming
+        # body, at a WebSocket's switch to its own budget, or by the outer `finally` — through
+        # `_release_request_slot!`.
         # Allocated BEFORE the slot is taken, so nothing stands between the acquire and the `try`.
         adm = capped ? _Admission(false, in_flight, upgraded, max_upgraded_connections, false) : nothing
         if max_concurrent_requests > 0
@@ -1226,8 +1281,20 @@ function stream_handler(middleware::Function; max_body_bytes::Int64 = DEFAULT_MA
             # alternative is handing middleware a truncated body, which is strictly worse than handing
             # it nothing. The one exception is `rejection_headers`, which `serve(security_headers=…)`
             # supplies so the refusal carries the same security headers as every other response (#402).
-            req isa _BodyRejected &&
+            if req isa _BodyRejected
+                # The slot goes back BEFORE the refusal (#894). It bounds request bodies held in
+                # memory, and a refused request holds none: whatever `_http_stream_request` had
+                # buffered is unreachable once it returned this, and the swallow that follows reads
+                # into a fixed scratch buffer and keeps nothing. Held through the swallow, it kept one
+                # slot per refused connection for up to `_SWALLOW_TIMEOUT_NS`, before authentication,
+                # for the price of a request head. Released before the `@debug` record in
+                # `_reject_oversized_body!`, so that record is a point at which the slot is free.
+                # Exactly once: `_release_request_slot!` is a CAS on `adm.held`, so the `finally`
+                # below finds it `false` and leaves the count alone. A no-op when only
+                # `max_upgraded_connections` is set (`held` was never `true`).
+                adm === nothing || _release_request_slot!(adm)
                 return _reject_oversized_body!(stream, max_body_bytes, req.drain, rejection_headers)
+            end
             req.context[:ip] = ip
             req.context[:stream] = stream
             # Only the WebSocket branch reads it, and only a WebSocket budget gives it work (#376).

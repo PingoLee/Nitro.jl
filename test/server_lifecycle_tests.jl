@@ -1128,6 +1128,65 @@ end
     end
 end
 
+@testset "a refused 413 gives its slot back before the swallow (#894)" begin
+    # A body over `max_body_bytes` is refused, and then up to 2 MiB of it is read and discarded for
+    # up to 5 s BEFORE the 413 is written, so a client that writes before it reads gets the status
+    # rather than a reset. That swallow keeps nothing, so it needs no slot. Unpatched, the refused
+    # request held its slot through it: the `/ok` below was a 503, because a client that declares a
+    # body and sends it slowly sits in the swallow, holding the only slot, before any auth runs.
+    entered, release = Threads.Atomic{Bool}(false), Base.Event()
+    ctx = _capacity_context(entered, release)
+    port = get_free_port()
+    # The server's tasks are spawned inside `with_logger`, so they inherit this logger. The debug
+    # record `_reject_oversized_body!` writes is the synchronization point: `stream_handler` gives
+    # the slot back before calling it, and the swallow runs after it. Read under the logger's lock.
+    logger = Test.TestLogger(min_level = Base.CoreLogging.Debug)
+    Base.CoreLogging.with_logger(() -> _serve(ctx, port; max_concurrent_requests = 1,
+                                              max_body_bytes = 1024), logger)
+    refused(r) = r.level == Base.CoreLogging.Debug &&
+                 r.message == "Request body exceeds max_body_bytes; refused with 413"
+    records() = @lock logger.lock copy(logger.logs)
+    sock = Sockets.connect(Sockets.localhost, port)
+    try
+        # Over the limit, under the swallow's own budget, and no `Expect`: the refusal reads the body
+        # first. 100 of its 4096 bytes are sent, so the swallow waits for the rest.
+        seen = IOBuffer()
+        reader = @async try
+            while true
+                chunk = readavailable(sock)
+                isempty(chunk) && break
+                write(seen, chunk)
+            end
+            String(take!(seen))
+        catch e
+            String(take!(seen)) * read_failed(e)
+        end
+        yield()
+        write(sock, "POST /echo HTTP/1.1\r\nHost: $HOST\r\nContent-Length: 4096\r\n" *
+                    "Connection: close\r\n\r\n" * repeat("a", 100))
+        flush(sock)
+        @test timedwait(() -> any(refused, records()), 20.0; pollint = 0.02) === :ok
+        # The slot is free while the refusal is still swallowing (unpatched: a 503).
+        @test startswith(_get(port, "/ok"), "HTTP/1.1 200")
+        write(sock, repeat("a", 4096 - 100))
+        flush(sock)
+        @test timedwait(() -> istaskdone(reader), 20.0; pollint = 0.02) === :ok
+        @test startswith(fetch(reader), "HTTP/1.1 413")
+        # Released once: a second release from the `finally` would have let the count go negative,
+        # and a count below zero would admit two requests at once under a cap of one.
+        parked = @async _get(port, "/park")
+        @test timedwait(() -> entered[], 20.0; pollint = 0.02) === :ok
+        @test startswith(_get(port, "/ok"), "HTTP/1.1 503")
+        notify(release)
+        @test timedwait(() -> istaskdone(parked), 20.0; pollint = 0.02) === :ok
+        @test startswith(fetch(parked), "HTTP/1.1 200")
+    finally
+        close(sock)
+        notify(release)
+        Nitro.Core.terminate(ctx)
+    end
+end
+
 # #402. The 413 and 503 are built in `stream_handler`, before the middleware pipeline exists for
 # the request, so `SecurityHeaders` as ordinary middleware can never reach them. Under
 # `serve(security_headers = …)` they carry the same frozen pairs as every pipeline response.

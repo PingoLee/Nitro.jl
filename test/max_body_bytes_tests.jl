@@ -198,6 +198,99 @@ end
 
 end
 
+@testitem "A refusal skips the swallow past both drain budgets (#894)" tags=[:core, :network, :security] setup=[NitroCommon] begin
+using Test
+using HTTP
+using Sockets
+using Nitro
+
+# The two refusals' shared tail, `_send_rejection!`, driven directly under a raw HTTP.jl stream
+# server, so what is observed is its swallow alone. How much it read is HTTP's own count of the
+# fixed-length body left unread (`FixedLengthBody.remaining`), taken after the refusal returns.
+const Core_ = Nitro.Core
+const CRLF = "\r\n"
+const SKIP = Int64(Core_._SWALLOW_SKIP_ABOVE_BYTES)
+const PREFIX = 64 * 1024          # what each client actually sends of its declared body
+const SEEN = Channel{Any}(Inf)
+
+function refuser(status::Int)
+    return function (stream::HTTP.Stream)
+        head = HTTP.startread(stream)
+        body = stream.request_body
+        err = nothing
+        try
+            if status == 413
+                Core_._reject_oversized_body!(stream, Int64(1024), true)
+            else
+                Core_._reject_over_capacity!(stream, Int64(1))
+            end
+        catch e
+            err = e
+        end
+        fixed = body isa HTTP.FixedLengthBody
+        put!(SEEN, (; declared = Int64(head.content_length), fixed,
+                      remaining = fixed ? body.remaining : Int64(-2), err))
+        return nothing
+    end
+end
+
+# The head, a 64 KiB prefix of the declared body, then a half-close: a swallow that runs reads the
+# prefix and stops at the EOF, so a red is fast rather than a 5 s wait on the deadline.
+function refused(port, declared::Int64)
+    sock = Sockets.connect(HOST, port)
+    try
+        write(sock, string("POST /b HTTP/1.1", CRLF, "Host: x", CRLF,
+                           "Content-Length: ", declared, CRLF, CRLF))
+        write(sock, fill(UInt8('z'), PREFIX))
+        closewrite(sock)
+        reply = try
+            String(read(sock))
+        catch e
+            read_failed(e)
+        end
+        timedwait(() -> isready(SEEN), 30.0; pollint = 0.01) === :ok ||
+            error("the handler reported nothing in 30 s")
+        return reply, take!(SEEN)
+    finally
+        close(sock)
+    end
+end
+
+@testset "the line is the two budgets added" begin
+    # Nitro's swallow, then HTTP.jl's 1 MiB after-response drain (JuliaWeb/HTTP.jl#1494).
+    @test SKIP == Core_._MAX_SWALLOW_BYTES + 1024 * 1024
+    @test Core_._swallow_declared(Int64(-1))        # chunked declares nothing: keeps the swallow
+    @test Core_._swallow_declared(Int64(0))
+    @test Core_._swallow_declared(SKIP)
+    @test !Core_._swallow_declared(SKIP + 1)
+    @test !Core_._swallow_declared(typemax(Int64))
+end
+
+for status in (413, 503)
+    port = get_free_port()
+    server = HTTP.listen!(refuser(status), HOST, port)
+    try
+        @testset "$status: a declared length past the line is answered with nothing read" begin
+            reply, seen = refused(port, SKIP + 1)
+            @test seen.err === nothing
+            @test seen.fixed
+            @test seen.remaining == SKIP + 1       # unpatched: SKIP + 1 - 65536
+            @test startswith(reply, "HTTP/1.1 $status")
+        end
+        @testset "$status: a declared length on the line keeps the swallow" begin
+            reply, seen = refused(port, SKIP)
+            @test seen.err === nothing
+            @test seen.fixed
+            @test seen.remaining == SKIP - PREFIX  # the prefix was read and discarded
+            @test startswith(reply, "HTTP/1.1 $status")
+        end
+    finally
+        close(server)
+    end
+end
+
+end
+
 @testitem "The body read keeps every byte and allocates by the body, not by the chunk (#535)" tags=[:core, :network] setup=[NitroCommon] begin
 using Test
 using HTTP
