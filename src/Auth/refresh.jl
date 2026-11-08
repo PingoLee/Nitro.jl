@@ -184,3 +184,203 @@ function RefreshTokenPruner(store::AbstractRefreshTokenStore; interval::Period =
         on_startup = on_startup,
         on_shutdown = on_shutdown)
 end
+
+# ── Issuing and rotating ────────────────────────────────────────────────────────────────────
+
+"""
+    RefreshRotation(access_claims::Dict{String,Any}, refresh_token::String)
+
+What [`rotate_refresh_token`](@ref) returns:
+
+- `access_claims`: the claims for the new **access** token, which the application signs itself:
+  `encode_jwt(rotation.access_claims, access_secret; expires_in = 900)`. They are the app claims
+  given at sign-in, plus `sub` and `token_use = "access"`.
+- `refresh_token`: the next refresh token in the same family. Send it to the client in place of
+  the one it presented, which is now spent.
+
+Its `show` redacts the token.
+"""
+struct RefreshRotation
+    access_claims::Dict{String, Any}
+    refresh_token::String
+end
+
+Base.show(io::IO, r::RefreshRotation) =
+    print(io, "RefreshRotation(", length(r.access_claims), " access claims, <redacted refresh token>)")
+
+# The claims an app attached at sign-in, without the ones rotation owns. Carried into each next
+# refresh token and into the access claims.
+function _app_claims(claims::AbstractDict)::Dict{String, Any}
+    out = Dict{String, Any}()
+    for (key, value) in pairs(claims)
+        name = string(key)
+        name in _REFRESH_RESERVED_CLAIMS && continue
+        out[name] = value
+    end
+    return out
+end
+
+# Sign one refresh token and build the record that matches it, from ONE clock read.
+function _mint_refresh(subject::String, family::String, ttl::Int, app_claims::Dict{String, Any},
+                       secret)::Tuple{String, RefreshTokenRecord}
+    now = _current_timestamp()
+    jti = _refresh_id()
+    payload = copy(app_claims)
+    payload["sub"] = subject
+    payload["jti"] = jti
+    payload["fam"] = family
+    payload["token_use"] = "refresh"
+    payload["iat"] = now
+    payload["exp"] = now + ttl
+    token = encode_jwt(payload, secret)
+    return (token, RefreshTokenRecord(jti, family, subject, now + ttl))
+end
+
+function _check_ttl(ttl::Integer)::Int
+    ttl > 0 || throw(ArgumentError("refresh-token ttl must be a positive number of seconds, got $ttl"))
+    return Int(ttl)
+end
+
+"""
+    issue_refresh_token(store, subject; secret, ttl = 14 days, claims = Dict()) -> String
+
+Mint the first refresh token of a new family for `subject` (at sign-in), record it in `store`, and
+return the signed token.
+
+The token is a JWT signed with `secret` (anything `encode_jwt` accepts) carrying `sub`, a fresh
+random `jti`, its family id `fam`, `token_use = "refresh"`, `iat`, `exp = iat + ttl` and the app's
+own `claims`. Those
+claims are carried into every rotated token **and** into `RefreshRotation.access_claims`, so pass
+only claims meant for both. An `iss` or `aud` here is checked by `rotate_refresh_token(...; issuer,
+audience)` and then lands in the access claims too. Setting `jti`, `fam`, `sub`, `token_use`, `iat`,
+`exp` or `nbf` through `claims` is an `ArgumentError`.
+
+Each call starts a new family under a fresh random id: one family per sign-in. Rotation never
+starts one. The id is signed into every token of the family (`fam`), which is what lets any old
+token that comes back be recognized as a reuse. There is deliberately no way to choose it. A
+caller-chosen id (a device id, say) could recreate a revoked family, which would bring its old
+tokens back to life.
+
+**Use a separate `secret` from your access tokens.** Then an access-token validator refuses a
+refresh token by its signature. If you share one secret, guard ordinary routes with
+`claim_required("token_use", "access")`.
+
+```julia
+refresh_store = MemoryRefreshTokenStore()
+token = issue_refresh_token(refresh_store, string(driver.id); secret = REFRESH_SECRET,
+                            claims = Dict("role" => driver.role))
+```
+"""
+function issue_refresh_token(store::AbstractRefreshTokenStore, subject::AbstractString; secret,
+                             ttl::Integer = DEFAULT_REFRESH_TTL_SECONDS,
+                             claims::AbstractDict = Dict{String, Any}())::String
+    isempty(subject) && throw(ArgumentError("issue_refresh_token: subject must be non-empty"))
+    seconds = _check_ttl(ttl)
+    app_claims = Dict{String, Any}()
+    for (key, value) in pairs(claims)
+        name = string(key)
+        name in _REFRESH_RESERVED_CLAIMS && throw(ArgumentError(
+            "issue_refresh_token: `$name` is set by rotation and cannot be passed in `claims`"))
+        app_claims[name] = value
+    end
+    token, record = _mint_refresh(String(subject), _refresh_id(), seconds, app_claims, secret)
+    # A fresh 128-bit family id is never already held, so `false` means a store that broke its
+    # contract, not a collision.
+    record_refresh_token!(store, record; new_family = true) || throw(ArgumentError(
+        "issue_refresh_token: the store refused a new family; check its record_refresh_token! method"))
+    return token
+end
+
+# Verify a presented refresh token: signature and time bounds through `decode_jwt`, then the
+# claims rotation needs. Every refusal is `:invalid`, and the `AuthError`'s message is not kept:
+# "expired" against "bad signature" is not a client's to learn (the same choice `BearerAuth` makes).
+# Returns `(claims, family, jti, subject)`.
+function _verify_refresh(token::AbstractString, secret, issuer,
+                         audience)::Tuple{Dict{String, Any}, String, String, String}
+    claims = try
+        decode_jwt(token, secret; issuer = issuer, audience = audience, require_exp = true,
+                   required_claims = _REFRESH_REQUIRED_CLAIMS)
+    catch e
+        e isa AuthError || rethrow()
+        throw(RefreshTokenError(:invalid))
+    end
+    claims isa Dict{String, Any} || throw(RefreshTokenError(:invalid))
+    token_use = get(claims, "token_use", nothing)
+    (token_use isa String && token_use == "refresh") || throw(RefreshTokenError(:invalid))
+    family = get(claims, "fam", nothing)
+    (family isa String && !isempty(family)) || throw(RefreshTokenError(:invalid))
+    jti = get(claims, "jti", nothing)
+    (jti isa String && !isempty(jti)) || throw(RefreshTokenError(:invalid))
+    subject = get(claims, "sub", nothing)
+    (subject isa String && !isempty(subject)) || throw(RefreshTokenError(:invalid))
+    return (claims, family, jti, subject)
+end
+
+# A store's answer to `consume_refresh_token!` as a record, or the refusal it means.
+function _admit(store::AbstractRefreshTokenStore, outcome, family::String,
+                subject::String)::RefreshTokenRecord
+    outcome isa RefreshTokenMiss && throw(RefreshTokenError(outcome.reason))
+    outcome isa RefreshTokenRecord || throw(ArgumentError(
+        "consume_refresh_token! must return a RefreshTokenRecord or a RefreshTokenMiss, got a $(typeof(outcome))"))
+    # The signed `sub` and the stored subject must agree. They can only disagree if the store is
+    # wrong or two issuers share a secret and a family space, and either way the token is not this
+    # store's to honour.
+    (outcome.subject == subject && outcome.family == family) || throw(RefreshTokenError(:invalid))
+    return outcome
+end
+
+"""
+    rotate_refresh_token(store, token; secret, ttl = 14 days, issuer = nothing, audience = nothing) -> RefreshRotation
+
+Spend the refresh `token` and issue the next one in its family. This is the body of a refresh
+endpoint.
+
+1. Verifies `token` with `decode_jwt` (signature, `exp` required, `issuer`/`audience` when given),
+   and requires `token_use = "refresh"`, a `jti`, a `fam` and a `sub`.
+2. Consumes it in `store`, atomically: it must be its family's current token. Exactly one of any
+   number of concurrent rotations of one token gets past this point.
+3. Records the next token in the same family, valid for `ttl` seconds from now.
+4. Returns a [`RefreshRotation`](@ref): the access claims for the application to sign with
+   `encode_jwt`, and the new refresh token. This function never mints an access token.
+
+A refusal throws [`RefreshTokenError`](@ref)`(reason)`. **A token that is not its family's current
+one revokes the whole family** (`:reused`): it was rotated away already, so two parties hold the
+lineage. The attacker's copy and the legitimate client's current token both stop working, and the
+user signs in again. This holds for as long as the family lives, however long ago the old token
+was rotated away. It includes a client that sends one token twice at once, for example from two
+tabs, so a client must serialize its refreshes.
+
+The claims handed back are the ones given at sign-in. Re-check the subject before you sign them,
+because a disabled or demoted account should not get a fresh access token with yesterday's role:
+
+```julia
+function refresh(req, body::Json{RefreshRequest})
+    rotation = rotate_refresh_token(refresh_store, body.payload.refresh_token; secret = REFRESH_SECRET)
+    driver = find_driver(rotation.access_claims["sub"])
+    (driver === nothing || !driver.active) && return Res.status(401)
+    claims = merge(rotation.access_claims, Dict("role" => driver.role))   # the current role
+    access = encode_jwt(claims, ACCESS_SECRET; expires_in = 900)
+    return Res.json(Dict("access_token" => access, "refresh_token" => rotation.refresh_token))
+end
+```
+
+Uncaught, a `RefreshTokenError` is a fixed `401`.
+"""
+function rotate_refresh_token(store::AbstractRefreshTokenStore, token::AbstractString; secret,
+                              ttl::Integer = DEFAULT_REFRESH_TTL_SECONDS, issuer = nothing,
+                              audience = nothing)::RefreshRotation
+    seconds = _check_ttl(ttl)
+    claims, family, jti, subject = _verify_refresh(token, secret, issuer, audience)
+    record = _admit(store, consume_refresh_token!(store, family, jti; at = _current_timestamp()),
+                    family, subject)
+    app_claims = _app_claims(claims)
+    next, next_record = _mint_refresh(subject, record.family, seconds, app_claims, secret)
+    # `false` means the family was revoked between our consume and now -- a concurrent reuse or a
+    # logout. The new token is not stored, so it is refused if it is ever presented.
+    record_refresh_token!(store, next_record; new_family = false) ||
+        throw(RefreshTokenError(:revoked))
+    access_claims = app_claims
+    access_claims["sub"] = subject
+    access_claims["token_use"] = "access"
+    return RefreshRotation(access_claims, next)
+end

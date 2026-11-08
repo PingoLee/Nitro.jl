@@ -126,3 +126,113 @@ end
     @test timedwait(() -> istaskdone(task), 10.0) === :ok
     @test_throws ArgumentError RefreshTokenPruner(counting; interval = Month(1))
 end
+
+# ── Rotation ────────────────────────────────────────────────────────────────────────────────
+
+@testitem "refresh tokens: rotation spends the old jti and issues a new one (#231)" tags=[:auth, :core] setup=[NitroCommon] begin
+    using Test
+    using Nitro.Auth
+
+    ts() = Nitro.Auth._current_timestamp()
+    secret = jwtkey("refresh")
+    store = MemoryRefreshTokenStore()
+    token = issue_refresh_token(store, "42"; secret, claims = Dict("role" => "driver"))
+    claims = decode_jwt(token, secret)
+    @test claims["token_use"] == "refresh"
+    @test claims["sub"] == "42"
+    @test claims["role"] == "driver"
+    @test claims["exp"] - claims["iat"] == Nitro.Auth.DEFAULT_REFRESH_TTL_SECONDS
+    @test claims["jti"] isa String && length(claims["jti"]) == 22   # 128 bits, base64url
+    @test claims["fam"] isa String && length(claims["fam"]) == 22
+
+    rotation = rotate_refresh_token(store, token; secret, ttl = 600)
+    @test rotation isa RefreshRotation
+    next = decode_jwt(rotation.refresh_token, secret)
+    @test next["jti"] != claims["jti"]
+    @test next["fam"] == claims["fam"]
+    @test next["sub"] == "42" && next["role"] == "driver" && next["token_use"] == "refresh"
+    @test next["exp"] - next["iat"] == 600
+    # The access claims are the app's to sign: its claims, `sub`, and the access discriminator.
+    @test rotation.access_claims == Dict{String, Any}("sub" => "42", "role" => "driver",
+                                                       "token_use" => "access")
+    @test !occursin(rotation.refresh_token, repr(rotation))
+
+    # The old token is no longer current, the new one is -- read straight off the store.
+    old = consume_refresh_token!(store, claims["fam"], claims["jti"]; at = ts())
+    @test old isa RefreshTokenMiss && old.reason === :reused
+    fresh = consume_refresh_token!(store, next["fam"], next["jti"]; at = ts())
+    @test fresh isa RefreshTokenRecord && fresh.subject == "42"
+
+    # The issuance contract.
+    @test_throws ArgumentError issue_refresh_token(store, "42"; secret, claims = Dict("jti" => "x"))
+    @test_throws ArgumentError issue_refresh_token(store, "42"; secret, claims = Dict("fam" => "x"))
+    @test_throws ArgumentError issue_refresh_token(store, "42"; secret, claims = Dict(:token_use => "access"))
+    @test_throws ArgumentError issue_refresh_token(store, ""; secret)
+    @test_throws ArgumentError issue_refresh_token(store, "42"; secret, ttl = 0)
+    # Family ids are never caller-chosen (a chosen one could revive a revoked family).
+    @test_throws MethodError issue_refresh_token(store, "42"; secret, family = "device-1")
+
+    # A store at its bound: a token of an evicted family is refused, never honoured.
+    small = MemoryRefreshTokenStore(max_tokens = 3)
+    tokens = [issue_refresh_token(small, string(i); secret) for i in 1:4]
+    err = try; rotate_refresh_token(small, tokens[1]; secret); nothing; catch e; e; end
+    @test err isa RefreshTokenError && err.reason === :unknown
+    @test rotate_refresh_token(small, tokens[4]; secret) isa RefreshRotation
+
+    @test_throws ArgumentError RefreshTokenError(:nope)
+end
+
+@testitem "refresh tokens: only verified refresh tokens reach the store (#231)" tags=[:auth, :core] setup=[NitroCommon] begin
+    using Test
+    using Nitro.Auth
+
+    reason(f) = try; f(); nothing; catch e; e isa RefreshTokenError ? e.reason : rethrow(); end
+    ts() = Nitro.Auth._current_timestamp()
+
+    secret = jwtkey("refresh")
+    store = MemoryRefreshTokenStore()
+
+    # `decode_jwt`'s time bound still holds: a token past its `exp` (beyond the skew) is refused
+    # before the store is asked, so the family's current token is NOT taken by the attempt.
+    @test record_refresh_token!(store, RefreshTokenRecord("jti-old", "fam-old", "42", ts() - 3600);
+                                new_family = true)
+    stale = encode_jwt(Dict("sub" => "42", "jti" => "jti-old", "fam" => "fam-old",
+                            "token_use" => "refresh", "iat" => ts() - 7200, "exp" => ts() - 3600), secret)
+    @test reason(() -> rotate_refresh_token(store, stale; secret)) === :invalid
+    @test consume_refresh_token!(store, "fam-old", "jti-old"; at = ts() - 7200) isa RefreshTokenRecord
+
+    token = issue_refresh_token(store, "42"; secret)
+    claims = decode_jwt(token, secret)
+    jti, fam = claims["jti"], claims["fam"]
+    # Wrong key, forged signature, not a JWT.
+    @test reason(() -> rotate_refresh_token(store, token; secret = jwtkey("other"))) === :invalid
+    parts = split(token, '.')
+    @test reason(() -> rotate_refresh_token(store, join([parts[1], parts[2], "AAAA"], '.'); secret)) === :invalid
+    @test reason(() -> rotate_refresh_token(store, "not-a-jwt"; secret)) === :invalid
+    # An access token signed with the same secret is not a refresh token, even with a jti and fam.
+    access = encode_jwt(Dict("sub" => "42", "jti" => jti, "fam" => fam, "token_use" => "access"), secret; expires_in = 600)
+    @test reason(() -> rotate_refresh_token(store, access; secret)) === :invalid
+    # A refresh token without a jti, a fam, or an exp does not verify.
+    no_jti = encode_jwt(Dict("sub" => "42", "fam" => fam, "token_use" => "refresh"), secret; expires_in = 600)
+    @test reason(() -> rotate_refresh_token(store, no_jti; secret)) === :invalid
+    no_fam = encode_jwt(Dict("sub" => "42", "jti" => jti, "token_use" => "refresh"), secret; expires_in = 600)
+    @test reason(() -> rotate_refresh_token(store, no_fam; secret)) === :invalid
+    no_exp = encode_jwt(Dict("sub" => "42", "jti" => jti, "fam" => fam, "token_use" => "refresh"), secret)
+    @test reason(() -> rotate_refresh_token(store, no_exp; secret)) === :invalid
+    # A signed `sub` that disagrees with the store's record. Only a holder of the secret can sign
+    # one, and the attempt takes that family's current token, so it uses a token of its own.
+    victim = decode_jwt(issue_refresh_token(store, "42"; secret), secret)
+    swapped = encode_jwt(Dict("sub" => "43", "jti" => victim["jti"], "fam" => victim["fam"],
+                              "token_use" => "refresh"), secret; expires_in = 600)
+    @test reason(() -> rotate_refresh_token(store, swapped; secret)) === :invalid
+    # A family this store never issued.
+    foreign = issue_refresh_token(MemoryRefreshTokenStore(), "42"; secret)
+    @test reason(() -> rotate_refresh_token(store, foreign; secret)) === :unknown
+    # Issuer and audience are checked when given.
+    iss = issue_refresh_token(store, "42"; secret, claims = Dict("iss" => "fleet"))
+    @test reason(() -> rotate_refresh_token(store, iss; secret, issuer = "other")) === :invalid
+    @test rotate_refresh_token(store, iss; secret, issuer = "fleet") isa RefreshRotation
+
+    # None of those refusals took the real token.
+    @test rotate_refresh_token(store, token; secret) isa RefreshRotation
+end

@@ -19,6 +19,7 @@ import ..Core.Types: record_refresh_token!, consume_refresh_token!, revoke_refre
                      prune_refresh_tokens!
 using ..Core.Crypto: _empty_hmac_key, _hmac_sha256, _pbkdf2_hmac_sha256, base64url_encode, base64url_decode,
                      secure_random_bytes
+using ..Core.Errors: RefreshTokenError
 using ..Core.Middleware.JanitorMiddleware: _janitor
 using ..Core.Util.BodyParsers: _parse_json_bounded, _parse_json_dict_bounded
 using ..Core.Util: _auth_credential, _takes_request, BoundedLRU, _count_one
@@ -39,9 +40,10 @@ export AuthError,
     # Refresh-token lifecycle (#231): the store contract, the in-memory store and its pruner,
     # and the rotation functions.
     AbstractRefreshTokenStore, MemoryRefreshTokenStore, RefreshTokenPruner,
-    RefreshTokenRecord, RefreshTokenMiss,
+    RefreshTokenRecord, RefreshTokenMiss, RefreshTokenError, RefreshRotation,
     record_refresh_token!, consume_refresh_token!, revoke_refresh_family!, prune_refresh_tokens!,
-    missing_refresh_store_methods
+    missing_refresh_store_methods,
+    issue_refresh_token, rotate_refresh_token
 
 struct AuthError <: Exception
     msg::String
