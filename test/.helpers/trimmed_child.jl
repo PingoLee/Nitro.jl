@@ -393,6 +393,122 @@ case!(RE, "_trimmed_note", "a fixed line", () -> T._trimmed_note("Nitro: a note"
       :fallback, "Nitro: a note", nothing)
 dynamic!(RE, "_trimmed_note", T._trimmed_note, String)
 
+# The request path's line, once per (type, route) (#883). Each case uses a pair of its own, so it
+# writes its line in the trimmed run; the JIT answers `nothing` and records nothing. The request's
+# target and query carry the sentinel: the line names the route's pattern, never the target.
+memo_request(route) = (r = HTTP.Request("GET", "/memo/" * SENTINEL * "?q=" * SENTINEL);
+                       route === nothing || (r.context[:route] = route); r)
+function stashed_request(route)
+    r = memo_request(nothing)
+    r.context[T.ROUTE_RESOLUTION_KEY] = T.RouteResolution(T.nitro_router(), r.method, r.target,
+        identity, route, Dict{String,String}(), r.method, Dict{String,T.RouteMiddleware}(),
+        T.CopyOnWriteDict{T.RouteMiddleware}())
+    return r
+end
+case!(RE, "_request_failure_line", "a pair on a route",
+      () -> T._request_failure_line("a site", :ArgumentError, "/case/{id}"),
+      :fallback, "Nitro: a site: ArgumentError on route /case/{id}", nothing)
+case!(RE, "_request_failure_line", "a pair with no route",
+      () -> T._request_failure_line("a site", :ArgumentError, nothing),
+      :fallback, "Nitro: a site: ArgumentError with no route", nothing)
+dynamic!(RE, "_request_failure_line", T._request_failure_line, String, Symbol, String)
+dynamic!(RE, "_request_failure_line", T._request_failure_line, String, Symbol, Nothing)
+case!(RE, "Util._trimmed_request_failure", "a matched route, an exception with a secret field",
+      () -> T._trimmed_request_failure("a request failed", TrimSentinel(SENTINEL), memo_request("/case/matched")),
+      :fallback, "Nitro: a request failed: TrimSentinel on route /case/matched", nothing)
+case!(RE, "Util._trimmed_request_failure", "the stashed route, before the terminal wrote :route",
+      () -> T._trimmed_request_failure("a request failed", ArgumentError(SENTINEL), stashed_request("/case/stashed")),
+      :fallback, "Nitro: a request failed: ArgumentError on route /case/stashed", nothing)
+case!(RE, "Util._trimmed_request_failure", "no route: the target is never the route",
+      () -> T._trimmed_request_failure("a request failed", KeyError(SENTINEL), memo_request(nothing)),
+      :fallback, "Nitro: a request failed: KeyError with no route", nothing)
+dynamic!(RE, "Util._trimmed_request_failure", T._trimmed_request_failure, String, Any, T.BytesRequest)
+dynamic!(RE, "Util._trimmed_request_failure", T._trimmed_request_failure, String, Any, Nothing)
+
+# Run once before the flip and once after it; the parent counts each line on stderr, so a line the
+# JIT wrote, or one the memo let through twice, makes a count 2 or more.
+function request_failures()
+    for _ in 1:5
+        T._trimmed_request_failure("a request failed", ArgumentError(SENTINEL), memo_request("/memo/a"))
+    end
+    T._trimmed_request_failure("a request failed", ArgumentError(SENTINEL), memo_request("/memo/b"))
+    T._trimmed_request_failure("a request failed", TrimSentinel(SENTINEL), memo_request("/memo/a"))
+    T._trimmed_request_failure("a request failed", TrimSentinel(SENTINEL), memo_request("/memo/a"))
+    return nothing
+end
+
+# The four sites of the error boundary (#883), each driven directly with a pair of its own. None of
+# them reaches a route's endpoint, so nothing `ccall`s a thunk this process never exported. Their
+# `@error` records go to a `NullLogger`; the trimmed run's lines are counted by the parent.
+function rerouted_refusal()
+    r = T.nitro_router()
+    HTTP.register!(r, "GET", "/site/new", identity)
+    source = T.CopyOnWriteDict{T.RouteMiddleware}()
+    T.publish!(source, RH.genkey("GET", "/site/new"), (Function[identity], nothing))
+    res = T.RouteResolution(r, "GET", "/site/old", identity, "/site/old", Dict{String,String}(),
+                            "GET", Dict{String,T.RouteMiddleware}(), source)
+    req = HTTP.Request("GET", "/site/new?q=" * SENTINEL)
+    return Nitro.Core._route_rerouted(r, T.MissResponses(HTTP.Response(404), HTTP.Response(405)), req, res)
+end
+function boundary_sites()
+    statuses = Int[]
+    Base.CoreLogging.with_logger(Base.CoreLogging.NullLogger()) do
+        for _ in 1:3
+            # handlerequest's `ERROR:`: a handler threw on a matched route, and a request with none.
+            push!(statuses, U.handlerequest(() -> throw(TrimSentinel(SENTINEL)), true;
+                                            request = memo_request("/site/handler")).status)
+            push!(statuses, U.handlerequest(() -> throw(TrimSentinel(SENTINEL)), true;
+                                            request = memo_request(nothing)).status)
+            push!(statuses, RH._not_a_response(TrimBody(SENTINEL), memo_request("/site/value")).status)
+            push!(statuses, Nitro.Core._refuse_foreign_leaf(memo_request(nothing), "/site/foreign").status)
+            push!(statuses, rerouted_refusal().status)
+        end
+    end
+    println("SITES_500=", all(==(500), statuses))
+    return nothing
+end
+
+# Nitro's own hook runner failing past the catch around the hook (#883): the shape of #846's miss
+# inside `stopped`'s catch. The runners are replaced for two concrete middleware types only. Each
+# entry is built inside the run, so after the flip it carries the `@cfunction` shim and the call
+# goes through `_lifecycle_call`'s `EndpointFailure`. The exception still leaves the broadcast as
+# itself; in the trimmed run `_run_lifecycle` also writes a line, which the parent counts.
+struct RunnerBoom <: Function end
+(::RunnerBoom)() = nothing
+const RUNNER_STOP = Nitro.Core.LifecycleMiddleware(middleware = identity, on_stopped = RunnerBoom())
+const RUNNER_START = Nitro.Core.LifecycleMiddleware(middleware = identity, on_startup = RunnerBoom())
+T.stopped(::typeof(RUNNER_STOP)) = throw(TrimSentinel(SENTINEL))
+T.startup(::typeof(RUNNER_START)) = throw(TrimSentinel(SENTINEL))
+function runner_failures()
+    stop = outcome(() -> Nitro.Core._teardown!(Nitro.Core.App(), T.LifecycleEntry[],
+        [T.serve_lifecycle_entry(RUNNER_STOP)], nothing; listener = false, timeout = 0))
+    start = outcome(() -> Nitro.Core._startup_hooks(T.LifecycleEntry[], [T.serve_lifecycle_entry(RUNNER_START)]))
+    println("RUNNER_RAISES_", T._trimmed() ? "TRIMMED" : "JIT", "=",
+            stop[1:2] == (:error, "TrimSentinel") && start[1:2] == (:error, "TrimSentinel"))
+    return nothing
+end
+
+# After the flip, last of all the request-path lines: fill the set to its cap, then check that the
+# next new pair writes the final line once and that nothing is written after it.
+function past_the_cap()
+    memo = T.REQUEST_FAILURES
+    held = lock(() -> length(memo.seen), memo.lock)
+    for i in 1:(T._REQUEST_FAILURE_CAP - held)
+        T._request_failure_line("a cap filler", :CapFiller, "/cap/$i")
+    end
+    final = T._request_failure_line("past the cap", :CapFiller, "/cap/past/1")
+    println("CAP_FINAL=", final == T._REQUEST_FAILURES_FULL)
+    after = Any[T._request_failure_line("past the cap", :CapFiller, "/cap/past/$i") for i in 2:20]
+    push!(after, T._trimmed_request_failure("a request failed", ArgumentError(SENTINEL), memo_request("/memo/c")))
+    push!(after, T._request_failure_line("a cap filler", :CapFiller, "/cap/1"))   # a pair already seen
+    println("CAP_SILENT=", all(isnothing, after) && lock(() -> length(memo.seen), memo.lock) == T._REQUEST_FAILURE_CAP)
+    # What `__init__` does when the module loads: a pair recorded while a `juliac` image was built
+    # must not silence the same failure at run time. Checked on the state, writing nothing.
+    T.__init__()
+    println("RESET=", lock(() -> isempty(memo.seen) && !memo.full, memo.lock))
+    return nothing
+end
+
 # A throwing hook through each lifecycle phase, run once per phase of this child, its records sent
 # to a `NullLogger`. Only the trimmed run writes the hooks' lines; the parent counts them on stderr.
 throwing_lifecycle() = Nitro.Core.LifecycleMiddleware(middleware = h -> h,
@@ -470,11 +586,17 @@ end
 jit = [outcome(c[3]) for c in CASES]
 flip_before = Auth._validator_takes_request(one_arg, true)
 failed_hooks()
+request_failures()
+boundary_sites()
+runner_failures()
 
 Core.eval(T, :(_trimmed() = true))
 
 flip_after = Auth._validator_takes_request(one_arg, true)
 failed_hooks()
+request_failures()
+boundary_sites()
+runner_failures()
 println("FLIP=", T._trimmed() === true && flip_before === false && flip_after === true)
 
 for (i, (key, name, thunk, expect)) in enumerate(CASES)
@@ -504,4 +626,5 @@ for key in union(cased, dynamic_keys)
     file, func = split(key, ':'; limit = 2)
     get(TRIMMED_SITES, (file, func), nothing) in (:A, :B) || println("NOCHECK ", key, " | checked but not listed as A or B")
 end
+past_the_cap()      # last: no request-path line may follow the final one
 println("DONE")

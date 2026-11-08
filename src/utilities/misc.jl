@@ -14,6 +14,12 @@ export recursive_merge, parseparam, parsebody, parseparam_checked,
 
 ### Request helper functions ###
 
+# The line a trimmed build writes for `handlerequest`'s `ERROR:` branch, once per (type, route)
+# (#883). Declared here and defined in src/routeendpoint.jl, beside `_trimmed_failure`: its body
+# reads `_trimmed()`, which lives in `Types`, and `Types` is included after this module. A forward
+# declaration, as src/core.jl's accessor stubs are.
+function _trimmed_request_failure end
+
 
 function handle_error(::ValidationError)
     return Res.json(("message" => "400: Bad Request"), status = 400)
@@ -63,7 +69,10 @@ function _error_response(@nospecialize(error))
     return handle_error(nothing)
 end
 
-function handlerequest(getresponse::Function, catch_errors::Bool; show_errors::Bool = true)
+# `request` is the request being answered, when the caller has one: it names the route in the line a
+# trimmed build writes for an `ERROR:` (#883). It is read only in that branch.
+function handlerequest(getresponse::Function, catch_errors::Bool; show_errors::Bool = true,
+                       request::Union{Nothing,HTTP.Request} = nothing)
     if !catch_errors
         return getresponse()
     else
@@ -138,6 +147,10 @@ function handlerequest(getresponse::Function, catch_errors::Bool; show_errors::B
                 # session store with `SessionStoreFault` (#612). Never "improve" this line by logging
                 # `current_exceptions()`, a cause chain, or the original exception.
                 @error "ERROR: " exception=(loggable(error), catch_backtrace())
+                # A trimmed build drops that record (#846), so it writes one value-free line of its
+                # own: the exception's type name and the route's registered pattern, once per pair
+                # in the process (#883). One line per request would let a client flood the terminal.
+                _trimmed_request_failure("a request failed", error, request)
             end
             return _error_response(error)
         end
