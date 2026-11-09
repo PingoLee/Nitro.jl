@@ -68,6 +68,22 @@ function main(; root::AbstractString = pkgdir(@__MODULE__), kwargs...)
 end
 ```
 
+```julia
+# db/models.jl — typed bindings, then the model set `set_models` registers
+module models
+
+import PormG.Models
+
+Product::Models.ModelType = Models.Model("products",
+    id   = Models.IDField(),
+    name = Models.CharField(max_length = 100),
+)
+
+Models.@models Product
+
+end
+```
+
 - **Never call `load_many`/`load` in a module body.** A package's module body runs at precompile
   time and never again, so the connection would not exist at runtime, and a JuliaC image would
   carry `connection.yml`'s password. It goes in `main()` — the boot in `bigger_applications.md` is
@@ -75,6 +91,9 @@ end
 - **Never show `@import_models` in a package's module body.** It registers the models as it
   includes them, PormG 0.9 refuses that before their folder is loaded, and a precompile is never a
   REPL: the package does not precompile.
+- **End `db/models.jl` with `Models.@models` naming every model.** `set_models` registers that
+  set and refuses a module without one (`ModelDefinitionError`). Bind each model with a typed
+  global (`Product::Models.ModelType = Models.Model(…)`), as PormG's template does.
 - **Name the environment at the `load`** (`env = something(sync_pormg_env!(), current_env())`):
   outside a REPL PormG refuses a `load` with none.
 - **`db/` is found from `main`'s `root`.** `main.jl` passes `APP_ROOT`, else the working
