@@ -732,8 +732,10 @@ GuardMiddleware(claim_required("token_use", "access"))
 process cannot see the first's tokens. It holds one row per family, at most `max_tokens`
 (100,000 by default). A refresh rewrites its family's row and a sign-out removes it, so the bound
 counts concurrent sign-ins, never refreshes, and reuse detection lasts as long as a family does.
-Eviction **fails closed**: every token of an evicted family is refused, never accepted. Put a
-`RateLimiter` on the refresh route as well. Behind more than one process, implement
+Eviction **fails closed**: every token of an evicted family is refused, never accepted, and the
+store logs one warning the first time it evicts. Put a `RateLimiter` on the **login** route: it is
+the only route that adds a row, so a client that loops it can fill the table and sign everyone
+else out. Put one on the refresh route as well. Behind more than one process, implement
 `AbstractRefreshTokenStore` on your database. Its docstring is the contract, and the rule that
 matters most is that `consume_refresh_token!` checks and clears the current token in **one**
 atomic step.

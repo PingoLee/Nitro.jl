@@ -127,6 +127,42 @@ end
     @test_throws ArgumentError RefreshTokenPruner(counting; interval = Month(1))
 end
 
+@testitem "refresh tokens: the first eviction warns once, naming only the bound (#231)" tags=[:auth, :core] setup=[NitroCommon] begin
+    using Test
+    using Nitro.Auth
+
+    # Only a sign-in adds a family, so a client looping the login route is what fills the table.
+    # The store says so once: the first eviction warns, later ones do not, and the record names
+    # the bound and nothing a token carries.
+    secret = jwtkey("refresh")
+    store = MemoryRefreshTokenStore(max_tokens = 2)
+    logger = Test.TestLogger(min_level = Base.CoreLogging.Debug)
+    tokens = Base.CoreLogging.with_logger(logger) do
+        filled = [issue_refresh_token(store, "42"; secret) for _ in 1:2]
+        # Full, but nothing evicted yet: no warning.
+        @test isempty(lock(() -> copy(logger.logs), logger.lock))
+        # Rotation rewrites a row and never adds one, so it never evicts.
+        filled[2] = rotate_refresh_token(store, filled[2]; secret).refresh_token
+        @test isempty(lock(() -> copy(logger.logs), logger.lock))
+        vcat(filled, [issue_refresh_token(store, "42"; secret) for _ in 1:2])   # two evictions
+    end
+    records = lock(() -> copy(logger.logs), logger.lock)
+    @test length(records) == 1
+    warning = only(records)
+    @test warning.level == Base.CoreLogging.Warn
+    @test occursin("MemoryRefreshTokenStore is full", string(warning.message))
+    @test Dict(warning.kwargs) == Dict(:max_tokens => 2)
+    sentinels = String[secret]
+    for token in tokens
+        claims = decode_jwt(token, secret)
+        append!(sentinels, (token, claims["jti"], claims["fam"]))
+    end
+    @test !any(s -> occursin(s, string(warning.message)) || occursin(s, string(warning.kwargs)), sentinels)
+    # The two oldest families were evicted, and fail closed.
+    err = try; rotate_refresh_token(store, tokens[1]; secret); nothing; catch e; e; end
+    @test err isa RefreshTokenError && err.reason === :unknown
+end
+
 # ── Rotation ────────────────────────────────────────────────────────────────────────────────
 
 @testitem "refresh tokens: rotation spends the old jti and issues a new one (#231)" tags=[:auth, :core] setup=[NitroCommon] begin

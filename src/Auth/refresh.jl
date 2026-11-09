@@ -75,9 +75,12 @@ process, use a persistent store.
 rotation rewrites its family's row and never adds one, and a revocation (a logout, a detected
 reuse) removes it. So the bound counts sign-ins, never refreshes. Reuse detection lasts as long as
 a family lives, however many refreshes other clients make. Once full, a new sign-in evicts the
-least recently used family. Eviction **fails closed**: every token of an evicted family is refused
-as `:unknown`, the attacker's copy included. Run a [`RefreshTokenPruner`](@ref), which removes
-expired families before the bound has to.
+least recently used family, and the store logs one warning the first time that happens. Eviction
+**fails closed**: every token of an evicted family is refused as `:unknown`, the attacker's copy
+included, and that family's reuse-detection evidence goes with it. Run a
+[`RefreshTokenPruner`](@ref), which removes expired families before the bound has to, and
+rate-limit the route that signs users in: it is the only one that adds a row, so it is where one
+client could fill the table and push every other sign-in out.
 
 One `ReentrantLock` guards the table. `consume_refresh_token!` holds it for the check and the
 clear, which is the compare-and-swap rotation depends on.
@@ -86,12 +89,13 @@ struct MemoryRefreshTokenStore <: AbstractRefreshTokenStore
     families::BoundedLRU{String, _Family, typeof(_count_one)}
     lock::ReentrantLock
     max_tokens::Int
+    warned_full::Threads.Atomic{Bool}
 
     function MemoryRefreshTokenStore(; max_tokens::Integer = DEFAULT_MAX_REFRESH_TOKENS)
         max_tokens > 0 || throw(ArgumentError(
             "MemoryRefreshTokenStore: max_tokens must be positive, got $max_tokens"))
         n = Int(max_tokens)
-        return new(BoundedLRU{String, _Family}(n), ReentrantLock(), n)
+        return new(BoundedLRU{String, _Family}(n), ReentrantLock(), n, Threads.Atomic{Bool}(false))
     end
 end
 
@@ -100,25 +104,42 @@ end
 Base.show(io::IO, store::MemoryRefreshTokenStore) =
     print(io, "MemoryRefreshTokenStore(max_tokens = ", store.max_tokens, ")")
 
+# Once per store, as `MemoryStore` warns for sessions: at capacity EVERY new sign-in evicts a
+# family, and a warning per eviction would be a second flood riding on the first. The bound is the
+# only value it names -- never a subject, a family id or a jti.
+function _warn_refresh_store_full(store::MemoryRefreshTokenStore)
+    Threads.atomic_xchg!(store.warned_full, true) && return nothing
+    @warn "MemoryRefreshTokenStore is full: each new sign-in now evicts the least recently used " *
+          "family, whose tokens are then refused. Raise `max_tokens`, rate-limit the sign-in " *
+          "route, run a `RefreshTokenPruner`, or use a persistent store." max_tokens = store.max_tokens
+    return nothing
+end
+
 function record_refresh_token!(store::MemoryRefreshTokenStore, record::RefreshTokenRecord;
                                new_family::Bool)
-    return lock(store.lock) do
+    # Only a new family adds a row, so only it can evict one: decided inside the lock, warned
+    # outside it.
+    stored, evicted = lock(store.lock) do
         state = get(store.families, record.family, nothing)
         if new_family
-            state === nothing || return false
+            state === nothing || return (false, false)
+            evicts = length(store.families) >= store.max_tokens
             store.families[record.family] =
                 _Family(record.jti, record.subject, record.expires_at, record.expires_at)
+            return (true, evicts)
         else
             # Only the rotation that consumed the current token may record its successor: the row
             # must be present (not revoked, which deletes it) with no current token. A family
             # revoked between this rotation's consume and now refuses here, so a concurrent reuse
             # cannot be outrun.
-            (state === nothing || state.current !== nothing) && return false
+            (state === nothing || state.current !== nothing) && return (false, false)
             store.families[record.family] = _Family(record.jti, record.subject, record.expires_at,
                                                     max(state.lives_until, record.expires_at))
+            return (true, false)
         end
-        return true
     end
+    evicted && _warn_refresh_store_full(store)
+    return stored
 end
 
 function consume_refresh_token!(store::MemoryRefreshTokenStore, family::String, jti::String;
