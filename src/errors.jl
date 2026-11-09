@@ -702,7 +702,11 @@ different reasons**, and conflating them is how this list rots:
    anything. `AccessLog`'s writer (`_run`/`_flush!` in
    `src/middleware/access_log.jl`, #649) is this group too: the app's sink failing with an
    overflow costs one dropped batch, and an interrupt ends the drain with a `@warn`, the janitor's
-   shape. Do not "fix" these to match the table above.
+   shape. `_run_lifecycle` (`src/routeendpoint.jl`, #892) belongs here too: under the JIT it
+   catches what escapes Nitro's own hook runner, rethrows the interrupt for the broadcast's caller
+   to defer (#185), and hands anything else back to be raised once the lifecycle is done, so an
+   overflow is still raised, only later, as `_lifecycle_call` already carries one in a trimmed
+   build. Do not "fix" these to match the table above.
 3. **The error boundary itself — the place the other two are MEANT to arrive.**
    `ErrorBoundary` in `src/core/framework_middleware.jl` (#256) wraps the whole middleware chain
    so that what this predicate lets through gets logged and answered with a 500. Widening it would
@@ -724,7 +728,12 @@ Three catch-alls sit outside every group because they swallow nothing: `_endpoin
 (`src/context.jl`), the far side of a trimmed build's `ccall`s, where an exception must not unwind
 through the foreign frame. Each returns what
 it caught as a value, and the caller's side throws it again, as itself, so an interrupt or an
-overflow reaches the catch it would have reached from a direct call.
+overflow reaches the catch it would have reached from a direct call. For `_lifecycle_call` the
+caller, `_run_lifecycle`, throws only an interrupt at once: any other failure of Nitro's own hook
+runner is kept by the broadcast and thrown, as itself, once the rest of the lifecycle has run
+(#892). Under the JIT `_run_lifecycle` calls the runner directly, in its own narrow catch: it
+rethrows the interrupt, which the broadcast's caller defers (#185), and logs anything else with
+its backtrace before handing it back the same way. It is not a request path, so it stays narrow.
 
 ### The executors' per-attempt catch uses the predicate and deliberately does NOT rethrow
 

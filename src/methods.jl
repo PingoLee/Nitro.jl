@@ -941,7 +941,12 @@ notified from a `LifecycleMiddleware`'s `on_shutdown`, which runs *before* the d
     every remaining hook still runs, the lifecycle state is still cleared, and the listener is
     still closed — an interrupted drain escalates straight to a force-close, cutting in-flight
     requests rather than waiting out the remaining budget. `terminate` then rethrows the
-    `InterruptException`, so it is the one documented way this function throws (#185).
+    `InterruptException` (#185).
+
+The other way it throws is a failure of Nitro's own hook runner, past the catch around a hook (a
+bug in Nitro, not in the hook). It skips nothing either: every remaining hook, the listener
+close and every `on_stopped` still run, and `terminate` raises the first such failure at the end
+(#892). An interrupt in the same teardown is raised instead, and the failure is logged.
 
 See also `serve`.
 """

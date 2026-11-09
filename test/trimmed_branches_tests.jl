@@ -84,10 +84,11 @@ end
 end
 
 # Nitro's own hook runner failing past the hook's catch (#883). In a trimmed build the call goes
-# through `_lifecycle_call`, which hands the exception back as an `EndpointFailure`;
-# `_run_lifecycle` throws it again, as itself, and writes a line naming the phase first. Under the
-# JIT the same failure raises with no line.
-@testset "a failed hook runner writes one line, and the failure still raises (#883)" begin
+# through `_lifecycle_call`, which hands the exception back as an `EndpointFailure`, and
+# `_run_lifecycle` writes a line naming the phase. Under the JIT `_run_lifecycle`'s own catch
+# hands it back the same way, with an `@error` record and no line. Either way the broadcast goes
+# on to the next entry, and the lifecycle raises the failure, as itself, once it is done (#892).
+@testset "a failed hook runner writes one line, skips no later hook, and still raises (#883, #892)" begin
     errlines = split(err, '\n'; keepempty = false)
     for phase in ("on_startup", "on_stopped")
         want = "Nitro: the $phase hook runner failed: TrimSentinel"
@@ -95,6 +96,8 @@ end
     end
     @test "RUNNER_RAISES_JIT=true" in lines || out
     @test "RUNNER_RAISES_TRIMMED=true" in lines || out
+    @test "RUNNER_NEXT_RAN_JIT=true" in lines || out
+    @test "RUNNER_NEXT_RAN_TRIMMED=true" in lines || out
 end
 
 @testset "no check failed, and every listed site has its checks" begin

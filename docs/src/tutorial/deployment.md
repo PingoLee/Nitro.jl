@@ -846,6 +846,10 @@ dies. A failed `on_stopped`, for example, prints:
 Nitro: LifecycleMiddleware.on_stopped failed: ArgumentError
 ```
 
+If Nitro's own hook runner fails, rather than your hook, the line reads
+`Nitro: the on_stopped hook runner failed: ArgumentError`. The hooks after it still run, and
+`terminate` (or `serve`) raises the failure once they have.
+
 These lines follow the build, not `Main._main`: an untrimmed executable keeps its log records and
 writes none of them. A failure your own code must report in a trimmed build has to be written to
 `Core.stderr` the same way.

@@ -1604,12 +1604,12 @@ the request through a `request` keyword, which `Serializer` and `ErrorBoundary` 
 `_lifecycle_call`, which turns whatever escapes Nitro's own hook runner into an `EndpointFailure`,
 so that nothing unwinds through the foreign frame. Traced with the trimmed-branch child: the entry
 is built after the flip, so it carries its `@cfunction` shim, and the runner is replaced for one
-concrete middleware type. `_run_lifecycle` throws the error again, as itself. It leaves the
-broadcast, which skips the hooks after it, and then `_teardown!` or `_startup_hooks`, and so
+concrete middleware type. `_run_lifecycle` used to throw the error again, as itself. It left the
+broadcast, which skipped the hooks after it, and then `_teardown!` or `_startup_hooks`, and so
 `terminate` or `serve`. Nothing on that way wrote a line. `_run_lifecycle` now writes
-`Nitro: the <phase> hook runner failed: <type>` before the rethrow: one line per entry and phase,
-a count the app's registrations bound, so no memo. An interrupt writes no line, as in
-`handlerequest`.
+`Nitro: the <phase> hook runner failed: <type>`: one line per entry and phase, a count the app's
+registrations bound, so no memo. An interrupt writes no line, as in `handlerequest`, and is still
+thrown at once. Since #892 the failure is returned rather than thrown (see below).
 
 #846's mechanism comment reported that `terminate` printed `ok` after such a miss inside
 `stopped`'s catch. That does not reproduce. The case was rebuilt as a trimmed executable that
@@ -1621,7 +1621,26 @@ miss.
 - stderr holds only the runner's line.
 
 `_teardown!` has not changed since #846's base (`0f72a4aa`), so why that scratch printed `ok` is
-not known. Whether one runner's failure should skip the rest of its phase is #892.
+not known.
+
+**#892: finish, then raise.** One runner's failure no longer skips the rest. `_run_lifecycle`
+returns the `EndpointFailure`. Under the JIT it calls the runner inside its own narrow catch, which
+logs each failure with its backtrace and hands it back the same way, so both builds take this
+route. The broadcast keeps the first failure in a carrier its caller owns for the whole
+lifecycle: both halves of the startup broadcast, or all of `_teardown!`, the listener close and
+every `on_stopped` included. Once that is done, `_raise_runner_failure` throws it, as itself. If
+an interrupt is being carried as well, the interrupt is returned and the failure is logged.
+
+The executable above, rebuilt with the runner replaced to throw (`ArgumentError`), from `main` at
+`c8db514d` and the change on top of it (Julia 1.13.2, JuliaC 0.3.12, `--trim=unsafe-warn`,
+`JULIA_CPU_TARGET=native`). Both print the runner's line on stderr first.
+
+| | `main` | after |
+|---|---|---|
+| `step terminate` | threw `ArgumentError` | threw `ArgumentError` |
+| `step second_on_stopped_ran` | `false` | `true` |
+| its verifier | 6 | 6 |
+| `ENTRY=app` / `ENTRY=probe` verifier | | 6 / 15, the pin; the probe's 23 lines as expected, stderr 0 bytes |
 
 Built 2026-11-07 with JuliaC 0.3.12, Julia 1.13.2, `--trim=unsafe-warn`, `JULIA_CPU_TARGET=native`,
 from `main` at `cccd14be` and the change on top of it:
