@@ -166,9 +166,11 @@ models_src = read(models_file, String)
 ends = collect(eachmatch(r"^end\b"m, models_src))
 @test !isempty(ends)
 close_at = last(ends).offset
+# Written the way PormG's template says to (PormG #1602, #1650): a typed binding, and the module's
+# model set after it, which `set_models` reads. Without the set, `set_models` refuses the module.
 models_src = models_src[1:prevind(models_src, close_at)] *
-    "Item = Models.Model(\"item\", id = Models.IDField(), " *
-    "name = Models.CharField(max_length = 50))\n\n" * models_src[close_at:end]
+    "Item::Models.ModelType = Models.Model(\"item\", id = Models.IDField(), " *
+    "name = Models.CharField(max_length = 50))\n\nModels.@models Item\n\n" * models_src[close_at:end]
 write(models_file, models_src)
 modfile = joinpath(root, "src", "ShopApp.jl")
 src = read(modfile, String)

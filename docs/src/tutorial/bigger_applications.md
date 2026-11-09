@@ -75,6 +75,29 @@ as it includes them, and PormG refuses to register models whose folder no `load`
 outside a REPL. A precompile is never a REPL, so a package with `@import_models` in its module
 body and `load_many` in `main()` fails to precompile.
 
+Inside `db/models.jl`, bind each model with a typed global, and end the module with a
+`Models.@models` line naming every model: that line is the model set `set_models` registers, and `set_models` refuses a module that
+has none. PormG's own template, which `PormG.setup` writes, says the same:
+
+```julia
+# db/models.jl
+module models
+
+import PormG.Models
+
+Product::Models.ModelType = Models.Model("products",
+    id    = Models.IDField(),
+    name  = Models.CharField(max_length = 100),
+    price = Models.DecimalField(max_digits = 10, decimal_places = 2),
+)
+
+Models.@models Product
+
+end
+```
+
+The package's module then includes that file and binds it in `main()`:
+
 ```julia
 # src/MyApp.jl
 module MyApp

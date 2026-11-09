@@ -899,9 +899,9 @@ const RealPormGWorkerStore = _load_pormg_worker_store_type()
 # -- A stand-in PormG connection, for `pormg_nitro_worker` and the #202 guard ------
 #
 # Mirrors `FakeSessionPool` in `pormg_session_tests.jl`; see the rationale there.
-# `PormG.connection(key=k)` is just `config[k].connections`, `config` is a
-# `Dict{String,PormGSettings}` and `PormGSettings` is an ABSTRACT type, so an entry under a
-# test-only key is enough. Subtyping `PormG.PormGSQLite` rather than using a bare struct means
+# `PormG.connection(key=k)` is just `config[k].connections`, and `Settings.connections` takes
+# any pool, so a real `Settings` around a fake pool under a test-only key is enough (since PormG
+# #1622 `config` holds `Configuration.Settings` only). Subtyping `PormG.PormGSQLite` rather than using a bare struct means
 # the REAL `create_table`/`create_index` run against the REAL task model; only `fetch` is
 # overridden, and on our own concrete type, so it is more specific than PormG's method rather
 # than piracy.
@@ -909,19 +909,13 @@ struct FakeTaskPool <: PormG.PormGSQLite
     sql::Vector{String}
 end
 
-struct FakeTaskSettings <: PormG.PormGSettings
-    connections::FakeTaskPool
-end
+# `change_data` is the switch a real `connection.yml` sets, which PormG's `delete()` reads before
+# any SQL (#379, #398). `db_def_folder = key`: the default folder is "db" for every key.
+fake_task_settings(conn::FakeTaskPool, key::String; change_data::Bool = false) =
+    PormG.Configuration.Settings(connections = conn, change_data = change_data, db_def_folder = key)
 
 PormG.ConnectionPool.fetch(c::FakeTaskPool, sql::String; kwargs...) =
     (push!(c.sql, sql); nothing)
-
-# `FakeTaskSettings` plus the `change_data` switch a real `connection.yml` sets, which PormG's
-# `delete()` reads before any SQL (#379, #398).
-struct FakeFenceSettings <: PormG.PormGSettings
-    connections::FakeTaskPool
-    change_data::Bool
-end
 
 # Connections that only RENDER: `delete(; show_query = :dict, connection = …)` builds the statement
 # a dialect would run without touching a database, which is all the #398 shape pin needs.
@@ -1492,7 +1486,7 @@ else
                 error("test-only PormG connection key is already registered: $key")
             for writable in (false, true)
                 pool = FakeTaskPool(String[])
-                PormG.config[key] = FakeFenceSettings(pool, writable)
+                PormG.config[key] = fake_task_settings(pool, key; change_data = writable)
                 try
                     model = getproperty(PormGExt, :task_model)(key)
                     store_real = RealPormGWorkerStore(model=model, db_key=key)
@@ -3504,7 +3498,7 @@ else
             haskey(PormG.config, key) &&
                 error("test-only PormG connection key is already registered: $key")
             conn = FakeTaskPool(String[])
-            PormG.config[key] = FakeTaskSettings(conn)
+            PormG.config[key] = fake_task_settings(conn, key)
             try
                 bound = getproperty(PormGExt, :task_model)(key)
                 unbound = getproperty(PormGExt, :task_model)(key)
@@ -4339,10 +4333,9 @@ using PormG
 using SQLite
 
 key = "nitro_worker_infers_845"
-PormG.register_connection(key, joinpath(mktempdir(), "workers.sqlite"); adapter = "SQLite", env = "test")
+PormG.register_connection(key, joinpath(mktempdir(), "workers.sqlite"); adapter = "SQLite", env = "test",
+                          change_data = true, change_db = true)
 try
-    PormG.config[key].change_data = true
-    PormG.config[key].change_db = true
     factory(k) = pormg_nitro_worker(db_key = k)
     S = Base.infer_return_type(factory, (String,))
     @test isconcretetype(S)

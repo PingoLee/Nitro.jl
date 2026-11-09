@@ -6,8 +6,10 @@
 # `pormg_nitro_pools` closes each key's pool from its `on_stopped` hook through
 # `PormG.Configuration.close_pool!(key)`, and PormG reaches its pool module there through
 # `getfield(parentmodule(@__MODULE__), :ConnectionPool)`, a lookup #813 expected the verifier not to
-# type. (It does: the lookup's effects are total, so it folds. The wall is the pool's own type, which
-# PormG's `config` holds as an abstract `PormGSettings`, so `.connections` is an `Any`.) The two
+# type. (It does: the lookup's effects are total, so it folds. The wall was the pool's own type: at
+# PormG 0.9.0 `config` held an abstract `PormGSettings`, so `.connections` was an `Any`. Since PormG
+# #1622 `config` holds `Settings`, whose `connections` is still an open union, and PormG reaches the
+# pool through `ConnectionPool.with_pool`'s closed dispatch.) The two
 # builds differ only in `POOLS`, which is read at top level (build time under juliac, as `app.jl`
 # reads its knobs): with it, `serve` gets `(pormg_nitro_pools(keys = ["db"]),)`; without it, `()`.
 # The rows the first build has and the second does not are what the pools layer costs.
@@ -16,13 +18,16 @@
 #   1. registers key "db" on a SQLite file in a fresh temporary directory;
 #   2. `ping("db")`, then one lease through the pool narrowed to its concrete type, so the pool has
 #      a live slot to close if the image can open one (the string form of `close_pool!` returns
-#      early on a pool that was never built). On PormG 0.9 at 5531c68c neither can in a trimmed
-#      image (`ping` returns `false`; the lease misses in `_is_offline`), so steps 3-5 run on a
-#      built pool with no live slot, and the direct `close_pool!` in step 5 is what shows the miss;
+#      early on a pool that was never built). On PormG 0.9.0 (5531c68c) neither could in a trimmed
+#      image (`ping` returned `false`; the lease missed in `_is_offline`). At 2d461c3a `ping` is
+#      `true`, so a slot is live; the lease still misses, at `release_connection`. The direct
+#      `close_pool!` in step 5 is what shows a miss on the close path;
 #   3. `serve(app; async = true, middleware)`, one `internalrequest`, then `terminate(app)`;
 #   4. counts the live slots again. A missed call inside `on_stopped` is caught there and logged
 #      with `@error`, and a trimmed executable prints no `@error` records, so the slots, read as a
-#      plain field and never through `ConnectionPool`, are what says whether the close ran;
+#      plain field and never through `ConnectionPool`, are what says whether the close ran. They
+#      say only that the slots were emptied: PormG's `_close_pool_slots!` takes the handles out
+#      under its lock before anything after it can fail (PormG #1697 fails there, at 2d461c3a);
 #   5. calls `close_pool!("db")` itself, with nothing catching it but the probe.
 # Every step prints one `step` line to `Core.stdout` (a trimmed executable's `Base.stdout` is
 # stale); an exception is printed by its type name only. The exit code is the step that failed
@@ -48,8 +53,8 @@ end
 
 const CP = PormG.ConnectionPool
 
-# The key's pool, narrowed to its concrete type before anything touches it: `PormGSettings` holds
-# it as `Any`, and every PormG call that takes it from there is a dynamic call in a trimmed image.
+# The key's pool, narrowed to its concrete type before anything touches it: `Settings.connections`
+# is an open union, and a call that takes it from there untyped is a dynamic call in a trimmed image.
 # The probe narrows only for its own reads, so the path under test keeps PormG's own types.
 function sqlite_pool()
     pool = PormG.Configuration.config["db"].connections
