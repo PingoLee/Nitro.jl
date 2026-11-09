@@ -899,7 +899,26 @@ never stops, and one parked in its retry backoff sees it when the backoff ends.
 leaves the job running, which is what it meant. Only a cause that came before the response reaches
 the run. That is the opposite of Go's default, where a request's context is cancelled when the
 handler returns and work meant to outlive it must be detached with `context.WithoutCancel`.
-`submit_task` takes `parent`; `submit_queued_task` does not yet.
+
+`submit_queued_task` takes `parent` too, for work sent to a declared queue:
+
+```julia
+id = submit_queued_task(app, "compute", "render", task_info -> render_scene(task_info),
+                        Owner(user_id(req)); parent = cancel_token(req))
+```
+
+A queued item can wait in the buffer behind other work, so it gets one more check, when a processor
+takes it. **If the request has settled a cause by then, the item never starts:** it is recorded
+`CANCELLED` with the request's reason and its callback is never called, because the request has
+already been asked to stop and nothing ran. A disconnect that check does not observe lets the item
+start, and the run sees it at its first check instead. An item whose request completed while it
+waited runs as usual.
+
+A buffered item keeps its request alive until a processor takes it, so a backlog of linked items
+holds one request each. The item lets go of the request as soon as it leaves the buffer: a run
+holds the link until it ends, and an abandoned item drops it at once. An `External(…)` queue
+refuses `parent` with an `ArgumentError`, because its runs execute in a consumer process, which
+has no request to poll.
 
 Tasks can also retry on failure by passing `TaskOptions`.
 

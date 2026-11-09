@@ -6261,6 +6261,337 @@ end
 
 end
 
+# #906: the queued form of #662's link, against a real client. Three requests on one queue of
+# concurrency 1: a linked run the client abandons mid-run; a linked item whose client leaves while
+# it is still buffered behind a parked blocker (it must end CANCELLED without its callback ever
+# running); and a linked item whose request completes while it is buffered (it must run).
+@testitem "Workers -- a queued run linked to its request stops when the client leaves (#906)" tags=[:workers, :network] setup=[NitroCommon] begin
+
+using Test
+using HTTP
+using Nitro
+using Nitro.Workers
+using Nitro.Workers: get_task_info
+using Sockets
+
+mutable struct LinkProbe
+    @atomic count::Int
+    @atomic ended::Symbol           # :running, then :cancelled, :returned or :threw
+    @atomic info::Union{Nothing, TaskInfo}
+end
+LinkProbe() = LinkProbe(0, :running, nothing)
+
+function burn!(probe::LinkProbe, task_info::TaskInfo)
+    @atomic probe.info = task_info
+    deadline = time_ns() + 15_000_000_000      # a missed cancel ends here, not in the watchdog
+    try
+        while time_ns() < deadline
+            stop = time_ns() + 1_000_000
+            while time_ns() < stop
+                @atomic probe.count += 1
+            end
+            checkpoint!(task_info)
+        end
+        @atomic probe.ended = :returned
+        return :returned
+    catch err
+        @atomic probe.ended = err isa TaskCancelledError ? :cancelled : :threw
+        rethrow()
+    end
+end
+
+running(probe) = (@atomic probe.ended) === :running
+terminal(rt, id) = get_task_info(rt.store, id).status in (COMPLETED, CANCELLED, FAILED)
+
+rt = WorkerRuntime(InMemoryWorkerStore(); queues = ["q"])
+owner = Owner("u")
+
+# 1. Linked and running when the client leaves. The handler parks without polling `req`.
+probe = LinkProbe()
+running_id = Channel{String}(1)
+function report(req)
+    put!(running_id, submit_queued_task("q", "running", info -> burn!(probe, info), owner;
+                                        runtime = rt, parent = cancel_token(req)))
+    timedwait(() -> !running(probe), 20.0)
+    return Res.send("done")
+end
+
+# 2. Linked and still buffered when the client leaves. The handler parks until the item is decided.
+left_ran = Threads.Atomic{Int}(0)
+left = Channel{Tuple{String, Nitro.CancelToken}}(1)
+function wait_in_line(req)
+    token = cancel_token(req)
+    id = submit_queued_task("q", "left", _ -> (Threads.atomic_add!(left_ran, 1); :ran), owner;
+                            runtime = rt, parent = token)
+    put!(left, (id, token))
+    timedwait(() -> terminal(rt, id), 20.0)
+    return Res.send("done")
+end
+
+# 3. Linked and still buffered when its request completes.
+completed_ran = Threads.Atomic{Int}(0)
+completed = Channel{Tuple{String, Nitro.CancelToken}}(1)
+function accept(req)
+    token = cancel_token(req)
+    put!(completed, (submit_queued_task("q", "completed", _ -> (Threads.atomic_add!(completed_ran, 1); :ran),
+                                        owner; runtime = rt, parent = token), token))
+    return Res.send("accepted")
+end
+
+# Holds the queue's one processor until `gate` is notified, so what is submitted next waits.
+function block!(tag, gate)
+    entered = Threads.Atomic{Bool}(false)
+    submit_queued_task("q", tag, _ -> (entered[] = true; wait(gate); :done), owner; runtime = rt)
+    @test timedwait(() -> entered[], 30.0) === :ok
+end
+
+gates = (Base.Event(), Base.Event())
+app = App()
+urlpatterns(app, "", path("/report", report), path("/wait", wait_in_line), path("/accept", accept))
+port = get_free_port()
+try
+    serve(app; host = HOST, port, async = true, show_banner = false, access_log = nothing)
+    @test timedwait(() -> isopen(app.service), 10.0) === :ok
+
+    # -- 1. running
+    sock = Sockets.connect(HOST, port)
+    write(sock, "GET /report HTTP/1.1\r\nHost: x\r\n\r\n")
+    @test timedwait(() -> isready(running_id), 30.0) === :ok
+    a = take!(running_id)
+    @test timedwait(() -> (@atomic probe.count) > 0, 30.0) === :ok
+    close(sock)
+    @test timedwait(() -> !running(probe), 10.0) === :ok
+    @test (@atomic probe.ended) === :cancelled
+    info = @atomic probe.info
+    @test info !== nothing && cancel_reason(info) === :client_disconnected
+    @test timedwait(() -> get_task_info(rt.store, a).status == CANCELLED, 10.0) === :ok
+    @test get_task_info(rt.store, a).error == "Cancelled: the client of its request disconnected"
+    # On the in-memory store the run object IS the record; it drops the link when the run ends.
+    @test info !== nothing && get_task_info(rt.store, a) === info
+    @test info !== nothing && timedwait(() -> (@atomic info.parent) === nothing, 10.0) === :ok
+    @test info !== nothing && cancel_reason(info) === :client_disconnected
+
+    # -- 2. buffered, the client leaves
+    block!("blocker-1", gates[1])
+    sock = Sockets.connect(HOST, port)
+    write(sock, "GET /wait HTTP/1.1\r\nHost: x\r\n\r\n")
+    @test timedwait(() -> isready(left), 30.0) === :ok
+    b, b_token = take!(left)
+    @test get_task_info(rt.store, b).status == PENDING
+    close(sock)
+    # Settle the cause while the item is still in the buffer, then let the queue move.
+    @test timedwait(() -> cancel_reason(b_token) === :client_disconnected, 10.0) === :ok
+    @test get_task_info(rt.store, b).status == PENDING
+    notify(gates[1])
+    @test timedwait(() -> terminal(rt, b), 10.0) === :ok
+    rec = get_task_info(rt.store, b)
+    @test rec.status == CANCELLED
+    @test rec.error == "Cancelled: the client of its request disconnected"
+    @test cancel_reason(rec) === :client_disconnected
+    @test rec.started_at === nothing
+    @test (@atomic rec.parent) === nothing
+    @test left_ran[] == 0                       # its callback never ran
+
+    # -- 3. buffered, the request completes
+    block!("blocker-2", gates[2])
+    @test HTTP.get("http://$HOST:$port/accept"; status_exception = false).status == 200
+    @test timedwait(() -> isready(completed), 10.0) === :ok
+    c, c_token = take!(completed)
+    @test timedwait(() -> cancel_reason(c_token) === :completed, 10.0) === :ok
+    @test get_task_info(rt.store, c).status == PENDING
+    notify(gates[2])
+    @test timedwait(() -> terminal(rt, c), 10.0) === :ok
+    rec = get_task_info(rt.store, c)
+    @test rec.status == COMPLETED
+    @test completed_ran[] == 1
+    @test cancel_reason(rec) === :none
+    @test (@atomic rec.parent) === nothing
+finally
+    foreach(notify, gates)
+    timedwait(() -> !running(probe), 20.0)
+    terminate(app)
+    reset_runtime!(rt)
+end
+
+end
+
+# #906 without a socket: tokens whose request settled a cause by construction (a passed deadline, a
+# started shutdown) or completed, and the white-box exits a buffered item can leave by.
+@testitem "Workers -- a queued item's request link: the dequeue check and every buffer exit (#906)" tags=[:core, :workers] setup=[NitroCommon] begin
+
+using Test
+using Nitro
+using Nitro.Workers
+using Nitro.Workers: get_task_info, QueueItem, _register_or_watch!, _execute_queued_task,
+                     _abandon_queued_item!, _cancel_message
+using Nitro.Core.Constants: ShutdownSignal, signal_shutdown!
+
+waitfor(f; timeout = 10) = timedwait(f, timeout; pollint = 0.02) === :ok
+live_token() = Nitro.CancelToken(ShutdownSignal(), nothing)
+# A request whose handler deadline has passed: its first check settles `:timeout`.
+expired_token() = Nitro.CancelToken(ShutdownSignal(), nothing, time_ns() - UInt64(1))
+
+# Holds `rt`'s queue "q" (concurrency 1) until `gate` is notified.
+function block!(rt, owner, tag, gate)
+    entered = Threads.Atomic{Bool}(false)
+    id = submit_queued_task("q", tag, _ -> (entered[] = true; wait(gate); :done), owner; runtime = rt)
+    @test waitfor(() -> entered[]; timeout = 30)
+    return id
+end
+
+@testset "a cause settled while buffered: CANCELLED with that reason, the callback never runs" begin
+    rt = WorkerRuntime(InMemoryWorkerStore(); queues = ["q"])
+    owner = Owner("u")
+    gate = Base.Event()
+    ran = Threads.Atomic{Int}(0)
+    count! = _ -> (Threads.atomic_add!(ran, 1); :ran)
+    try
+        blocker = block!(rt, owner, "blocker", gate)
+        flag = ShutdownSignal()
+        timed_out = submit_queued_task("q", "timed-out", count!, owner; runtime = rt, parent = expired_token())
+        shut_down = submit_queued_task("q", "shut-down", count!, owner; runtime = rt,
+                                       parent = Nitro.CancelToken(flag, nothing))
+        unlinked = submit_queued_task("q", "unlinked", count!, owner; runtime = rt)
+        signal_shutdown!(flag)                  # the second request's server begins to drain
+        notify(gate)
+
+        # FIFO on one processor: once the unlinked item is done, the two before it were decided.
+        @test waitfor(() -> get_task_info(rt.store, unlinked).status == COMPLETED)
+        for (id, reason) in ((timed_out, :timeout), (shut_down, :shutdown))
+            rec = get_task_info(rt.store, id)
+            @test rec.status == CANCELLED
+            @test rec.error == _cancel_message(reason)
+            @test cancel_reason(rec) === reason
+            @test rec.started_at === nothing
+            @test (@atomic rec.parent) === nothing
+        end
+        @test ran[] == 1                        # the unlinked item alone
+        @test (@atomic get_task_info(rt.store, unlinked).parent) === nothing
+        @test get_task_info(rt.store, blocker).status == COMPLETED
+    finally
+        notify(gate)
+        reset_runtime!(rt)
+    end
+end
+
+@testset "a request that completed while buffered: the item runs, linked only while it runs" begin
+    rt = WorkerRuntime(InMemoryWorkerStore(); queues = ["q"])
+    owner = Owner("u")
+    gate = Base.Event()
+    seen = Channel{Tuple{Bool, Symbol}}(1)
+    try
+        block!(rt, owner, "blocker", gate)
+        token = live_token()
+        id = submit_queued_task("q", "accepted", function (task_info)
+            put!(seen, ((@atomic task_info.parent) === token, cancel_reason(task_info)))
+            return :ran
+        end, owner; runtime = rt, parent = token)
+        Nitro.Core._mark_ended!(token)          # its response was written, with no cause
+        @test cancel_reason(token) === :completed
+        notify(gate)
+        @test waitfor(() -> get_task_info(rt.store, id).status == COMPLETED)
+        @test isready(seen) && take!(seen) == (true, :none)
+        rec = get_task_info(rt.store, id)
+        @test cancel_reason(rec) === :none
+        @test (@atomic rec.parent) === nothing
+    finally
+        notify(gate)
+        reset_runtime!(rt)
+    end
+end
+
+@testset "the item lets go of its token when it starts, is declined, cancelled or abandoned" begin
+    store = InMemoryWorkerStore()
+    rt = WorkerRuntime(store; queues = ["q"])
+    owner = Owner("u")
+    ran = Threads.Atomic{Int}(0)
+    never = _ -> (Threads.atomic_add!(ran, 1); :never)
+    try
+        # Started: the processor takes the link off the item and hands it to the run.
+        token = live_token()
+        key = scoped_task_key("started", owner)
+        run = _register_or_watch!(rt, key, owner; queue_name = "q")
+        holder = Ref{Union{Nothing, QueueItem}}(nothing)
+        during = Ref{Tuple{Bool, Bool}}((false, false))
+        item = QueueItem(key, run, function (task_info)
+            during[] = ((@atomic holder[].parent) === nothing, (@atomic task_info.parent) === token)
+            return :ran
+        end, TaskOptions(), token)
+        holder[] = item
+        # Shows whether it is linked, never the token (which holds the request's stream).
+        @test occursin("linked to a request", repr(item)) && !occursin("CancelToken", repr(item))
+        _execute_queued_task(rt, item)
+        @test !occursin("linked to a request", repr(item))
+        @test during[] == (true, true)
+        @test get_task_info(store, key).status == COMPLETED
+        @test (@atomic get_task_info(store, key).parent) === nothing
+        @test (@atomic item.parent) === nothing
+
+        # Declined at the claim (a `cancel_task` reached it first): nothing runs, the link drops.
+        key = scoped_task_key("declined", owner)
+        run = _register_or_watch!(rt, key, owner; queue_name = "q")
+        @test cancel_task(key, owner; runtime = rt)[:status] == "Task cancelled"
+        item = QueueItem(key, run, never, TaskOptions(), live_token())
+        @test _execute_queued_task(rt, item) === nothing
+        @test (@atomic item.parent) === nothing
+        @test get_task_info(store, key).error == _cancel_message(:user)
+
+        # Cancelled at dequeue: the link drops from the item AND from the record.
+        key = scoped_task_key("dequeued", owner)
+        run = _register_or_watch!(rt, key, owner; queue_name = "q")
+        item = QueueItem(key, run, never, TaskOptions(), expired_token())
+        _execute_queued_task(rt, item)
+        @test (@atomic item.parent) === nothing
+        rec = get_task_info(store, key)
+        @test rec.status == CANCELLED && cancel_reason(rec) === :timeout
+        @test (@atomic rec.parent) === nothing
+
+        # Abandoned by a teardown.
+        key = scoped_task_key("abandoned", owner)
+        run = _register_or_watch!(rt, key, owner; queue_name = "q")
+        item = QueueItem(key, run, never, TaskOptions(), live_token())
+        @test _abandon_queued_item!(rt, item)
+        @test (@atomic item.parent) === nothing
+        @test get_task_info(store, key).error == _cancel_message(:shutdown)
+        Nitro.Workers._release_run!(rt, run)
+        @test ran[] == 0
+
+        # Never reached the buffer: a `put!` on a closed channel. The submit fails loudly and the
+        # record is terminal, as for an unlinked item (#182).
+        close(Nitro.Workers._get_or_create_queue(rt, "q").channel)
+        @test_throws InvalidStateException submit_queued_task("q", "late", never, owner; runtime = rt,
+                                                              parent = live_token())
+        @test get_task_info(store, scoped_task_key("late", owner)).status == CANCELLED
+        @test ran[] == 0
+    finally
+        reset_runtime!(rt)
+    end
+end
+
+@testset "a buffered linked item abandoned by shutdown! is CANCELLED and never runs" begin
+    rt = WorkerRuntime(InMemoryWorkerStore(); queues = ["q"])
+    owner = Owner("u")
+    gate = Base.Event()
+    ran = Threads.Atomic{Int}(0)
+    try
+        block!(rt, owner, "blocker", gate)
+        id = submit_queued_task("q", "abandoned", _ -> (Threads.atomic_add!(ran, 1); :ran), owner;
+                                runtime = rt, parent = live_token())
+        shutdown!(rt; drain_timeout = 0)        # `false`: the parked blocker is still in flight
+        rec = get_task_info(rt.store, id)
+        @test rec.status == CANCELLED
+        @test rec.error == _cancel_message(:shutdown)
+        notify(gate)
+        sleep(0.2)
+        @test ran[] == 0
+    finally
+        notify(gate)
+        reset_runtime!(rt)
+    end
+end
+
+end
+
 @testitem "Workers -- named jobs (#514)" tags=[:core, :workers] setup=[NitroCommon] begin
 
 using Test
@@ -6869,6 +7200,18 @@ end
             Job("crunch", HeavyArgs(n = 1)), owner; options = TaskOptions(timeout = 5))
         @test get_task_info(runtime.store, scoped_task_key("c", owner)) === nothing
         @test get_task_info(runtime.store, scoped_task_key("o", owner)) === nothing
+        # ...and a request link (#906): a consumer process has no request to poll. Refused before
+        # anything is written, whichever form submits, and the message names the queue.
+        tok = Nitro.CancelToken(Nitro.Core.Constants.ShutdownSignal(), nothing)
+        @test_throws "cannot pass `parent`" submit_queued_task(app, "heavy", "p",
+            Job("crunch", HeavyArgs(n = 1)), owner; parent = tok)
+        @test_throws "queue 'heavy'" submit_queued_task(app, "heavy", "p",
+            Job("crunch", HeavyArgs(n = 1)), owner; parent = tok)
+        # Checked before the closure refusal, so a closure submit is told about `parent` too.
+        @test_throws "cannot pass `parent`" submit_queued_task(app, "heavy", "p", _ -> 1, owner; parent = tok)
+        @test_throws "cannot pass `parent`" submit_queued_task("heavy", "p", _ -> 1, owner; runtime, parent = tok)
+        @test get_task_info(runtime.store, scoped_task_key("p", owner)) === nothing
+        @test isempty(runtime.reservations)
         # The in-process queue beside it still takes closures.
         id = submit_queued_task(app, "email", "e", _ -> :sent, owner)
         @test timedwait(() -> get_task_info(runtime.store, id).status == COMPLETED, 5) === :ok
