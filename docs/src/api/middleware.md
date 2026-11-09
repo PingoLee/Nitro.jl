@@ -5,7 +5,9 @@ Several of the factories below instead return a [`LifecycleMiddleware`](@ref Nit
 that `serve()` and `terminate()` run, so the middleware can own a background task or a connection
 pool for as long as the server is up. `serve()`, `path()` and `urlpatterns()` take either form; only code composing
 a chain by hand needs the `.middleware` field. The type is not exported, so construct one as
-`Nitro.LifecycleMiddleware(...)`.
+`Nitro.LifecycleMiddleware(...)`. A hook that throws is logged and the rest still run. A failure
+of Nitro's own hook runner no longer skips the hooks after it either: the lifecycle finishes, and
+`serve()` or `terminate()` raises the failure then.
 
 **A middleware returns an `HTTP.Response`.** Nitro checks that once, where the global middleware
 chain hands its result to the framework's own outer layers (the error handling, `SecurityHeaders`,

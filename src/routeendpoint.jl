@@ -501,6 +501,10 @@ before. **In a trimmed image it is a `ccall`**: through the thunk a `--trim` bui
 route-owned entry ([`route_lifecycle_entry`](@ref)), or through the `@cfunction` `serve` took for
 a serve-owned one ([`serve_lifecycle_entry`](@ref)). An entry with neither has no code to call,
 and running it is an error.
+
+Running an entry returns `nothing`, the hook's deferred `InterruptException`, or an
+`EndpointFailure` when Nitro's own hook runner failed past the catch around the hook (#892). The
+broadcast keeps the first such failure, runs the rest of the lifecycle, and raises it then.
 """
 mutable struct LifecycleEntry
     const mw   :: LifecycleMiddleware
@@ -592,8 +596,34 @@ function _lifecycle_fptr!(e::LifecycleEntry)::Ptr{Cvoid}
     return p
 end
 
-function _run_lifecycle(e::LifecycleEntry, phase::Cint)::Union{Nothing,InterruptException}
-    _trimmed() || return _lifecycle_direct(e.mw, phase)
+# Run one entry's hook for `phase`. A failure that escapes Nitro's own hook runner
+# (`startup`/`shutdown`/`stopped` on the middleware) is RETURNED as an `EndpointFailure`, not
+# thrown, in both builds (#892). The runners catch whatever a hook throws, so this is a bug in
+# Nitro (in a trimmed build, a miss inside the runner's own catch, #846). Throwing it here used to
+# abort the broadcast: every later hook was skipped, a pool-closing `on_stopped` among them. The
+# broadcast now keeps the first failure, runs the rest of the lifecycle, and throws it at the end
+# (`_raise_runner_failure`, src/core/lifecycle.jl), so `serve` or `terminate` still raises it, as
+# itself.
+#
+# Each failure is reported here, where it happens, so one after the first is not lost. Under the
+# JIT that is an `@error` with the runner's own backtrace, which the later raise no longer
+# carries. A trimmed build writes no log record, so it writes a line instead (#883): the phase
+# and the exception's type, one per entry and phase, a count the app's own registrations bound,
+# so it needs no memo. There the failure comes back from `_lifecycle_call`, the far side of the
+# `ccall`.
+#
+# An interrupt is not a failure. It is thrown again here, as itself, as it always was: the
+# broadcast's caller defers it (#185), and `handlerequest` reports none either.
+function _run_lifecycle(e::LifecycleEntry, phase::Cint)::Union{Nothing,InterruptException,EndpointFailure}
+    if !_trimmed()
+        try
+            return _lifecycle_direct(e.mw, phase)::Union{Nothing,InterruptException}
+        catch err
+            err isa InterruptException && rethrow()
+            @error string("Nitro: ", _runner_site(phase), " failed") exception=(loggable(err), catch_backtrace())
+            return EndpointFailure(err)
+        end
+    end
     result = if e.shim != C_NULL
         ccall(e.shim, Any, (Any, Cint), e.mw, phase)
     else
@@ -602,15 +632,9 @@ function _run_lifecycle(e::LifecycleEntry, phase::Cint)::Union{Nothing,Interrupt
         out[]
     end
     if result isa EndpointFailure
-        # Nitro's own hook runner failed, past the catch around the hook (#883). The exception is
-        # thrown again here, as itself, and leaves the broadcast and then `serve` or `terminate`.
-        # Nothing on that way writes a line a trimmed build keeps, so this one does. It names the
-        # phase and the exception's type. That is one line per entry and phase, a count the app's
-        # own registrations bound, so it needs no memo.
-        # An interrupt is not a failure: the broadcast defers and re-raises it, and `handlerequest`
-        # writes no line for one either.
-        result.err isa InterruptException || _trimmed_failure(_runner_site(phase), result.err)
-        throw(result.err)
+        result.err isa InterruptException && throw(result.err)
+        _trimmed_failure(_runner_site(phase), result.err)
+        return result
     end
     return result::Union{Nothing,InterruptException}
 end
@@ -619,7 +643,7 @@ _runner_site(phase::Cint)::String =
     phase == _PHASE_STARTUP ? "the on_startup hook runner" :
     phase == _PHASE_STOPPED ? "the on_stopped hook runner" : "the on_shutdown hook runner"
 
-# The hook runner for a phase, called directly: the JIT's whole path, and the far side of a trimmed
+# The hook runner for a phase, called directly: the JIT's path, and the far side of a trimmed
 # build's foreign call.
 _lifecycle_direct(mw::LifecycleMiddleware, phase::Cint) =
     phase == _PHASE_STARTUP ? startup(mw) :

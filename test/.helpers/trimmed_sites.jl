@@ -107,6 +107,7 @@ const TRIMMED_FAILURE_SITES = Dict{Tuple{Symbol, String, String}, Int}(
     (:_trimmed_note, "src/core/lifecycle.jl", "_close_deferring_interrupt") => 1,     # a second interrupt there
     (:_trimmed_failure, "src/core/lifecycle.jl", "_drop_listener!") => 1,   # an abandoned listener's close threw
     (:_trimmed_failure, "src/core/lifecycle.jl", "startserver") => 1,       # the blocking serve wait threw
+    (:_trimmed_failure, "src/core/lifecycle.jl", "_startup_broadcast") => 1,  # a throw lost to a Ctrl-C (#892)
     (:_trimmed_note, "src/routeendpoint.jl", "_trimmed_failure") => 1,      # the helper itself
     # The request path's memo (#883): a pair's line, and the final line once the cap is reached.
     (:_trimmed_note, "src/routeendpoint.jl", "_request_failure_line") => 2,

@@ -471,20 +471,38 @@ end
 # Nitro's own hook runner failing past the catch around the hook (#883): the shape of #846's miss
 # inside `stopped`'s catch. The runners are replaced for two concrete middleware types only. Each
 # entry is built inside the run, so after the flip it carries the `@cfunction` shim and the call
-# goes through `_lifecycle_call`'s `EndpointFailure`. The exception still leaves the broadcast as
-# itself; in the trimmed run `_run_lifecycle` also writes a line, which the parent counts.
+# goes through `_lifecycle_call`'s `EndpointFailure`. The broadcast goes on to the next entry, a
+# recorder, and the exception leaves the lifecycle as itself once it is done (#892); in the trimmed
+# run `_run_lifecycle` also writes a line, which the parent counts.
 struct RunnerBoom <: Function end
 (::RunnerBoom)() = nothing
 const RUNNER_STOP = Nitro.Core.LifecycleMiddleware(middleware = identity, on_stopped = RunnerBoom())
 const RUNNER_START = Nitro.Core.LifecycleMiddleware(middleware = identity, on_startup = RunnerBoom())
 T.stopped(::typeof(RUNNER_STOP)) = throw(TrimSentinel(SENTINEL))
 T.startup(::typeof(RUNNER_START)) = throw(TrimSentinel(SENTINEL))
+const RUNNER_AFTER = String[]
+struct RunnerRecord <: Function
+    what::String
+end
+(r::RunnerRecord)() = push!(RUNNER_AFTER, r.what)
+const RUNNER_NEXT = Nitro.Core.LifecycleMiddleware(middleware = identity,
+    on_startup = RunnerRecord("startup"), on_stopped = RunnerRecord("stopped"))
 function runner_failures()
-    stop = outcome(() -> Nitro.Core._teardown!(Nitro.Core.App(), T.LifecycleEntry[],
-        [T.serve_lifecycle_entry(RUNNER_STOP)], nothing; listener = false, timeout = 0))
-    start = outcome(() -> Nitro.Core._startup_hooks(T.LifecycleEntry[], [T.serve_lifecycle_entry(RUNNER_START)]))
-    println("RUNNER_RAISES_", T._trimmed() ? "TRIMMED" : "JIT", "=",
+    empty!(RUNNER_AFTER)
+    # The JIT run logs each runner failure as an `@error` (#892); sent to a `NullLogger`, as the
+    # other sites' records are. The trimmed run's lines go to `Core.stderr` regardless.
+    stop, start = Base.CoreLogging.with_logger(Base.CoreLogging.NullLogger()) do
+        # LIFO: the failing runner's `on_stopped` comes first, the recorder's after it.
+        (outcome(() -> Nitro.Core._teardown!(Nitro.Core.App(), T.LifecycleEntry[],
+             [T.serve_lifecycle_entry(RUNNER_NEXT), T.serve_lifecycle_entry(RUNNER_STOP)], nothing;
+             listener = false, timeout = 0)),
+         outcome(() -> Nitro.Core._startup_hooks(T.LifecycleEntry[],
+             [T.serve_lifecycle_entry(RUNNER_START), T.serve_lifecycle_entry(RUNNER_NEXT)])))
+    end
+    mode = T._trimmed() ? "TRIMMED" : "JIT"
+    println("RUNNER_RAISES_", mode, "=",
             stop[1:2] == (:error, "TrimSentinel") && start[1:2] == (:error, "TrimSentinel"))
+    println("RUNNER_NEXT_RAN_", mode, "=", RUNNER_AFTER == ["stopped", "startup"])
     return nothing
 end
 

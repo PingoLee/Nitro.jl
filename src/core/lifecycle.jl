@@ -827,6 +827,9 @@ function _eager_revise_loop(done::Threads.Atomic{Bool}, hooks = revise_hooks())
     return nothing
 end
 
+# The first runner failure of a whole lifecycle, the carrier `_broadcast_entries` fills (#892).
+const RunnerFailure = Base.RefValue{Union{Nothing,Types.EndpointFailure}}
+
 # Broadcast `hook` (`startup` or `shutdown`) over `entries`, deferring any interrupt (#185).
 #
 # `startup`/`shutdown` (src/types.jl) HAND BACK an `InterruptException` instead of throwing it,
@@ -844,25 +847,69 @@ end
 #
 # `hook::F`, a type parameter: this method only passes `hook` on, so a `::Function` argument would
 # not be specialized, and the call in `_broadcast_entries` would be dynamic on the serve path (#572).
+#
+# ── A failed hook runner (#892) ──
+#
+# A `LifecycleEntry` hands back an `EndpointFailure` when Nitro's own runner failed past the catch
+# around the hook (`_run_lifecycle`, src/routeendpoint.jl): a bug in Nitro, not in the hook. The
+# loop treats it like a hook's own failure and goes on to the next entry, so no hook is skipped
+# because another entry's runner broke. It keeps the FIRST failure in `failed`, the carrier its
+# caller owns for the whole lifecycle: both halves of the startup broadcast, or the whole of
+# `_teardown!`, the listener close and every `on_stopped` included. The caller raises it once that
+# is done (`_raise_runner_failure`), so `serve` or `terminate` still reports it, as itself. Every
+# failure, the later ones included, was already reported where it happened (`_run_lifecycle`: an
+# `@error` under the JIT, a line in a trimmed build), so raising only the first loses none.
+#
+# A caller that passes no carrier gets the same rule over just these entries: the loop runs to the
+# end and the failure is raised before this returns.
 function _broadcast_lifecycle(hook::F, entries,
-                              interrupt::Nullable{InterruptException} = nothing
+                              interrupt::Nullable{InterruptException} = nothing,
+                              failed::Nullable{RunnerFailure} = nothing
                              )::Nullable{InterruptException} where {F<:Function}
-    return @with IN_LIFECYCLE_HOOK => true _broadcast_entries(hook, entries, interrupt)
+    carrier = isnothing(failed) ? RunnerFailure(nothing) : failed
+    interrupt = @with IN_LIFECYCLE_HOOK => true _broadcast_entries(hook, entries, interrupt, carrier)
+    return isnothing(failed) ? _raise_runner_failure(interrupt, carrier[]) : interrupt
 end
 
 function _broadcast_entries(hook::F, entries,
-                            interrupt::Nullable{InterruptException}
+                            interrupt::Nullable{InterruptException},
+                            failed::RunnerFailure
                            )::Nullable{InterruptException} where {F<:Function}
     for lf in entries
         raised = hook(lf)
-        isnothing(interrupt) && (interrupt = raised)
+        if raised isa Types.EndpointFailure
+            isnothing(failed[]) && (failed[] = raised)
+        elseif isnothing(interrupt)
+            interrupt = raised
+        end
     end
     return interrupt
 end
 
-# `startserver`'s startup broadcast: route-owned hooks first, then serve-owned (#82).
-_startup_hooks(route_lf, serve_lf)::Nullable{InterruptException} =
-    _broadcast_lifecycle(startup, serve_lf, _broadcast_lifecycle(startup, route_lf))
+# What a lifecycle owes its caller once every hook has run (#892): the deferred interrupt, or the
+# first runner failure, thrown as itself. When both happened, the interrupt is returned and the
+# failure is logged. The interrupt is the operator's request to stop, and the caller's whole
+# unwinding is built around re-raising it once (#185); the failure is Nitro's own bug, and raising
+# it instead would turn a Ctrl-C into an error the operator did not ask for. The failure itself
+# was reported when it happened (`_run_lifecycle`); the record below says why it is not raised. A
+# trimmed build drops that record (#846), and the line `_run_lifecycle` wrote is what remains.
+function _raise_runner_failure(interrupt::Nullable{InterruptException},
+                               failure::Union{Nothing,Types.EndpointFailure}
+                              )::Nullable{InterruptException}
+    isnothing(failure) && return interrupt
+    isnothing(interrupt) && throw(failure.err)
+    @error "Nitro: a lifecycle hook runner failed; the interrupt is raised instead" exception=loggable(failure.err)
+    return interrupt
+end
+
+# `startserver`'s startup broadcast: route-owned hooks first, then serve-owned (#82). One carrier
+# over both halves, so a failed runner in the route-owned half does not skip the serve-owned one.
+function _startup_hooks(route_lf, serve_lf)::Nullable{InterruptException}
+    failed = RunnerFailure(nothing)
+    interrupt = _broadcast_lifecycle(startup, route_lf, nothing, failed)
+    interrupt = _broadcast_lifecycle(startup, serve_lf, interrupt, failed)
+    return _raise_runner_failure(interrupt, failed[])
+end
 
 # Outside a REPL, the startup broadcast runs on a `:default` task, not on thread 1 (#824). A
 # SIGTERM ends a script by running the `atexit` hooks on thread 1, on top of whatever thread 1 was
@@ -912,7 +959,16 @@ function _startup_broadcast(route_lf, serve_lf)::Nullable{InterruptException}
     end
     result = fetch(task)
     result isa InterruptException && return something(interrupt, result)
-    isnothing(result) || throw(result)
+    isnothing(result) && return interrupt
+    isnothing(interrupt) && throw(result)
+    # A Ctrl-C on this wait AND a throw out of the broadcast (a failed hook runner, #892, or
+    # something structural): the interrupt wins, as `_raise_runner_failure` decides inside the
+    # broadcast, and `startserver` unwinds either way. The throw is logged, not dropped. A
+    # structural one (a throwing logger, `_lifecycle_fptr!`'s refusal) never wrote a line of its
+    # own, and `serve` used to raise it; a trimmed build drops the record (#846), so the line
+    # beside it is all that is left there.
+    @error "Nitro: the startup broadcast failed; the interrupt is raised instead" exception=loggable(result)
+    Types._trimmed_failure("the startup broadcast", result)
     return interrupt
 end
 
@@ -966,9 +1022,19 @@ end
 # serve-owned, each in registration order. So: serve-owned reversed, then route-owned reversed.
 # Teardown order is a specified contract, not hash order — see `Service` (src/context.jl) for why
 # LIFO and not something else.
+#
+# A failed hook runner (#892) is carried the way an interrupt is: one carrier over all four
+# broadcasts, so the rest of the `on_shutdown` hooks, the clears, the listener close and every
+# `on_stopped` still run, and the first failure is thrown as the last step, unless an interrupt
+# is also being carried (`_raise_runner_failure`). The `catch`es below never see one. One way out
+# abandons the carrier: a non-interrupt throw out of `_close_deferring_interrupt` (a `close` that
+# throws something structural) leaves through the `finally` once the `on_stopped` hooks have run,
+# so that throw is what the caller gets and the carried failure is never raised. It is not lost:
+# `_run_lifecycle` reported it when it happened.
 function _teardown!(context::App, route_lf, serve_lf,
                     interrupt::Nullable{InterruptException};
                     listener::Bool, timeout::Real)::Nullable{InterruptException}
+    failed = RunnerFailure(nothing)
     # Deferred, not broadcast-and-pray (#185): an interrupt from any hook is carried past the
     # rest of the sequence and handed back, so the clears and the `close` below are
     # unconditional.
@@ -984,8 +1050,8 @@ function _teardown!(context::App, route_lf, serve_lf,
     # them would be protecting statements that are themselves partial-state transitions — a
     # half-run clear is worse than a skipped one.
     try
-        interrupt = _broadcast_lifecycle(shutdown, Iterators.reverse(serve_lf), interrupt)
-        interrupt = _broadcast_lifecycle(shutdown, Iterators.reverse(route_lf), interrupt)
+        interrupt = _broadcast_lifecycle(shutdown, Iterators.reverse(serve_lf), interrupt, failed)
+        interrupt = _broadcast_lifecycle(shutdown, Iterators.reverse(route_lf), interrupt, failed)
     catch e
         e isa InterruptException || rethrow()
         interrupt = something(interrupt, e)
@@ -1020,14 +1086,14 @@ function _teardown!(context::App, route_lf, serve_lf,
         listener && (interrupt = _close_deferring_interrupt(context.service, timeout, interrupt))
     finally
         try
-            interrupt = _broadcast_lifecycle(stopped, Iterators.reverse(serve_lf), interrupt)
-            interrupt = _broadcast_lifecycle(stopped, Iterators.reverse(route_lf), interrupt)
+            interrupt = _broadcast_lifecycle(stopped, Iterators.reverse(serve_lf), interrupt, failed)
+            interrupt = _broadcast_lifecycle(stopped, Iterators.reverse(route_lf), interrupt, failed)
         catch e
             e isa InterruptException || rethrow()
             interrupt = something(interrupt, e)
         end
     end
-    return interrupt
+    return _raise_runner_failure(interrupt, failed[])
 end
 
 # Documented on the public `Nitro.terminate` (src/methods.jl); see the note on `serve` above.
@@ -1180,10 +1246,14 @@ function startserver(ctx::App; host, port, show_banner=false, async=false, kwarg
     try
         interrupt = _startup_broadcast(route_lf, serve_lf)
     catch e
-        # Something structural (a throwing logger, an async failure): `startup` catches whatever a
-        # hook throws, so reaching this line means the broadcast itself broke. It used to strand
+        # Something structural (a throwing logger, an async failure, or a failed hook runner, which
+        # `_startup_hooks` raises only once every startup hook has run, #892): `startup` catches
+        # whatever a hook throws, so reaching this line means the broadcast itself broke. It used to strand
         # the open listener, on purpose, as the loud signal; with no listener yet, the hooks that
-        # ran are unwound and the error is raised as it was.
+        # ran are unwound and the error is raised as it was, with one exception: if a hook runner
+        # also fails during the unwind, `_teardown!` throws that failure out of the unwind, and it
+        # replaces this one, so `serve` raises the second. When this one was a runner failure too,
+        # both were logged where they happened (`_run_lifecycle`), so neither is lost.
         if !(e isa InterruptException)
             _unwind_start!(ctx, claim, route_lf, serve_lf, nothing)
             rethrow()

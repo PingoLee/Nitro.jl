@@ -1239,3 +1239,218 @@ end
     end
 end
 end # @testitem
+
+
+@testitem "Lifecycle runner failure — the lifecycle finishes, then raises (#892)" tags=[:middleware, :network] setup=[NitroCommon] begin
+using Test
+using HTTP
+using Nitro
+using Nitro.Core: LifecycleMiddleware
+import Nitro: App, path
+const T = Nitro.Core.Types
+
+# Nitro's own hook runner (`startup`/`shutdown`/`stopped` on the middleware) failing past the
+# catch around the hook. In a trimmed build that is a miss inside the runner's own catch (#846);
+# under the JIT only a bug in the runner gets there. Injected the way #883's trace did it: the
+# runner method is replaced, for one concrete middleware type, to throw. Each `Boom*` type makes
+# its middleware's type unique to this item, so the replacements reach nothing else.
+#
+# Against the unpatched code each of the hooks asserted to run after a failed runner is skipped,
+# and in the teardown the listener close and every `on_stopped` are skipped with it.
+
+struct RunnerSentinel <: Exception
+    id::Int
+end
+_pass(handler) = (req::HTTP.Request -> handler(req))
+
+struct BoomStopped <: Function end
+(::BoomStopped)() = nothing
+struct BoomShutdown <: Function end
+(::BoomShutdown)() = nothing
+struct BoomStartup <: Function end
+(::BoomStartup)() = nothing
+struct BoomSecond <: Function end
+(::BoomSecond)() = nothing
+struct BoomInterrupt <: Function end
+(::BoomInterrupt)() = nothing
+struct BoomStartInterrupt <: Function end
+(::BoomStartInterrupt)() = nothing
+
+const BOOM_STOP  = LifecycleMiddleware(middleware = _pass, on_stopped = BoomStopped())
+const BOOM_DOWN  = LifecycleMiddleware(middleware = _pass, on_shutdown = BoomShutdown())
+const BOOM_START = LifecycleMiddleware(middleware = _pass, on_startup = BoomStartup())
+const BOOM_TWO   = LifecycleMiddleware(middleware = _pass, on_stopped = BoomSecond())
+const BOOM_INTR  = LifecycleMiddleware(middleware = _pass, on_stopped = BoomInterrupt())
+const BOOM_START_INTR = LifecycleMiddleware(middleware = _pass, on_startup = BoomStartInterrupt())
+const ARMED = Ref(true)
+T.stopped(::typeof(BOOM_STOP)) = throw(RunnerSentinel(1))
+T.shutdown(::typeof(BOOM_DOWN)) = throw(RunnerSentinel(1))
+T.startup(::typeof(BOOM_START)) = ARMED[] ? throw(RunnerSentinel(1)) : nothing
+T.stopped(::typeof(BOOM_TWO)) = throw(RunnerSentinel(2))
+T.stopped(::typeof(BOOM_INTR)) = throw(InterruptException())   # escapes the runner, not a hook
+T.startup(::typeof(BOOM_START_INTR)) = throw(InterruptException())
+
+# A recorder per name and phase: a fresh closure each, so no two compare equal (see the #185 items
+# above on promotion folding equal entries together).
+function recorder(log::Vector{String}, name::String)
+    LifecycleMiddleware(middleware = _pass,
+        on_startup  = () -> push!(log, "$name:startup"),
+        on_shutdown = () -> push!(log, "$name:shutdown"),
+        on_stopped  = () -> push!(log, "$name:stopped"))
+end
+_serve(ctx; kw...) = Nitro.Core.serve(ctx; host = HOST, port = get_free_port(), async = true,
+                                      show_banner = false, show_errors = false,
+                                      access_log = nothing, kw...)
+# Records at Warn and above, to count the runner's own report and the interrupt's.
+function _logged(f)
+    logger = Test.TestLogger(min_level = Base.CoreLogging.Warn)
+    Base.CoreLogging.with_logger(f, logger)
+    return logger.logs
+end
+_count(logs, text) = count(r -> occursin(text, string(r.message)), logs)
+
+@testset "the broadcast runs every entry, then raises the first failure" begin
+    log = String[]
+    entries = [T.serve_lifecycle_entry(m) for m in
+               (recorder(log, "a"), BOOM_STOP, recorder(log, "b"), BOOM_TWO, recorder(log, "c"))]
+    err = nothing
+    logs = _logged() do
+        err = try
+            Nitro.Core._broadcast_lifecycle(T.stopped, entries)
+            nothing
+        catch e
+            e
+        end
+    end
+    @test err == RunnerSentinel(1)          # the FIRST failure, not the last
+    @test log == ["a:stopped", "b:stopped", "c:stopped"]
+    # Both failures were reported where they happened, the second included, with a backtrace.
+    runner = filter(r -> occursin("the on_stopped hook runner failed", string(r.message)), logs)
+    @test length(runner) == 2
+    @test all(r -> haskey(r.kwargs, :exception) && r.kwargs[:exception] isa Tuple, runner)
+
+
+    # With the caller's carrier, the loop returns and the failure waits in the carrier.
+    empty!(log)
+    failed = Nitro.Core.RunnerFailure(nothing)
+    _logged() do
+        @test Nitro.Core._broadcast_lifecycle(T.stopped, entries, nothing, failed) === nothing
+    end
+    @test failed[] isa T.EndpointFailure && failed[].err == RunnerSentinel(1)
+    @test log == ["a:stopped", "b:stopped", "c:stopped"]
+    # A later broadcast over the same carrier keeps the first.
+    _logged() do
+        @test Nitro.Core._broadcast_lifecycle(T.stopped, entries[4:4], nothing, failed) === nothing
+    end
+    @test failed[].err == RunnerSentinel(1)
+end
+
+@testset "an interrupt escaping the runner still leaves the broadcast at once, as itself" begin
+    # Unchanged by #892: `_run_lifecycle` throws it again, and the caller defers it (#185).
+    log = String[]
+    entries = [T.serve_lifecycle_entry(m) for m in (BOOM_INTR, recorder(log, "a"))]
+    @test_throws InterruptException Nitro.Core._broadcast_lifecycle(T.stopped, entries)
+    @test isempty(log)
+end
+
+@testset "startup: a runner failure, then an interrupt out of another runner" begin
+    # The interrupt leaves the broadcast at once, as above, so the carried failure is never
+    # raised; it was reported when it happened, so it is not lost.
+    log = String[]
+    ARMED[] = true
+    logs = try
+        _logged() do
+            @test_throws InterruptException Nitro.Core._startup_hooks(
+                [T.serve_lifecycle_entry(BOOM_START)],
+                [T.serve_lifecycle_entry(recorder(log, "s")), T.serve_lifecycle_entry(BOOM_START_INTR)])
+        end
+    finally
+        ARMED[] = false
+    end
+    @test log == ["s:startup"]
+    @test _count(logs, "the on_startup hook runner failed") == 1
+end
+
+@testset "terminate: a failed on_stopped runner skips no later on_stopped" begin
+    log = String[]
+    ctx = App()
+    # LIFO: `b` stops first, then the failing runner, then `a`.
+    _serve(ctx; middleware = [recorder(log, "a"), BOOM_STOP, recorder(log, "b")])
+    @test timedwait(() -> Base.isopen(ctx.service), 10.0) === :ok
+    logs = _logged() do
+        @test_throws RunnerSentinel Nitro.Core.terminate(ctx)
+    end
+    @test filter(endswith(":stopped"), log) == ["b:stopped", "a:stopped"]
+    @test _count(logs, "the on_stopped hook runner failed") == 1
+    @test !Base.isopen(ctx.service)
+    @test ctx.service.server[] === nothing
+    @test Nitro.Core.AppContext._idle(ctx.service)
+    # Not stranded: the app serves and stops again.
+    _serve(ctx)
+    @test timedwait(() -> Base.isopen(ctx.service), 10.0) === :ok
+    Nitro.Core.terminate(ctx)
+    @test !Base.isopen(ctx.service)
+end
+
+@testset "terminate: a failed on_shutdown runner still closes the listener and runs on_stopped" begin
+    log = String[]
+    ctx = App()
+    _serve(ctx; middleware = [recorder(log, "a"), BOOM_DOWN, recorder(log, "b")])
+    @test timedwait(() -> Base.isopen(ctx.service), 10.0) === :ok
+    logs = _logged() do
+        @test_throws RunnerSentinel Nitro.Core.terminate(ctx)
+    end
+    # Before #892 the raise came straight out of the shutdown broadcast: `a:shutdown` and every
+    # `on_stopped` were skipped, and the listener stayed open.
+    @test filter(!endswith(":startup"), log) ==
+          ["b:shutdown", "a:shutdown", "b:stopped", "a:stopped"]
+    @test _count(logs, "the on_shutdown hook runner failed") == 1
+    @test !Base.isopen(ctx.service)
+    @test ctx.service.server[] === nothing
+    @test isempty(ctx.service.serve_lifecycle)
+    @test Nitro.Core.AppContext._idle(ctx.service)
+end
+
+@testset "serve: a failed on_startup runner in the route half still starts the serve half" begin
+    log = String[]
+    ctx = App()
+    Nitro.Core.Routing.urlpatterns(ctx, "", Nitro.RouteDefinition[
+        path("/boom", (req::HTTP.Request) -> Res.send("ok"), middleware = [BOOM_START])
+    ])
+    ARMED[] = true
+    logs = try
+        _logged() do
+            @test_throws RunnerSentinel _serve(ctx; middleware = [recorder(log, "s")])
+        end
+    finally
+        ARMED[] = false
+    end
+    # Route-owned first: the serve-owned hook started anyway, and the unwind paired it.
+    @test log == ["s:startup", "s:shutdown", "s:stopped"]
+    @test _count(logs, "the on_startup hook runner failed") == 1
+    @test !Base.isopen(ctx.service)
+    @test ctx.service.server[] === nothing
+    @test Nitro.Core.AppContext._idle(ctx.service)
+    _serve(ctx)
+    @test timedwait(() -> Base.isopen(ctx.service), 10.0) === :ok
+    Nitro.Core.terminate(ctx)
+end
+
+@testset "an interrupt in the same lifecycle wins; the failure is logged" begin
+    log = String[]
+    intr = LifecycleMiddleware(middleware = _pass, on_stopped = () -> throw(InterruptException()))
+    ctx = App()
+    # LIFO on_stopped: `intr` (deferred), then the failing runner, then `a`.
+    _serve(ctx; middleware = [recorder(log, "a"), BOOM_STOP, intr])
+    @test timedwait(() -> Base.isopen(ctx.service), 10.0) === :ok
+    logs = _logged() do
+        @test_throws InterruptException Nitro.Core.terminate(ctx)
+    end
+    @test "a:stopped" in log
+    @test !Base.isopen(ctx.service)
+    @test Nitro.Core.AppContext._idle(ctx.service)
+    @test _count(logs, "the on_stopped hook runner failed") == 1
+    @test _count(logs, "a lifecycle hook runner failed; the interrupt is raised instead") == 1
+end
+
+end # @testitem

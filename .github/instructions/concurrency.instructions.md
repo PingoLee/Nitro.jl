@@ -123,7 +123,9 @@ lives in the code comment it names, and that comment is canonical.
   table: which catches rethrow `StackOverflowError`, `OutOfMemoryError` and `InterruptException`,
   which stay narrow on purpose, and why the worker executors record `FAILED` instead of
   rethrowing. Add every new catch site to that table.
-- **Shutdown code never throws.** `close` and `terminate` run after the listener is down (#427).
+- **Shutdown code never throws before the teardown is done.** `close` and `terminate` run after
+  the listener is down (#427). `terminate` re-raises a deferred interrupt (#185), or the first
+  hook-runner failure (#892), only after the listener is down and every `on_stopped` has run.
 
 ## 5. Handlers that compute
 

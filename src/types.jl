@@ -1409,7 +1409,10 @@ or `AccessLog` for the per-activation run struct.
 A hook that throws is logged and swallowed, and the rest of the sequence still runs — see
 [`startup`](@ref), [`shutdown`](@ref) and [`stopped`](@ref). Ctrl-C is the one throw that is not discarded: the
 sequence still runs to completion, and `serve()`/`terminate()` then re-raise the interrupt
-once (#185).
+once (#185). A failure of Nitro's own hook runner, past the catch around the hook, no longer
+skips the hooks after it either (#892): the rest of the sequence runs (on the way down, the
+listener close and every `on_stopped` too), and `serve()`/`terminate()` then raise the first such
+failure. If an interrupt is being re-raised, it is raised instead and the failure is logged.
 """
 struct LifecycleMiddleware{M<:Function, S<:Union{Function,Nothing}, D<:Union{Function,Nothing},
                            P<:Union{Function,Nothing}}
@@ -1477,6 +1480,10 @@ finishes broadcasting over the remaining hooks, unwinds them (each hook's `on_sh
 `on_stopped`; the listener has not opened yet, #799), and re-raises the interrupt once. Ctrl-C
 during startup is honored without stranding the sequence (#185).
 
+If Nitro's own runner fails past this catch (a bug in Nitro, not in the hook), the hooks after it
+still start, and `serve()` raises the first such failure once they all have, after unwinding them
+(#892).
+
 !!! note "Why not `e isa InterruptException && rethrow()`"
     That idiom (`src/utilities/misc.jl`, `src/middleware/janitor.jl`) is for *leaf* catch-alls,
     where rethrowing kills one operation and nothing else. `startup`/`shutdown` are *sequencers*,
@@ -1521,6 +1528,11 @@ lifecycle list, closes the listener — escalating an interrupted drain to
 a force-close — runs the [`stopped`](@ref) broadcast, and only then re-raises it. If more than one hook is interrupted, each is logged
 and the first is re-raised; the rest are dropped, since an `InterruptException` carries nothing to
 tell them apart (#185).
+
+If Nitro's own runner fails past this catch (a bug in Nitro, not in the hook), the rest of the
+teardown still runs, the listener close and every `on_stopped` included, and `terminate()` raises
+the first such failure at its end. An interrupt being re-raised wins, and the failure is logged
+(#892).
 """
 function shutdown(lf::LifecycleMiddleware)::Union{Nothing,InterruptException}
     isnothing(lf.on_shutdown) && return nothing
@@ -1543,7 +1555,8 @@ listener has closed and the drain is over (#161); apps do not normally call it.
 
 The contract is `shutdown`'s: a `nothing` hook is a no-op, a throwing hook is logged and
 swallowed, the hook's value is discarded, and an `InterruptException` is logged and *returned*,
-so `terminate()` finishes the broadcast before re-raising it.
+so `terminate()` finishes the broadcast before re-raising it. A failure of Nitro's own runner
+skips no later `on_stopped` hook either: `terminate()` raises it once they have all run (#892).
 """
 function stopped(lf::LifecycleMiddleware)::Union{Nothing,InterruptException}
     isnothing(lf.on_stopped) && return nothing
