@@ -11,12 +11,12 @@ PrecompileTools = "aea7be01-6a6a-4083-8856-8a6e6704d82a"
 
 [sources]
 Nitro = {path = "../../.."}
-PormG = {url = "https://github.com/PingoLee/PormG.jl.git", rev = "2d461c3a086fdb2b04c8e97810578b777447fb9b"}
+PormG = {url = "https://github.com/PingoLee/PormG.jl.git", rev = "6e8364f7fcc4773993e9553155a5dea0d6d57865"}
 
 [compat]
 HTTP = "~2.15"
 Nitro = "0.7.0"
-PormG = "^0.9"
+PormG = "^0.10"
 Postgres = "2.4"
 PrecompileTools = "1"
 julia = "^1.13"

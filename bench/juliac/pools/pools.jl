@@ -19,15 +19,18 @@
 #   2. `ping("db")`, then one lease through the pool narrowed to its concrete type, so the pool has
 #      a live slot to close if the image can open one (the string form of `close_pool!` returns
 #      early on a pool that was never built). On PormG 0.9.0 (5531c68c) neither could in a trimmed
-#      image (`ping` returned `false`; the lease missed in `_is_offline`). At 2d461c3a `ping` is
-#      `true`, so a slot is live; the lease still misses, at `release_connection`. The direct
-#      `close_pool!` in step 5 is what shows a miss on the close path;
+#      image (`ping` returned `false`; the lease missed in `_is_offline`). At 2d461c3a `ping` was
+#      `true` but the lease missed at `release_connection`; at v0.10.0 (6e8364f7) both run, and
+#      the image prints the JIT's step lines and exits 0. The direct `close_pool!` in step 5 is
+#      what shows a miss on the close path;
 #   3. `serve(app; async = true, middleware)`, one `internalrequest`, then `terminate(app)`;
 #   4. counts the live slots again. A missed call inside `on_stopped` is caught there and logged
 #      with `@error`, and a trimmed executable prints no `@error` records, so the slots, read as a
 #      plain field and never through `ConnectionPool`, are what says whether the close ran. They
 #      say only that the slots were emptied: PormG's `_close_pool_slots!` takes the handles out
-#      under its lock before anything after it can fail (PormG #1697 fails there, at 2d461c3a);
+#      under its lock before anything after it can fail. At 2d461c3a what came after it failed
+#      (step 5 threw `MissingCodeError` in `_close_pool_slots!` with the pools layer, and missed
+#      `_close_driver_handle!` without it); at v0.10.0 step 5 is `ok` in both builds;
 #   5. calls `close_pool!("db")` itself, with nothing catching it but the probe.
 # Every step prints one `step` line to `Core.stdout` (a trimmed executable's `Base.stdout` is
 # stale); an exception is printed by its type name only. The exit code is the step that failed
