@@ -39,12 +39,19 @@ The last row is the edit an app may owe. Build the store before the transaction,
 
 Two waits a boot can now meet, neither of which needs an edit:
 
-- **SQLite, every boot.** `ensure_table!` checks for the table inside a write transaction
-  (`BEGIN IMMEDIATE`), so a boot waits behind another process's open write transaction on the same
-  file, up to the connection's busy timeout, and fails with `OperationalError` (`database is
-  locked`) past it. The old boot took no write lock on an existing table. It matters only when
-  another process, a separate `consume!` consumer say, holds a long write transaction while an
-  instance starts.
+- **SQLite, every boot.** `ensure_table!` checks for the table inside a write transaction, so
+  building a store waits behind any write transaction already open on that database, in one of two
+  ways:
+  - **Another process's**, on the same file: `BEGIN IMMEDIATE` waits up to the connection's busy
+    timeout, then fails with `OperationalError` (`database is locked`).
+  - **Another task's in the same process**, inside `run_in_transaction` or `atomic` on the same
+    key: PormG queues a process's SQLite writers on the pool's write lock, which has no timeout. A
+    factory built at that moment, lazily on a first request say, waits until that transaction ends,
+    with no error.
+
+  The old boot took no write lock on an existing table. Either wait matters only when a long write
+  transaction is open while a store is built: a separate `consume!` consumer's across processes,
+  the application's own within one.
 - **PostgreSQL, a missing table only.** Creating it waits on PormG's migration advisory lock, the
   one `migrate` holds, so a first boot that coincides with a `migrate` run waits for it, and fails
   with `OperationalError` past PormG's lock timeout. A table that exists is found without the
