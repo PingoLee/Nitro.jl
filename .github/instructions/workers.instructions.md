@@ -95,6 +95,34 @@ contains `::`. Those rules together are what make `(user, key) → id` injective
 scopes' id spaces disjoint, and make `owner_of` a total inverse; drop any one and two distinct
 pairs collide.
 
+### Linking a run to its request — `parent`
+
+`submit_task(…; parent = cancel_token(req))` ([#662](https://github.com/PingoLee/Nitro.jl/issues/662))
+and `submit_queued_task(…; parent = cancel_token(req))`
+([#906](https://github.com/PingoLee/Nitro.jl/issues/906)) link a run to the request that submitted
+it. The run reads the request's cause (`:client_disconnected`, `:timeout`, `:shutdown`) as its own
+at its next `cancel_requested`/`checkpoint!`. The rules that hold the link together:
+
+- **Completion never cancels.** The run reads the request's own view, never the token's
+  `:completed`: a handler that submits a job and returns `202` leaves it running. Do not "fix" that
+  into Go's cancel-on-return.
+- **A queued item is checked again when a processor takes it.** If its request settled a cause
+  while the item sat in the buffer, the item is recorded `CANCELLED` with that reason, through the
+  run-fenced CAS from `PENDING`, and its callback never starts. A cause of the run's own (a drain's
+  `:shutdown` set after the claim) does not count here: that item starts and stops at its first
+  check, like an unlinked one.
+- **A buffered item holds its request's token until a processor takes it**, which hands the link
+  to the run; the run drops it when it ends. Every other exit (a declined claim, a cancel at
+  dequeue, a teardown abandoning the item, a submit that never reached the buffer) drops it at once.
+- **`External(…)` queues refuse `parent`** with an `ArgumentError`: the run happens in another
+  process, which a request token cannot reach.
+- **A check the executor makes outside the callback cannot fail the run**
+  ([#909](https://github.com/PingoLee/Nitro.jl/issues/909)). Reading the request can run its
+  disconnect probe, which rethrows a socket error other than the peer leaving. The dequeue check,
+  the attempt loop's checks between attempts and the cancel message read it through
+  `_settled_cause`, which counts a non-fatal throw as no cause. The callback's own check is the
+  public `cancel_reason` and still throws, which fails that attempt.
+
 ### Reporting progress — never assign the field
 
 `TaskInfo.progress` is declared `@atomic`. Plain assignment from a callback throws
