@@ -560,6 +560,26 @@ PormG refuses that before their folder is loaded, and a precompile is never a RE
 does not precompile. Loading in the module body instead would read `db/connection.yml`, password
 included, at precompile time, and a JuliaC image keeps it.
 
+**`db/models.jl` ends with a `Models.@models` line naming every model.** That line is the model set
+`set_models` registers, and `set_models` refuses a module without one (`ModelDefinitionError`).
+Bind each model with a typed global, the form PormG's template writes:
+
+```julia
+# db/models.jl
+module models
+
+import PormG.Models
+
+Product::Models.ModelType = Models.Model("products",
+    id   = Models.IDField(),
+    name = Models.CharField(max_length = 100),
+)
+
+Models.@models Product
+
+end
+```
+
 **Find `db/` from `root`, not from `pkgdir` alone.** In a JuliaC executable `pkgdir` and
 `@__DIR__` name the temporary copy of the project the image was built from, gone at run time. So
 `main.jl` passes `root = get(ENV, "APP_ROOT", pwd())`: set `APP_ROOT` to the folder that holds
