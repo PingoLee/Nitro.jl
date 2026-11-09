@@ -686,6 +686,47 @@ end
 
 end # module SharedClaimStore
 
+# A request token whose disconnect probe THROWS, with something other than the `NetClosingError` it
+# reads as "gone" (#909, #910). Real objects, no mock: the stream's connection holds a poll FD whose
+# lifetime lock is already closed, and marked a file, so `_with_fd_ref` refuses the reference with
+# Reseau's `FileClosingError`, which `_peer_gone` rethrows. Closing the lock flips atomics only:
+# no syscall runs, nothing is destroyed, and a poll FD built directly (not through `_new_netfd`)
+# carries no finalizer. `INVALID_FD` besides, so nothing could ever reach a real descriptor.
+#
+# `throwing_probe_token()` checks its own premise first: if a Reseau or HTTP bump moves one of
+# these internals, it fails here, by name, before any test reads a "no cause" it did not stage.
+@testsetup module ThrowingProbe
+
+using Test
+using HTTP
+using Nitro
+using Nitro.Core.Constants: ShutdownSignal
+
+export throwing_probe_token, probe_now!, probe_after!
+
+const R = Nitro.Core.Reseau
+
+function throwing_probe_token()
+    pfd = R.IOPoll.FD(R.IOPoll.INVALID_FD; is_file = true)
+    R.IOPoll._fdlock_incref_and_close!(pfd.fdlock) || error("ThrowingProbe: the FD lock was already closed")
+    nfd = R.NetCommon.FD(pfd, R.SocketOps.AF_INET, R.SocketOps.SOCK_STREAM, :tcp, true,
+                         nothing, nothing, nothing)
+    conn = R.TCP.Conn(nfd)
+    stream = HTTP.Stream(HTTP.Request("GET", "/"))
+    stream.tracked = HTTP._ServerConn(conn, ReentrantLock(), nothing, HTTP._ConnState.ACTIVE, Int64(0))
+    @test_throws R.IOPoll.FileClosingError Nitro.Core._peer_gone(stream)
+    return Nitro.CancelToken(ShutdownSignal(), stream)
+end
+
+# The probe claims one 10 ms interval through a CAS on `next_probe_ns`, so these aim the throw:
+# `probe_now!` lets the next check probe (and throw), `probe_after!` holds every check off for
+# `seconds`, so the first check after that window is the one that throws.
+probe_now!(token::Nitro.CancelToken) = (@atomic token.next_probe_ns = zero(UInt64); token)
+probe_after!(token::Nitro.CancelToken, seconds::Real) =
+    (@atomic token.next_probe_ns = time_ns() + round(UInt64, seconds * 1e9); token)
+
+end # module ThrowingProbe
+
 # ── The example tree's rot guard (test/examples_tests.jl) ──
 #
 # An example only stays right if something runs it. Each item in test/examples_tests.jl runs one

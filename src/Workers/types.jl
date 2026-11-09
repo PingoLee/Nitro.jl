@@ -575,17 +575,47 @@ check finds one, it is set on the run's token, first cause wins. The check runs 
 (throttled) disconnect probe, on the run's task. A request that completed cancels nothing: a job
 submitted by a handler that then returns keeps running.
 """
-function cancel_reason(task_info::TaskInfo)::Symbol
+cancel_reason(task_info::TaskInfo)::Symbol = _cancel_reason(task_info, _request_reason)
+
+# The one body of a run's cause, parameterized on how the linked request is read: `_request_reason`
+# for the public accessor, `_settled_cause` for the executors' own checks (#909).
+function _cancel_reason(task_info::TaskInfo, read_request::F)::Symbol where {F}
     reason = @atomic task_info.cancel_reason
     reason === :none || return reason
     parent = @atomic task_info.parent
     parent === nothing && return :none
     # The request's view, never the token's `:completed` (see `submit_task`'s `parent`).
-    inherited = _request_reason(parent)
+    inherited = read_request(parent)
     inherited === :none && return :none
     _request_cancel!(task_info, inherited)
     return @atomic task_info.cancel_reason
 end
+
+# What a linked request's check means when the EXECUTOR makes it, outside the callback (#909). The
+# check can run the request's disconnect probe (`_peer_gone`), which rethrows a socket error other
+# than the peer leaving. A non-fatal throw counts as no cause, and this is the one place that says
+# so: the dequeue check of a queued item (#906), the attempt loop's checks between attempts (the
+# `TaskCancelledError` test, `_backoff_wait`, the check after the backoff), and the cancel message
+# `_cancel_task!` renders all read the request through here.
+#
+# Escaping instead stranded the record: from the dequeue check it reached the processor's catch-all
+# and left the record `PENDING`, which no sweep reaps; from the attempt loop, the record stayed
+# `RUNNING` until a zombie sweep marked it `FAILED`. The run's own outcome is the truth about the
+# run, so a broken socket is not recorded as a failure of it. The callback's OWN check is the
+# public `cancel_reason`, which still throws: that is an attempt failing, and the loop records it.
+#
+# `is_unrecoverable` rethrows, as everywhere (`src/errors.jl`'s site table). `read` exists for the
+# test that needs a reader which raises one of those three, which no real probe can on demand.
+_settled_cause(parent::CancelToken)::Symbol = _settled_cause(_request_reason, parent)
+function _settled_cause(read::F, parent::CancelToken)::Symbol where {F}
+    try
+        return read(parent)
+    catch err
+        is_unrecoverable(err) && rethrow()
+        return :none
+    end
+end
+_settled_cause(task_info::TaskInfo)::Symbol = _cancel_reason(task_info, _settled_cause)
 
 """
     TaskTimeoutError(timeout)

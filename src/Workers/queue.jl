@@ -220,9 +220,14 @@ _fail_task!(runtime::WorkerRuntime, task_info::TaskInfo, message::String) =
 # The one cause that writes nothing of its own is a teardown drain -- so `"Cancelled by user"` was
 # reachable only when no user had cancelled anything. Reading the reason off the task removes the
 # parameter that made the two paths differ, rather than asking both to remember one string.
+#
+# The reason is read through `_settled_cause`, not `cancel_reason` (#909): the attempt loop reaches
+# here from a durable read that found the record CANCELLED (a `cancel_task`, which claims the record
+# before it sets the token, or a cancel from another process), so the token can still be unset and
+# a linked run's request is checked -- and that check must not throw out of the loop.
 _cancel_task!(runtime::WorkerRuntime, task_info::TaskInfo) =
     _finish_task!(runtime, task_info, CANCELLED;
-                  error=_cancel_message(cancel_reason(task_info)), progress=task_info.progress)
+                  error=_cancel_message(_settled_cause(task_info)), progress=task_info.progress)
 
 # Record a queued task that a teardown will never run (#182).
 #
@@ -258,21 +263,6 @@ function _abandon_queued_item!(runtime::WorkerRuntime, item::QueueItem)
                            run_id=item.run_id,
                            error=_cancel_message(:shutdown),
                            completed_at=current_time_utc())
-end
-
-# The dequeue check of a linked item's request (#906), which may run the request's disconnect probe
-# here, outside the attempt loop. A probe that throws (a socket error other than the peer leaving)
-# counts as no cause: the run starts, and its callback's own check meets the same failure inside
-# `_run_attempts!`, where it is recorded. Escaping from here instead would reach the processor's
-# catch-all and strand the record `PENDING`, which no sweep reaps. `is_unrecoverable` rethrows, as
-# everywhere (`src/errors.jl`'s site table).
-function _dequeue_request_reason(parent::CancelToken)::Symbol
-    try
-        return _request_reason(parent)
-    catch err
-        is_unrecoverable(err) && rethrow()
-        return :none
-    end
 end
 
 function _execute_queued_task(runtime::WorkerRuntime, item::QueueItem)
@@ -365,8 +355,12 @@ function _execute_queued_task(runtime::WorkerRuntime, item::QueueItem)
             # settles the request's cause on the run's token, so the record's `cancel_reason` reads
             # it and the stored text is that cause's -- unless the run's own token already holds a
             # cause (a drain's `:shutdown`), which wins, first cause first.
-            if _dequeue_request_reason(parent) !== :none
-                cancel_reason(task_info)
+            #
+            # The dequeue check may run the request's disconnect probe here, outside the attempt
+            # loop, so it goes through `_settled_cause` (#909): a probe that throws counts as no
+            # cause, and the run starts.
+            if _settled_cause(parent) !== :none
+                _settled_cause(task_info)
                 return _cancel_task!(runtime, task_info)
             end
         end
@@ -458,7 +452,12 @@ function _run_attempts!(runtime::WorkerRuntime, task_info::TaskInfo, callback::F
             # one. Never retried: the token is never reset, so a retry would start cancelled.
             # Only when the token IS set: one the callback built itself is an ordinary failure,
             # for the reason the `InterruptException` note above gives.
-            if unwrapped isa TaskCancelledError && cancel_requested(task_info)
+            #
+            # This check, `_backoff_wait`'s and the one after the backoff are the executor's, made
+            # from inside this `catch`, so they read a linked request through `_settled_cause`
+            # (#909): a probe that throws there is no cause, not an exception that escapes the loop
+            # and strands the record.
+            if unwrapped isa TaskCancelledError && _settled_cause(task_info) !== :none
                 return on_cancel(task_info)
             end
 
@@ -491,7 +490,7 @@ function _run_attempts!(runtime::WorkerRuntime, task_info::TaskInfo, callback::F
 
             # The token is process-local, so a cancel issued on another node sets nothing here. One
             # durable read per ATTEMPT (not per poll) covers that without a round-trip every 50ms.
-            if cancel_requested(task_info)
+            if _settled_cause(task_info) !== :none
                 return on_cancel(task_info)
             end
             resumed = get_task_info(runtime.store, task_info.id)
@@ -509,13 +508,15 @@ end
 # default retries. Now it parks once on an `Event` woken by a `Timer` at the deadline and by
 # `_request_cancel!` through `cancel_waker` (see that field for why a cancel cannot slip between
 # the publish and the wait).
+#
+# Both checks read a linked request through `_settled_cause` (#909), like the attempt loop it serves.
 function _backoff_wait(task_info::TaskInfo, seconds::Float64)
-    cancel_requested(task_info) && return nothing
+    _settled_cause(task_info) !== :none && return nothing
     woken = Base.Event()
     @atomic task_info.cancel_waker = woken
     timer = Timer(_ -> notify(woken), seconds)
     try
-        cancel_requested(task_info) || wait(woken)
+        _settled_cause(task_info) !== :none || wait(woken)
     finally
         close(timer)
         @atomic task_info.cancel_waker = nothing
