@@ -1670,6 +1670,28 @@ image then misses in the invoker before the handler runs: the verifier reports t
 and the line names `MethodError` instead of the handler's own exception. The scratch app's first
 build was written that way.
 
+### 3.17 The pools probe across PormG pins (#913)
+
+The pools probe (`bench/juliac/pools/`, #813) is not one of the two pinned totals (§3). Most of its
+count is PormG's, so it moves with the PormG pin more than with Nitro. #913 rebuilt both builds
+before and after moving the pin from `2d461c3a` to `v0.10.0`, with `--trim=unsafe-warn` on Julia
+1.13 and JuliaC, from the same Nitro tree, with only the PormG `rev` changed:
+
+| PormG pin | `POOLS=1` | `POOLS=0` | the image's run |
+|---|--:|--:|---|
+| `5531c68c` (`v0.9.0`; §3.16, Nitro `d5dde82b`) | 136 | | `close_pool_direct threw MethodError` |
+| `2d461c3a` (PormG `main`, still version 0.9.0) | 527 errors, 30 warnings | 526 errors, 30 warnings | exit 6: the lease misses at `release_connection`; step 5 throws `MissingCodeError` in `_close_pool_slots!` (`POOLS=1`) or misses `_close_driver_handle!` (`POOLS=0`) |
+| `6e8364f7` (`v0.10.0`) | 135 errors, 24 warnings | 134 errors, 24 warnings | exit 0: every step `ok`, the same lines as the JIT run |
+
+- **The pools layer costs one row at every pin.** That is the gap between the `POOLS=1` and
+  `POOLS=0` builds.
+- **The rise and the fall are PormG's.** Nothing in Nitro differs between the last two rows. The 24
+  PormG commits between them include the pool's handle and error barriers (PormG #1683, #1696), no
+  reassigned captured variable (#1697), identity-keyed pool registries (#1706) and closed
+  query-node slots (#1698).
+- **The 136 row is not directly comparable.** It was counted on an older Nitro tree, and §3.16
+  reports it as one total.
+
 ## 4. The decision: `--trim=safe` is a target
 
 **The question was:** is `--trim=safe` a product target for Nitro, or a ratchet that only keeps
