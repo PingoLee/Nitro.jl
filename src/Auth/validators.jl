@@ -86,6 +86,18 @@ function _report_missing_claim!(seen::Set{NTuple{3, Nullable{String}}}, seen_loc
     return nothing
 end
 
+# Whether verified `claims` are a refresh token's (#231). A refresh token has no legitimate use at
+# a resource route, so `jwt_validator` refuses one whatever guards the route has: with a shared
+# secret, a route that forgot `claim_required("token_use", "access")` would otherwise take a
+# 14-day refresh token as a bearer. The check is mandatory in the verifier, as AWS Cognito's
+# verifiers make `token_use` mandatory; Spring keeps the equivalent in the
+# `JwtAuthenticationConverter` that turns a verified JWT into an authentication. A token with no
+# `token_use` is not one: apps that never minted the claim are unaffected.
+function _is_refresh_token(claims::Dict{String, Any})::Bool
+    use = get(claims, "token_use", nothing)
+    return use isa String && use == "refresh"
+end
+
 # What the `jwt_validator` closure holds: a `JWTKeyset`, or a single secret as a `SecretString`.
 # A plain string is wrapped here, because `repr` of a closure prints its captures -- an
 # exception holding the middleware chain printed the JWT key in clear beside a masked CSRF key
@@ -109,6 +121,14 @@ JWT and returns the authenticated principal.
 
 Safe by default: every token is signature-verified and time-bounded (`exp`, or `iat` +
 `exp_timeout` fallback). Hardening is opt-in on top — never the other way around.
+
+**A refresh token is never a bearer credential.** A token whose `token_use` claim is
+`"refresh"` (what [`issue_refresh_token`](@ref) mints) is refused, so `BearerAuth` and
+`CookieAuthMiddleware` answer it with a `401` on every route. A refresh token has no use at a
+resource route: the refresh endpoint verifies it itself, through
+[`rotate_refresh_token`](@ref) or `decode_jwt`. A token with no `token_use` claim is unaffected.
+`claim_required("token_use", "access")` on ordinary routes stays useful as defence in depth: it
+also refuses a token that carries no `token_use` at all.
 
 # Identity
 
@@ -297,6 +317,9 @@ function jwt_validator(secret_or_keyset;
 
     return function(token::AbstractString, req::Union{HTTP.Request, Nothing}=nothing)
         claims, kid = _decode_jwt(token, keyset; decode_kwargs...)
+        # Before anything reads a claim or a `user_validator` runs: a refresh token is refused
+        # outright (#231). The message names the kind of token, never its value.
+        _is_refresh_token(claims) && throw(AuthError("A refresh token is not a bearer credential"))
         resolved_kid = kid_trusted && kid !== nothing ? String(kid) : nothing
         # `resolved_kid`, never the raw header kid: the header value is attacker-chosen,
         # and this one has been resolved against the keyset. An unverified kid must not

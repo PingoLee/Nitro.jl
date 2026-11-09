@@ -745,3 +745,55 @@ end
     @test per_request.count <= 15
 end
 end
+
+@testitem "Auth middleware — jwt_validator refuses a refresh token on every route (#231)" tags=[:middleware, :auth, :security] setup=[NitroCommon] begin
+    using Test
+    using HTTP
+    using Nitro
+    using Nitro.Auth
+
+    # One secret for both kinds of token: the tutorial's "if you share one key" case. A route with
+    # no `claim_required("token_use", "access")` guard must still refuse the refresh token.
+    secret = jwtkey("shared")
+    refresh = issue_refresh_token(MemoryRefreshTokenStore(), "42"; secret)
+    handmade = encode_jwt(Dict("sub" => "42", "token_use" => "refresh"), secret; expires_in = 600)
+    access = encode_jwt(Dict("sub" => "42", "token_use" => "access"), secret; expires_in = 600)
+    plain = encode_jwt(Dict("sub" => "42"), secret; expires_in = 600)   # no token_use: unchanged
+
+    looked_up = Ref(0)
+    validator = jwt_validator(secret)
+    with_user = jwt_validator(secret; user_validator = p -> (looked_up[] += 1; p.id))
+    @test_throws AuthError validator(refresh)
+
+    reached = Ref(0)
+    inner = req -> (reached[] += 1; HTTP.Response(200, "ok"))
+    function bearer(mw, token)
+        req = HTTP.Request("GET", "/drivers")
+        HTTP.setheader(req, "Authorization" => "Bearer $token")
+        return mw(inner)(req)
+    end
+    function cookie(mw, token)
+        req = HTTP.Request("GET", "/drivers")
+        HTTP.setheader(req, "Cookie" => "auth_token=$token")
+        return mw(inner)(req)
+    end
+
+    for v in (validator, with_user)
+        @test bearer(BearerAuth(v), refresh).status == 401
+        @test bearer(BearerAuth(v), handmade).status == 401
+        @test cookie(CookieAuthMiddleware(v), refresh).status == 401
+        @test cookie(CookieAuthMiddleware(v), handmade).status == 401
+    end
+    # Refused before the app's user lookup runs, and before the handler.
+    @test looked_up[] == 0
+    @test reached[] == 0
+
+    for v in (validator, with_user)
+        @test bearer(BearerAuth(v), access).status == 200
+        @test bearer(BearerAuth(v), plain).status == 200
+        @test cookie(CookieAuthMiddleware(v), access).status == 200
+        @test cookie(CookieAuthMiddleware(v), plain).status == 200
+    end
+    @test reached[] == 8
+    @test looked_up[] == 4
+end

@@ -283,8 +283,9 @@ caller-chosen id (a device id, say) could recreate a revoked family, which would
 tokens back to life.
 
 **Use a separate `secret` from your access tokens.** Then an access-token validator refuses a
-refresh token by its signature. If you share one secret, guard ordinary routes with
-`claim_required("token_use", "access")`.
+refresh token by its signature. With a shared secret, `jwt_validator` still refuses any token whose
+`token_use` is `"refresh"`, so `BearerAuth` never authenticates one, and
+`claim_required("token_use", "access")` on ordinary routes is defence in depth.
 
 ```julia
 refresh_store = MemoryRefreshTokenStore()

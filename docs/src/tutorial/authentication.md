@@ -720,9 +720,11 @@ What each piece does, and what it leaves to you:
     current token: its retry with the old one is a reuse, and the user signs in again.
 
 **Sign refresh tokens with a different key from access tokens.** Then your access-token
-validator refuses a refresh token by its signature, and no guard has to remember to. If you
-share one key, the `token_use` claim is the discriminator, and every ordinary route needs the
-guard:
+validator refuses a refresh token by its signature. If you share one key, the framework still
+refuses it: `jwt_validator` rejects any token whose `token_use` is `"refresh"`, so `BearerAuth`
+and `CookieAuthMiddleware` answer one with a `401` on every route, guarded or not. A claim guard
+on ordinary routes is defence in depth on top of that. It also refuses a token minted with no
+`token_use` at all:
 
 ```julia
 GuardMiddleware(claim_required("token_use", "access"))
@@ -740,25 +742,37 @@ else out. Put one on the refresh route as well. Behind more than one process, im
 matters most is that `consume_refresh_token!` checks and clears the current token in **one**
 atomic step.
 
-#### Without a store: two tokens and a guard
+#### Without a store: two tokens that differ by a claim
 
-If you do not need rotation, mint two tokens that differ by a claim, and let an ordinary guard
-keep the long-lived one away from your ordinary routes:
+If you do not need rotation, mint two tokens that differ by a claim. `jwt_validator` refuses the
+long-lived one, so it never authenticates an ordinary route; the refresh endpoint verifies it
+itself, from the request body, and accepts nothing else:
 
 ```julia
 # At login: a short access token, and a long-lived one marked for one purpose only.
-access  = encode_jwt(Dict("sub" => user.id, "token_use" => "access"),  secret; expires_in=900)
-refresh = encode_jwt(Dict("sub" => user.id, "token_use" => "refresh"), secret; expires_in=60*60*24*14)
+access  = encode_jwt(Dict("sub" => driver.id, "token_use" => "access"),  secret; expires_in=900)
+refresh = encode_jwt(Dict("sub" => driver.id, "token_use" => "refresh"), secret; expires_in=60*60*24*14)
+
+struct RefreshRequest; refresh_token::String; end
 
 # The refresh endpoint accepts ONLY the refresh token — a stolen access token cannot mint more.
-urlpatterns(app, "",
-    path("/auth/refresh", refresh_handler, method="POST", middleware=[
-        BearerAuth(validator),
-        GuardMiddleware(claim_required("token_use", "refresh")),
-    ]),
-)
+function refresh_handler(req, body::Json{RefreshRequest})
+    claims = try
+        decode_jwt(body.payload.refresh_token, secret; require_exp = true,
+                   required_claims = ["sub", "token_use"])
+    catch e
+        e isa AuthError || rethrow()
+        return Res.status(401)
+    end
+    claims["token_use"] == "refresh" || return Res.status(401)
+    access = encode_jwt(Dict("sub" => claims["sub"], "token_use" => "access"), secret; expires_in=900)
+    return Res.json(Dict("access_token" => access))
+end
 
-# ...and every ordinary route refuses the refresh token in the other direction.
+urlpatterns(app, "", path("/auth/refresh", refresh_handler, method="POST"))
+
+# Every ordinary route: `jwt_validator` already refuses the refresh token, and this guard also
+# refuses a token minted with no `token_use`.
 GuardMiddleware(claim_required("token_use", "access"))
 ```
 
