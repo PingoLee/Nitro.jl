@@ -131,8 +131,9 @@ function record_refresh_token!(store::MemoryRefreshTokenStore, record::RefreshTo
             # Only the rotation that consumed the current token may record its successor: the row
             # must be present (not revoked, which deletes it) with no current token. A family
             # revoked between this rotation's consume and now refuses here, so a concurrent reuse
-            # cannot be outrun.
-            (state === nothing || state.current !== nothing) && return (false, false)
+            # cannot be outrun. A family never changes subject.
+            (state === nothing || state.current !== nothing || state.subject != record.subject) &&
+                return (false, false)
             store.families[record.family] = _Family(record.jti, record.subject, record.expires_at,
                                                     max(state.lives_until, record.expires_at))
             return (true, false)
@@ -350,10 +351,16 @@ function _admit(store::AbstractRefreshTokenStore, outcome, family::String,
     end
     outcome isa RefreshTokenRecord || throw(ArgumentError(
         "consume_refresh_token! must return a RefreshTokenRecord or a RefreshTokenMiss, got a $(typeof(outcome))"))
-    # The signed `sub` and the stored subject must agree. They can only disagree if the store is
-    # wrong or two issuers share a secret and a family space, and either way the token is not this
-    # store's to honour.
-    (outcome.subject == subject && outcome.family == family) || throw(RefreshTokenError(:invalid))
+    # The signed `sub` and the stored subject must agree. A token that verified, names a live
+    # family and its CURRENT jti, and carries another `sub` was signed by someone holding the
+    # secret who also knows that family's current token: positive evidence of compromise, not a
+    # client mistake. The consume above has already taken the current token, so leaving the family
+    # half-rotated would only defer the revocation to the victim's next refresh. Revoke it now.
+    if outcome.subject != subject || outcome.family != family
+        revoke_refresh_family!(store, family)
+        outcome.family == family || revoke_refresh_family!(store, outcome.family)
+        throw(RefreshTokenError(:invalid))
+    end
     return outcome
 end
 

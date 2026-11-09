@@ -47,6 +47,8 @@ end
     first = consume_refresh_token!(store, "A", "a1"; at = 500)
     @test first isa RefreshTokenRecord && first.jti == "a1" && first.family == "A" && first.subject == "7"
     @test consume_refresh_token!(store, "A", "a1"; at = 500).reason === :reused       # second presentation
+    # A family never changes subject: a successor for anyone else is refused, with no write.
+    @test !record_refresh_token!(store, RefreshTokenRecord("a2", "A", "8", 2_000); new_family = false)
     @test record_refresh_token!(store, rec("a2", "A", 2_000); new_family = false)    # the successor
     @test consume_refresh_token!(store, "A", "a1"; at = 500).reason === :reused       # still recognized
     @test consume_refresh_token!(store, "Z", "a1"; at = 500).reason === :unknown
@@ -255,12 +257,16 @@ end
     @test reason(() -> rotate_refresh_token(store, no_fam; secret)) === :invalid
     no_exp = encode_jwt(Dict("sub" => "42", "jti" => jti, "fam" => fam, "token_use" => "refresh"), secret)
     @test reason(() -> rotate_refresh_token(store, no_exp; secret)) === :invalid
-    # A signed `sub` that disagrees with the store's record. Only a holder of the secret can sign
-    # one, and the attempt takes that family's current token, so it uses a token of its own.
-    victim = decode_jwt(issue_refresh_token(store, "42"; secret), secret)
+    # A signed `sub` that disagrees with the store's record, carrying the victim's live family and
+    # CURRENT jti. Only a holder of the secret who also knows that token can sign one, so it is
+    # evidence of compromise: refused, and the victim's family is revoked at once rather than left
+    # half-rotated. It uses a token of its own, so the real one below is untouched.
+    victim_token = issue_refresh_token(store, "42"; secret)
+    victim = decode_jwt(victim_token, secret)
     swapped = encode_jwt(Dict("sub" => "43", "jti" => victim["jti"], "fam" => victim["fam"],
                               "token_use" => "refresh"), secret; expires_in = 600)
     @test reason(() -> rotate_refresh_token(store, swapped; secret)) === :invalid
+    @test reason(() -> rotate_refresh_token(store, victim_token; secret)) === :unknown
     # A family this store never issued.
     foreign = issue_refresh_token(MemoryRefreshTokenStore(), "42"; secret)
     @test reason(() -> rotate_refresh_token(store, foreign; secret)) === :unknown

@@ -534,7 +534,7 @@ however many refreshes other clients make.
 
 | Method | Contract |
 |---|---|
-| `record_refresh_token!(store, record::RefreshTokenRecord; new_family::Bool)` | Make `record` its family's current token. With `new_family = true` the family must be **absent**, and is created. With `false` it must be **present, with no current token** (one `consume_refresh_token!` just took it). Returns `true`, or `false` with no write otherwise |
+| `record_refresh_token!(store, record::RefreshTokenRecord; new_family::Bool)` | Make `record` its family's current token. With `new_family = true` the family must be **absent**, and is created. With `false` it must be **present, with no current token** (one `consume_refresh_token!` just took it), **and** `record.subject` must equal the family's subject. A family never changes hands. `rotate_refresh_token` checks the subject before it records, and the store refusing a mismatch too is load-bearing: it keeps a token for another subject out of the family whatever the caller does. Returns `true`, or `false` with no write otherwise |
 | `consume_refresh_token!(store, family::String, jti::String; at::Int)` | **One atomic step**: if `jti` is the family's current token and has not expired, clear the current token and return the [`RefreshTokenRecord`](@ref); otherwise return a [`RefreshTokenMiss`](@ref): `:unknown` (no such family), `:reused` (`jti` is not the current token), `:expired` |
 | `revoke_refresh_family!(store, family::String)` | Remove the family, idempotently. Afterwards its tokens are `:unknown` and nothing can be recorded into it |
 | `prune_refresh_tokens!(store; at::Int)` | Drop families whose every token has expired by `at` |
