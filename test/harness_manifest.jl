@@ -114,6 +114,7 @@ const TEST_FILES = [
     "dx_tests.jl",
     "auth_module_tests.jl",
     "auth_keyset_tests.jl",
+    "auth_refresh_tests.jl",
     "auth_tests.jl",
     "revise_test.jl",
 

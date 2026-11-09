@@ -20,15 +20,22 @@ untouched. The one exception is a `STREAM` or `WEBSOCKET` handler under
 (usually `nothing`) is not an error.
 
 **A middleware that throws** is handled the same way as a handler that throws, as long as
-`catch_errors=true` (the default for both `serve()` and `internalrequest()`). The exception is
-logged with its backtrace and the client receives `{"message": "500: Internal Server Error"}`.
-A `ValidationError` is answered with a `400` instead, an `UnsupportedMediaTypeError` with a
-`415`, and an `AuthorizationError` with a `403` (`{"message": "403: Forbidden"}`); all three are
-recorded at `@debug` only, and the `403`'s log line leaves out the error's message, which can
-name a caller-chosen queue or task key. A `WorkerUnavailableError` (an App-first worker call on
-an `App` with no worker runtime installed) is a `503`, logged at `@warn` without a backtrace. A
-`WorkerCapacityError` (a worker limit reached) is a `503`, or a `429` for a per-owner quota,
-logged at `@debug`. The access log records the status either way. An `InterruptException` is not converted; it propagates.
+`catch_errors=true` (the default for both `serve()` and `internalrequest()`). Each body is
+`{"message": "<status>: <reason phrase>"}`, fixed per status, and never carries the error's own
+message:
+
+| Thrown | Status | Logged |
+|---|---|---|
+| `ValidationError` | `400` | `@debug` |
+| `UnsupportedMediaTypeError` | `415` | `@debug` |
+| `RefreshTokenError` (a refused refresh token, see [Authentication](auth.md)) | `401` | `@debug`, with the refusal's `reason` only, never the token |
+| `AuthorizationError` | `403` | `@debug`, without the error's message, which can name a caller-chosen queue or task key |
+| `WorkerUnavailableError` (an App-first worker call on an `App` with no worker runtime installed) | `503` | `@warn`, without a backtrace |
+| `WorkerCapacityError` (a worker limit reached) | `503`, or `429` for a per-owner quota | `@debug` |
+| anything else | `500` | `@error`, with its backtrace |
+
+The access log records the status either way. An `InterruptException` is not converted; it
+propagates.
 
 **What the error log record carries.** Its `exception` is `(e, backtrace)`, where `e` is a
 `Nitro.Errors.LoggedException` and not the exception that was thrown. It has two fields: `type`,

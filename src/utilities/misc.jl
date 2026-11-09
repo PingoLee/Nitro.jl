@@ -3,7 +3,7 @@ using JSON
 using Dates
 
 using ..Errors: ValidationError, UnsupportedMediaTypeError, AuthorizationError, WorkerUnavailableError,
-    WorkerCapacityError, is_unrecoverable, loggable
+    WorkerCapacityError, RefreshTokenError, is_unrecoverable, loggable
 using .BodyParsers: _parse_json_bounded
 
 export recursive_merge, parseparam, parsebody, parseparam_checked,
@@ -36,6 +36,14 @@ function handle_error(::AuthorizationError)
     return Res.json(("message" => "403: Forbidden"), status = 403)
 end
 
+# A refused refresh token (#231) is a refused CREDENTIAL, so 401 by the auth contract -- the
+# status `BearerAuth` gives an expired token -- not the 403 a guard gives an authorized-but-denied
+# caller. One fixed body for every reason: which reason it was is the app's to reveal or not, by
+# catching the error itself.
+function handle_error(::RefreshTokenError)
+    return Res.json(("message" => "401: Unauthorized"), status = 401)
+end
+
 # The App a worker call named has no runtime installed (#322). It used to fall back to the
 # process-wide runtime, which carries none of the app's policy; now it is refused, and "the
 # service this route needs is not up" is a 503, not a 500.
@@ -64,6 +72,7 @@ function _error_response(@nospecialize(error))
     error isa ValidationError && return handle_error(error)
     error isa UnsupportedMediaTypeError && return handle_error(error)
     error isa AuthorizationError && return handle_error(error)
+    error isa RefreshTokenError && return handle_error(error)
     error isa WorkerUnavailableError && return handle_error(error)
     error isa WorkerCapacityError && return handle_error(error)
     return handle_error(nothing)
@@ -121,6 +130,10 @@ function handlerequest(getresponse::Function, catch_errors::Bool; show_errors::B
                 # `.msg`: an `AuthorizationError`'s message names the caller-chosen queue or task key
                 # verbatim, and it is not pinned value-free the way `ValidationError.msg` is (#323).
                 show_errors && @debug "Request refused (403 Forbidden)"
+            elseif error isa RefreshTokenError
+                # A refused credential, so no backtrace. `reason` is one of a closed set of symbols;
+                # the error has no field that could carry the token, its jti or its family (#231).
+                show_errors && @debug "Request refused (401 Unauthorized): refresh token" reason=error.reason
             elseif error isa WorkerUnavailableError
                 # A misconfiguration or a restart gap, not a client fault -- so visible, at
                 # `@warn`, but without a backtrace per request. `.msg` is fixed text naming the

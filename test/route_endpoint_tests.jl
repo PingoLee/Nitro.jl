@@ -294,7 +294,7 @@ end
     cases = (E.ValidationError("x") => 400, E.UnsupportedMediaTypeError("x") => 415,
              E.AuthorizationError("x") => 403, E.WorkerUnavailableError("x") => 503,
              E.WorkerCapacityError(:owner, "x") => 429, E.WorkerCapacityError(:queue, "x") => 503,
-             ErrorException("x") => 500)
+             E.RefreshTokenError(:reused) => 401, ErrorException("x") => 500)
     for (e, status) in cases
         @test U._error_response(e).status == status
         @test String(U._error_response(e).body) == String(U.handle_error(e).body)
@@ -302,6 +302,6 @@ end
     @test isempty(dynamic_calls(U._error_response, (Any,)))
     # One branch per `handle_error` method: a new method without a branch in `_error_response`
     # would answer 500 for its type. Count them so adding one fails here first.
-    @test length(methods(U.handle_error)) == 6
+    @test length(methods(U.handle_error)) == 7
 end
 end

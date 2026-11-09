@@ -5,7 +5,7 @@ import JSON
 import HTTP
 
 export ValidationError, CookieError, AuthorizationError, StoreInterfaceError, UnsupportedMediaTypeError,
-    WorkerUnavailableError, WorkerCapacityError, ClaimPoisonedError
+    WorkerUnavailableError, WorkerCapacityError, ClaimPoisonedError, RefreshTokenError
 
 """
     ValidationError(msg::String)
@@ -155,6 +155,49 @@ end
 function Base.showerror(io::IO, e::AuthorizationError)
     print(io, "Authorization Error: $(e.msg)")
 end
+
+"""
+The reasons a [`RefreshTokenError`](@ref) can carry.
+"""
+const REFRESH_REFUSAL_REASONS = (:invalid, :unknown, :revoked, :reused, :expired)
+
+"""
+    RefreshTokenError(reason::Symbol)
+
+What `Nitro.Auth.rotate_refresh_token` and `revoke_refresh_token` throw when they refuse a refresh
+token (#231). `reason` is one of:
+
+- `:invalid`: the token did not verify. This covers a bad signature, an expired `exp`, a missing
+  `jti`/`fam`/`sub`, a `token_use` other than `"refresh"`, an issuer or audience mismatch, and a
+  subject that disagrees with the store;
+- `:unknown`: the store has no live family for it. It was never issued here, or its family was
+  revoked (a logout or a detected reuse), pruned or evicted;
+- `:revoked`: its family was revoked while this rotation was under way, by a concurrent reuse or a
+  logout, so the next token was not issued;
+- `:reused`: the token is not its family's current one: it was rotated away already. **Its whole
+  family has just been revoked**, so the legitimate client's current token is refused too. That is
+  the point of reuse detection (RFC 9700 §4.14.2): the server cannot tell the thief from the
+  client, so it ends both;
+- `:expired`: the store's current token expired (the token was inside `decode_jwt`'s clock skew).
+
+Uncaught, it is answered like any other refused credential: a fixed `401` with no body detail,
+logged at `@debug` with `reason` only and no backtrace. Catch it to answer in your own shape (for
+example OAuth's `invalid_grant`), or to record a `:reused` as a security event.
+
+The error carries the reason only, never the token, its `jti` or its family.
+"""
+struct RefreshTokenError <: Exception
+    reason::Symbol
+
+    function RefreshTokenError(reason::Symbol)
+        reason in REFRESH_REFUSAL_REASONS || throw(ArgumentError(
+            "RefreshTokenError: reason must be one of $(REFRESH_REFUSAL_REASONS), got :$reason"))
+        return new(reason)
+    end
+end
+
+Base.showerror(io::IO, e::RefreshTokenError) =
+    print(io, "RefreshTokenError: refresh token refused (:", e.reason, ")")
 
 """
     AuthDenial(response::HTTP.Response)
@@ -568,8 +611,9 @@ function Base.showerror(io::IO, e::StoreInterfaceError)
                 "`, which its store contract requires.")
     print(io, "Define a method `", name, "(::", e.store_type, ", ...)`. ",
               "The full contract is in the docstring of the abstract store type ",
-              "(`?AbstractWorkerStore` or `?AbstractSessionStore`); ",
-              "`missing_store_methods` / `missing_session_methods` list everything a type is ",
+              "(`?AbstractWorkerStore`, `?AbstractSessionStore` or `?AbstractRefreshTokenStore`); ",
+              "`missing_store_methods` / `missing_session_methods` / `missing_refresh_store_methods` ",
+              "list everything a type is ",
               "still missing; `missing_claim_methods` lists the worker store's optional claim ",
               "capability, which only a store backing an external queue needs.")
 end
