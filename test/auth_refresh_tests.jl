@@ -387,6 +387,26 @@ end
     @test isempty(store.inner.families)
 end
 
+@testitem "refresh tokens: a signing failure leaves the presented token current (#231)" tags=[:auth, :core] setup=[NitroCommon] begin
+    using Test
+    using Nitro.Auth
+
+    # A deterministic throwing signer: a keyset whose SIGNING key is scoped to `role` only, so
+    # `encode_jwt` refuses the successor's `sub`/`fam`/`token_use`, while its unscoped verify-only
+    # key `b` verifies the presented token. The successor is minted before the consume, so the
+    # throw leaves the family as it was and the client's retry rotates normally. Minted after the
+    # consume, the retry would read as a reuse and revoke the family.
+    signer_b = JWTKeyset("b" => jwtkey("b"))
+    scoped = JWTKeyset("a" => jwtkey("a"); verify = ["b" => jwtkey("b")], claims = ["a" => ["role"]])
+    store = MemoryRefreshTokenStore()
+    token = issue_refresh_token(store, "42"; secret = signer_b)
+    @test_throws ArgumentError rotate_refresh_token(store, token; secret = scoped)
+    @test_throws ArgumentError rotate_refresh_token(store, token; secret = scoped)
+    retried = rotate_refresh_token(store, token; secret = signer_b)
+    @test retried isa RefreshRotation
+    @test rotate_refresh_token(store, retried.refresh_token; secret = signer_b) isa RefreshRotation
+end
+
 @testitem "refresh tokens: nothing logs or renders a token, jti or family (#231)" tags=[:auth, :core] setup=[NitroCommon] begin
     using Test
     using HTTP

@@ -365,10 +365,13 @@ endpoint.
 
 1. Verifies `token` with `decode_jwt` (signature, `exp` required, `issuer`/`audience` when given),
    and requires `token_use = "refresh"`, a `jti`, a `fam` and a `sub`.
-2. Consumes it in `store`, atomically: it must be its family's current token. Exactly one of any
-   number of concurrent rotations of one token gets past this point.
-3. Records the next token in the same family, valid for `ttl` seconds from now.
-4. Returns a [`RefreshRotation`](@ref): the access claims for the application to sign with
+2. Signs the next token in the same family, valid for `ttl` seconds from now. This comes before
+   the store is touched, so a signing failure leaves the presented token current and the client
+   can retry.
+3. Consumes the presented token in `store`, atomically: it must be its family's current token.
+   Exactly one of any number of concurrent rotations of one token gets past this point.
+4. Records the next token as the family's current one.
+5. Returns a [`RefreshRotation`](@ref): the access claims for the application to sign with
    `encode_jwt`, and the new refresh token. This function never mints an access token.
 
 A refusal throws [`RefreshTokenError`](@ref)`(reason)`. **A token that is not its family's current
@@ -399,10 +402,15 @@ function rotate_refresh_token(store::AbstractRefreshTokenStore, token::AbstractS
                               audience = nothing)::RefreshRotation
     seconds = _check_ttl(ttl)
     claims, family, jti, subject = _verify_refresh(token, secret, issuer, audience)
-    record = _admit(store, consume_refresh_token!(store, family, jti; at = _current_timestamp()),
-                    family, subject)
     app_claims = _app_claims(claims)
-    next, next_record = _mint_refresh(subject, record.family, seconds, app_claims, secret)
+    # Mint the successor BEFORE the consume. Signing can throw (a keyset whose scoped signing key
+    # refuses the payload), and a throw after the consume would leave the family with no current
+    # token: the client's legitimate retry would then read as a reuse and revoke it. The
+    # successor needs nothing the store returns: its family is the signed `fam`, which `_admit`
+    # checks against the store's record. So only the record step follows the consume.
+    next, next_record = _mint_refresh(subject, family, seconds, app_claims, secret)
+    _admit(store, consume_refresh_token!(store, family, jti; at = _current_timestamp()),
+           family, subject)
     # `false` means the family was revoked between our consume and now -- a concurrent reuse or a
     # logout. The new token is not stored, so it is refused if it is ever presented.
     record_refresh_token!(store, next_record; new_family = false) ||

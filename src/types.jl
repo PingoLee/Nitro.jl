@@ -553,6 +553,14 @@ apart.
 A family must outlive its current token's predecessors: keep it until the **latest** `expires_at`
 of any token it was given, not the current one's, so an old token is still recognized as a reuse.
 
+**Between a consume and its record, only the record runs.** `rotate_refresh_token` signs the
+successor first, then consumes, then records, so no signing failure can strike in that window. A
+failure there still costs the family: with no current token, the client's legitimate retry reads as
+a reuse and revokes it. So the one store call that follows a consume, `record_refresh_token!` with
+`new_family = false`, should be as unlikely to fail as the store can make it: no extra round trip,
+lookup or validation that `consume_refresh_token!` could have done first. A persistent store keeps
+this order too, and must not move work of its own between the two.
+
 A store that loses a family (eviction, a missing row) must **fail closed**. Its tokens read as
 `:unknown`, never as live, and a record into it is refused.
 
