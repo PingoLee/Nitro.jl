@@ -638,14 +638,17 @@ struct SharedStore <: AbstractWorkerStore
     # Run inside every `count_external_runs`, before it reads: a test sleeps in it to hold a
     # submit between its bound's count and its write (#711).
     count_hook::Base.RefValue{Any}
+    # Run before every `try_transition!` with the id and the target status: a test sets it to make
+    # a run's completing write, or its failure write, throw (#918).
+    transition_hook::Base.RefValue{Any}
 end
 SharedStore() = SharedStore(InMemoryWorkerStore(), Ref{Any}(nothing), Ref{Any}(nothing), Ref{Any}(nothing),
-                            Ref{Any}(nothing), Ref{Any}(nothing), Ref{Any}(nothing))
+                            Ref{Any}(nothing), Ref{Any}(nothing), Ref{Any}(nothing), Ref{Any}(nothing))
 
 # Each forward with the contract's own arity: a varargs forward can be ambiguous with the
 # generated fixed-arity fallbacks on `AbstractWorkerStore`.
 for (f, n) in ((:set_task!, 2), (:replace_task!, 2), (:add_watcher!, 2),
-               (:try_transition!, 3), (:delete_task!, 1), (:try_delete_task!, 2), (:cleanup_tasks!, 1),
+               (:delete_task!, 1), (:try_delete_task!, 2), (:cleanup_tasks!, 1),
                (:get_all_tasks, 1), (:get_queue_authorizer, 0), (:set_queue_authorizer!, 1),
                (:get_watch_authorizer, 0), (:set_watch_authorizer!, 1), (:get_error_redactor, 0),
                (:set_error_redactor!, 1), (:release_claim!, 2), (:clear_records!, 0),
@@ -654,6 +657,11 @@ for (f, n) in ((:set_task!, 2), (:replace_task!, 2), (:add_watcher!, 2),
     @eval _W.$f(s::SharedStore, $(args...); kw...) = _W.$f(s.inner, $(args...); kw...)
 end
 _W.task_locks(s::SharedStore) = _W.task_locks(s.inner)
+function _W.try_transition!(s::SharedStore, id, from, to; kw...)
+    hook = s.transition_hook[]
+    hook === nothing || Base.invokelatest(hook, id, to)
+    return _W.try_transition!(s.inner, id, from, to; kw...)
+end
 function _W.count_external_runs(s::SharedStore, statuses; kw...)
     hook = s.count_hook[]
     hook === nothing || Base.invokelatest(hook)
