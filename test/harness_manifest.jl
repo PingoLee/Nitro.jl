@@ -49,6 +49,7 @@ const TEST_FILES = [
     "extensions/pormg_env_tests.jl",
     "extensions/pormg_pools_tests.jl",
     "extensions/newapp_pormg_tests.jl",
+    "extensions/pormg_catch_policy_tests.jl",
 
     # ── Special Handler Tests ─────────────────────────────────────────────────
     "sse_tests.jl",
