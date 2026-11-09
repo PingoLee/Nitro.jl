@@ -6860,6 +6860,145 @@ end
 
 end
 
+# #918: a run's completing write used to sit inside the attempt's `try`, so a store that threw there
+# read as the callback failing, and `retry_on_failure` ran a callback that had already returned
+# again. The `try` covers the callback alone now: a completing write that throws is recorded
+# `FAILED` once, with a fixed message naming only the exception's type, and if that write throws
+# too the record is left `RUNNING` for the zombie sweep. `SharedStore`'s `transition_hook` makes
+# the store throw on the completing write, or on the failure write.
+@testitem "Workers -- a failed completion write never re-runs the callback (#918)" tags=[:workers] setup=[NitroCommon, SharedClaimStore] begin
+
+using Test
+using Nitro
+using Nitro.Workers
+using Nitro.Workers: get_task_info, QueueItem, _register_or_watch!, _execute_queued_task,
+                     _execute_task_async
+
+waitfor(f; timeout = 20) = timedwait(f, timeout; pollint = 0.02) === :ok
+terminal(s) = s in (COMPLETED, FAILED, CANCELLED)
+
+# Two retries: before the fix, a completing write that kept throwing ran the callback three times.
+const OPTIONS = TaskOptions(retry_on_failure = true, max_retries = 2)
+# The stored message names the type only. The store's own message quotes a value, which must not
+# reach the record.
+unstored(type) = "The callback returned, but its outcome could not be stored ($type)"
+const SECRET = "password=SENTINEL-918"
+
+# Make `store`'s completing write throw `exc`, `:once` or `:always`, and its failure write throw too
+# when `failure`.
+function faulty!(store; completion::Symbol, failure::Bool = false,
+                 exc = ErrorException("store down: $SECRET"))
+    left = Threads.Atomic{Int}(completion === :once ? 1 : typemax(Int))
+    store.transition_hook[] = function (id, to)
+        to == COMPLETED && Threads.atomic_sub!(left, 1) > 0 && throw(exc)
+        to == FAILED && failure && throw(ErrorException("store still down: $SECRET"))
+        return nothing
+    end
+    return store
+end
+
+counted(ran) = _ -> (Threads.atomic_add!(ran, 1); :done)
+
+# Submit through the public path and wait for the record to settle.
+function submitted(path::Symbol; kw...)
+    store = SharedStore()
+    rt = WorkerRuntime(store; queues = ["q"])
+    ran = Threads.Atomic{Int}(0)
+    try
+        faulty!(store; kw...)
+        key = "k-$path"
+        id = path === :async ?
+            submit_task(key, counted(ran), Owner("u"); runtime = rt, options = OPTIONS) :
+            submit_queued_task("q", key, counted(ran), Owner("u"); runtime = rt, options = OPTIONS)
+        settled = waitfor(() -> terminal(get_task_info(store, id).status))
+        rec = get_task_info(store, id)
+        return (; settled, status = rec.status, error = rec.error, ran = ran[])
+    finally
+        reset_runtime!(rt)
+    end
+end
+
+# Run the executor directly, so an exception escaping it is visible: the queued executor's call
+# throws, and the async one's task fails. Logs are captured at `Error`.
+function driven(path::Symbol; kw...)
+    store = SharedStore()
+    rt = WorkerRuntime(store; queues = ["q"])
+    owner = Owner("u")
+    ran = Threads.Atomic{Int}(0)
+    logger = Test.TestLogger(; min_level = Base.CoreLogging.Error)
+    key = Nitro.Workers.scoped_task_key("driven-$path", owner)
+    try
+        faulty!(store; kw...)
+        escaped = Base.CoreLogging.with_logger(logger) do
+            if path === :queued
+                run = _register_or_watch!(rt, key, owner; queue_name = "q")
+                try
+                    _execute_queued_task(rt, QueueItem(key, run, counted(ran), OPTIONS))
+                    nothing
+                catch e
+                    e
+                end
+            else
+                run = _register_or_watch!(rt, key, owner)
+                task = _execute_task_async(rt, key, counted(ran), OPTIONS, run)
+                @test waitfor(() -> istaskdone(task))
+                istaskfailed(task) ? task.exception : nothing
+            end
+        end
+        rec = get_task_info(store, key)
+        logs = lock(() -> copy(logger.logs), logger.lock)
+        return (; rt, store, key, escaped, status = rec.status, error = rec.error, ran = ran[], logs)
+    catch
+        reset_runtime!(rt)
+        rethrow()
+    end
+end
+
+messages(logs) = [string(r.message) for r in logs]
+
+@testset "the completing write throws once: run once, FAILED with the type only ($path)" for path in (:async, :queued)
+    r = submitted(path; completion = :once)
+    @test r.settled
+    @test r.ran == 1
+    @test r.status == FAILED
+    @test r.error == unstored("ErrorException")
+    @test !occursin("SENTINEL", something(r.error, ""))
+end
+
+@testset "the completing and the failure write both throw: left RUNNING for the sweep ($path)" for path in (:async, :queued)
+    r = driven(path; completion = :always, failure = true)
+    try
+        @test r.escaped === nothing
+        @test r.ran == 1
+        @test r.status == RUNNING
+        msgs = messages(r.logs)
+        @test count(m -> occursin("leaving it RUNNING", m), msgs) == 1
+        @test !any(m -> occursin("aborted outside task execution", m), msgs)
+        # The run is over and holds no handle, so the zombie sweep reclaims the record.
+        r.store.transition_hook[] = nothing
+        @test recover_zombie_tasks!(runtime = r.rt) == 1
+        @test get_task_info(r.store, r.key).status == FAILED
+        @test r.ran == 1
+    finally
+        reset_runtime!(r.rt)
+    end
+end
+
+@testset "an unrecoverable exception from the completing write: FAILED, never rethrown ($path)" for path in (:async, :queued)
+    # #367's terminal arm, applied to the completing write's own catch.
+    r = driven(path; completion = :always, exc = InterruptException())
+    try
+        @test r.escaped === nothing
+        @test r.ran == 1
+        @test r.status == FAILED
+        @test r.error == unstored("InterruptException")
+    finally
+        reset_runtime!(r.rt)
+    end
+end
+
+end
+
 @testitem "Workers -- named jobs (#514)" tags=[:core, :workers] setup=[NitroCommon] begin
 
 using Test
@@ -7704,10 +7843,17 @@ const GATES = Dict{String, Base.Event}()
 seen!(tag, v) = lock(() -> (SEEN[tag] = v), SEEN_LOCK)
 seen(tag) = lock(() -> Base.get(SEEN, tag, nothing), SEEN_LOCK)
 gate(tag) = lock(() -> get!(Base.Event, GATES, tag), SEEN_LOCK)
+# How many times each tag's job ran (#918).
+const RUNS = Dict{String, Int}()
+ran!(tag) = lock(() -> (RUNS[tag] = Base.get(RUNS, tag, 0) + 1), SEEN_LOCK)
+runs(tag) = lock(() -> Base.get(RUNS, tag, 0), SEEN_LOCK)
 
 function work(task_info, w::Work)
     if w.mode == "return"
         return w.n * 2
+    elseif w.mode == "count"
+        ran!(w.tag)
+        return w.n
     elseif w.mode == "loop" || (w.mode == "attempt" && task_info.attempt == 1)
         try
             while true
@@ -7925,6 +8071,34 @@ end
         @test rec.status == FAILED
         @test occursin("Handed back", rec.error)
     finally
+        stop!(web, c)
+    end
+end
+
+# #918: the consumer keeps its rule for a store write that throws. The completing write's failure
+# is not recorded FAILED by the consumer and does not re-run the job: it reaches the run task's
+# catch, the lease runs out, and `requeue_expired!` decides by the queue's policy. `:fail` makes
+# that outcome the same whether the consumer's own tick or the call below adjudicates it.
+@testset "a completing write that throws is left to the lease, and the job ran once (#918)" begin
+    store = SharedStore()
+    heavy = External(on_lease_expiry = :fail, options = TaskOptions(retry_on_failure = true, max_retries = 2))
+    web, c, _ = pair(; store, heavy)
+    try
+        store.transition_hook[] = (id, to) -> to == COMPLETED && throw(ErrorException("store down"))
+        id = submit(web, "cw", "count")
+        @test waitfor(() -> runs("cw") == 1)
+        @test waitfor(() -> (@atomic c.held_count) == 0)
+        rec = get_task_info(store, id)
+        @test rec.status in (RUNNING, FAILED)
+        @test !occursin("outcome could not be stored", something(rec.error, ""))
+        requeue_expired!(store, now(UTC) + Hour(1); policies = Dict("heavy" => LeasePolicy(:fail)))
+        rec = get_task_info(store, id)
+        @test rec.status == FAILED
+        @test rec.error == "Lease expired on queue 'heavy' (on_lease_expiry = :fail)"
+        sleep(0.3)
+        @test runs("cw") == 1
+    finally
+        store.transition_hook[] = nothing
         stop!(web, c)
     end
 end

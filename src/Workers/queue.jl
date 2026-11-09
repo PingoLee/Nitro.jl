@@ -403,16 +403,26 @@ end
 # `on_cancel(task_info)` are the two outcomes a consumer redirects to a hand-back; the defaults are
 # the in-process terminal writes. Every other outcome -- a terminal failure, the last failed
 # attempt -- is `_fail_task!` for both.
+#
+# The attempt's `try` covers the CALLBACK ONLY (#918). The completing write used to sit inside it,
+# so a store that threw there read as the callback failing, and `retry_on_failure` ran a callback
+# that had already returned again: its email, charge or file once per attempt. A callback that
+# returned is never run again by this loop; `_record_outcome!` writes its outcome under its own
+# catch, and `on_complete_failed(task_info, exception)` is the third outcome a caller redirects.
+# In process the default records `FAILED` once (`_record_unstored_outcome!`); a consumer rethrows,
+# so its run task's catch leaves the row to its lease and `requeue_expired!` decides by the queue's
+# policy, as for any other store write that throws there.
 function _run_attempts!(runtime::WorkerRuntime, task_info::TaskInfo, callback::Function,
                         options::TaskOptions, handoff::Base.RefValue{_RunHandoff};
                         on_complete::Function = (info, result) -> _complete_task!(runtime, info, result),
-                        on_cancel::Function = info -> _cancel_task!(runtime, info))
+                        on_cancel::Function = info -> _cancel_task!(runtime, info),
+                        on_complete_failed::Function = (info, e) -> _record_unstored_outcome!(runtime, info, e))
     max_attempts = options.retry_on_failure ? options.max_retries : 0
     for retry_count in 0:max_attempts
+        local result
         try
             handoff[] = _RunHandoff(handoff[])       # a fresh one per attempt
             result = timeout_call(callback, task_info; timeout=options.timeout, handoff=handoff[])
-            return on_complete(task_info, result)
         catch error
             # A callback woken by the process's EXIT is not a failed run (#807). Exit runs every
             # finalizer, live `Timer`s included, and a `Timer`'s wakes a callback parked in `sleep`
@@ -497,10 +507,65 @@ function _run_attempts!(runtime::WorkerRuntime, task_info::TaskInfo, callback::F
             if resumed !== nothing && resumed.status == CANCELLED
                 return on_cancel(task_info)
             end
+            continue                                  # the next attempt
         end
+        # Outside the attempt's `try`: the callback returned. Neither the handoff nor the slot is
+        # touched here -- the attempt's handoff is already settled, and the caller's `finally`
+        # reads the same last one it did before.
+        return _record_outcome!(runtime, task_info, result, on_complete, on_complete_failed)
     end
 
     return task_info
+end
+
+# Write the outcome of a callback that RETURNED (#918), under a catch of its own, so a store that
+# throws here can never be read as the callback failing and retried.
+#
+# - `process_exiting()` first, for the reason `_run_attempts!`'s catch gives (#807): no write, no
+#   log, and the record stays `RUNNING` as a crash would leave it.
+# - The three `is_unrecoverable` exceptions are recorded `FAILED` and never rethrown, on every path,
+#   the consumer's included: #367's terminal arm, which is what reached them when this write sat
+#   inside the attempt's `try`. See that function's site table (src/errors.jl).
+# - Anything else is `on_complete_failed`'s to decide.
+function _record_outcome!(runtime::WorkerRuntime, task_info::TaskInfo, result,
+                          on_complete::Function, on_complete_failed::Function)
+    try
+        return on_complete(task_info, result)
+    catch error
+        process_exiting() && return task_info
+        unwrapped = _unwrap_exception(error)
+        is_unrecoverable(unwrapped) && return _record_unstored_outcome!(runtime, task_info, unwrapped)
+        return on_complete_failed(task_info, unwrapped)
+    end
+end
+
+# The stored error of a run whose callback returned but whose outcome the store refused (#918).
+# One fixed sentence and the exception type's NAME -- never its message, which can quote stored
+# values (the reason `_store_error_text` runs a redactor), and never the full type, which can carry
+# a value as a parameter (`loggable` names the type the same way).
+_unstored_outcome_message(e) =
+    string("The callback returned, but its outcome could not be stored (", nameof(typeof(e)), ")")
+
+# Record `FAILED` once for a callback that returned but whose completing write threw (#918). Never
+# retried: core cannot tell a transient store failure from a deterministic one (a result the store
+# cannot serialize fails the same way every time) without naming the store's types, so it does not
+# guess. The write is `_finish_task!`'s `run_id`-fenced CAS from `(PENDING, RUNNING)`, so when the
+# completing write committed and THEN threw, this one loses and the `COMPLETED` record stands.
+#
+# When this write throws too, the record is left `RUNNING` and nothing escapes: the run is over,
+# its caller's `finally` deregisters its handle, and `recover_zombie_tasks!` reads exactly that as a
+# dead run. Everything is caught, the three unrecoverable exceptions included, for #367's reason:
+# nothing waits on an executor, so a rethrow only fails a detached task or reaches the queue
+# processor's "aborted outside task execution" catch (#909 closed the same shape).
+function _record_unstored_outcome!(runtime::WorkerRuntime, task_info::TaskInfo, error)
+    @error "Nitro.Workers: a run's callback returned, but its outcome could not be stored; recording it FAILED" task_id = task_info.id exception = (loggable(error), catch_backtrace())
+    try
+        return _fail_task!(runtime, task_info, _unstored_outcome_message(error))
+    catch failure
+        process_exiting() && return task_info
+        @error "Nitro.Workers: a run's outcome could not be stored, nor its failure; leaving it RUNNING for the zombie sweep" task_id = task_info.id exception = (loggable(failure), catch_backtrace())
+        return task_info
+    end
 end
 
 # Park for `seconds`, or until `task_info`'s cancellation token is set (#568). This used to poll the

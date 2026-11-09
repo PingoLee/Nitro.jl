@@ -2191,6 +2191,29 @@ else
             @test isempty(m._table[t.id]["result"])
         end
 
+        @testset "a result too deep to store fails the run once, and never re-runs it (#918)" begin
+            # The completing write's own refusal, end to end: the callback returned, so a retry
+            # would only run it again to fail the same way. Recorded FAILED once, naming the type.
+            nested(k) = (v = Any[]; for _ in 2:k; v = Any[v]; end; v)
+            m = MockTaskModel()
+            store_dp = RealPormGWorkerStore(model=m)
+            rt_dp = WorkerRuntime(store_dp)
+            owner = Owner("alice")
+            ran = Threads.Atomic{Int}(0)
+            try
+                id = submit_task("deep-e2e", () -> (Threads.atomic_add!(ran, 1); nested(513)), owner;
+                                 runtime=rt_dp, options=TaskOptions(retry_on_failure=true, max_retries=2))
+                @test _settled(() -> m._table[id]["status"] in ("FAILED", "COMPLETED"); timeout=20)
+                rec = get_task_info(store_dp, id)
+                @test rec.status == FAILED
+                @test rec.error == "The callback returned, but its outcome could not be stored (ArgumentError)"
+                @test isempty(m._table[id]["result"])
+                @test ran[] == 1
+            finally
+                reset_runtime!(rt_dp)
+            end
+        end
+
         @testset "a Ctrl-C in PormG's wrapper leaves every task-store call bare (#904)" begin
             # The task store's catches logged and rethrew PormG's wrapper, and one frame up a
             # narrow catch still missed it: zombie recovery's `e isa InterruptException`, around

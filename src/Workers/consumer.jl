@@ -669,7 +669,10 @@ function _run_claimed!(c::ConsumerHandle, run::TaskInfo, queue::String)
                 on_complete = (info, result) -> _gives_back(info) ? _hand_back!(c, info, queue) :
                                                                     _complete_task!(c.runtime, info, result),
                 on_cancel = info -> _gives_back(info) ? _hand_back!(c, info, queue) :
-                                                        _cancel_task!(c.runtime, info))
+                                                        _cancel_task!(c.runtime, info),
+                # A completing write that threw (#918) is a store write like any other here: the
+                # catch below leaves the row to its lease, never records FAILED itself.
+                on_complete_failed = (_, _) -> rethrow())
         end
     catch e
         _is_interrupt(e) && throw(InterruptException())

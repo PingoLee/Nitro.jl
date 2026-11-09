@@ -756,6 +756,14 @@ through `_fail_task!`, never rethrown (#367).
   exit's own wake, the catch (`_run_attempts!`, shared by both executors and a consumer's run)
   returns without a read, a write or a log (#807). There the record staying `RUNNING` *is* the
   honest one: the process ended under the run, which then sits where a crash would have left it.
+- **The completing write has its own catch, outside the attempt's `try`** (`_record_outcome!` in
+  `src/Workers/queue.jl`, #918), so a store that throws while recording a callback that returned is
+  never read as the callback failing and retried. It applies the predicate the same way, after the
+  same `process_exiting()` check: the three are recorded `FAILED` and never rethrown, on all three
+  paths. Anything else goes to the caller's `on_complete_failed`: in process,
+  `_record_unstored_outcome!` records `FAILED` once and, should that write throw too, catches
+  everything and leaves the record `RUNNING` for the zombie sweep; a consumer rethrows to its run
+  task's catch, which leaves the row to its lease.
 
 Those three groups plus the sites in the table are every `e isa InterruptException && rethrow()`
 in `src/`; `grep -rn 'isa InterruptException && rethrow()' src/` is the audit, and a hit it
