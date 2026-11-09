@@ -22,7 +22,7 @@
 #      image (`ping` returned `false`; the lease missed in `_is_offline`). At 2d461c3a `ping` was
 #      `true` but the lease missed at `release_connection`; at v0.10.0 (6e8364f7) both run, and
 #      the image prints the JIT's step lines and exits 0. The direct `close_pool!` in step 5 is
-#      what shows a miss on the close path;
+#      what would show a miss on the close path;
 #   3. `serve(app; async = true, middleware)`, one `internalrequest`, then `terminate(app)`;
 #   4. counts the live slots again. A missed call inside `on_stopped` is caught there and logged
 #      with `@error`, and a trimmed executable prints no `@error` records, so the slots, read as a
