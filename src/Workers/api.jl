@@ -996,7 +996,8 @@ end
 # run, and it is the only thing that makes the read below this run's own.
 #
 # `parent` is the request the run is linked to (`submit_task(…; parent)`, #662), set on the claimed
-# run object before the callback starts, so every check the run makes sees it.
+# run object before the callback starts, so every check the run makes sees it, and cleared when the
+# run ends, so a finished record does not keep the request alive.
 function _execute_task_async(runtime::WorkerRuntime, task_key::String, callback::Function, options::TaskOptions, run_id::UUID,
                              parent::Union{Nothing, _CancelState} = nothing)
     # `_spawn_detached`, not `Threads.@spawn`: the run must not inherit the submitter's dynamic
@@ -1078,6 +1079,12 @@ function _execute_task_async(runtime::WorkerRuntime, task_key::String, callback:
             return _run_attempts!(runtime, task_info, callback, options, handoff)
         finally
             _deregister_run!(runtime, task_info)
+            # Drop the request link once the run is over. On `InMemoryWorkerStore` the claimed run
+            # object IS the stored record, kept until the retention sweep, and the token holds the
+            # request's `HTTP.Stream` (its body, headers and response), so a finished linked run
+            # pinned one request per record. Any cause the link delivered is already settled on
+            # `task_info.cancel_reason`, so `cancel_reason(task_info)` reads the same after this.
+            parent === nothing || (@atomic task_info.parent = nothing)
             _handed_off(handoff[]) || _release_run!(runtime, run_id)
         end
     end

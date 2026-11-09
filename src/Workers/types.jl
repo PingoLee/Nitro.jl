@@ -266,7 +266,9 @@ mutable struct TaskInfo
     @atomic cancel_waker::Union{Nothing, Base.Event}
     # The request this run was linked to with `submit_task(…; parent = cancel_token(req))` (#662), or
     # `nothing`. Set once, on the run object the callback receives, before the callback starts
-    # (`_execute_task_async`); `cancel_reason` reads it. Process-local like the token, never
+    # (`_execute_task_async`), and cleared when the run ends, so a record kept until the retention
+    # sweep does not keep the request's stream alive; `cancel_reason` reads it. Process-local like
+    # the token, never
     # persisted, never copied by `set_task!` or `_successor_run`: it names a request in THIS
     # process, and a successor run is a claim, which only an external queue makes.
     @atomic parent::Union{Nothing, _CancelState}

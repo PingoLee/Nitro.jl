@@ -6147,6 +6147,7 @@ using Test
 using HTTP
 using Nitro
 using Nitro.Workers
+using Nitro.Workers: get_task_info
 using Sockets
 
 mutable struct LinkProbe
@@ -6219,6 +6220,12 @@ try
     @test timedwait(() -> get_task_status(a, Owner("u"); runtime = rt)[:status] == "CANCELLED", 10.0) === :ok
     status = get_task_status(a, Owner("u"); runtime = rt)
     @test get(status, :error, nothing) == "Cancelled: the client of its request disconnected"
+    # The finished run drops its link (round 2 of #900): on the in-memory store the run object IS
+    # the stored record, kept until the retention sweep, and the token holds the request's stream.
+    # The cause it delivered stays settled on the run.
+    @test info !== nothing && get_task_info(rt.store, a) === info
+    @test info !== nothing && timedwait(() -> (@atomic info.parent) === nothing, 10.0) === :ok
+    @test info !== nothing && cancel_reason(info) === :client_disconnected
 
     # The control: no parent, so the disconnect is not its business.
     c0 = @atomic unlinked.count
@@ -6244,6 +6251,8 @@ try
     @test o !== nothing && cancel_reason(o) === :none
     @test !haskey(cancel_task(oid, Owner("u"); runtime = rt), :error)
     @test timedwait(() -> !running(outlives), 10.0) === :ok
+    @test o !== nothing && timedwait(() -> (@atomic o.parent) === nothing, 10.0) === :ok
+    @test o !== nothing && cancel_reason(o) === :user
 finally
     timedwait(() -> !running(linked) && !running(unlinked) && !running(outlives), 20.0)
     terminate(app)
