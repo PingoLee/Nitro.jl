@@ -127,6 +127,11 @@ public newapp
 # `Nitro.precompile_server(app; …)`, and the bare name would read as HTTP.jl's own.
 public precompile_server
 
+# Public, not exported (#662): the type of `cancel_token(req)`, named so a signature can take one
+# (`parent::Union{Nothing, Nitro.CancelToken}`). Opaque: `cancel_requested`/`cancel_reason` read it.
+using .Core: CancelToken
+public CancelToken
+
 # Public, not exported (#752): what an executable's `@main` prints when start-up fails
 # (docs/src/tutorial/deployment.md). Called qualified, `Nitro.startup_failure_text(e)`.
 using .Core.Errors: startup_failure_text

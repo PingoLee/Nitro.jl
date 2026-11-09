@@ -283,7 +283,7 @@ using HTTP
 using Nitro
 using Base.CoreLogging: with_logger, Debug
 using Test: TestLogger
-using Nitro.Core: REQUEST_CANCEL_STATE_KEY, _CancelState, _deadline_returned!, _serve_listener,
+using Nitro.Core: REQUEST_CANCEL_STATE_KEY, CancelToken, _deadline_returned!, _serve_listener,
                   _handler_timeout_ns, setupmiddleware, stream_handler, DEFAULT_MAX_BODY_BYTES
 using Nitro.Core.Constants: ShutdownSignal, NEVER_SHUTTING_DOWN, signal_shutdown!
 
@@ -325,7 +325,7 @@ end
                                 (cancel_reason(kept[][2]), cancel_requested(kept[][2])))))
     @test internalrequest(app, HTTP.Request("GET", "/keep")).status == 200
     req, token = kept[]
-    @test token isa _CancelState
+    @test token isa CancelToken
     @test cancel_token(req) === token                 # one token per request
     @test cancel_reason(token) === :completed
     @test cancel_requested(token)
@@ -354,14 +354,14 @@ end
 
 @testset "a cause that came before the end keeps reading; nothing settles after it" begin
     flag = ShutdownSignal()
-    early = _CancelState(flag, nothing)
+    early = CancelToken(flag, nothing)
     signal_shutdown!(flag)
     @test cancel_reason(early) === :shutdown          # settled while the request was live
     Nitro.Core._mark_ended!(early)
     @test cancel_reason(early) === :shutdown          # first cause wins over :completed
 
     flag2 = ShutdownSignal()
-    late = _CancelState(flag2, nothing)
+    late = CancelToken(flag2, nothing)
     Nitro.Core._mark_ended!(late)
     signal_shutdown!(flag2)
     @test cancel_reason(late) === :completed          # the end came first
@@ -369,15 +369,15 @@ end
 end
 
 @testset "the deadline: :timeout once passed, first cause wins, disarmed when the handler returns" begin
-    past = _CancelState(NEVER_SHUTTING_DOWN, nothing, time_ns() - UInt64(1))
+    past = CancelToken(NEVER_SHUTTING_DOWN, nothing, time_ns() - UInt64(1))
     @test cancel_reason(past) === :timeout
     flag = ShutdownSignal()
-    first_ = _CancelState(flag, nothing, time_ns() + UInt64(3_600_000_000_000))
+    first_ = CancelToken(flag, nothing, time_ns() + UInt64(3_600_000_000_000))
     signal_shutdown!(flag)
     @test cancel_reason(first_) === :shutdown
     @atomic first_.deadline_ns = time_ns() - UInt64(1)
     @test cancel_reason(first_) === :shutdown         # the deadline came second
-    future = _CancelState(NEVER_SHUTTING_DOWN, nothing, time_ns() + UInt64(3_600_000_000_000))
+    future = CancelToken(NEVER_SHUTTING_DOWN, nothing, time_ns() + UInt64(3_600_000_000_000))
     @test cancel_reason(future) === :none
     @test Nitro.Core._disarm_deadline!(future) != 0
     @test (@atomic future.deadline_ns) == 0
@@ -387,11 +387,11 @@ end
     logger = TestLogger(min_level = Debug)
     req = HTTP.Request("GET", "/reports/7?token=secret-in-query")
     req.context[:route] = "/reports/{id}"
-    state = _CancelState(NEVER_SHUTTING_DOWN, nothing, time_ns() - UInt64(250_000_000))
+    state = CancelToken(NEVER_SHUTTING_DOWN, nothing, time_ns() - UInt64(250_000_000))
     with_logger(logger) do
         _deadline_returned!(state, req)
     end
-    on_time = _CancelState(NEVER_SHUTTING_DOWN, nothing, time_ns() + UInt64(3_600_000_000_000))
+    on_time = CancelToken(NEVER_SHUTTING_DOWN, nothing, time_ns() + UInt64(3_600_000_000_000))
     with_logger(logger) do
         _deadline_returned!(on_time, req)
     end
@@ -410,7 +410,7 @@ end
 end
 
 @testset "a repeat token check allocates nothing" begin
-    token = _CancelState(NEVER_SHUTTING_DOWN, nothing, time_ns() + UInt64(3_600_000_000_000))
+    token = CancelToken(NEVER_SHUTTING_DOWN, nothing, time_ns() + UInt64(3_600_000_000_000))
     @testset let a = allocs(() -> cancel_reason(token); calls = 100)
         @test a.count == 0
         @test a.bytes == 0
@@ -704,5 +704,74 @@ try
     end
 finally
     terminate(app)
+end
+end
+
+@testitem "Request cancellation: the token and a linked run show no secret (#662)" tags=[:core, :network] setup=[NitroCommon] begin
+using Test
+using HTTP
+using Nitro
+using Nitro.Workers
+using Sockets
+
+# `cancel_token(req)` holds the request's stream, and a linked run holds the token. The default
+# `show` walks both down to `stream.message`, so a `@info "…" token`, a REPL display or an error
+# log would copy the client's cookie, bearer token and query out. Sentinels sit in all three
+# (HTTP.jl masks some header values in its own `show`, never the query).
+const COOKIE = "C00KIE5ENTINEL"
+const BEARER = "BEARER5ENTINEL"
+const QUERY = "QUERY5ENTINEL"
+leaks(s) = occursin(COOKIE, s) || occursin(BEARER, s) || occursin(QUERY, s)
+renders(x) = (sprint(show, x), sprint(show, MIME"text/plain"(), x), sprint(print, x), repr([x]),
+              sprint(show, MIME"text/plain"(), [x]), string((; x)))
+
+rt = WorkerRuntime(InMemoryWorkerStore())
+release = Channel{Nothing}(1)
+infos = Channel{TaskInfo}(1)
+seen = Channel{Tuple{Nitro.CancelToken, TaskInfo}}(1)
+function show_probe(req)
+    token = cancel_token(req)
+    submit_task("show", info -> (put!(infos, info); take!(release); :ok), Owner("u");
+                runtime = rt, parent = token)
+    info = timedwait(() -> isready(infos), 30.0) === :ok ? take!(infos) : error("the run never started")
+    put!(seen, (token, info))
+    return Res.send("ok")
+end
+
+app = App()
+urlpatterns(app, "", path("/show", show_probe))
+port = get_free_port()
+try
+    serve(app; host = HOST, port, async = true, show_banner = false, access_log = nothing)
+    @test timedwait(() -> isopen(app.service), 10.0) === :ok
+    resp = HTTP.get("http://$HOST:$port/show?api_key=$QUERY",
+                    ["Cookie" => "sid=$COOKIE", "Authorization" => "Bearer $BEARER"];
+                    status_exception = false)
+    @test resp.status == 200
+    @test timedwait(() -> isready(seen), 10.0) === :ok
+    token, info = take!(seen)
+    @test token isa Nitro.CancelToken
+    @test (@atomic info.parent) === token          # the run is still running, still linked
+
+    # The control: without the methods, the request is one walk away.
+    @test leaks(sprint(Base.show_default, token))
+
+    for s in renders(token)
+        @test !leaks(s)
+    end
+    @test sprint(show, token) == "CancelToken(reason = :none, deadline = :none, ended = true)"
+    for s in renders(info)
+        @test !leaks(s)
+    end
+    @test occursin("linked to a request", sprint(show, info))
+    @test occursin("status = RUNNING", sprint(show, info))
+
+    put!(release, nothing)
+    @test timedwait(() -> (@atomic info.parent) === nothing, 10.0) === :ok
+    @test !occursin("linked", sprint(show, info))
+finally
+    isready(release) || put!(release, nothing)
+    terminate(app)
+    reset_runtime!(rt)
 end
 end

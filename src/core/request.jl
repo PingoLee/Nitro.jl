@@ -479,7 +479,17 @@ const CANCEL_PROBE_INTERVAL_NS = UInt64(10_000_000)
 # `req.context`, an unsynchronized `Dict`: hence "call `cancel_reason(req)` from the handler's
 # task". Holding the state itself (`cancel_token(req)`, #662) needs no such lookup, so any task
 # may read it.
-mutable struct _CancelState
+"""
+    Nitro.CancelToken
+
+What [`cancel_token`](@ref) returns: a request's cancellation token. Public so a signature can name
+it (`parent::Union{Nothing, Nitro.CancelToken}`), not exported, and opaque: `cancel_requested` and
+`cancel_reason` are its whole interface, and its fields are not API.
+
+It shows as its state alone, `CancelToken(reason = :none, deadline = :armed, ended = false)`. It
+never prints the request it belongs to, whose headers can carry a cookie or a bearer token.
+"""
+mutable struct CancelToken
     # The first cause, or `:none`. Written only by `_settle_cancel!`, a CAS: first cause wins.
     @atomic reason        :: Symbol
     @atomic next_probe_ns :: UInt64
@@ -498,26 +508,37 @@ mutable struct _CancelState
     const stream          :: Union{Nothing, HTTP.Stream}
 end
 
-_CancelState(shutting_down::Constants.ShutdownSignal, stream::Union{Nothing, HTTP.Stream},
+CancelToken(shutting_down::Constants.ShutdownSignal, stream::Union{Nothing, HTTP.Stream},
              deadline_ns::UInt64 = zero(UInt64)) =
-    _CancelState(:none, zero(UInt64), deadline_ns, false, shutting_down, stream)
+    CancelToken(:none, zero(UInt64), deadline_ns, false, shutting_down, stream)
+
+# The state, never the request: the default `show` walks `stream.message`, whose headers carry the
+# client's cookies and `Authorization` (the same rule as `App`'s and the server handle's `show`). A
+# read with no side effect: the settled reason, not a check that could settle one.
+function Base.show(io::IO, token::CancelToken)
+    deadline = (@atomic token.deadline_ns) == 0 ? :none : :armed
+    print(io, "CancelToken(reason = ", repr(@atomic token.reason), ", deadline = ", repr(deadline),
+          ", ended = ", _ended(token), ")")
+    return nothing
+end
+Base.show(io::IO, ::MIME"text/plain", token::CancelToken) = show(io, token)
 
 # Not `request_cache!`: `internalrequest` clears a finished run's state from a reused request by
 # storing `nothing` under the key (`RequestContext` has no `delete!`), and anything but a state
 # there means "none yet".
-function _cancel_state(req::HTTP.Request)::_CancelState
+function _cancel_state(req::HTTP.Request)::CancelToken
     ctx = req.context
     existing = Base.get(ctx, REQUEST_CANCEL_STATE_KEY, nothing)
-    existing isa _CancelState && return existing
+    existing isa CancelToken && return existing
     stream = Base.get(ctx, :stream, nothing)
-    state = _CancelState(Constants.REQUEST_SCOPE[].shutting_down, stream isa HTTP.Stream ? stream : nothing)
+    state = CancelToken(Constants.REQUEST_SCOPE[].shutting_down, stream isa HTTP.Stream ? stream : nothing)
     ctx[REQUEST_CANCEL_STATE_KEY] = state
     return state
 end
 
 # First cause wins, as for a worker run: a client that left before the deploy stays
 # `:client_disconnected`.
-function _settle_cancel!(state::_CancelState, reason::Symbol)::Symbol
+function _settle_cancel!(state::CancelToken, reason::Symbol)::Symbol
     @atomicreplace state.reason :none => reason
     return @atomic state.reason
 end
@@ -530,7 +551,7 @@ end
 # `write_closed` alone made every WebSocket handler "ended" from its first frame: blind to
 # `:shutdown`, and its token `:completed` while it ran. A WebSocket request ends when
 # `_upgrade_websocket!` returns, which sets `ended`.
-function _ended(state::_CancelState)::Bool
+function _ended(state::CancelToken)::Bool
     (@atomic state.ended) && return true
     stream = state.stream
     stream === nothing && return false
@@ -545,17 +566,17 @@ _upgraded(stream::HTTP.Stream)::Bool = (resp = stream.response; resp !== nothing
 
 # A request whose stream became a WebSocket (#661): its handler is the socket's loop, which
 # `handler_timeout` does not bound. Go's `http.TimeoutHandler` likewise refuses to be hijacked.
-function _websocket(state::_CancelState)::Bool
+function _websocket(state::CancelToken)::Bool
     stream = state.stream
     return stream !== nothing && (@atomic :acquire stream.write_closed) && _upgraded(stream)
 end
 
 # `internalrequest`'s end of the request (#662), for a token a task still holds.
-_mark_ended!(state::_CancelState) = (@atomic state.ended = true; nothing)
+_mark_ended!(state::CancelToken) = (@atomic state.ended = true; nothing)
 
 # The handler has returned (#661): no `:timeout` from here on. Returns the deadline it disarmed,
 # `0` if there was none, so the caller can tell a late return.
-_disarm_deadline!(state::_CancelState)::UInt64 = @atomicswap state.deadline_ns = zero(UInt64)
+_disarm_deadline!(state::CancelToken)::UInt64 = @atomicswap state.deadline_ns = zero(UInt64)
 
 # The request's own view: its causes, never `:completed`. `cancel_reason(req)` reads it, and so does
 # a Workers run linked with `submit_task(…; parent = cancel_token(req))`.
@@ -570,7 +591,7 @@ _disarm_deadline!(state::_CancelState)::UInt64 = @atomicswap state.deadline_ns =
 # In order: the run's shutdown, the deadline, then the throttled probe, which shares the deadline's
 # clock read. "First cause wins" is the first cause a CHECK observes, in that order: nothing
 # watches between checks.
-function _request_reason(state::_CancelState)::Symbol
+function _request_reason(state::CancelToken)::Symbol
     reason = @atomic state.reason
     reason === :none || return reason
     _ended(state) && return @atomic state.reason
@@ -668,11 +689,12 @@ each cause means, what the check costs, and what it cannot see.
 cancel_requested(req::HTTP.Request)::Bool = cancel_reason(req) !== :none
 
 """
-    cancel_token(req::HTTP.Request)
+    cancel_token(req::HTTP.Request) -> Nitro.CancelToken
 
-The request's cancellation token, for a task the handler spawns or a background job it submits.
-Read it with the same two functions, `cancel_requested(token)` and `cancel_reason(token)`. The
-token is opaque: those two functions are its whole interface.
+The request's cancellation token, a [`Nitro.CancelToken`](@ref Nitro.Core.CancelToken), for a
+task the handler spawns or a background job it submits. Read it with the same two functions,
+`cancel_requested(token)` and `cancel_reason(token)`. The token is opaque: those two functions are
+its whole interface.
 
 ```julia
 function search(req)
@@ -711,7 +733,7 @@ a job submitted by a handler that then returns keeps running. See `Nitro.Workers
 Creating the token costs what the first `cancel_reason(req)` call costs; a request whose handler
 never asks for one pays nothing.
 """
-cancel_token(req::HTTP.Request)::_CancelState = _cancel_state(req)
+cancel_token(req::HTTP.Request)::CancelToken = _cancel_state(req)
 
 """
     cancel_reason(token) -> Symbol
@@ -720,7 +742,7 @@ Why the request behind `token`, from [`cancel_token`](@ref), would like its work
 `cancel_reason(req)`'s causes, `:completed` once the response was written with none of them, or
 `:none`. Safe to call from any task.
 """
-function cancel_reason(token::_CancelState)::Symbol
+function cancel_reason(token::CancelToken)::Symbol
     reason = _request_reason(token)
     reason === :none || return reason
     return _ended(token) ? :completed : :none
@@ -732,4 +754,4 @@ end
 Exactly `cancel_reason(token) !== :none`, for a token from [`cancel_token`](@ref). Safe to call
 from any task.
 """
-cancel_requested(token::_CancelState)::Bool = cancel_reason(token) !== :none
+cancel_requested(token::CancelToken)::Bool = cancel_reason(token) !== :none

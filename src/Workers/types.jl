@@ -268,10 +268,10 @@ mutable struct TaskInfo
     # `nothing`. Set once, on the run object the callback receives, before the callback starts
     # (`_execute_task_async`), and cleared when the run ends, so a record kept until the retention
     # sweep does not keep the request's stream alive; `cancel_reason` reads it. Process-local like
-    # the token, never
-    # persisted, never copied by `set_task!` or `_successor_run`: it names a request in THIS
-    # process, and a successor run is a claim, which only an external queue makes.
-    @atomic parent::Union{Nothing, _CancelState}
+    # the token, never persisted, never copied by `set_task!` or `_successor_run`: it names a
+    # request in THIS process, and a successor run is a claim, which only an external queue makes.
+    # Never shown: `TaskInfo`'s `show` prints whether it is set, not the token.
+    @atomic parent::Union{Nothing, CancelToken}
 
     function TaskInfo(id::String; queue_name::Union{Nothing, String}=nothing, external::Bool=false,
                       job_name::Union{Nothing, String}=nothing, job_args::Union{Nothing, String}=nothing)
@@ -300,6 +300,23 @@ mutable struct TaskInfo
         )
     end
 end
+
+# The record's state, never what the application handed it or what it links to. The default `show`
+# walked every field: `parent` holds the request's stream, whose headers carry the client's cookies
+# and `Authorization` (#662), and `result`, `error` and `job_args` are the application's values,
+# which a log line that only wanted the status should not copy out. Same rule as `App`'s `show`.
+function Base.show(io::IO, t::TaskInfo)
+    print(io, "TaskInfo(", repr(t.id), ", status = ", t.status, ", progress = ", @atomic(t.progress))
+    t.queue_name === nothing || print(io, ", queue = ", repr(t.queue_name))
+    t.job_name === nothing || print(io, ", job = ", repr(t.job_name))
+    t.external && print(io, ", external, attempt = ", t.attempt)
+    reason = @atomic t.cancel_reason
+    reason === :none || print(io, ", cancel_reason = ", repr(reason))
+    (@atomic t.parent) === nothing || print(io, ", linked to a request")
+    print(io, ")")
+    return nothing
+end
+Base.show(io::IO, ::MIME"text/plain", t::TaskInfo) = show(io, t)
 
 # A new run of the same submission (#514): what a claim, a hand-back or a lease requeue publishes.
 # A NEW object, so a holder of the previous run's object keeps the previous `run_id` and loses

@@ -55,8 +55,9 @@ pattern and what it costs.
 cancel_reason(::Nitro.Request)
 cancel_requested(::Nitro.Request)
 cancel_token
-cancel_reason(::Nitro.Core._CancelState)
-cancel_requested(::Nitro.Core._CancelState)
+Nitro.CancelToken
+cancel_reason(::Nitro.CancelToken)
+cancel_requested(::Nitro.CancelToken)
 ```
 
 ## Request Body Parsers

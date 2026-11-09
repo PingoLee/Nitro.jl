@@ -999,7 +999,7 @@ end
 # run object before the callback starts, so every check the run makes sees it, and cleared when the
 # run ends, so a finished record does not keep the request alive.
 function _execute_task_async(runtime::WorkerRuntime, task_key::String, callback::Function, options::TaskOptions, run_id::UUID,
-                             parent::Union{Nothing, _CancelState} = nothing)
+                             parent::Union{Nothing, CancelToken} = nothing)
     # `_spawn_detached`, not `Threads.@spawn`: the run must not inherit the submitter's dynamic
     # scope, or `_claim_run!` below writes on the submitter's open PormG transaction (#209).
     task = _spawn_detached() do
@@ -1176,7 +1176,7 @@ same key (see above) does not link it. A run every watcher shares (a `:global` k
 run whose result belongs to that request.
 """
 function submit_task(task_key::AbstractString, callback::Function, owner::Owner; scope::Symbol=:user, watchers::AbstractVector{Owner}=Owner[], options::TaskOptions=TaskOptions(), runtime::WorkerRuntime=default_runtime(),
-                     parent::Union{Nothing, _CancelState}=nothing)
+                     parent::Union{Nothing, CancelToken}=nothing)
     return _submit_task(runtime, task_key, _ClosureRun(callback), owner, scope, watchers, options, parent)
 end
 
@@ -1184,7 +1184,7 @@ end
 submit_task(::AbstractString, ::Job, ::Owner; kwargs...) = _throw_job_needs_app("submit_task")
 
 function submit_task(ctx::App, task_key::AbstractString, job::Job, owner::Owner; scope::Symbol=:user, watchers::AbstractVector{Owner}=Owner[], options::TaskOptions=TaskOptions(), key::Symbol=DEFAULT_EXTENSION_KEY, runtime::Union{Nothing, WorkerRuntime}=nothing,
-                     parent::Union{Nothing, _CancelState}=nothing)
+                     parent::Union{Nothing, CancelToken}=nothing)
     resolved = _resolve_runtime(ctx; key, runtime)
     return _submit_task(resolved, task_key, _PendingJob(_job_registry(ctx), job), owner, scope, watchers, options, parent)
 end
@@ -1195,7 +1195,7 @@ end
 # record is written, so a refused job writes nothing and reserves nothing.
 function _submit_task(runtime::WorkerRuntime, task_key::AbstractString, work, owner::Owner,
                       scope::Symbol, watchers::AbstractVector{Owner}, options::TaskOptions,
-                      parent::Union{Nothing, _CancelState})
+                      parent::Union{Nothing, CancelToken})
     _authorize_queue!(runtime.store, DEFAULT_QUEUE_NAME, owner)
 
     key = scoped_task_key(task_key, owner; scope)
@@ -1220,7 +1220,7 @@ function _submit_task(runtime::WorkerRuntime, task_key::AbstractString, work, ow
 end
 
 function submit_task(ctx::App, task_key::AbstractString, callback::Function, owner::Owner; scope::Symbol=:user, watchers::AbstractVector{Owner}=Owner[], options::TaskOptions=TaskOptions(), key::Symbol=DEFAULT_EXTENSION_KEY, runtime::Union{Nothing, WorkerRuntime}=nothing,
-                     parent::Union{Nothing, _CancelState}=nothing)
+                     parent::Union{Nothing, CancelToken}=nothing)
     return submit_task(task_key, callback, owner; scope, watchers, options, runtime=_resolve_runtime(ctx; key, runtime), parent)
 end
 

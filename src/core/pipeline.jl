@@ -535,7 +535,7 @@ end
 # still holds the previous run's token keeps that object, and it keeps reading `:completed`.
 function _begin_internal_request!(req::HTTP.Request)::Nothing
     state = get(req.context, REQUEST_CANCEL_STATE_KEY, nothing)
-    state isa _CancelState && state.stream === nothing && (@atomic state.ended) &&
+    state isa CancelToken && state.stream === nothing && (@atomic state.ended) &&
         (req.context[REQUEST_CANCEL_STATE_KEY] = nothing)
     return nothing
 end
@@ -549,7 +549,7 @@ end
 # before that.
 function _end_internal_request!(req::HTTP.Request)::Nothing
     state = get(req.context, REQUEST_CANCEL_STATE_KEY, nothing)
-    state isa _CancelState && state.stream === nothing && _mark_ended!(state)
+    state isa CancelToken && state.stream === nothing && _mark_ended!(state)
     return nothing
 end
 
