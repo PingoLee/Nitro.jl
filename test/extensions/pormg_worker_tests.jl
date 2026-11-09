@@ -597,12 +597,19 @@ struct FlakyReadQuerySet
     inner::MockTaskQuerySet
     fail_next::Ref{Int}
     fail_ids::Set{String}
+    # #791: the next N reads raise `OperationalError`, PormG's transient class, which the store's
+    # `with_read_retry` retries; `fail_next` raises a plain error, which it does not. `reads` counts
+    # every guarded read, so a test can tell one read from a read and its retry.
+    blips::Ref{Int}
+    reads::Ref{Int}
 end
 
 function _flaky_guard(qs::FlakyReadQuerySet)
     inner = getfield(qs, :inner)
     fail_next = getfield(qs, :fail_next)
     fail_ids = getfield(qs, :fail_ids)
+    blips = getfield(qs, :blips)
+    reads = getfield(qs, :reads)
 
     # Under the database lock, for two reasons. `fail_ids` is mutated by the test task while the
     # queue processor is live (see `fail_id!` below), so the membership test races it. And the
@@ -611,6 +618,12 @@ function _flaky_guard(qs::FlakyReadQuerySet)
     # follows, not a nested one: the guard models a failed connection, which is its own event
     # and not part of the read it precedes.
     lock(getfield(inner, :mdb).lock) do
+        reads[] += 1
+        if blips[] > 0
+            blips[] -= 1
+            throw(PormG.OperationalError("sqlite", ErrorException("simulated dropped connection");
+                                         message = "database is locked"))
+        end
         # Targeted: fail only reads filtered to a specific task id, so a test can
         # break one row's read without disturbing the writes around it.
         id = Base.get(getfield(inner, :filters), "id", nothing)
@@ -632,12 +645,15 @@ function Base.getproperty(qs::FlakyReadQuerySet, name::Symbol)
     fail_next = getfield(qs, :fail_next)
     fail_ids = getfield(qs, :fail_ids)
 
+    blips = getfield(qs, :blips)
+    reads = getfield(qs, :reads)
+
     if name === :db
-        return (key::String) -> FlakyReadQuerySet(inner.db(key), fail_next, fail_ids)
+        return (key::String) -> FlakyReadQuerySet(inner.db(key), fail_next, fail_ids, blips, reads)
     elseif name in (:filter, :values, :order_by, :limit, :select_for_update)
         # Every chaining builder is re-wrapped. Falling through to `inner` would hand back the bare
         # queryset, and the `.list()` after a projection or a page would bypass the guard.
-        return (args...; kw...) -> FlakyReadQuerySet(getproperty(inner, name)(args...; kw...), fail_next, fail_ids)
+        return (args...; kw...) -> FlakyReadQuerySet(getproperty(inner, name)(args...; kw...), fail_next, fail_ids, blips, reads)
     elseif name === :first
         return function()
             _flaky_guard(qs)
@@ -659,10 +675,13 @@ struct FlakyReadModel
     # point. `fail_ids` is the opposite case and has helpers below.
     fail_next::Ref{Int}
     fail_ids::Set{String}
+    # The two #791 knobs, `FlakyReadQuerySet`'s; set by the test task while nothing is in flight.
+    blips::Ref{Int}
+    reads::Ref{Int}
 end
 
 FlakyReadModel(db_keys::String...) =
-    FlakyReadModel(MockDB(db_keys...), Ref(0), Set{String}())
+    FlakyReadModel(MockDB(db_keys...), Ref(0), Set{String}(), Ref(0), Ref(0))
 
 # The test-side writers to `fail_ids`. Guarding only the READ in `_flaky_guard` would be a
 # no-op: these fire either side of a `timedwait` with a queued task in flight, so the `Set` is
@@ -678,6 +697,8 @@ function Base.getproperty(m::FlakyReadModel, name::Symbol)
             MockTaskQuerySet(getfield(m, :mdb), nothing, Dict{String,Any}()),
             getfield(m, :fail_next),
             getfield(m, :fail_ids),
+            getfield(m, :blips),
+            getfield(m, :reads),
         )
     elseif name === :_table
         return getfield(m, :mdb).tables["db"]
@@ -896,15 +917,12 @@ end
 
 const RealPormGWorkerStore = _load_pormg_worker_store_type()
 
-# -- A stand-in PormG connection, for `pormg_nitro_worker` and the #202 guard ------
+# -- A stand-in PormG connection, for the #202 guard and the delete refusals ------
 #
-# Mirrors `FakeSessionPool` in `pormg_session_tests.jl`; see the rationale there.
-# `PormG.connection(key=k)` is just `config[k].connections`, and `Settings.connections` takes
-# any pool, so a real `Settings` around a fake pool under a test-only key is enough (since PormG
-# #1622 `config` holds `Configuration.Settings` only). Subtyping `PormG.PormGSQLite` rather than using a bare struct means
-# the REAL `create_table`/`create_index` run against the REAL task model; only `fetch` is
-# overridden, and on our own concrete type, so it is more specific than PormG's method rather
-# than piracy.
+# Mirrors `FakeSessionPool` in `pormg_session_tests.jl`; see the rationale there. A real `Settings`
+# around a fake pool under a test-only key, where nothing should reach a driver; the factory's
+# bootstrap runs on a real SQLite file instead (#791). Only `fetch` is overridden, on our own
+# concrete type, so it is more specific than PormG's method rather than piracy.
 struct FakeTaskPool <: PormG.PormGSQLite
     sql::Vector{String}
 end
@@ -1839,6 +1857,48 @@ else
 
             # The failure was transient, so the next sweep recovers it.
             @test recover_zombie_tasks!(; runtime=rt_f) == 1
+        end
+
+        @testset "a transient read failure is retried; inside a transaction it is not (#791)" begin
+            flaky = FlakyReadModel()
+            store_r = RealPormGWorkerStore(model = flaky)
+            t = TaskInfo("alice::blip")
+            replace_task!(store_r, t.id, t)
+            quietly(f) = Base.CoreLogging.with_logger(f, Base.CoreLogging.NullLogger())
+
+            # One dropped connection, then the read succeeds: the row is found, not lost to a blip.
+            # Unpatched, the `OperationalError` was rethrown out of the read.
+            flaky.reads[] = 0; flaky.blips[] = 1
+            got = quietly(() -> get_task_info(store_r, t.id))
+            @test got isa TaskInfo && got.id == t.id
+            @test flaky.reads[] == 2
+
+            # Every attempt fails: the last error is logged and rethrown, as any failed read is.
+            retries = getproperty(PormGExt, :_READ_RETRY_ATTEMPTS)
+            flaky.reads[] = 0; flaky.blips[] = 1 + retries
+            @test_throws PormG.OperationalError quietly(() -> get_task_info(store_r, t.id))
+            @test flaky.reads[] == 1 + retries
+
+            # Not PormG's transient class: read once, never retried.
+            flaky.reads[] = 0; flaky.fail_next[] = 1
+            @test_throws "simulated transient database read failure" quietly(() -> get_task_info(store_r, t.id))
+            @test flaky.reads[] == 1
+
+            # Inside an application's open transaction (#209): once, unretried, and the error
+            # propagates as itself, not as PormG's `TransactionError`, so the application's block
+            # rolls back and it retries the block.
+            flaky.reads[] = 0; flaky.blips[] = 1
+            PormG.with_tx_context(FakeTaskPool(String[]), nothing) do
+                @test_throws PormG.OperationalError quietly(() -> get_task_info(store_r, t.id))
+            end
+            @test flaky.reads[] == 1
+            flaky.blips[] = 0
+
+            # The authorization read before it retries the same way: a blip there must not fail a
+            # status poll that the full read would have survived.
+            flaky.reads[] = 0; flaky.blips[] = 1
+            @test quietly(() -> getproperty(PormGExt, :_may_read_durable)(store_r, Owner("bob"), t.id)) == false
+            @test flaky.reads[] == 2
         end
 
         # Walk a paged listing to the end, the way the public docstring tells an app to.
@@ -3524,8 +3584,11 @@ else
                     @test_throws PormG.TransactionError check(bound, conn)
                 end
 
-                # And the factory hands the store a model bound to the key it was asked for.
-                store_b = pormg_nitro_worker(db_key=key)
+                # The store a factory builds carries a model bound to its key. The factory itself
+                # creates its table through `ensure_table!`, which needs a real database (#791):
+                # its binding is asserted in the real-SQLite bootstrap item below. Here, the model
+                # it builds and hands the store.
+                store_b = RealPormGWorkerStore(model = getproperty(PormGExt, :task_model)(key), db_key = key)
                 @test store_b.db_key == key
                 @test store_b.model.connect_key == key
 
@@ -3577,13 +3640,12 @@ else
             @test !any(is_alter, current.sql)
             @test length(current.sql) == 1
 
-            # The same through the whole table bootstrap, whose CREATE TABLE is what gives a new
-            # database the column. That premise is asserted, not assumed: a model that stopped
-            # emitting `run_id` would put every boot back on the migration path, logging on each.
+            # The same through the whole upgrade path an existing table takes (#791): an up-to-date
+            # table is probed and altered nowhere. That a NEW table gets the column from the model,
+            # so a new database never takes this path at all, is asserted on a real SQLite file in
+            # "PormG worker store: the table bootstrap on a real SQLite file (#791)" below.
             booted = FakeSchemaPool(true)
-            getproperty(PormGExt, :_ensure_task_table!)(booted, with_offline_keys(getproperty(PormGExt, :task_model), "db"))
-            @test occursin("CREATE TABLE", first(booted.sql))
-            @test occursin("\"run_id\"", first(booted.sql))
+            getproperty(PormGExt, :_upgrade_task_table!)(booted)
             @test !any(is_alter, booted.sql)
 
             # A pre-#108 table is still migrated, probed first, and backfilled with the nil UUID.
@@ -4098,7 +4160,7 @@ else
         @testset "the claim columns are added on boot, each probed first (#514)" begin
             is_alter(s) = startswith(s, "ALTER TABLE")
             pre = FakeSchemaPool(true; claim_columns = Set{String}())
-            getproperty(PormGExt, :_ensure_task_table!)(pre, with_offline_keys(getproperty(PormGExt, :task_model), "db"))
+            getproperty(PormGExt, :_upgrade_task_table!)(pre)
             @test pre.claim_columns == Set(ADDED_COLUMNS)
             alters = filter(is_alter, pre.sql)
             @test length(alters) == 6
@@ -4113,14 +4175,14 @@ else
                 # Probed before it was altered.
                 @test i !== nothing && occursin("\"nitro_task\".\"$col\"", pre.sql[i - 1])
             end
-            @test any(s -> occursin("nitro_task_claim_idx", s), pre.sql)
-            @test any(s -> occursin("nitro_task_lease_idx", s), pre.sql)
+            # The claim indexes come after the columns they cover.
+            claim_at = findfirst(s -> occursin("nitro_task_claim_idx", s), pre.sql)
+            lease_at = findfirst(s -> occursin("nitro_task_lease_idx", s), pre.sql)
+            @test claim_at !== nothing && lease_at !== nothing
+            @test claim_at !== nothing && claim_at > maximum(findall(is_alter, pre.sql))
 
-            # A fresh database gets them from CREATE TABLE, so its boot alters nothing.
-            fresh = FakeSchemaPool(true)
-            getproperty(PormGExt, :_ensure_task_table!)(fresh, with_offline_keys(getproperty(PormGExt, :task_model), "db"))
-            @test all(c -> occursin("\"$c\"", first(fresh.sql)), ADDED_COLUMNS)
-            @test !any(is_alter, fresh.sql)
+            # A fresh database gets them from the model through `ensure_table!` and alters nothing:
+            # asserted on a real SQLite file in the bootstrap item below (#791).
 
             # A row written before #514 reads back with the defaults the ALTER gave it.
             legacy_row = Dict{String, Any}(
@@ -4139,7 +4201,7 @@ else
             is_alter(s) = startswith(s, "ALTER TABLE")
             # A table from step 1: the claim columns, not the job columns. Exactly two ALTERs.
             step1 = FakeSchemaPool(true; claim_columns = Set(CLAIM_COLUMNS))
-            getproperty(PormGExt, :_ensure_task_table!)(step1, with_offline_keys(getproperty(PormGExt, :task_model), "db"))
+            getproperty(PormGExt, :_upgrade_task_table!)(step1)
             @test step1.claim_columns == Set(ADDED_COLUMNS)
             @test filter(is_alter, step1.sql) == ["ALTER TABLE \"nitro_task\" ADD COLUMN \"job_name\" VARCHAR(255)",
                                                   "ALTER TABLE \"nitro_task\" ADD COLUMN \"job_args\" TEXT"]
@@ -4351,6 +4413,141 @@ finally
     # Closes the pool the factory opened, then drops the entry: a leaked entry could be picked up
     # by a later test item, since PormG falls back to the sole loaded connection for an unbound model.
     PormG.Configuration.unregister_connection(key)
+end
+
+end
+
+# The table bootstrap on a REAL SQLite file (#791), as the session store's item does: `ensure_table!`
+# runs its own transaction and reads the live schema, so no recording fake can stand in for it. The
+# schema is read back with SQLite itself. Every key keeps `change_db` at its default, false.
+@testitem "PormG worker store: the table bootstrap on a real SQLite file (#791)" tags=[:extension, :pormg, :workers] setup=[NitroCommon] begin
+
+using Test
+using Dates
+using Nitro
+using PormG
+using SQLite
+using Nitro.Workers: get_task_info, TaskInfo, PENDING
+
+const ext = Base.get_extension(Nitro, :NitroPormGExt)
+
+function schema(path::String, table::String)
+    db = SQLite.DB(path)
+    try
+        columns = Set{String}(String(r.name) for r in
+            SQLite.DBInterface.execute(db, "PRAGMA table_info(\"$table\")"))
+        indexes = Set{String}(String(r.name) for r in SQLite.DBInterface.execute(db,
+            "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = '$table' AND sql IS NOT NULL"))
+        return (; columns, indexes)
+    finally
+        close(db)
+    end
+end
+
+function sqlite_exec(path::String, statements::String...)
+    db = SQLite.DB(path)
+    try
+        foreach(s -> SQLite.DBInterface.execute(db, s), statements)
+    finally
+        close(db)
+    end
+end
+
+function with_sqlite_key(f, key::String; prepare = nothing)
+    haskey(PormG.config, key) && error("test-only PormG connection key is already registered: $key")
+    path = joinpath(mktempdir(), "$key.sqlite")
+    prepare === nothing || prepare(path)
+    PormG.register_connection(key, path; adapter = "SQLite", env = "test", change_data = true)
+    try
+        return f(path)
+    finally
+        PormG.Configuration.unregister_connection(key)
+    end
+end
+
+const CURRENT_COLUMNS = Set(["id", "run_id", "status", "progress", "result", "error", "created_at",
+    "started_at", "completed_at", "watchers", "queue_name", "external", "claimed_by",
+    "lease_expires_at", "attempt", "job_name", "job_args"])
+const CURRENT_INDEXES = Set(["nitro_task_started_at_idx", "nitro_task_completed_at_idx",
+    "nitro_task_claim_idx", "nitro_task_lease_idx"])
+
+# The composite indexes' columns, in order, as SQLite reports them.
+function index_columns(path::String, index::String)
+    db = SQLite.DB(path)
+    try
+        return String[String(r.name) for r in SQLite.DBInterface.execute(db, "PRAGMA index_info(\"$index\")")]
+    finally
+        close(db)
+    end
+end
+
+@testset "a missing table is created from the model, all four indexes included" begin
+    with_sqlite_key("nitro_task_create_791") do path
+        key = "nitro_task_create_791"
+        @test !PormG.config[key].change_db
+        @test ext._ensure_task_table!(key, ext.task_model(key)) === :created
+        s = schema(path, "nitro_task")
+        @test s.columns == CURRENT_COLUMNS
+        # The one-column names are PormG's derived ones (#1341), which are the old fixed names; the
+        # composite ones come from the model's `Index` meta, under their fixed names.
+        @test s.indexes == CURRENT_INDEXES
+        @test index_columns(path, "nitro_task_claim_idx") == ["queue_name", "status", "external", "created_at"]
+        @test index_columns(path, "nitro_task_lease_idx") == ["status", "lease_expires_at"]
+        @test ext._ensure_task_table!(key, ext.task_model(key)) === :exists
+        @test schema(path, "nitro_task") == s
+    end
+end
+
+@testset "the factory hands its db_key to the store it returns, bound" begin
+    with_sqlite_key("nitro_task_conn_791") do path
+        key = "nitro_task_conn_791"
+        store = pormg_nitro_worker(db_key = key)
+        @test store.db_key == key
+        @test store.model.connect_key == key
+        @test PormG.Models.ensure_model_initialized(store.model) === true
+        @test schema(path, "nitro_task").columns == CURRENT_COLUMNS
+    end
+end
+
+@testset "a table an older Nitro created boots as before" begin
+    # The oldest shape: before `run_id` (#108) and before the claim and named-job columns (#514),
+    # with only the two timestamp indexes, and one row in it. `ensure_table!` reports `:exists`, so
+    # the upgrade path adds the seven columns and the two claim indexes after them.
+    prepare(path) = sqlite_exec(path,
+        """CREATE TABLE "nitro_task" ("id" TEXT(255) PRIMARY KEY NOT NULL, "status" TEXT(20) NOT NULL,
+           "progress" REAL NOT NULL DEFAULT 0.0, "result" TEXT NOT NULL DEFAULT '',
+           "error" TEXT NOT NULL DEFAULT '', "created_at" DATETIME NOT NULL, "started_at" DATETIME NULL,
+           "completed_at" DATETIME NULL, "watchers" TEXT NOT NULL DEFAULT '[]',
+           "queue_name" TEXT(100) NOT NULL)""",
+        """CREATE INDEX "nitro_task_started_at_idx" ON "nitro_task" ("started_at")""",
+        """CREATE INDEX "nitro_task_completed_at_idx" ON "nitro_task" ("completed_at")""",
+        """INSERT INTO "nitro_task" ("id", "status", "created_at", "queue_name")
+           VALUES ('u::legacy', 'PENDING', '2026-01-01T00:00:00.000+00:00', 'heavy')""")
+    with_sqlite_key("nitro_task_legacy_791"; prepare) do path
+        key = "nitro_task_legacy_791"
+        store = pormg_nitro_worker(db_key = key)
+        s = schema(path, "nitro_task")
+        @test s.columns == CURRENT_COLUMNS
+        @test s.indexes == CURRENT_INDEXES
+        @test index_columns(path, "nitro_task_claim_idx") == ["queue_name", "status", "external", "created_at"]
+        # The row written before the upgrade reads back with the defaults each ALTER gave it.
+        t = get_task_info(store, "u::legacy")
+        @test t isa TaskInfo
+        @test t.status == PENDING
+        @test string(t.run_id) == "00000000-0000-0000-0000-000000000000"   # the ALTER's nil-UUID default (#108)
+        @test (t.external, t.claimed_by, t.lease_expires_at, t.attempt) == (false, nothing, nothing, 0)
+        @test (t.job_name, t.job_args) == (nothing, nothing)
+    end
+end
+
+@testset "inside an open transaction on its connection the factory refuses, before any DDL" begin
+    with_sqlite_key("nitro_task_tx_791") do path
+        key = "nitro_task_tx_791"
+        @test_throws PormG.TransactionError PormG.run_in_transaction(key) do
+            pormg_nitro_worker(db_key = key)
+        end
+        @test isempty(schema(path, "nitro_task").columns)
+    end
 end
 
 end

@@ -242,6 +242,10 @@ function Base.getproperty(qs::MockQuerySet, name::Symbol)
         end
     elseif name === :first
         return function()
+            # `:before_first` runs before every `.first()`, and may throw: a failed connection,
+            # its own event before the read (#791's retry tests).
+            before = get(getfield(qs, :mdb).hooks, :before_first, nothing)
+            before === nothing || before()
             row = lock(_mock_lock(qs)) do
                 matched = _matching_keys_locked(qs)
                 isempty(matched) ? nothing : _as_db_row(_selected_table(qs)[first(matched)])
@@ -479,19 +483,19 @@ function with_offline_keys(f, keys::String...)
     end
 end
 
-# -- A stand-in PormG connection, for `pormg_nitro_session` ---------------
+# -- A stand-in PormG connection, for the paths that must not touch a database ----
 #
 # `PormG.connection(key=k)` is just `config[k].connections` (`PormG/src/Configuration.jl`), and
 # `Settings.connections` takes any pool, so a real `Settings` around a fake pool, registered under a
-# test-only key, is enough to run `pormg_nitro_session` end to end with nothing behind it. Since
-# PormG #1622 `config` holds `Configuration.Settings` only: a settings type of the test's own no
-# longer fits in it.
+# test-only key, stands in for a connection where nothing should reach a driver: a factory call
+# refused before its bootstrap, and the transaction-scope guard. Since PormG #1622 `config` holds
+# `Configuration.Settings` only, so a settings type of the test's own no longer fits in it. The
+# bootstrap itself runs on a real SQLite file (#791): `ensure_table!` opens its own transaction and
+# reads the live schema, which this pool cannot answer.
 #
-# `FakeSessionPool <: PormG.PormGSQLite` on purpose rather than a bare struct: subtyping means
-# `_ensure_session_table!` runs PormG's REAL `create_table`/`create_index` against the REAL
-# session model, so this covers the bootstrap SQL too. Only `fetch` is overridden -- it is the
-# one step that would touch a driver -- and the method is on our own concrete type, so it is
-# more specific than PormG's `Union{PormGPostgres,PormGSQLite}` method rather than piracy.
+# `FakeSessionPool <: PormG.PormGSQLite` so PormG's dispatch treats it as a SQLite pool. Only
+# `fetch` is overridden, and on our own concrete type, so it is more specific than PormG's
+# method rather than piracy; it records every statement, which is how a test asserts none ran.
 struct FakeSessionPool <: PormG.PormGSQLite
     sql::Vector{String}
 end
@@ -876,6 +880,73 @@ end
             # `src/middleware/session_middleware.jl`, which would otherwise take a database
             # blip as a reason to stop pruning. Nothing covered this before.
             @test cleanup_expired_sessions!(failing) === nothing
+        end
+    end
+
+    @testset "a transient read failure is retried, not read as a logout (#791)" begin
+        # PormG's transient class, which `with_read_retry` retries. The driver cause carries a
+        # sentinel that must never reach a log line: PormG logs the error's type, SQLSTATE and
+        # value-free message, never the exception (#1675), and the store adds the id nowhere.
+        blip() = PormG.OperationalError("sqlite", ErrorException("leak-sentinel-cause");
+                                        message = "database is locked")
+        m = MockModel()
+        s = RealPormGSessionStore(model = m)
+        set_session!(s, "sess-blip-id", Dict{String,Any}("user_id" => 1); ttl = 3600)
+        hooks = getfield(m, :mdb).hooks
+        calls = Ref(0)
+        logger = Test.TestLogger(min_level = Base.CoreLogging.Warn)
+        try
+            # One failure, then success: the visitor stays signed in. Unpatched, this read was
+            # swallowed into "no session".
+            hooks[:before_first] = () -> (calls[] += 1; calls[] == 1 && throw(blip()); nothing)
+            Base.CoreLogging.with_logger(logger) do
+                @test get_session(s, "sess-blip-id") == Dict{String,Any}("user_id" => 1)
+            end
+            @test calls[] == 2
+            text = lock(logger.lock) do
+                join((string(r.message, " ", r.kwargs) for r in logger.logs), "\n")
+            end
+            @test occursin("with_read_retry", text)             # the retry did log
+            @test !occursin("leak-sentinel-cause", text)
+            @test !occursin("sess-blip-id", text)
+
+            # Every attempt fails: one read and two retries, then the swallow still reads it as no
+            # session rather than throwing into the request.
+            calls[] = 0
+            hooks[:before_first] = () -> (calls[] += 1; throw(blip()))
+            Base.CoreLogging.with_logger(Base.CoreLogging.NullLogger()) do
+                @test get_session(s, "sess-blip-id") === nothing
+            end
+            @test calls[] == 1 + getproperty(PormGExt, :_READ_RETRY_ATTEMPTS)
+
+            # Not `OperationalError`: not retried, read once, swallowed as before.
+            calls[] = 0
+            hooks[:before_first] = () -> (calls[] += 1; error("mock persistence failure"))
+            Base.CoreLogging.with_logger(Base.CoreLogging.NullLogger()) do
+                @test get_session(s, "sess-blip-id") === nothing
+            end
+            @test calls[] == 1
+
+            # Inside an application's open transaction (#209) the read runs once, unretried and
+            # without PormG's `TransactionError`: the application retries its block, not this
+            # statement. A transient failure there still reads as no session, through the swallow.
+            calls[] = 0
+            hooks[:before_first] = () -> (calls[] += 1; throw(blip()))
+            PormG.with_tx_context(FakeSessionPool(String[]), nothing) do
+                Base.CoreLogging.with_logger(Base.CoreLogging.NullLogger()) do
+                    @test get_session(s, "sess-blip-id") === nothing
+                end
+            end
+            @test calls[] == 1
+            # And a healthy read inside one simply runs.
+            calls[] = 0
+            hooks[:before_first] = () -> (calls[] += 1; nothing)
+            PormG.with_tx_context(FakeSessionPool(String[]), nothing) do
+                @test get_session(s, "sess-blip-id") == Dict{String,Any}("user_id" => 1)
+            end
+            @test calls[] == 1
+        finally
+            delete!(hooks, :before_first)
         end
     end
 
@@ -1340,48 +1411,10 @@ end
     @test all(u -> any(r -> r === u, routed), uses)
 end
 
-@testset "pormg_nitro_session hands its db_key to the store it returns (#199)" begin
-    # #199 is two defects sharing one cause. The store half is covered above; this is the other
-    # half: `pormg_nitro_session` used `db_key` to reach a connection, created the table on it,
-    # and then built `PormGSessionStore(model=model)` -- dropping the argument on the floor. Every
-    # mock above would happily pass a store that was simply never told which database it is on.
-    key = "nitro-test-session-conn"
-    # `error`, not `@test`, for the same reason as the testset above: a red assertion that then
-    # clobbers and deletes a real `PormG.config` entry turns one failure into a broken process.
-    haskey(PormG.config, key) && error("test-only PormG connection key is already registered: $key")
-    conn = FakeSessionPool(String[])
-    PormG.config[key] = fake_session_settings(conn, key)
-    try
-        store = pormg_nitro_session(db_key=key)
-
-        # THE assertion. `store.db_key == "db"` here is the shipped bug.
-        @test store.db_key == key
-
-        # ... and it really is the shipped function under test: the real session model,
-        # bootstrapped on the connection it was asked for.
-        #
-        # An identity check against `session_model()` used to stand here, back when the model
-        # was a process-wide singleton. Since #202 each store gets its OWN model bound to its
-        # own key -- a shared one could not carry two different `connect_key`s -- so the
-        # meaningful assertion is the binding, not the object.
-        @test store.model.name == "nitro_session"
-        @test store.model.connect_key == key
-        # CREATE TABLE, the `created_at` probe (#362), CREATE INDEX. This pool answers every
-        # statement, so the probe finds the column and no ALTER follows.
-        @test length(conn.sql) == 3
-        @test any(q -> occursin("nitro_session", q), conn.sql)
-        @test any(q -> occursin("nitro_session_expires_at_idx", q), conn.sql)
-        @test any(q -> occursin("\"nitro_session\".\"created_at\"", q), conn.sql)
-    finally
-        # `config` is process-global and PormG falls back to `first(keys(config))` when a model is
-        # unbound and exactly one connection is loaded, so a leaked entry could silently be picked
-        # up by a later test item.
-        delete!(PormG.config, key)
-    end
-
-    # The default is still the default, and is not a function of what ran above.
-    @test !haskey(PormG.config, key)
-end
+# `pormg_nitro_session` handing its `db_key` to the store it returns (#199) is asserted on a real
+# SQLite file, in "PormG session store: the table bootstrap on a real SQLite file (#199, #791)"
+# below: the factory creates its table through `ensure_table!` (#791), which runs its own
+# transaction and reads the live schema, and a recording fake pool can do neither.
 
 # A connection whose `nitro_session` has the `created_at` column (#362) or does not, answering the
 # way a real driver does: a statement naming a missing column throws, and so does an `ALTER`
@@ -1424,14 +1457,14 @@ struct FakePostgresPool <: PormG.PormGPostgres end
     @test ensure!(current) === nothing
     @test current.sql == ["SELECT \"nitro_session\".\"created_at\" FROM \"nitro_session\" LIMIT 0"]
 
-    # That premise is asserted, not assumed: through the whole bootstrap, CREATE TABLE carries
-    # the column, so a new database never takes the migration path.
+    # The same through the whole upgrade path an existing table takes (#791): the probe, then the
+    # expiry index under its fixed name, and no ALTER. That a NEW table gets the column from the
+    # model, so a new database never takes this path, is asserted on a real SQLite file below.
     booted = FakeSessionSchemaPool(true)
-    getproperty(PormGExt, :_ensure_session_table!)(
-        booted, with_offline_keys(getproperty(PormGExt, :session_model), "db"))
-    @test occursin("CREATE TABLE", first(booted.sql))
-    @test occursin("\"created_at\"", first(booted.sql))
+    getproperty(PormGExt, :_upgrade_session_table!)(booted)
     @test !any(is_alter, booted.sql)
+    @test length(booted.sql) == 2
+    @test occursin("\"nitro_session_expires_at_idx\"", last(booted.sql))
 
     # A pre-#362 table is migrated: probed first, then ONE ALTER whose constant default stamps
     # every existing row with the migration instant, in PormG's canonical UTC form.
@@ -1549,6 +1582,127 @@ finally
     # PormG falls back to the sole loaded connection for an unbound model, so a leaked entry could
     # be picked up by a later test item -- the reason every other item here removes its key.
     delete!(PormG.config, key)
+end
+
+end
+
+# The table bootstrap on a REAL SQLite file (#791): `ensure_table!` runs its own transaction and
+# reads the live schema, which no recording fake can stand in for. The schema is read back with
+# SQLite itself, never through the code under test. Every key is registered with `change_db` left
+# at its default, false, PormG's production posture, on which the factory still creates its table.
+@testitem "PormG session store: the table bootstrap on a real SQLite file (#199, #791)" tags=[:extension, :pormg] setup=[NitroCommon] begin
+
+using Test
+using Dates
+using Nitro
+using PormG
+using SQLite
+using Nitro.Types: get_session, set_session!
+
+const ext = Base.get_extension(Nitro, :NitroPormGExt)
+
+# The live table's columns and its named indexes (a primary key's automatic index has no `sql`).
+function schema(path::String, table::String)
+    db = SQLite.DB(path)
+    try
+        columns = Set{String}(String(r.name) for r in
+            SQLite.DBInterface.execute(db, "PRAGMA table_info(\"$table\")"))
+        indexes = Set{String}(String(r.name) for r in SQLite.DBInterface.execute(db,
+            "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = '$table' AND sql IS NOT NULL"))
+        return (; columns, indexes)
+    finally
+        close(db)
+    end
+end
+
+function sqlite_exec(path::String, statements::String...)
+    db = SQLite.DB(path)
+    try
+        foreach(s -> SQLite.DBInterface.execute(db, s), statements)
+    finally
+        close(db)
+    end
+end
+
+# A fresh SQLite file registered under `key`, `prepare(path)` run on it first (to leave an older
+# table behind), and the key removed whatever `f` did: a leaked entry is PormG's sole-connection
+# fallback for every later item.
+function with_sqlite_key(f, key::String; prepare = nothing)
+    haskey(PormG.config, key) && error("test-only PormG connection key is already registered: $key")
+    path = joinpath(mktempdir(), "$key.sqlite")
+    prepare === nothing || prepare(path)
+    PormG.register_connection(key, path; adapter = "SQLite", env = "test", change_data = true)
+    try
+        return f(path)
+    finally
+        PormG.Configuration.unregister_connection(key)
+    end
+end
+
+const CURRENT_COLUMNS = Set(["session_key", "session_data", "expires_at", "created_at"])
+
+@testset "a missing table is created from the model, whatever change_db says" begin
+    with_sqlite_key("nitro_session_create_791") do path
+        key = "nitro_session_create_791"
+        @test !PormG.config[key].change_db
+        @test ext._ensure_session_table!(key, ext.session_model(key)) === :created
+        s = schema(path, "nitro_session")
+        @test s.columns == CURRENT_COLUMNS
+        # The index PormG derives for `expires_at`'s `db_index` is the name the table always had.
+        @test s.indexes == Set(["nitro_session_expires_at_idx"])
+        # The next boot finds the table and takes the upgrade path, which changes nothing.
+        @test ext._ensure_session_table!(key, ext.session_model(key)) === :exists
+        @test schema(path, "nitro_session") == s
+    end
+end
+
+@testset "the factory hands its db_key to the store it returns (#199)" begin
+    # #199 was two defects sharing one cause. This half: `pormg_nitro_session` used `db_key` to
+    # reach a connection, created the table on it, and then built `PormGSessionStore(model=model)`,
+    # dropping the argument on the floor, so the store read and wrote another database.
+    with_sqlite_key("nitro_session_conn_199") do path
+        key = "nitro_session_conn_199"
+        store = pormg_nitro_session(db_key = key)
+        @test store.db_key == key                      # `"db"` here is the shipped bug
+        @test store.model.name == "nitro_session"
+        @test store.model.connect_key == key
+        @test schema(path, "nitro_session").columns == CURRENT_COLUMNS
+        set_session!(store, "conn-1", Dict{String,Any}("v" => 1); ttl = 60)
+        @test get_session(store, "conn-1") == Dict{String,Any}("v" => 1)
+    end
+end
+
+@testset "a table an older Nitro created boots as before" begin
+    # The oldest shape the factory ever created: before `created_at` (#362), with the expiry index
+    # under its fixed name, and one live session in it. `ensure_table!` reports `:exists` and alters
+    # nothing, so the upgrade path is what adds the column and keeps the index.
+    live_until = ext._canonical_utc(Dates.now(Dates.UTC) + Dates.Hour(1))
+    prepare(path) = sqlite_exec(path,
+        """CREATE TABLE "nitro_session" ("session_key" TEXT(40) PRIMARY KEY NOT NULL,
+           "session_data" TEXT NOT NULL DEFAULT '{}', "expires_at" DATETIME NOT NULL)""",
+        """CREATE INDEX "nitro_session_expires_at_idx" ON "nitro_session" ("expires_at")""",
+        """INSERT INTO "nitro_session" VALUES ('legacy-1', '{"v":1}', '$live_until')""")
+    with_sqlite_key("nitro_session_legacy_791"; prepare) do path
+        key = "nitro_session_legacy_791"
+        @test schema(path, "nitro_session").columns == setdiff(CURRENT_COLUMNS, ["created_at"])
+        store = pormg_nitro_session(db_key = key)
+        s = schema(path, "nitro_session")
+        @test s.columns == CURRENT_COLUMNS
+        # One index, under the old name: not a second copy under a derived one.
+        @test s.indexes == Set(["nitro_session_expires_at_idx"])
+        # The session written before the upgrade still reads, stamped by the ALTER's default.
+        @test get_session(store, "legacy-1") == Dict{String,Any}("v" => 1)
+    end
+end
+
+@testset "inside an open transaction on its connection the factory refuses, before any DDL" begin
+    with_sqlite_key("nitro_session_tx_791") do path
+        key = "nitro_session_tx_791"
+        @test_throws PormG.TransactionError PormG.run_in_transaction(key) do
+            pormg_nitro_session(db_key = key)
+        end
+        @test isempty(schema(path, "nitro_session").columns)
+    end
 end
 
 end

@@ -341,12 +341,42 @@ function _db_fault(e)
     return (exception_type = nameof(typeof(e)),)
 end
 
+"""
+    _read_retrying(f)
+
+Run the read `f` through `PormG.with_read_retry` (#791): retried up to `_READ_RETRY_ATTEMPTS` more
+times, `_READ_RETRY_BACKOFF` seconds apart, when it raises `OperationalError`, the class PormG
+reserves for a transient failure (a dropped connection the pool has already recovered, a deadlock,
+SQLite's `database is locked`). Any other error, and a cancelled statement, propagates on the first
+raise. Each retry logs the error's type, SQLSTATE and PormG's value-free message, never the
+exception, so the warning cannot quote a statement's values (PormG #1675; Nitro's `_db_fault` rule).
+
+`inside_transaction = :run_once`: a session or task read can run inside an application's own
+`run_in_transaction` block (#209), and the store cannot know whether one is open. There the read runs
+once, unretried and without raising `TransactionError`: a lost connection loses the whole
+transaction, so the application retries its block, not one statement in it (PormG #1443).
+
+Only reads go through this: each is a single `SELECT`, safe to run twice. Writes never retry here.
+The bound is small because a session read is on the request path: at most two retries and 0.1 s of
+waiting before the last error propagates.
+"""
+_read_retrying(f) = PormG.with_read_retry(f; attempts = _READ_RETRY_ATTEMPTS,
+    backoff = _READ_RETRY_BACKOFF, inside_transaction = :run_once)
+
+const _READ_RETRY_ATTEMPTS = 2
+const _READ_RETRY_BACKOFF = 0.05
+
 function Base.get(store::PormGSessionStore, session_id::String, default)
     # Both catches below follow #254: an interrupt, a stack overflow or an out-of-memory is not
     # "no session" -- reported as one, it would log the visitor out and carry on in a process
     # that may be corrupted. They propagate; everything else still reads as `default`.
+    #
+    # The read is retried on a transient failure first (`_read_retrying`, #791), so a dropped
+    # connection does not log the visitor out. The catch stays: the retry covers `OperationalError`
+    # only, and any failure it does not recover (a permanent one, or the last transient one) must
+    # still read as no session rather than throw into the request.
     result = try
-        _session_objects(store).filter("session_key" => session_id).first()
+        _read_retrying(() -> _session_objects(store).filter("session_key" => session_id).first())
     catch e
         is_unrecoverable(e) && rethrow()
         @warn "PormGSessionStore: failed to read session" _db_fault(e)...
@@ -564,26 +594,45 @@ end
 # ============================================================================
 
 """
-    _ensure_session_table!(conn, model)
+    _ensure_session_table!(db_key, model) -> Symbol
 
-Execute `CREATE TABLE IF NOT EXISTS` and `CREATE INDEX IF NOT EXISTS` for the
-session model.  Safe to call on every startup — the IF NOT EXISTS guard makes
-it a no-op when the table already exists.
+Create the `nitro_session` table on `db_key` if it is missing, or bring an existing one up to date.
+Safe on every boot. Returns what `ensure_table!` reported, `:created` or `:exists`.
+
+**A missing table** is created by `PormG.Migrations.ensure_table!` (#791): the model's own DDL,
+`expires_at`'s index included, in one transaction, and on PostgreSQL under PormG's migration
+advisory lock, so two instances booting together create it once. `force = true`, because the
+table is Nitro's infrastructure, kept out of the application's migrations, and not part of the
+schema `change_db` governs: without it, `ensure_table!` refuses on a `change_db: false` connection,
+which is PormG's production posture and what `register_connection` builds. The factory always
+created the table whatever `change_db` said, and still does. Like any `ensure_table!` call, it
+raises `TransactionError` inside an open transaction on that connection.
+
+**An existing table** is left to `_upgrade_session_table!`, because `ensure_table!` never alters
+one.
 """
-function _ensure_session_table!(conn, model)
-    create_table_sql = PormG.Dialect.create_table(conn, model)
-    PormG.ConnectionPool.fetch(conn, create_table_sql)
+function _ensure_session_table!(db_key::String, model)
+    outcome = PormG.Migrations.ensure_table!(model, db_key; force = true)
+    outcome === :exists && _upgrade_session_table!(PormG.connection(key = db_key))
+    return outcome
+end
 
-    # A table created before #362 does not get `created_at` from the statement above.
+"""
+    _upgrade_session_table!(conn)
+
+What a `nitro_session` table created by an older Nitro needs, and nothing a current one lacks: the
+`created_at` column (#362), probed first, and the expiry index, under the name the table has always
+had. These are the statements the boot ran before `ensure_table!` (#791), minus the
+`CREATE TABLE IF NOT EXISTS`, so a pre-existing table gets the same DDL as before. (Not the same
+locking: `ensure_table!`'s existence check runs first, inside a write transaction on SQLite; the
+#791 upgrade entry says what a boot can wait on.) The index name is the
+one PormG derives for `expires_at`'s `db_index` (`<table>_<column>_idx`, PormG #1341), so a table
+`ensure_table!` created and one this upgraded hold the same index.
+"""
+function _upgrade_session_table!(conn)
     _ensure_session_created_at_column!(conn)
-
-    create_index_sql = PormG.Dialect.create_index(
-        conn,
-        "\"nitro_session_expires_at_idx\"",
-        "\"nitro_session\"",
-        ["\"expires_at\""],
-    )
-    PormG.ConnectionPool.fetch(conn, create_index_sql)
+    PormG.ConnectionPool.fetch(conn, PormG.Dialect.create_index(
+        conn, "\"nitro_session_expires_at_idx\"", "\"nitro_session\"", ["\"expires_at\""]))
     return nothing
 end
 
@@ -629,8 +678,7 @@ function pormg_nitro_session(; db_key::String="db", max_sessions::Nullable{Integ
     if isnothing(model)
         error("pormg_nitro_session: PormG.Models is not available. Ensure PormG is properly loaded.")
     end
-    conn = PormG.connection(key=db_key)
-    _ensure_session_table!(conn, model)
+    _ensure_session_table!(db_key, model)
     return PormGSessionStore(model=model, db_key=db_key, max_sessions=max_sessions)
 end
 
@@ -644,9 +692,10 @@ PormG model for the `nitro_task` table, bound to `db_key`.
 Columns:
 - `id`           — VARCHAR(255), primary key. Holds the *scoped* task id, which under
                    the default `:user` scope is `"<user_id>::<task_key>"`, so it needs
-                   room for both halves. `_ensure_task_table!` only issues
-                   `CREATE TABLE IF NOT EXISTS`: a database created before this column
-                   was widened keeps its old width and needs a manual `ALTER TABLE`
+                   room for both halves. The boot never alters a column it finds
+                   (`ensure_table!` creates a missing table and touches no existing one):
+                   a database created before this column was widened keeps its old
+                   width and needs a manual `ALTER TABLE`
                    (SQLite ignores `VARCHAR` lengths, so only Postgres/MySQL care).
 - `run_id`       — VARCHAR(36), the identity of one *run* of this task. Fenced against in
                    `try_transition!`'s WHERE clause so a previous run's terminal write cannot
@@ -670,7 +719,7 @@ Columns:
                    its current run (VARCHAR(255), NULL when none), until when (TIMESTAMPTZ), and
                    how many times it has been claimed (INTEGER). Written only by `replace_task!`
                    and the claim operations, never by `set_task!`. Added after the table shipped,
-                   so `_ensure_task_table!` adds them on boot; the two claim indexes
+                   so `_upgrade_task_table!` adds them on boot; the two claim indexes
                    (`nitro_task_claim_idx`, `nitro_task_lease_idx`) serve `claim_next!` and
                    `requeue_expired!`.
 - `job_name`, `job_args` — a named job's registered name (VARCHAR(255)) and its arguments as JSON
@@ -678,9 +727,25 @@ Columns:
                    Submission identity: written by `replace_task!`, carried by the claim
                    operations, never written by `set_task!`. Added on boot like the claim columns.
 """
+# The two composite indexes, by their fixed names: the model declares them (so `ensure_table!`
+# creates them with a new table) and `_upgrade_task_table!` creates them on an older one, from this
+# one list. `claim` serves `claim_next!`'s read: equality on the first three, then its ORDER BY
+# (#514). Plain, not partial: the ORM binds `external` and `status` as parameters, and SQLite cannot
+# use a partial index whose condition a query meets only through a parameter. `lease` serves
+# `requeue_expired!`'s scan: RUNNING rows whose lease is past.
+const _TASK_COMPOSITE_INDEXES = (
+    (name = "nitro_task_claim_idx", fields = ("queue_name", "status", "external", "created_at")),
+    (name = "nitro_task_lease_idx", fields = ("status", "lease_expires_at")),
+)
+
+# The columns the model declares `db_index = true`. PormG names each such index
+# `nitro_task_<column>_idx` (#1341), the name an older table already has it under.
+const _TASK_ONE_COLUMN_INDEXES = ("started_at", "completed_at")
+
 function _define_task_model(db_key::String)
     if isdefined(PormG, :Models)
-        m = PormG.Models.Model("nitro_task",
+        m = PormG.Models.Model("nitro_task";
+            indexes = [PormG.Models.Index(fields = i.fields, name = i.name) for i in _TASK_COMPOSITE_INDEXES],
             id           = PormG.Models.CharField(max_length=255, primary_key=true),
             run_id       = PormG.Models.CharField(max_length=36, default=""),
             status       = PormG.Models.CharField(max_length=20),
@@ -964,8 +1029,11 @@ function get_task_info(store::PormGWorkerStore, task_id::String)
     # longer raises a message that quotes a stored blob (see `_parse_stored_json`), so this is a
     # second guarantee and not the only one. The caller gets the whole exception from the
     # rethrow, and that exception is value-free for the same reason.
+    #
+    # The read is retried on a transient failure first (`_read_retrying`, #791). What it does not
+    # recover is logged and rethrown here as before.
     try
-        result = _task_objects(store).filter("id" => task_id).first()
+        result = _read_retrying(() -> _task_objects(store).filter("id" => task_id).first())
         if isnothing(result)
             return nothing
         end
@@ -984,7 +1052,8 @@ _may_read_durable(::PormGWorkerStore, ::System, ::String) = true
 function _may_read_durable(store::PormGWorkerStore, authority::Owner, task_id::String)
     _owns(authority, task_id) && return true
     row = try
-        _task_objects(store).filter("id" => task_id).values("watchers").first()
+        # Retried on a transient failure like `get_task_info`, the read it precedes (#791).
+        _read_retrying(() -> _task_objects(store).filter("id" => task_id).values("watchers").first())
     catch e
         @warn "PormGWorkerStore: failed to read task" task_id exception_type=typeof(e)
         rethrow()
@@ -1897,52 +1966,42 @@ _interrupted(e) = e isa InterruptException ||
     (e isa PormG.DatabaseError && e.cause isa InterruptException)
 
 """
-    _ensure_task_table!(conn, model)
+    _ensure_task_table!(db_key, model) -> Symbol
 
-Execute `CREATE TABLE IF NOT EXISTS` and index creations for the `nitro_task` table.
+Create the `nitro_task` table on `db_key` if it is missing, or bring an existing one up to date:
+`_ensure_session_table!`'s shape, whose docstring says why `ensure_table!` and why `force = true`
+(#791). A new table gets every column and all four indexes from the model, the two composite ones
+through its `Index` meta (`_TASK_COMPOSITE_INDEXES`). An existing one is left to
+`_upgrade_task_table!`. Returns `:created` or `:exists`.
 """
-function _ensure_task_table!(conn, model)
-    create_table_sql = PormG.Dialect.create_table(conn, model)
-    PormG.ConnectionPool.fetch(conn, create_table_sql)
+function _ensure_task_table!(db_key::String, model)
+    outcome = PormG.Migrations.ensure_table!(model, db_key; force = true)
+    outcome === :exists && _upgrade_task_table!(PormG.connection(key = db_key))
+    return outcome
+end
 
-    # A table created before #108 does not get `run_id` from the statement above, nor one created
-    # before #514 the claim and named-job columns.
+"""
+    _upgrade_task_table!(conn)
+
+What a `nitro_task` table created by an older Nitro needs: the columns added after the table
+shipped, each probed first (`run_id`, #108; the claim and named-job columns, #514), then every index
+under the name it has always had, `IF NOT EXISTS`. These are the statements the boot ran before
+`ensure_table!` (#791), minus the `CREATE TABLE IF NOT EXISTS`, so a pre-existing table gets the
+same DDL as before (see `_upgrade_session_table!` on locking). The columns come first because the
+claim indexes cover two of them (`external`, `lease_expires_at`).
+"""
+function _upgrade_task_table!(conn)
     _ensure_run_id_column!(conn)
     _ensure_claim_columns!(conn)
     _ensure_job_columns!(conn)
-
-    create_index_sql1 = PormG.Dialect.create_index(
-        conn,
-        "\"nitro_task_started_at_idx\"",
-        "\"nitro_task\"",
-        ["\"started_at\""],
-    )
-    PormG.ConnectionPool.fetch(conn, create_index_sql1)
-
-    create_index_sql2 = PormG.Dialect.create_index(
-        conn,
-        "\"nitro_task_completed_at_idx\"",
-        "\"nitro_task\"",
-        ["\"completed_at\""],
-    )
-    PormG.ConnectionPool.fetch(conn, create_index_sql2)
-
-    # `claim_next!`'s read: equality on the first three, then its ORDER BY (#514). Plain, not
-    # partial: the ORM binds `external` and `status` as parameters, and SQLite cannot use a partial
-    # index whose condition a query meets only through a parameter.
-    PormG.ConnectionPool.fetch(conn, PormG.Dialect.create_index(
-        conn,
-        "\"nitro_task_claim_idx\"",
-        "\"nitro_task\"",
-        ["\"queue_name\"", "\"status\"", "\"external\"", "\"created_at\""],
-    ))
-    # `requeue_expired!`'s scan: RUNNING rows whose lease is past.
-    PormG.ConnectionPool.fetch(conn, PormG.Dialect.create_index(
-        conn,
-        "\"nitro_task_lease_idx\"",
-        "\"nitro_task\"",
-        ["\"status\"", "\"lease_expires_at\""],
-    ))
+    for column in _TASK_ONE_COLUMN_INDEXES
+        PormG.ConnectionPool.fetch(conn, PormG.Dialect.create_index(
+            conn, "\"nitro_task_$(column)_idx\"", "\"nitro_task\"", ["\"$column\""]))
+    end
+    for index in _TASK_COMPOSITE_INDEXES
+        PormG.ConnectionPool.fetch(conn, PormG.Dialect.create_index(
+            conn, "\"$(index.name)\"", "\"nitro_task\"", String["\"$f\"" for f in index.fields]))
+    end
     return nothing
 end
 
@@ -1952,8 +2011,7 @@ function pormg_nitro_worker(; db_key::String="db")
     if isnothing(model)
         error("pormg_nitro_worker: PormG.Models is not available. Ensure PormG is properly loaded.")
     end
-    conn = PormG.connection(key=db_key)
-    _ensure_task_table!(conn, model)
+    _ensure_task_table!(db_key, model)
     return PormGWorkerStore(model=model, db_key=db_key)
 end
 
