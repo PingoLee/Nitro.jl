@@ -264,10 +264,11 @@ mutable struct TaskInfo
     # re-reads the token; the canceller sets the token, then reads the waker. At least one of them
     # sees the other, so a cancel cannot fall between the two and leave the backoff asleep.
     @atomic cancel_waker::Union{Nothing, Base.Event}
-    # The request this run was linked to with `submit_task(…; parent = cancel_token(req))` (#662), or
-    # `nothing`. Set once, on the run object the callback receives, before the callback starts
-    # (`_execute_task_async`), and cleared when the run ends, so a record kept until the retention
-    # sweep does not keep the request's stream alive; `cancel_reason` reads it. Process-local like
+    # The request this run was linked to with `submit_task(…; parent = cancel_token(req))` (#662) or
+    # `submit_queued_task(…; parent)` (#906), or `nothing`. Set once, on the run object the callback
+    # receives, before the callback starts (`_execute_task_async`, `_execute_queued_task`), and
+    # cleared when the run ends, so a record kept until the retention sweep does not keep the
+    # request's stream alive; `cancel_reason` reads it. Process-local like
     # the token, never persisted, never copied by `set_task!` or `_successor_run`: it names a
     # request in THIS process, and a successor run is a claim, which only an external queue makes.
     # Never shown: `TaskInfo`'s `show` prints whether it is set, not the token.
@@ -416,15 +417,19 @@ The six things that can request a cancellation, as the symbols [`cancel_reason`]
 | Reason | Who set it | What it already did to the record |
 |---|---|---|
 | `:user` | `cancel_task` | claimed `CANCELLED` **before** setting the token |
-| `:timeout` | an expired `TaskOptions(timeout=…)`; or the deadline of the request the run is linked to (`submit_task(…; parent)`, #662) | nothing yet. Its own deadline throws [`TaskTimeoutError`](@ref), which is terminal `FAILED`; a request's deadline is the request's cause, below |
+| `:timeout` | an expired `TaskOptions(timeout=…)`; or the deadline of the request the run is linked to (`submit_task(…; parent)`, #662, or `submit_queued_task(…; parent)`, #906) | nothing yet. Its own deadline throws [`TaskTimeoutError`](@ref), which is terminal `FAILED`; a request's deadline is the request's cause, below |
 | `:superseded` | re-running a key whose predecessor is still executing | replaced the record, so the predecessor's `run_id` fence now fails |
-| `:shutdown` | a teardown drain ([`shutdown!`](@ref), #176), or a consumer process's drain (#514); or `terminate` draining the server of the request the run is linked to | **nothing** — a terminal write there would race the run's own, the #88/#108 failure mode. On a consumer the run is **handed back** to the queue, not recorded |
+| `:shutdown` | a teardown drain ([`shutdown!`](@ref), #176), or a consumer process's drain (#514); or `terminate` draining the server of the request the run is linked to (`parent`, #662/#906) | **nothing** — a terminal write there would race the run's own, the #88/#108 failure mode. On a consumer the run is **handed back** to the queue, not recorded |
 | `:lease_lost` | a consumer process's heartbeat, finding its lease taken back and the same submission re-queued or re-claimed (#514) | taken the run back: another run of it will happen. The run is handed back, which loses its fence and writes nothing |
-| `:client_disconnected` | the client of the request the run is linked to left before its response was written (`submit_task(…; parent)`, #662) | **nothing**: the run writes its own `CANCELLED` when it stops |
+| `:client_disconnected` | the client of the request the run is linked to left before its response was written (`submit_task(…; parent)`, #662, or `submit_queued_task(…; parent)`, #906) | **nothing**: the run writes its own `CANCELLED` when it stops |
 
 A request's cause reaches a linked run when the run next checks its token (`cancel_requested`,
 [`checkpoint!`](@ref)): it is polled, not pushed, so a run parked in its retry backoff sees it when
 the backoff ends. A request's completion never cancels a linked run.
+
+A queued item is checked once more, when it leaves the buffer: if that check finds its request has
+settled a cause (`:client_disconnected`, `:timeout` or `:shutdown`), the item is recorded
+`CANCELLED` with that reason **without starting**, and its callback never runs (#906).
 
 That last column is why the reason exists. Most causes have already decided the record by the
 time the callback notices, so only a drain leaves the run to write its own terminal state — and
@@ -563,8 +568,9 @@ a cross-process callback reads `:none` and must poll the record. And it says not
 was *stored* — most causes have already written the record, or will never write a
 cancellation at all. [`shutdown!`](@ref) has the table.
 
-**A run linked to a request** (`submit_task(…; parent = cancel_token(req))`, #662) also reads the
-request's cause, `:client_disconnected`, `:timeout` or `:shutdown`, as its own: the first time a
+**A run linked to a request** (`submit_task(…; parent = cancel_token(req))`, #662, or
+`submit_queued_task(…; parent)`, #906) also reads the request's cause, `:client_disconnected`,
+`:timeout` or `:shutdown`, as its own: the first time a
 check finds one, it is set on the run's token, first cause wins. The check runs the request's own
 (throttled) disconnect probe, on the run's task. A request that completed cancels nothing: a job
 submitted by a handler that then returns keeps running.
@@ -731,8 +737,9 @@ function External(; on_lease_expiry::Union{Nothing, Symbol} = nothing, max_attem
     return External(LeasePolicy(on_lease_expiry; max_attempts = Int(max_attempts)), max_pending, options)
 end
 
-struct QueueItem
-    task_key::String
+# Mutable only for `parent`, the one field that changes: every other field is `const`.
+mutable struct QueueItem
+    const task_key::String
     # The run this item was queued FOR, not merely the key it was queued under. A queued item can
     # sit in the buffer while its key moves on — `cancel_task` makes the record terminal, a
     # re-submit then replaces it with a fresh run — so by the time a teardown abandons the backlog
@@ -752,15 +759,38 @@ struct QueueItem
     # The identity therefore has to be CARRIED from where it was minted, which is the general
     # rule workers §6 states: a fence value must come from before the window it guards, never
     # from inside it.
-    run_id::UUID
-    callback::Function
-    options::TaskOptions
-    created_at::DateTime
+    const run_id::UUID
+    const callback::Function
+    const options::TaskOptions
+    const created_at::DateTime
+    # The request this item was submitted under with `submit_queued_task(…; parent =
+    # cancel_token(req))` (#906), or `nothing`. The token holds the request's `HTTP.Stream` (its
+    # body, headers and response), so the item lets go of it the moment it leaves the buffer, by
+    # whichever way it leaves: `_execute_queued_task` takes it (`_take_parent!`) before anything
+    # else, handing it to the run object only for the run's duration; `_abandon_queued_item!` and a
+    # failed `put!` clear it. A buffered item must not keep the stream alive for longer than it
+    # waits, the same rule as the run-end clear of #900's round 2. The token is never shown or
+    # logged: `show` says only whether it is set.
+    @atomic parent::Union{Nothing, CancelToken}
 
-    function QueueItem(task_key::String, run_id::UUID, callback::Function, options::TaskOptions)
-        return new(task_key, run_id, callback, options, current_time_utc())
+    function QueueItem(task_key::String, run_id::UUID, callback::Function, options::TaskOptions,
+                       parent::Union{Nothing, CancelToken} = nothing)
+        return new(task_key, run_id, callback, options, current_time_utc(), parent)
     end
 end
+
+# Whether the item is linked, never the link, nor the callback's captures: the same rule as
+# `TaskInfo`'s `show` (#662, #906).
+function Base.show(io::IO, item::QueueItem)
+    print(io, "QueueItem(", repr(item.task_key), ", run_id = ", item.run_id)
+    (@atomic item.parent) === nothing || print(io, ", linked to a request")
+    print(io, ")")
+    return nothing
+end
+Base.show(io::IO, ::MIME"text/plain", item::QueueItem) = show(io, item)
+
+# Take the item's request link, leaving `nothing`: whoever takes it owns it from here (#906).
+_take_parent!(item::QueueItem)::Union{Nothing, CancelToken} = @atomicswap item.parent = nothing
 
 # A declared queue: one buffer drained by up to `concurrency` processor tasks (#513).
 #

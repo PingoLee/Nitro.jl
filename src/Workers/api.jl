@@ -1226,8 +1226,8 @@ end
 
 """
     submit_queued_task(queue_name, task_key, callback, owner::Owner; scope=:user,
-                       watchers=Owner[], options=TaskOptions(), runtime=default_runtime())
-    submit_queued_task(app, queue_name, task_key, callback_or_job, owner::Owner; scope, watchers, options, key, runtime)
+                       watchers=Owner[], options=TaskOptions(), runtime=default_runtime(), parent=nothing)
+    submit_queued_task(app, queue_name, task_key, callback_or_job, owner::Owner; scope, watchers, options, key, runtime, parent)
 
 Queue `callback` on the declared queue `queue_name` and return the id it was stored under. On an
 `App`, a [`Job`](@ref) can stand in for the callback, as on [`submit_task`](@ref); closures and
@@ -1246,23 +1246,55 @@ return value is for; the difference is the queue's bound and order, and that the
 authorizer sees the real `queue_name`.
 
 This was `submit_sequential_task` until #513, which gave a queue a concurrency.
+
+# Linking a run to the request that submitted it
+
+`parent = cancel_token(req)` links the item to its request exactly as on [`submit_task`](@ref)
+([#906](https://github.com/PingoLee/Nitro.jl/issues/906)): once the client disconnects, the
+handler's `serve(handler_timeout = …)` passes, or `terminate` begins, a running item's
+[`cancel_reason`](@ref cancel_reason(::TaskInfo)) reads that cause at its next check, and a run that
+stops at a [`checkpoint!`](@ref) is recorded `CANCELLED`. A request that completes cancels nothing.
+
+```julia
+function render(req)
+    id = submit_queued_task(app, "compute", "render", task_info -> render_scene(task_info),
+                            Owner(user_id(req)); parent = cancel_token(req))
+    return Res.json(wait_for_result(app, id))       # the client leaving stops the job too
+end
+```
+
+**A queued item is checked once more, when a processor takes it.** If its request has settled a
+cause by then (`:client_disconnected`, `:timeout`, `:shutdown`), the item is recorded `CANCELLED`
+with that reason and its callback is not called: its request has already been asked to stop, and
+nothing ran. The check is the request's own, so a disconnect it does not observe (the probe runs at
+most once every 10 ms per request, and a connection that died without a FIN looks alive) lets the
+item start, and the run then sees the cause at its first check. An item whose request *completed*
+while it waited runs as usual.
+
+A buffered item keeps its request alive until a processor takes it, then hands the link to the run,
+which drops it when it ends. A teardown abandoning the item, or a submit whose item never reached
+the buffer, drops it at once. An `External(…)` queue refuses `parent` with an `ArgumentError`: its
+runs execute in a consumer process, which has no request to poll.
 """
-function submit_queued_task(queue_name::AbstractString, task_key::AbstractString, callback::Function, owner::Owner; scope::Symbol=:user, watchers::AbstractVector{Owner}=Owner[], options::TaskOptions=TaskOptions(), runtime::WorkerRuntime=default_runtime())
-    return _submit_queued_task(runtime, queue_name, task_key, _ClosureRun(callback), owner, scope, watchers, options)
+function submit_queued_task(queue_name::AbstractString, task_key::AbstractString, callback::Function, owner::Owner; scope::Symbol=:user, watchers::AbstractVector{Owner}=Owner[], options::TaskOptions=TaskOptions(), runtime::WorkerRuntime=default_runtime(),
+                            parent::Union{Nothing, CancelToken}=nothing)
+    return _submit_queued_task(runtime, queue_name, task_key, _ClosureRun(callback), owner, scope, watchers, options, parent)
 end
 
 submit_queued_task(::AbstractString, ::AbstractString, ::Job, ::Owner; kwargs...) =
     _throw_job_needs_app("submit_queued_task")
 
-function submit_queued_task(ctx::App, queue_name::AbstractString, task_key::AbstractString, job::Job, owner::Owner; scope::Symbol=:user, watchers::AbstractVector{Owner}=Owner[], options::TaskOptions=TaskOptions(), key::Symbol=DEFAULT_EXTENSION_KEY, runtime::Union{Nothing, WorkerRuntime}=nothing)
+function submit_queued_task(ctx::App, queue_name::AbstractString, task_key::AbstractString, job::Job, owner::Owner; scope::Symbol=:user, watchers::AbstractVector{Owner}=Owner[], options::TaskOptions=TaskOptions(), key::Symbol=DEFAULT_EXTENSION_KEY, runtime::Union{Nothing, WorkerRuntime}=nothing,
+                            parent::Union{Nothing, CancelToken}=nothing)
     resolved = _resolve_runtime(ctx; key, runtime)
-    return _submit_queued_task(resolved, queue_name, task_key, _PendingJob(_job_registry(ctx), job), owner, scope, watchers, options)
+    return _submit_queued_task(resolved, queue_name, task_key, _PendingJob(_job_registry(ctx), job), owner, scope, watchers, options, parent)
 end
 
 # The body of both `submit_queued_task` forms; see `_submit_task`.
 function _submit_queued_task(runtime::WorkerRuntime, queue_name::AbstractString, task_key::AbstractString,
                              work, owner::Owner, scope::Symbol,
-                             watchers::AbstractVector{Owner}, options::TaskOptions)
+                             watchers::AbstractVector{Owner}, options::TaskOptions,
+                             parent::Union{Nothing, CancelToken})
     queue_id = String(queue_name)
 
     _authorize_queue!(runtime.store, queue_id, owner)
@@ -1285,6 +1317,10 @@ function _submit_queued_task(runtime::WorkerRuntime, queue_name::AbstractString,
     # so a caller the authorizer refuses learns nothing about the queue.
     placement = _external_placement(runtime, queue_id)
     if placement !== nothing
+        # A consumer process runs the item, far from the request, so there is nothing to poll (#906).
+        parent === nothing || throw(ArgumentError(
+            "queue '$queue_id' is External(…): its runs execute in a consumer process, which has no " *
+            "request to poll, so a submit cannot pass `parent`. Link only a queue this process runs"))
         work isa _ClosureRun && throw(ArgumentError(
             "queue '$queue_id' is External(…): its runs execute in a consumer process, which cannot " *
             "run a closure. Register the job with `register_job!(app, name, ArgsType)` and submit " *
@@ -1315,7 +1351,7 @@ function _submit_queued_task(runtime::WorkerRuntime, queue_name::AbstractString,
     queue = _start_queue_processor(runtime, queue_id)
     run_id = _register_or_watch!(runtime, key, owner; queue_name=queue_id, grants=watchers, queue, job_name, job_args)
     if run_id !== nothing
-        item = QueueItem(key, run_id, callback, options)
+        item = QueueItem(key, run_id, callback, options, parent)
 
         # A teardown landing between resolving the queue and handing it the item makes this
         # `put!` throw, and the record written a moment ago by `_register_or_watch!` is then
@@ -1333,7 +1369,10 @@ function _submit_queued_task(runtime::WorkerRuntime, queue_name::AbstractString,
         try
             put!(queue.channel, item)
         catch error
-            # Unconditionally, whatever went wrong: the item never reached the buffer.
+            # Unconditionally, whatever went wrong: the item never reached the buffer. Nor will it
+            # run, so it lets go of its request here too (#906, `QueueItem.parent`). A FULL buffer
+            # never gets this far: `_register_or_watch!` refuses it before any item exists.
+            @atomic item.parent = nothing
             _release_capacity!(runtime, queue, run_id)
             error isa InvalidStateException || rethrow()
             try
@@ -1349,8 +1388,9 @@ function _submit_queued_task(runtime::WorkerRuntime, queue_name::AbstractString,
     return key
 end
 
-function submit_queued_task(ctx::App, queue_name::AbstractString, task_key::AbstractString, callback::Function, owner::Owner; scope::Symbol=:user, watchers::AbstractVector{Owner}=Owner[], options::TaskOptions=TaskOptions(), key::Symbol=DEFAULT_EXTENSION_KEY, runtime::Union{Nothing, WorkerRuntime}=nothing)
-    return submit_queued_task(queue_name, task_key, callback, owner; scope, watchers, options, runtime=_resolve_runtime(ctx; key, runtime))
+function submit_queued_task(ctx::App, queue_name::AbstractString, task_key::AbstractString, callback::Function, owner::Owner; scope::Symbol=:user, watchers::AbstractVector{Owner}=Owner[], options::TaskOptions=TaskOptions(), key::Symbol=DEFAULT_EXTENSION_KEY, runtime::Union{Nothing, WorkerRuntime}=nothing,
+                            parent::Union{Nothing, CancelToken}=nothing)
+    return submit_queued_task(queue_name, task_key, callback, owner; scope, watchers, options, runtime=_resolve_runtime(ctx; key, runtime), parent)
 end
 
 """

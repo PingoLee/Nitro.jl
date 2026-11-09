@@ -251,10 +251,28 @@ _cancel_task!(runtime::WorkerRuntime, task_info::TaskInfo) =
 # the processor checks `draining` for anything it had already taken, so one item can reach here
 # twice and the second call writes nothing.
 function _abandon_queued_item!(runtime::WorkerRuntime, item::QueueItem)
+    # First, before a store write that can throw: the item will never run, so it lets go of its
+    # request now (#906, `QueueItem.parent`).
+    @atomic item.parent = nothing
     return try_transition!(runtime.store, item.task_key, (PENDING,), CANCELLED;
                            run_id=item.run_id,
                            error=_cancel_message(:shutdown),
                            completed_at=current_time_utc())
+end
+
+# The dequeue check of a linked item's request (#906), which may run the request's disconnect probe
+# here, outside the attempt loop. A probe that throws (a socket error other than the peer leaving)
+# counts as no cause: the run starts, and its callback's own check meets the same failure inside
+# `_run_attempts!`, where it is recorded. Escaping from here instead would reach the processor's
+# catch-all and strand the record `PENDING`, which no sweep reaps. `is_unrecoverable` rethrows, as
+# everywhere (`src/errors.jl`'s site table).
+function _dequeue_request_reason(parent::CancelToken)::Symbol
+    try
+        return _request_reason(parent)
+    catch err
+        is_unrecoverable(err) && rethrow()
+        return :none
+    end
 end
 
 function _execute_queued_task(runtime::WorkerRuntime, item::QueueItem)
@@ -266,6 +284,11 @@ function _execute_queued_task(runtime::WorkerRuntime, item::QueueItem)
     # Every way out of this function gives back the run's capacity reservation (#324), exactly
     # once -- `_release_run!` is idempotent by `run_id` -- except a timed-out callback, which keeps
     # it until it actually returns (`_RunHandoff`, `execution.jl`).
+    #
+    # The request link (#906) is TAKEN off the item before anything else, so the item has let go
+    # of it on every way out below: a declined claim or a throwing store drops it with this frame,
+    # and a run holds it on its run object only until its `finally`.
+    parent = _take_parent!(item)
     task_info = try
         _claim_run!(runtime, item.task_key, item.run_id)
     catch
@@ -325,6 +348,29 @@ function _execute_queued_task(runtime::WorkerRuntime, item::QueueItem)
     # `_deregister_run!` is fenced on `run_id` and idempotent, so this is a no-op on every path
     # `_finish_task!` already covered.
     try
+        if parent !== nothing
+            # Before the start claim, so the callback's first check already sees the request, as
+            # `_execute_task_async` does (#662).
+            @atomic task_info.parent = parent
+            # A cause the request settled while the item sat in the buffer (#906): nothing has run,
+            # so the item is recorded CANCELLED with that reason instead of being started. The
+            # write is `_finish_task!`'s run-fenced CAS from `PENDING`, taken INSTEAD of the RUNNING
+            # claim below, so the two never race; a concurrent `cancel_task` is the same CAS, and
+            # whichever lands first stands. A request that completed while the item waited settled
+            # no cause, so the item runs: completion never cancels.
+            #
+            # The REQUEST's reason, not the run's whole token: a cause of the run's own (a drain's
+            # `:shutdown` set after the claim published the handles) takes the path an unlinked
+            # item takes, a start that stops at the callback's first check. `cancel_reason` then
+            # settles the request's cause on the run's token, so the record's `cancel_reason` reads
+            # it and the stored text is that cause's -- unless the run's own token already holds a
+            # cause (a drain's `:shutdown`), which wins, first cause first.
+            if _dequeue_request_reason(parent) !== :none
+                cancel_reason(task_info)
+                return _cancel_task!(runtime, task_info)
+            end
+        end
+
         # Fenced on the ITEM's identity, never on the record's. `_claim_run!` already proved
         # the two are equal, so this is the same VALUE -- but not the same provenance, and
         # provenance is the rule: workers §6 asks that a fence value come from before the window
@@ -346,6 +392,9 @@ function _execute_queued_task(runtime::WorkerRuntime, item::QueueItem)
         return _run_attempts!(runtime, task_info, item.callback, item.options, handoff)
     finally
         _deregister_run!(runtime, task_info)
+        # Drop the request link once the run is over, cancelled at dequeue included -- see the
+        # same clear in `_execute_task_async` for why a finished record must not keep it.
+        parent === nothing || (@atomic task_info.parent = nothing)
         _handed_off(handoff[]) || _release_run!(runtime, item.run_id)
     end
 end
