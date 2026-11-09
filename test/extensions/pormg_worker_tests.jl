@@ -2768,6 +2768,40 @@ else
             end
         end
 
+        @testset "a queued item whose request timed out while buffered: CANCELLED at dequeue (#906, #910)" begin
+            # The dequeue check's CANCELLED is `_finish_task!`'s run-fenced CAS from PENDING, which
+            # on this store is an UPDATE of the row. Read the ROW back, not a cached object: the
+            # stored reason text, no start stamp, and a callback that never ran.
+            m = MockTaskModel()
+            store_dq = RealPormGWorkerStore(model=m)
+            rt_dq = WorkerRuntime(store_dq; queues = ["dq"])
+            owner = Owner("user-dq")
+            gate = Base.Event()
+            entered = Threads.Atomic{Bool}(false)
+            ran = Threads.Atomic{Int}(0)
+            try
+                blocker = submit_queued_task("dq", "blocker", _ -> (entered[] = true; wait(gate); :done),
+                                             owner; runtime=rt_dq)
+                @test timedwait(() -> entered[], 30.0) == :ok
+                # A request whose handler deadline has passed: its first check settles `:timeout`.
+                expired = Nitro.CancelToken(Nitro.Core.Constants.ShutdownSignal(), nothing,
+                                            time_ns() - UInt64(1))
+                id = submit_queued_task("dq", "timed-out", _ -> (Threads.atomic_add!(ran, 1); :ran),
+                                        owner; runtime=rt_dq, parent=expired)
+                notify(gate)
+                @test timedwait(() -> get_task_status(id, owner; runtime=rt_dq)[:status] == "CANCELLED", 10.0) == :ok
+                @test timedwait(() -> get_task_status(blocker, owner; runtime=rt_dq)[:status] == "COMPLETED", 10.0) == :ok
+                row = m._table[id]
+                @test row["status"] == "CANCELLED"
+                @test row["error"] == "Cancelled by timeout"
+                @test row["started_at"] === nothing
+                @test ran[] == 0
+            finally
+                notify(gate)
+                reset_runtime!(rt_dq)
+            end
+        end
+
         @testset "the runtime tears a persistent backend down (#29, #167)" begin
             store_td = RealPormGWorkerStore(model=MockTaskModel())
             rt_store_td = WorkerRuntime(store_td; queues = ["td-queue"])
