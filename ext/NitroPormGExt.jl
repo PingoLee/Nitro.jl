@@ -624,8 +624,10 @@ What a `nitro_session` table created by an older Nitro needs, and nothing a curr
 `created_at` column (#362), probed first, and the expiry index, under the name the table has always
 had. These are the statements the boot ran before `ensure_table!` (#791), minus the
 `CREATE TABLE IF NOT EXISTS`, so a pre-existing table gets the same DDL as before. (Not the same
-locking: `ensure_table!`'s existence check runs first, inside a write transaction on SQLite; the
-#791 upgrade entry says what a boot can wait on.) The index name is the
+locking: `ensure_table!`'s existence check runs first, inside a write transaction on SQLite. That
+waits behind another process's write transaction up to the busy timeout, then raises
+`OperationalError`, and behind another task's in this process, on the pool's write lock, with no
+timeout. The #791 upgrade entry says more.) The index name is the
 one PormG derives for `expires_at`'s `db_index` (`<table>_<column>_idx`, PormG #1341), so a table
 `ensure_table!` created and one this upgraded hold the same index.
 """
