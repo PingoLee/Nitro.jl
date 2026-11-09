@@ -331,6 +331,17 @@ end
     @test revoke_refresh_token(MemoryRefreshTokenStore(), b; secret) === nothing
     # A token that does not verify signs nobody out.
     @test reason(() -> revoke_refresh_token(store2, "not-a-jwt"; secret)) === :invalid
+    # Nor does one past its `exp` (beyond decode_jwt's 30 s skew), even with a valid signature and a
+    # live family: a long-expired token that leaked must not be able to end a sign-in. The logout
+    # endpoint answers success anyway (RFC 7009 §2.2); the tutorial's handler shows how.
+    ts() = Nitro.Auth._current_timestamp()
+    store3 = MemoryRefreshTokenStore()
+    live = issue_refresh_token(store3, "7"; secret)
+    claims = decode_jwt(live, secret)
+    expired = encode_jwt(Dict("sub" => "7", "jti" => "spent-long-ago", "fam" => claims["fam"],
+                              "token_use" => "refresh", "iat" => ts() - 7200, "exp" => ts() - 3600), secret)
+    @test reason(() -> revoke_refresh_token(store3, expired; secret)) === :invalid
+    @test rotate_refresh_token(store3, live; secret) isa RefreshRotation
 end
 
 @testitem "refresh tokens: concurrent rotations of one token are a reuse (#231)" tags=[:auth, :core] setup=[NitroCommon] begin

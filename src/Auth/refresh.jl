@@ -435,9 +435,28 @@ Sign-out: verify the refresh `token` and revoke its whole family (its signed `fa
 nor any token rotated from it can be used again. Revoking one token and revoking its family are the
 same call, because under rotation a family holds at most one live token.
 
-It is idempotent. A token of a family that is already gone, or one that was rotated away, still
-signs its family out and returns normally, since holding any token of the family is enough to end
-it. A token that does not verify throws [`RefreshTokenError`](@ref)`(:invalid)`.
+It is idempotent for any token that **verifies**. A token of a family that is already gone, or one
+that was rotated away, still signs its family out and returns normally, since holding any token of
+the family is enough to end it.
+
+A token that does not verify throws [`RefreshTokenError`](@ref)`(:invalid)`, and that includes one
+past its `exp` (beyond `decode_jwt`'s 30-second skew). The verification is the same as
+`rotate_refresh_token`'s, deliberately: an expired token's own lineage has nothing live left to end
+unless it was rotated away, and a lenient check would let a token that leaked long ago sign a live
+family out. So a sign-out endpoint should answer success whatever this throws, as RFC 7009 §2.2
+says a revocation endpoint does for an invalid token: the client wanted to be signed out, and
+cannot do anything useful with an error.
+
+```julia
+function logout(req, body::Json{RefreshRequest})
+    try
+        revoke_refresh_token(refresh_store, body.payload.refresh_token; secret = REFRESH_SECRET)
+    catch e
+        e isa RefreshTokenError || rethrow()
+    end
+    return Res.status(204)
+end
+```
 """
 function revoke_refresh_token(store::AbstractRefreshTokenStore, token::AbstractString; secret,
                               issuer = nothing, audience = nothing)::Nothing

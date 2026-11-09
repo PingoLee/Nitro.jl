@@ -672,7 +672,11 @@ function refresh(req, body::Json{RefreshRequest})
 end
 
 function logout(req, body::Json{RefreshRequest})
-    revoke_refresh_token(refresh_store, body.payload.refresh_token; secret = REFRESH_SECRET)
+    try
+        revoke_refresh_token(refresh_store, body.payload.refresh_token; secret = REFRESH_SECRET)
+    catch e
+        e isa RefreshTokenError || rethrow()   # an expired or invalid token: signed out anyway
+    end
     return Res.status(204)
 end
 
@@ -707,7 +711,11 @@ What each piece does, and what it leaves to you:
   security event. The error never carries the token or its `jti`, and nothing on the refresh
   path logs one.
 - **`revoke_refresh_token`** is sign-out: it revokes the token's family. Revoking one token and
-  revoking its family are the same call, because a family has at most one live token.
+  revoking its family are the same call, because a family has at most one live token. It verifies
+  the token as rotation does, so an expired one throws `RefreshTokenError(:invalid)` and revokes
+  nothing. The handler above answers `204` anyway, as
+  [RFC 7009 §2.2](https://www.rfc-editor.org/rfc/rfc7009#section-2.2) says a revocation endpoint
+  should: the client wanted to be signed out, and can do nothing useful with an error.
 - **`RefreshTokenPruner`** removes expired families in the background. Expired tokens are
   refused whether or not it runs; it keeps the store's bound for live sign-ins.
 
