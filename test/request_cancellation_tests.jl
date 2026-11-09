@@ -759,6 +759,9 @@ try
     for s in renders(token)
         @test !leaks(s)
     end
+    # The client can hold the whole response before the server loop's `closewrite` marks the
+    # request ended (the ordering http_internals_contract_tests.jl pins), so wait for the end.
+    @test timedwait(() -> cancel_reason(token) === :completed, 10.0) === :ok
     @test sprint(show, token) == "CancelToken(reason = :none, deadline = :none, ended = true)"
     for s in renders(info)
         @test !leaks(s)
