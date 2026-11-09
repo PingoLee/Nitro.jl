@@ -30,7 +30,10 @@ take a bug in the runner.
   lifecycle goes on: under the JIT as an `@error` record carrying the runner's backtrace, in a
   trimmed build as the stderr line `Nitro: the <phase> hook runner failed: <Type>`.
 - **With Ctrl-C in the same lifecycle:** the interrupt is re-raised as before, and the runner
-  failure is logged instead of raised.
+  failure is logged instead of raised. The same holds when a Ctrl-C reaches `serve` while the
+  startup hooks throw anything else (the hooks run off thread 1 outside a REPL): `serve` used to
+  raise that throw and drop the interrupt. Now it raises the interrupt, logs the throw, and a
+  trimmed build writes `Nitro: the startup broadcast failed: <Type>`.
 
 ### How to find the calls to migrate
 

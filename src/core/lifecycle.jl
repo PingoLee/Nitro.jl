@@ -963,8 +963,12 @@ function _startup_broadcast(route_lf, serve_lf)::Nullable{InterruptException}
     isnothing(interrupt) && throw(result)
     # A Ctrl-C on this wait AND a throw out of the broadcast (a failed hook runner, #892, or
     # something structural): the interrupt wins, as `_raise_runner_failure` decides inside the
-    # broadcast, and `startserver` unwinds either way. The throw is logged, not dropped.
+    # broadcast, and `startserver` unwinds either way. The throw is logged, not dropped. A
+    # structural one (a throwing logger, `_lifecycle_fptr!`'s refusal) never wrote a line of its
+    # own, and `serve` used to raise it; a trimmed build drops the record (#846), so the line
+    # beside it is all that is left there.
     @error "Nitro: the startup broadcast failed; the interrupt is raised instead" exception=loggable(result)
+    Types._trimmed_failure("the startup broadcast", result)
     return interrupt
 end
 
@@ -1022,7 +1026,11 @@ end
 # A failed hook runner (#892) is carried the way an interrupt is: one carrier over all four
 # broadcasts, so the rest of the `on_shutdown` hooks, the clears, the listener close and every
 # `on_stopped` still run, and the first failure is thrown as the last step, unless an interrupt
-# is also being carried (`_raise_runner_failure`). The `catch`es below never see one.
+# is also being carried (`_raise_runner_failure`). The `catch`es below never see one. One way out
+# abandons the carrier: a non-interrupt throw out of `_close_deferring_interrupt` (a `close` that
+# throws something structural) leaves through the `finally` once the `on_stopped` hooks have run,
+# so that throw is what the caller gets and the carried failure is never raised. It is not lost:
+# `_run_lifecycle` reported it when it happened.
 function _teardown!(context::App, route_lf, serve_lf,
                     interrupt::Nullable{InterruptException};
                     listener::Bool, timeout::Real)::Nullable{InterruptException}
@@ -1242,7 +1250,10 @@ function startserver(ctx::App; host, port, show_banner=false, async=false, kwarg
         # `_startup_hooks` raises only once every startup hook has run, #892): `startup` catches
         # whatever a hook throws, so reaching this line means the broadcast itself broke. It used to strand
         # the open listener, on purpose, as the loud signal; with no listener yet, the hooks that
-        # ran are unwound and the error is raised as it was.
+        # ran are unwound and the error is raised as it was, with one exception: if a hook runner
+        # also fails during the unwind, `_teardown!` throws that failure out of the unwind, and it
+        # replaces this one, so `serve` raises the second. When this one was a runner failure too,
+        # both were logged where they happened (`_run_lifecycle`), so neither is lost.
         if !(e isa InterruptException)
             _unwind_start!(ctx, claim, route_lf, serve_lf, nothing)
             rethrow()
