@@ -37,6 +37,11 @@ import Sockets
 #       body through the public `startwrite` + `write`, and reads two `Stream` state fields.
 #       `_mark_reported!` writes `stream.io_error`, the field HTTP 2.11's stream loop reads to
 #       decide whether to log an error itself (JuliaWeb/HTTP.jl#1425).
+#   • src/core/request.jl — `_ended`/`_upgraded` (#662) read a request as over once its stream's
+#       `write_closed` is set, unless its response is a `101`: HTTP sets `write_closed` at
+#       `closewrite` for a plain response but BEFORE the handler for a WebSocket upgrade, and assigns
+#       `stream.response` before that release store. Pinned on a raw listener in
+#       "HTTP closes a stream's write side at closewrite, and before a WebSocket handler (#662)".
 #   • src/core/lifecycle.jl — refuses cleartext HTTP/2 (#375) with `listen!`'s `allow_h2c = false`.
 #       Public since HTTP.jl 2.9, so no longer an internal; pinned anyway because it is the whole
 #       of the refusal (it replaced an override of the private `_probe_h2_preface!`).
@@ -1064,6 +1069,82 @@ try
             @test isempty(http_records())
         end
     end
+finally
+    close(server)
+end
+end
+
+@testitem "HTTP closes a stream's write side at closewrite, and before a WebSocket handler (#662)" tags=[:core, :network] setup=[NitroCommon] begin
+using Test
+import HTTP
+import Nitro
+
+# `cancel_token(req)` reads `:completed` once the request has ended, and `src/core/request.jl` takes
+# a served request's end from HTTP's own state rather than writing one: `_ended` is the stream's
+# `write_closed` (acquire), unless `_upgraded`, the stream's response being a `101`. That rests on
+# two orderings in HTTP, pinned here on a raw listener with no Nitro in the path:
+#
+#   1. A plain response: `write_closed` is still false after the handler's writes and turns true at
+#      the `closewrite` the server loop makes once the handler returns. If HTTP set it earlier, a
+#      token would read `:completed` while the response is still being written; if never, never.
+#   2. A WebSocket upgrade: `upgrade` assigns `stream.response` (the `101`), release-stores
+#      `write_closed`, and only then calls the handler, which runs for the socket's life. So in the
+#      handler `write_closed` is already true, and `stream.response.status == 101` is visible after
+#      the acquire. If HTTP stopped assigning the response first, `_upgraded` could read the old one
+#      and a live WebSocket would read as ended: blind to `:shutdown`, its token `:completed`.
+PLAIN = Channel{NamedTuple}(1)
+WS = Channel{NamedTuple}(1)
+STREAMS = Channel{HTTP.Stream}(2)
+
+closed(stream) = @atomic :acquire stream.write_closed
+
+function handler(stream::HTTP.Stream)
+    HTTP.startread(stream)
+    put!(STREAMS, stream)
+    if HTTP.WebSockets.isupgrade(stream.message)
+        before = closed(stream)
+        HTTP.WebSockets.upgrade(stream) do ws
+            wc = closed(stream)                       # the acquire, then the response it orders
+            resp = stream.response
+            put!(WS, (; before, in_handler = wc, status = resp === nothing ? 0 : resp.status,
+                        upgraded = Nitro.Core._upgraded(stream)))
+            HTTP.WebSockets.send(ws, "seen")
+        end
+    else
+        before = closed(stream)
+        HTTP.setstatus(stream, 200)
+        HTTP.setheader(stream, "Content-Length" => "2")
+        HTTP.startwrite(stream)
+        write(stream, "ok")
+        put!(PLAIN, (; before, after_writes = closed(stream)))
+    end
+    return nothing
+end
+
+port = get_free_port()
+server = HTTP.listen!(handler, HOST, port)
+try
+    resp = HTTP.get("http://$HOST:$port/plain"; status_exception = false, retry = false)
+    @test (resp.status, String(resp.body)) == (200, "ok")
+    @test timedwait(() -> isready(PLAIN), 10.0) === :ok
+    plain = take!(PLAIN)
+    @test !plain.before
+    @test !plain.after_writes                         # not over while the handler still holds it
+    s = take!(STREAMS)
+    @test timedwait(() -> closed(s), 10.0) === :ok    # over at the loop's `closewrite`
+    @test s.response.status == 200
+    @test !Nitro.Core._upgraded(s)
+
+    got = HTTP.WebSockets.open("ws://$HOST:$port/ws") do ws
+        String(HTTP.WebSockets.receive(ws))
+    end
+    @test got == "seen"
+    @test timedwait(() -> isready(WS), 10.0) === :ok
+    ws = take!(WS)
+    @test !ws.before
+    @test ws.in_handler                               # closed before the handler ran
+    @test ws.status == 101
+    @test ws.upgraded
 finally
     close(server)
 end

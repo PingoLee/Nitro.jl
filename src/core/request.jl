@@ -561,7 +561,9 @@ end
 
 # Whether the stream was handed to a WebSocket. Read only once `write_closed` has been observed
 # with acquire: HTTP.jl assigns `stream.response` before its release store of `write_closed`, and
-# does not assign it again, so the read is ordered and cannot race.
+# does not assign it again, so the read is ordered and cannot race. Both orderings this and `_ended`
+# rest on are pinned in test/http_internals_contract_tests.jl, so an HTTP bump that moves them fails
+# there.
 _upgraded(stream::HTTP.Stream)::Bool = (resp = stream.response; resp !== nothing && resp.status == 101)
 
 # A request whose stream became a WebSocket (#661): its handler is the socket's loop, which
