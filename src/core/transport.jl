@@ -1085,7 +1085,18 @@ function _upgrade_websocket!(f::Function, req::HTTP.Request)
     finally
         # Every way out of `upgrade` — refused, the handler returned or threw, the peer vanished.
         adm === nothing || Threads.atomic_sub!(adm.upgraded, one(Int64))
+        # The socket's life is the request's (#662): an upgraded stream's `write_closed` is set
+        # before the handler runs, so `_ended` does not read it, and this is where a WebSocket
+        # request ends. A token a task the handler spawned still holds reads `:completed` from here.
+        # On the handler's task, so the `req.context` read is the handler's own.
+        _end_websocket_request!(req)
     end
+    return nothing
+end
+
+function _end_websocket_request!(req::HTTP.Request)::Nothing
+    state = get(req.context, REQUEST_CANCEL_STATE_KEY, nothing)
+    state isa CancelToken && _mark_ended!(state)
     return nothing
 end
 
@@ -1255,14 +1266,26 @@ _handoff_copy(resp::HTTP.Response)::HTTP.Response = own_response_headers(resp)
 # that sends a head and then trickles its body holds a slot as long as it likes, and without
 # `write_timeout` so does one that stops reading its response. Behind a buffering proxy neither
 # happens; exposed directly, set both alongside the cap — the `serve` docstring says so.
+#
+# `handler_timeout_ns > 0` is `serve(handler_timeout = …)` (#661). The clock starts at the top of
+# this function, right after HTTP.jl parsed the head and before the body read, and the request's
+# `CancelToken` is created here, eagerly, carrying the deadline and the run's `shutting_down`
+# signal (the pipeline binds `REQUEST_SCOPE` only later). At `0`, the default, none of that runs:
+# no clock read, no state, no write, only the branch on the captured `Int64`.
 function stream_handler(middleware::Function; max_body_bytes::Int64 = DEFAULT_MAX_BODY_BYTES,
                         max_concurrent_requests::Int64 = zero(Int64),
                         max_upgraded_connections::Int64 = zero(Int64),
-                        rejection_headers::Vector{Pair{String,String}} = Pair{String,String}[])
+                        rejection_headers::Vector{Pair{String,String}} = Pair{String,String}[],
+                        handler_timeout_ns::Int64 = zero(Int64),
+                        shutting_down::Constants.ShutdownSignal = Constants.NEVER_SHUTTING_DOWN)
     in_flight = Threads.Atomic{Int64}(0)
     upgraded  = Threads.Atomic{Int64}(0)
     capped = max_concurrent_requests > 0 || max_upgraded_connections > 0
     return function(stream::HTTP.Stream)
+        # Measured from the end of the head, not of the body (#661): the body's end is a moment
+        # the client chooses, and a trickled body would otherwise push the handler's deadline out.
+        # `read_timeout` bounds the body read; this bounds the body read and the handler together.
+        started_ns = handler_timeout_ns > 0 ? time_ns() : zero(UInt64)
         # The request slot is released exactly once — before a 413's swallow, early for a streaming
         # body, at a WebSocket's switch to its own budget, or by the outer `finally` — through
         # `_release_request_slot!`.
@@ -1273,6 +1296,8 @@ function stream_handler(middleware::Function; max_body_bytes::Int64 = DEFAULT_MA
                 return _reject_over_capacity!(stream, max_concurrent_requests, rejection_headers)
             @atomic adm.held = true
         end
+        # Declared before the `try`, so its `finally` can read it on every path (#661).
+        deadline::Union{Nothing, CancelToken} = nothing
         try
             ip = _peer_ip(stream)
             req = _http_stream_request(stream, max_body_bytes)
@@ -1302,8 +1327,17 @@ function stream_handler(middleware::Function; max_body_bytes::Int64 = DEFAULT_MA
                 adm.body_buffered = !(req.body isa HTTP.EmptyBody)
                 req.context[_ADMISSION_KEY] = adm
             end
+            if handler_timeout_ns > 0
+                deadline = _arm_deadline!(req, stream, shutting_down,
+                                          started_ns + UInt64(handler_timeout_ns))
+            end
 
             result = middleware(req)
+            # The handler is done (#661): no `:timeout` after this point, and a late return is
+            # still answered with what it produced, below. A 503 instead (Go's `TimeoutHandler`)
+            # would be a second writer racing the handler's own response on the non-consuming
+            # write path (nitro-core §4).
+            deadline === nothing || _deadline_returned!(deadline, req)
             # At its concrete body type (`Types.with_response`), so every call `_send_response!`
             # makes on the pipeline's value is static. Anything else gets the empty `200` it
             # always has.
@@ -1314,9 +1348,44 @@ function stream_handler(middleware::Function; max_body_bytes::Int64 = DEFAULT_MA
             end
             return nothing
         finally
+            # A pipeline that threw (`catch_errors = false`) skipped `_deadline_returned!`;
+            # disarm here too, so a token a task still holds never reads `:timeout` afterwards.
+            # Idempotent, and only with a deadline.
+            deadline === nothing || _disarm_deadline!(deadline)
             adm === nothing || _release_request_slot!(adm)
         end
     end
+end
+
+# `serve(handler_timeout = …)` (#661): the request's cancellation state, created before the
+# middleware runs so `cancel_reason(req)` and `cancel_token(req)` find the deadline. Nothing else
+# is written to the request, and no timer or task is started: a check compares the clock with
+# `deadline_ns` (`_request_reason`).
+function _arm_deadline!(req::HTTP.Request, stream::HTTP.Stream, shutting_down::Constants.ShutdownSignal,
+                        deadline_ns::UInt64)::CancelToken
+    state = CancelToken(shutting_down, stream, deadline_ns)
+    req.context[REQUEST_CANCEL_STATE_KEY] = state
+    return state
+end
+
+# The handler has returned. Disarms the deadline, so nothing that outlives the handler (a streamed
+# body's producer, a task holding the token) reads `:timeout`, and notes a late return at debug:
+# the route PATTERN and the overrun, never the target, whose query may carry a secret.
+function _deadline_returned!(state::CancelToken, req::HTTP.Request)::Nothing
+    now = time_ns()
+    deadline = _disarm_deadline!(state)
+    # A WebSocket's handler returns when the socket closes; that is not a late return.
+    deadline != zero(UInt64) && now > deadline && !_websocket(state) &&
+        _log_late_return(state, req, now - deadline)
+    return nothing
+end
+
+# `reason` is the cause the request had settled, `:none` when the handler never asked: a handler
+# that polled and still returned late reads `:timeout` (or the cause that came first).
+@noinline function _log_late_return(state::CancelToken, req::HTTP.Request, overrun_ns::UInt64)::Nothing
+    route = Base.get(req.context, :route, nothing)
+    @debug "Nitro: handler returned after its deadline; its response is still written" route = (route isa String ? route : "") overrun_ms = Int64(div(overrun_ns, UInt64(1_000_000))) reason = (@atomic state.reason)
+    return nothing
 end
 
 # The write half of `stream_handler`, once the pipeline has returned: `produced` is its value at a

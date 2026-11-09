@@ -77,8 +77,9 @@ export  # The application handle
         getparams, getquery, getjson, getform, getfiles, getpost,
         getsession, setsession!, getuser, getprincipal, getip, setip!, getpeerip, getcontext, payload, getexternalurl,
         route_missed,
-        # Cooperative cancellation (#466): one function, with methods for a request and a worker run
-        cancel_requested, cancel_reason,
+        # Cooperative cancellation (#466): one function, with methods for a request and a worker run;
+        # `cancel_token` hands the request's token to another task (#662)
+        cancel_requested, cancel_reason, cancel_token,
         formdata, multipart,
         # Environment resolution (#55) -- reports the env, never gates on it
         current_env,
@@ -125,6 +126,11 @@ public newapp
 # Public, not exported (#827): an application's precompile workload calls it once, qualified as
 # `Nitro.precompile_server(app; …)`, and the bare name would read as HTTP.jl's own.
 public precompile_server
+
+# Public, not exported (#662): the type of `cancel_token(req)`, named so a signature can take one
+# (`parent::Union{Nothing, Nitro.CancelToken}`). Opaque: `cancel_requested`/`cancel_reason` read it.
+using .Core: CancelToken
+public CancelToken
 
 # Public, not exported (#752): what an executable's `@main` prints when start-up fails
 # (docs/src/tutorial/deployment.md). Called qualified, `Nitro.startup_failure_text(e)`.

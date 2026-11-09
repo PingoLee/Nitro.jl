@@ -254,16 +254,33 @@ Base.show(io::IO, ::MIME"text/plain", s::Server{<:NitroStreamHandler}) = show(io
 #
 # `P`/`H` force specialization on both: `pipeline` is only passed on here, never called, so a
 # `::Function` argument would be compiled for `Function` alone (#572).
+#
+# `handler_timeout_ns` and `shutting_down` (#661) are captured as an `Int64` and a
+# `ShutdownSignal` whatever their values, so the listener's type is the same with and without a
+# deadline, and the precompile callers below may leave them at their defaults.
 function _serve_listener(pipeline::P, handler::H, body_limit::Int64, request_limit::Int64,
-                         upgraded_limit::Int64, security_headers) where {P<:Function, H}
+                         upgraded_limit::Int64, security_headers,
+                         handler_timeout_ns::Int64 = zero(Int64),
+                         shutting_down::Constants.ShutdownSignal = Constants.NEVER_SHUTTING_DOWN) where {P<:Function, H}
     request_handler = handler === stream_handler ?
         stream_handler(pipeline; max_body_bytes = body_limit,
                        max_concurrent_requests = request_limit,
                        max_upgraded_connections = upgraded_limit,
                        rejection_headers = security_headers === nothing ? Pair{String,String}[] :
-                                                                         security_headers.headers) :
+                                                                         security_headers.headers,
+                       handler_timeout_ns, shutting_down) :
         handler(pipeline)
     return NitroStreamHandler(parallel_stream_handler(request_handler)), request_handler
+end
+
+# `serve(handler_timeout = …)` in nanoseconds, `0` for none (#661). Seconds, a finite real > 0;
+# not a `Bool`, and not past what an `Int64` of nanoseconds holds (~292 years).
+_handler_timeout_ns(::Nothing)::Int64 = zero(Int64)
+function _handler_timeout_ns(seconds)::Int64
+    (seconds isa Real && !(seconds isa Bool) && isfinite(seconds) && 0 < seconds <= 9.0e9) ||
+        throw(ArgumentError("`handler_timeout` must be a number of seconds > 0, or `nothing` " *
+                            "for no deadline, got $(repr(seconds))"))
+    return max(one(Int64), round(Int64, Float64(seconds) * 1e9))
 end
 
 # `_serve_listener` for an `App` served with every default `serve` has: no middleware, the access
@@ -449,6 +466,7 @@ function serve(ctx::App;
     max_fields=DEFAULT_MAX_FIELDS,
     max_concurrent_requests=nothing,
     max_upgraded_connections=nothing,
+    handler_timeout=nothing,
     # Internal (#834): the blocking `Nitro.serve` wrappers pass a `Ref` and read back the
     # generation of the run THIS call claimed, or `0` if it claimed none, so their cleanup stops
     # exactly that run. Named here so it never reaches `HTTP.listen!` through `kwargs`.
@@ -578,6 +596,14 @@ function serve(ctx::App;
     end
     upgraded_limit = max_upgraded_connections === nothing ? zero(Int64) : Int64(max_upgraded_connections)
 
+    # The handler's deadline (#661), refused here for the same reason: read on every request.
+    # Opt-in; `nothing` is no deadline. Lives in Nitro's own `stream_handler`, which starts its clock
+    # before the body read, so a custom `handler` cannot have it.
+    handler_timeout_ns = _handler_timeout_ns(handler_timeout)
+    handler_timeout_ns == 0 || handler === stream_handler || throw(ArgumentError(
+        "`handler_timeout` cannot be applied to a custom `handler`: the deadline is started by " *
+        "Nitro's own `stream_handler`. Drop `handler`, or bound time inside it."))
+
     # Same reasoning as the checks above (#316): HTTP.jl only sees these at `listen!`, which runs
     # after the App has been mutated, so a typo'd timeout would otherwise fail half-way through.
     _validate_server_timeouts(kwargs)
@@ -672,14 +698,16 @@ function serve(ctx::App;
         if Types._trimmed() || revise == :none
             return _serve_pipeline(ctx, setupmiddleware(ctx; middleware, pipeline_kwargs...),
                                    handler, body_limit, request_limit, upgraded_limit, security_headers,
-                                   revise, host, port, show_banner, async, kwargs, claim)
+                                   handler_timeout_ns, revise, host, port, show_banner, async, kwargs,
+                                   claim)
         end
         # Prepended without `insert!`, so the `Tuple` form works too. Dev-only, and dynamic on
         # purpose: `ReviseHandler` reaches the revised world through `invokelatest`.
         return _serve_pipeline(ctx, setupmiddleware(ctx; middleware = (ReviseHandler(), middleware...),
                                                     pipeline_kwargs...),
                                handler, body_limit, request_limit, upgraded_limit, security_headers,
-                               revise, host, port, show_banner, async, kwargs, claim)
+                               handler_timeout_ns, revise, host, port, show_banner, async, kwargs,
+                               claim)
     catch
         claim.owns && _abandon_start!(ctx, claim)
         rethrow()
@@ -695,12 +723,17 @@ end
 # `::Function` alone, and the call into `_serve_listener` would be dynamic again.
 function _serve_pipeline(ctx::App, configured_middelware::P, handler::H, body_limit::Int64,
                          request_limit::Int64, upgraded_limit::Int64, security_headers,
-                         revise::Symbol, host, port, show_banner, async,
+                         handler_timeout_ns::Int64, revise::Symbol, host, port, show_banner, async,
                          kwargs, claim::StartClaim) where {P<:Function, H}
     # Once-assigned, because the `start` closure below captures it: a name reassigned before
     # capture is boxed (#364).
+    #
+    # The run's shutdown signal goes to the listener as well as to the pipeline (#661): with a
+    # `handler_timeout`, `stream_handler` creates the request's cancellation state before the
+    # pipeline binds `REQUEST_SCOPE`, and must capture the signal `setupmiddleware` captured.
     listener = first(_serve_listener(configured_middelware, handler, body_limit, request_limit,
-                                     upgraded_limit, security_headers))
+                                     upgraded_limit, security_headers, handler_timeout_ns,
+                                     ctx.service.shutting_down[]))
 
     if !Types._trimmed() && revise == :eager
         # Never overwrite a live watcher: its handle is the only way to stop it (#427). `close`

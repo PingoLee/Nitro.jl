@@ -514,12 +514,43 @@ function internalrequest(ctx::App, req::HTTP.Request; middleware::Union{Tuple,Ve
     # with its settings, and its terminal checks the route the chain was chosen for (#718).
     outer = get(req.context, Types.ROUTE_RESOLUTION_KEY, nothing)
     pipeline = setupmiddleware(ctx; middleware, serialize, catch_errors, security_headers)
-    outer === nothing && return _run_pipeline(pipeline, req)
+    if outer === nothing
+        _begin_internal_request!(req)
+        try
+            return _run_pipeline(pipeline, req)
+        finally
+            _end_internal_request!(req)
+        end
+    end
     try
         return _run_pipeline(pipeline, req)
     finally
         req.context[Types.ROUTE_RESOLUTION_KEY] = outer
     end
+end
+
+# A request object run through `internalrequest` again starts with no cancellation state (#662):
+# the previous run's has ended, and kept, it would hide every cause from this run. Stored as
+# `nothing`, which `_cancel_state` reads as absent (`RequestContext` has no `delete!`); a task that
+# still holds the previous run's token keeps that object, and it keeps reading `:completed`.
+function _begin_internal_request!(req::HTTP.Request)::Nothing
+    state = get(req.context, REQUEST_CANCEL_STATE_KEY, nothing)
+    state isa CancelToken && state.stream === nothing && (@atomic state.ended) &&
+        (req.context[REQUEST_CANCEL_STATE_KEY] = nothing)
+    return nothing
+end
+
+# The request is over (#662): a `cancel_token(req)` a task still holds reads `:completed` from now
+# on. Only for a request with no stream, whose end nothing else marks (a served request's is its
+# stream's `write_closed`), and only when no outer chain is still running on it: a middleware that
+# re-runs its own request through `internalrequest` after routing takes the `outer` branch above,
+# which leaves the request alone. One that does it BEFORE routing (a global middleware) is not
+# told apart: its inner run ends the state, and the outer handler then reads only causes settled
+# before that.
+function _end_internal_request!(req::HTTP.Request)::Nothing
+    state = get(req.context, REQUEST_CANCEL_STATE_KEY, nothing)
+    state isa CancelToken && state.stream === nothing && _mark_ended!(state)
+    return nothing
 end
 
 # The pipeline's call (#737). The pipeline's type is fully known (#572), so a caller whose request

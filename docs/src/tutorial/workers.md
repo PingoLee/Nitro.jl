@@ -830,7 +830,7 @@ cancel_task(app, task_id, Owner("user-1"))
 
 ### Why a cancellation happened
 
-Four different things set that token, and the record used to be unable to tell them apart — so a
+Several different things set that token, and the record used to be unable to tell them apart — so a
 rolling restart and a person clicking *cancel* both read as `CANCELLED`, and the stored message
 named a user on an event no user caused. `cancel_reason(task_info)` reports which one it was:
 
@@ -840,10 +840,19 @@ named a user on an event no user caused. `cancel_reason(task_info)` reports whic
 | `:shutdown` | a teardown drain (`shutdown!`, `uninstall!`, server stop) | `CANCELLED`, error `"Cancelled by worker shutdown"` — or nothing at all, if the callback returned normally |
 | `:timeout` | an expired `TaskOptions(timeout=…)` | `FAILED`, error `"Timeout of Ns exceeded"` — a deadline is never recorded as a cancellation |
 | `:superseded` | re-running a key whose previous run is still executing | nothing: the record already belongs to the new run |
+| `:client_disconnected` | the client of the request the run is linked to left (see below) | `CANCELLED`, error `"Cancelled: the client of its request disconnected"`, once the callback stops at a `checkpoint!` |
 | `:none` | nobody — it was not cancelled | — |
 
+A run linked to a request also reads that request's `:timeout` (its `serve(handler_timeout = …)`
+passed) and `:shutdown` (`terminate` began) as its own; see below. Those are recorded as the
+cancellations they are, `CANCELLED` with `"Cancelled by timeout"` or `"Cancelled by worker
+shutdown"` once the callback stops at a `checkpoint!`: the `FAILED` row above is the run's own
+`TaskOptions(timeout=…)`, which has already thrown.
+
 `cancel_requested(task_info)` is exactly `cancel_reason(task_info) !== :none`, so polling either
-costs the same single atomic read. Use the reason when a callback should react *differently* to a
+costs the same: two atomic reads, plus, for a run linked to a request that is still open, the
+request's own check (a clock read, and at most one socket peek every 10 ms). Use the reason when a
+callback should react *differently* to a
 deploy than to a person:
 
 ```julia
@@ -865,6 +874,32 @@ the person did stop it, and the shutdown merely arrived afterwards.
 
 Like the token itself, the reason is **process-local**: a cancel issued on another node reads as
 `:none` here, and a cross-process callback has to poll the durable record instead.
+
+### Stopping a job with the request that started it
+
+A handler that submits a job and then waits for its result can link the two, so the job stops when
+nobody is waiting for it any more. Pass the request's token,
+[`cancel_token(req)`](@ref cancel_token), as `parent`:
+
+```julia
+function report(req)
+    id = submit_task(app, "report", task_info -> build_report(task_info), Owner(user_id(req));
+                     parent = cancel_token(req))
+    return Res.json(wait_for_result(app, id))
+end
+```
+
+When the client disconnects, the handler's `serve(handler_timeout = …)` passes, or `terminate`
+begins, the run's `cancel_reason` reads `:client_disconnected`, `:timeout` or `:shutdown` the next
+time it checks, and a callback that stops at a `checkpoint!` is recorded `CANCELLED`. The link is
+checked where the run already checks its token, not pushed into it: a callback that never checks
+never stops, and one parked in its retry backoff sees it when the backoff ends.
+
+**A request that completes cancels nothing.** A handler that submits a job and answers `202` at once
+leaves the job running, which is what it meant. Only a cause that came before the response reaches
+the run. That is the opposite of Go's default, where a request's context is cancelled when the
+handler returns and work meant to outlive it must be detached with `context.WithoutCancel`.
+`submit_task` takes `parent`; `submit_queued_task` does not yet.
 
 Tasks can also retry on failure by passing `TaskOptions`.
 
