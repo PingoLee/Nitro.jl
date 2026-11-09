@@ -728,9 +728,12 @@ remember not to take that context (`context.WithoutCancel` exists for it). ASP.N
 `RequestAborted` fires on a disconnect only. Nitro keeps the handler's own view to the causes and
 puts the completion signal on the token, which only code that asked for it holds.
 
-**A Workers run can be linked to it.** `submit_task(…; parent = cancel_token(req))` cancels the run
-with the request's cause (`:client_disconnected`, `:timeout`, `:shutdown`), never with `:completed`:
-a job submitted by a handler that then returns keeps running. See `Nitro.Workers.submit_task`.
+**A Workers run can be linked to it.** `submit_task(…; parent = cancel_token(req))` and
+`submit_queued_task(…; parent = cancel_token(req))` cancel the run with the request's cause
+(`:client_disconnected`, `:timeout`, `:shutdown`), never with `:completed`: a job submitted by a
+handler that then returns keeps running. A queued item whose request settled a cause while it
+waited in the buffer is recorded `CANCELLED` without starting. See
+[`Nitro.Workers.submit_task`](@ref) and [`Nitro.Workers.submit_queued_task`](@ref).
 
 Creating the token costs what the first `cancel_reason(req)` call costs; a request whose handler
 never asks for one pays nothing.

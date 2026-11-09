@@ -369,7 +369,9 @@ const _READ_RETRY_BACKOFF = 0.05
 function Base.get(store::PormGSessionStore, session_id::String, default)
     # Both catches below follow #254: an interrupt, a stack overflow or an out-of-memory is not
     # "no session" -- reported as one, it would log the visitor out and carry on in a process
-    # that may be corrupted. They propagate; everything else still reads as `default`.
+    # that may be corrupted. They propagate; everything else still reads as `default`. A Ctrl-C
+    # arrives in PormG's wrapper, which `_unrecoverable` sees through (#904): `is_unrecoverable`
+    # alone read it as "no session".
     #
     # The read is retried on a transient failure first (`_read_retrying`, #791), so a dropped
     # connection does not log the visitor out. The catch stays: the retry covers `OperationalError`
@@ -378,7 +380,7 @@ function Base.get(store::PormGSessionStore, session_id::String, default)
     result = try
         _read_retrying(() -> _session_objects(store).filter("session_key" => session_id).first())
     catch e
-        is_unrecoverable(e) && rethrow()
+        _unrecoverable(e) && rethrow(_bare(e))
         @warn "PormGSessionStore: failed to read session" _db_fault(e)...
         return default
     end
@@ -395,7 +397,7 @@ function Base.get(store::PormGSessionStore, session_id::String, default)
         data = _deserialize_session(result[:session_data])
         return SessionPayload(data, expires_at, created_at)
     catch e
-        is_unrecoverable(e) && rethrow()
+        _unrecoverable(e) && rethrow(_bare(e))
         @warn "PormGSessionStore: failed to read session: the stored session does not decode" exception_type=typeof(e)
         return default
     end
@@ -426,6 +428,7 @@ function _parse_db_datetime(val)::DateTime
         try
             return Dates.DateTime(s, fmt)
         catch
+            # not a PormG statement (#904): a stored text that does not match this format
             continue
         end
     end
@@ -479,6 +482,7 @@ function set_session!(store::PormGSessionStore, session_id::String, data::Dict{S
         )
         created && _capped(store) && Threads.atomic_add!(store.count, 1)
     catch e
+        _unrecoverable(e) && rethrow(_bare(e))
         @warn "PormGSessionStore: failed to write session" _db_fault(e)...
         rethrow()
     end
@@ -502,6 +506,7 @@ function update_session!(store::PormGSessionStore, session_id::String, data::Dic
             "expires_at"   => now_utc + Dates.Second(ttl),
         )
     catch e
+        _unrecoverable(e) && rethrow(_bare(e))
         @warn "PormGSessionStore: failed to write session" _db_fault(e)...
         rethrow()
     end
@@ -551,6 +556,7 @@ function rotate_session!(store::PormGSessionStore, old_id::String, new_id::Strin
             "created_at"   => created_at,
         )
     catch e
+        _unrecoverable(e) && rethrow(_bare(e))
         @warn "PormGSessionStore: failed to rotate session" _db_fault(e)...
         rethrow()
     end
@@ -563,6 +569,7 @@ function delete_session!(store::PormGSessionStore, session_id::String)
         deleted = first(_session_objects(store).filter("session_key" => session_id).delete())
         _capped(store) && Threads.atomic_sub!(store.count, Int(deleted))
     catch e
+        _unrecoverable(e) && rethrow(_bare(e))
         @warn "PormGSessionStore: failed to delete session" _db_fault(e)...
         rethrow()
     end
@@ -577,6 +584,9 @@ function cleanup_expired_sessions!(store::PormGSessionStore)
         # other processes on the same table since the last tick (#440).
         _capped(store) && _recount_sessions!(store)
     catch e
+        # A Ctrl-C leaves bare (#904), so the janitor's `e isa InterruptException` stops on it as on
+        # a bare one; swallowed into the warning below, it made Ctrl-C during a prune a no-op.
+        _unrecoverable(e) && rethrow(_bare(e))
         @warn "PormGSessionStore: failed to cleanup expired sessions" _db_fault(e)...
     end
     return nothing
@@ -1002,7 +1012,7 @@ function _parse_stored_json(shape::Function, raw::AbstractString, column::String
     parsed = try
         Some(shape(_parse_stored(raw)))
     catch e
-        is_unrecoverable(e) && rethrow()
+        _unrecoverable(e) && rethrow(_bare(e))
         nothing
     end
     parsed === nothing &&
@@ -1041,6 +1051,7 @@ function get_task_info(store::PormGWorkerStore, task_id::String)
         end
         return _from_db_record(result)
     catch e
+        _unrecoverable(e) && rethrow(_bare(e))
         @warn "PormGWorkerStore: failed to read task" task_id exception_type=typeof(e)
         rethrow()
     end
@@ -1057,6 +1068,7 @@ function _may_read_durable(store::PormGWorkerStore, authority::Owner, task_id::S
         # Retried on a transient failure like `get_task_info`, the read it precedes (#791).
         _read_retrying(() -> _task_objects(store).filter("id" => task_id).values("watchers").first())
     catch e
+        _unrecoverable(e) && rethrow(_bare(e))
         @warn "PormGWorkerStore: failed to read task" task_id exception_type=typeof(e)
         rethrow()
     end
@@ -1150,6 +1162,7 @@ function _write_task!(store::PormGWorkerStore, task_id::String, task_info::TaskI
             _update_task_row!(store, task_id, record, false)
         end
     catch e
+        _unrecoverable(e) && rethrow(_bare(e))
         @warn "PormGWorkerStore: failed to write task" _db_fault(e)...
         rethrow()
     end
@@ -1176,6 +1189,7 @@ function _replace_task_row!(store::PormGWorkerStore, task_id::String, record, ta
                 # PostgreSQL transaction the failed INSERT has already aborted that transaction,
                 # so the re-read below throws instead and the submit fails loudly -- the app's
                 # transaction was lost either way.
+                _unrecoverable(e) && rethrow(_bare(e))
                 e isa PormG.IntegrityError || rethrow()
                 isnothing(_task_objects(store).filter("id" => task_id).first()) && rethrow()
             end
@@ -1270,6 +1284,7 @@ function delete_task!(store::PormGWorkerStore, task_id::String)
     try
         _task_objects(store).filter("id" => task_id).delete()
     catch e
+        _unrecoverable(e) && rethrow(_bare(e))
         @warn "PormGWorkerStore: failed to delete task" _db_fault(e)...
         rethrow()
     end
@@ -1344,9 +1359,9 @@ function cleanup_tasks!(store::PormGWorkerStore, retain_days::Int)
         return deleted
     catch e
         # A Ctrl-C leaves BARE: the retention scheduler recognises `e isa InterruptException` and
-        # nothing else, and PormG hands it back wrapped in a `DatabaseError` (`_interrupted`).
+        # nothing else, and PormG hands it back wrapped in a `DatabaseError` (`_unrecoverable`).
         # Swallowed into the warning below, it made Ctrl-C during a sweep a no-op.
-        _interrupted(e) && throw(InterruptException())
+        _unrecoverable(e) && rethrow(_bare(e))
         # What earlier pages already deleted is gone either way, so it is what this reports.
         @warn "PormGWorkerStore: failed to cleanup old tasks" deleted _db_fault(e)...
         return deleted
@@ -1480,6 +1495,7 @@ function get_all_tasks(store::PormGWorkerStore, authority::TaskAuthority;
                 _is_authorized(authority, task_info) && push!(out, task_info)
             end
         catch e
+            _unrecoverable(e) && rethrow(_bare(e))
             @warn "PormGWorkerStore: failed to list a page of tasks" exception_type=typeof(e)
             rethrow()
         end
@@ -1498,6 +1514,7 @@ function get_all_tasks(store::PormGWorkerStore, authority::TaskAuthority;
         end
         return tasks
     catch e
+        _unrecoverable(e) && rethrow(_bare(e))
         @warn "PormGWorkerStore: failed to list tasks" exception_type=typeof(e)
         rethrow()
     end
@@ -1527,7 +1544,7 @@ function _listed_task(row)::Union{Nothing, TaskInfo}
     catch e
         # Same #254 line as `_parse_stored_json`, which now rethrows these: skipping the row here
         # would swallow them again one frame up (#344).
-        is_unrecoverable(e) && rethrow()
+        _unrecoverable(e) && rethrow(_bare(e))
         @warn "PormGWorkerStore: skipping a task row that does not decode" task_id=id exception_type=typeof(e)
         return nothing
     end
@@ -1558,6 +1575,7 @@ function _running_ref_from_row(row)
     started_at = try
         _parse_optional_db_datetime(get_val(:started_at, "started_at"))
     catch e
+        # not a PormG statement (#904): parsing a value already fetched
         e isa InterruptException && rethrow()
         @warn "PormGWorkerStore: a RUNNING task's started_at does not parse; treating it as unstamped" task_id=id
         nothing
@@ -1590,6 +1608,7 @@ function list_running_task_refs(store::PormGWorkerStore; after::Union{Nothing, S
             ref === nothing || push!(refs, ref)
         end
     catch e
+        _unrecoverable(e) && rethrow(_bare(e))
         @warn "PormGWorkerStore: failed to list running tasks" _db_fault(e)...
         rethrow()
     end
@@ -1661,7 +1680,7 @@ function _claim_row!(store::PormGWorkerStore, row, queue_name::String, consumer_
     task = try
         _from_db_record(row)
     catch e
-        is_unrecoverable(e) && rethrow()
+        _unrecoverable(e) && rethrow(_bare(e))
         # A SECOND head row that does not decode, in one call, says the cause is not the rows: a
         # decode regression, or stored timestamps a new PormG reads differently. Failing every
         # row in the queue would make that irreversible, so stop and say so instead. The type
@@ -1912,7 +1931,7 @@ function _ensure_column!(conn, table::String, column::String, definition::String
         PormG.ConnectionPool.fetch(conn,
             "ALTER TABLE \"$table\" ADD COLUMN \"$column\" $definition")
     catch e
-        _interrupted(e) && rethrow()
+        _unrecoverable(e) && rethrow(_bare(e))
         _has_column(conn, table, column) || rethrow(e)
     end
     return nothing
@@ -1956,7 +1975,7 @@ function _has_column(conn, table::String, column::String)::Bool
         return true
     catch e
         # A Ctrl-C during the probe is not an answer: read as "missing", it would run the ALTER.
-        _interrupted(e) && rethrow()
+        _unrecoverable(e) && rethrow(_bare(e))
         return false
     end
 end
@@ -1966,6 +1985,28 @@ end
 # is the `InterruptException` -- a bare `e isa InterruptException` never matches it.
 _interrupted(e) = e isa InterruptException ||
     (e isa PormG.DatabaseError && e.cause isa InterruptException)
+
+# The ext's catch policy (#904): `is_unrecoverable` (#254), seeing through PormG's wrapper. Every
+# catch here opens with ONE line,
+#
+#     _unrecoverable(e) && rethrow(_bare(e))
+#
+# and `test/extensions/pormg_catch_policy_tests.jl` holds the ext to it. Only a catch that guards no
+# PormG statement may say so with the marker `# not a PormG statement (#904)` instead; the decode
+# catches that used `is_unrecoverable` before keep the line, so there is one predicate in the file.
+#
+# The shape is decided once. A Ctrl-C leaves BARE: `_bare` swaps PormG's wrapper for the
+# `InterruptException` it carries, because every catch above this one matches that type and not the
+# wrapper -- the janitor's per-tick `e isa InterruptException && rethrow()` and its outer stop
+# (`src/middleware/janitor.jl`), the Workers retention scheduler's loop, and the request path's
+# `is_unrecoverable` sites, which would read the wrapper as an ordinary store failure. Anything
+# else the predicate matches (an overflow, an out-of-memory) is passed on as itself. `rethrow`, not
+# `throw`, so the original backtrace stays in every case, as `is_unrecoverable`'s docstring asks.
+#
+# The unwrap lives here, not in `is_unrecoverable`: core cannot name PormG's types, and a hook
+# there would add process-wide mutable state to core for this one consumer.
+_unrecoverable(e) = _interrupted(e) || is_unrecoverable(e)
+_bare(e) = (e isa PormG.DatabaseError && e.cause isa InterruptException) ? InterruptException() : e
 
 """
     _ensure_task_table!(db_key, model) -> Symbol
@@ -2037,6 +2078,7 @@ function pormg_nitro_pools(; keys::AbstractVector{<:AbstractString}, drain_secon
         try
             PormG.Configuration.get_settings(key)
         catch e
+            # not a PormG statement (#904): a configuration lookup, which runs no query
             e isa PormG.InvalidConfigurationError || rethrow()
             throw(ArgumentError(
                 "pormg_nitro_pools: no PormG configuration is loaded for key \"$key\". Load it " *
@@ -2053,6 +2095,8 @@ function pormg_nitro_pools(; keys::AbstractVector{<:AbstractString}, drain_secon
             try
                 PormG.Configuration.close_pool!(key; drain_seconds = drain)
             catch e
+                # not a PormG statement (#904): closing a pool runs no query, and this catch stays
+                # narrow on purpose (`is_unrecoverable`'s group 2, #161)
                 e isa InterruptException && rethrow()
                 @error "pormg_nitro_pools: could not close the pool" key exception=(loggable(e), catch_backtrace())
                 # A trimmed build drops the record (#846); its line names `e`'s type and nothing else.
@@ -2141,6 +2185,7 @@ function __init__()
         try
             sync_pormg_env!()
         catch err
+            # not a PormG statement (#904): bridging an environment variable
             # Warn, never throw. An `__init__` that throws makes `using PormG` an `InitError`,
             # so a typo in a shell variable would render the application -- and the REPL
             # session you would diagnose it from -- unloadable. The authoritative, fatal check

@@ -1049,6 +1049,58 @@ end
         end
     end
 
+    @testset "a Ctrl-C in PormG's wrapper leaves every session-store call bare (#904)" begin
+        # PormG hands a Ctrl-C during a query back as a `DatabaseError` whose `cause` is the
+        # interrupt. `is_unrecoverable` alone does not see through that, so `get` read it as "no
+        # session" and the prune swallowed it. Every store call now rethrows it, as the bare
+        # `InterruptException` the janitor and the request path match on.
+        wrapped = PormG.StatementError("SQLite", InterruptException())
+        s = RealPormGSessionStore(model=ThrowingMockModel(wrapped))
+        payload = Dict{String,Any}("user_id" => 1)
+        @test_throws InterruptException Base.get(s, "sess-ctrl-c", :fallback)
+        @test_throws InterruptException cleanup_expired_sessions!(s)
+        @test_throws InterruptException Nitro.Core.Cookies.prunesessions!(s)
+        @test_throws InterruptException set_session!(s, "sess-ctrl-c", payload; ttl=3600)
+        @test_throws InterruptException update_session!(s, "sess-ctrl-c", payload; ttl=3600)
+        @test_throws InterruptException rotate_session!(s, "sess-ctrl-c", "sess-new", payload; ttl=3600)
+        @test_throws InterruptException delete_session!(s, "sess-ctrl-c")
+        # A Ctrl-C is not a store failure: none of them logs "failed to …" on the way out.
+        logger = Test.TestLogger(; min_level = Base.CoreLogging.Warn)
+        Base.CoreLogging.with_logger(logger) do
+            try
+                set_session!(s, "sess-ctrl-c", payload; ttl=3600)
+            catch
+            end
+        end
+        @test isempty(logger.logs)
+    end
+
+    @testset "a wrapped Ctrl-C during the session prune stops the janitor, as a bare one does (#904, #369)" begin
+        # The janitor's per-tick catch rethrows `InterruptException` only, and its outer handler
+        # stops the loop with one warning. A prune that swallowed the wrapper instead kept the
+        # janitor ticking, so the Ctrl-C was a no-op. The work stops the loop itself after a few
+        # calls, so the swallowing version ends too, and fails the assertions instead of hanging.
+        wrapped = PormG.StatementError("SQLite", InterruptException())
+        s = RealPormGSessionStore(model=ThrowingMockModel(wrapped))
+        token = Ref(true)
+        calls = Ref(0)
+        work = () -> begin
+            calls[] += 1
+            calls[] >= 5 && (token[] = false)
+            Nitro.Core.Cookies.prunesessions!(s)
+        end
+        logger = Test.TestLogger(; min_level = Base.CoreLogging.Warn)
+        result = Base.CoreLogging.with_logger(logger) do
+            Nitro.Core.Middleware.JanitorMiddleware._janitor_loop(
+                work, token, Dates.Millisecond(1), "SessionPruneTest", "session prune")
+        end
+        @test result === nothing
+        @test calls[] == 1                  # stopped at the first tick, not looping on
+        @test token[]                       # the interrupt ended it, not the work's own stop
+        @test any(l -> occursin("an interrupt (Ctrl-C) reached the session prune task", string(l.message)),
+                  logger.logs)
+    end
+
     @testset "a failed query's warning never quotes the row (#646, #647)" begin
         # On PostgreSQL the driver's error carries the server's DETAIL line, and a constraint
         # violation's DETAIL quotes the row: the session id, which is a bearer credential, and on a

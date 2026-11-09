@@ -6592,6 +6592,274 @@ end
 
 end
 
+# #909: the attempt loop reads a linked run's request from inside its own `catch` arm -- the
+# `TaskCancelledError` test, `_backoff_wait`, and the check after the backoff. A probe that threw
+# there used to escape `_run_attempts!` and leave the record `RUNNING` until a zombie sweep. The
+# policy is the dequeue check's (#906): a non-fatal throw from the probe is no cause, so the run
+# finishes on its own outcome. Each case runs on both submit paths. `ThrowingProbe` aims the throw
+# at one site through the probe's 10 ms claim (see that setup).
+@testitem "Workers -- a linked run whose request probe throws ends on its own outcome (#909)" tags=[:workers, :slow] setup=[NitroCommon, ThrowingProbe] begin
+
+using Test
+using Nitro
+using Nitro.Workers
+using Nitro.Workers: get_task_info
+
+waitfor(f; timeout = 20) = timedwait(f, timeout; pollint = 0.05) === :ok
+terminal(s) = s in (COMPLETED, FAILED, CANCELLED)
+
+# One linked run of `body(task_info, token, attempt)` on `path`, retried once: how it ended, and
+# how many attempts ran. `max_retries = 1`, so one backoff (2 s) is the whole wait.
+function linked_run(body, path::Symbol, key::String)
+    rt = WorkerRuntime(InMemoryWorkerStore(); queues = ["q"])
+    token = throwing_probe_token()
+    attempts = Threads.Atomic{Int}(0)
+    callback = task_info -> body(task_info, token, Threads.atomic_add!(attempts, 1) + 1)
+    options = TaskOptions(retry_on_failure = true, max_retries = 1)
+    try
+        id = path === :async ?
+            submit_task(key, callback, Owner("u"); runtime = rt, parent = token, options) :
+            submit_queued_task("q", key, callback, Owner("u"); runtime = rt, parent = token, options)
+        settled = waitfor(() -> terminal(get_task_info(rt.store, id).status))
+        rec = get_task_info(rt.store, id)
+        return (; settled, status = rec.status, error = rec.error, attempts = attempts[],
+                  parent_cleared = (@atomic rec.parent) === nothing)
+    finally
+        reset_runtime!(rt)
+    end
+end
+
+@testset "a throw in _backoff_wait: the retry runs and the run COMPLETES ($path)" for path in (:async, :queued)
+    r = linked_run(path, "backoff-$path") do task_info, token, attempt
+        attempt == 1 || return :second
+        probe_now!(token)                  # the first check after this failure probes, and throws
+        error("first attempt fails")
+    end
+    @test r.settled
+    @test r.status == COMPLETED
+    @test r.attempts == 2
+    @test r.parent_cleared
+end
+
+@testset "a throw at the check after the backoff: the run COMPLETES ($path)" for path in (:async, :queued)
+    r = linked_run(path, "after-$path") do task_info, token, attempt
+        attempt == 1 || return :second
+        # Every check inside the backoff is throttled; the one after its 2 s is the first to probe.
+        probe_after!(token, 1.0)
+        error("first attempt fails")
+    end
+    @test r.settled
+    @test r.status == COMPLETED
+    @test r.attempts == 2
+end
+
+@testset "a throw at the TaskCancelledError test: not a cancellation, retried ($path)" for path in (:async, :queued)
+    # A `TaskCancelledError` the callback built itself, with the token unset: the loop asks the
+    # token whether it is a real cancellation, and that ask is what probes.
+    r = linked_run(path, "selfcancel-$path") do task_info, token, attempt
+        attempt == 1 || return :second
+        probe_now!(token)
+        throw(TaskCancelledError(:user))
+    end
+    @test r.settled
+    @test r.status == COMPLETED
+    @test r.attempts == 2
+end
+
+@testset "every attempt fails: FAILED with the callback's own error, never RUNNING ($path)" for path in (:async, :queued)
+    # The callback's OWN check meets the throwing probe: that is an attempt failing, recorded as
+    # one. The loop's checks between the attempts meet it too, and read it as no cause.
+    r = linked_run(path, "allfail-$path") do task_info, token, attempt
+        probe_now!(token)
+        cancel_requested(task_info)        # throws FileClosingError, inside the callback
+        return :unreachable
+    end
+    @test r.settled
+    @test r.status == FAILED
+    @test r.attempts == 2
+    @test occursin("closed file", something(r.error, ""))
+    @test r.parent_cleared
+end
+
+@testset "a throw while recording a cancel another process wrote: the executor returns" begin
+    # The fourth read: `_cancel_task!` renders its message from the run's reason, and the loop
+    # reaches it from a durable read that found the record CANCELLED -- here a write standing in for
+    # a cancel issued on another node, which sets no token in this process. So the message's read
+    # checks the request, and its probe throws. Driven directly, so the escape is the call throwing.
+    rt = WorkerRuntime(InMemoryWorkerStore(); queues = ["q"])
+    owner = Owner("u")
+    token = throwing_probe_token()
+    try
+        key = Nitro.Workers.scoped_task_key("elsewhere", owner)
+        run = Nitro.Workers._register_or_watch!(rt, key, owner; queue_name = "q")
+        item = Nitro.Workers.QueueItem(key, run, function (task_info)
+            @test Nitro.Workers.try_transition!(rt.store, key, (RUNNING,), CANCELLED; run_id = run,
+                                                error = "Cancelled by user")
+            probe_now!(token)
+            error("fails after the cancel")
+        end, TaskOptions(), token)
+        @test Nitro.Workers._execute_queued_task(rt, item) !== nothing
+        rec = get_task_info(rt.store, key)
+        @test rec.status == CANCELLED
+        @test rec.error == "Cancelled by user"     # the other process's write stands
+        @test (@atomic rec.parent) === nothing
+    finally
+        reset_runtime!(rt)
+    end
+end
+
+@testset "_settled_cause: a non-fatal throw is no cause, an unrecoverable one propagates" begin
+    _settled_cause = Nitro.Workers._settled_cause
+    token = throwing_probe_token()
+    @test _settled_cause(token) === :none                  # the real probe, throwing
+    @test _settled_cause(_ -> throw(ErrorException("socket")), token) === :none
+    for fatal in (InterruptException(), StackOverflowError(), OutOfMemoryError())
+        @test_throws typeof(fatal) _settled_cause(_ -> throw(fatal), token)
+    end
+    # The request's own view is unchanged: `cancel_reason(token)` still surfaces the failure.
+    probe_now!(token)
+    @test_throws Nitro.Core.Reseau.IOPoll.FileClosingError cancel_reason(token)
+end
+
+end
+
+# #910: the paths of the queued request link (#906) that PR #908 left untested. Each only uses
+# transitions exercised elsewhere; these pin that the link takes them.
+@testitem "Workers -- the queued request link: the held pause, a throwing probe, a drain's own cause (#910)" tags=[:workers, :slow] setup=[NitroCommon, ThrowingProbe] begin
+
+using Test
+using Nitro
+using Nitro.Workers
+using Nitro.Workers: get_task_info, get_worker_queues, get_queue_lock, QueueItem,
+                     _register_or_watch!, _execute_queued_task, _request_cancel!, _cancel_message
+using Nitro.Core.Constants: ShutdownSignal, signal_shutdown!
+
+waitfor(f; timeout = 10) = timedwait(f, timeout; pollint = 0.02) === :ok
+live_token() = Nitro.CancelToken(ShutdownSignal(), nothing)
+held_items(rt) = lock(() -> copy(get_worker_queues(rt)["q"].held), get_queue_lock(rt))
+
+# A queue whose next item is HELD (#324): a queued callback that ignores its 1 s deadline is
+# abandoned and keeps its thread, which fills `max_concurrent_runs = 1`, so the processor parks the
+# next item on `queue.held` until it returns. `gate` lets it return.
+function saturate!(rt, owner, gate)
+    slow = submit_queued_task("q", "slow", () -> take!(gate), owner; runtime = rt,
+                              options = TaskOptions(timeout = 1))
+    @test waitfor(() -> get_task_info(rt.store, slow).status == FAILED; timeout = 15)
+    @test waitfor(() -> rt.abandoned_runs[] == 1)
+    return slow
+end
+
+@testset "held, then abandoned by shutdown!: CANCELLED, the token let go, never run" begin
+    rt = WorkerRuntime(InMemoryWorkerStore(); max_concurrent_runs = 1, queues = ["q"])
+    owner = Owner("u")
+    gate = Channel{Nothing}(2)
+    ran = Threads.Atomic{Int}(0)
+    try
+        saturate!(rt, owner, gate)
+        token = live_token()
+        id = submit_queued_task("q", "held", _ -> (Threads.atomic_add!(ran, 1); :ran), owner;
+                                runtime = rt, parent = token)
+        @test waitfor(() -> length(held_items(rt)) == 1)
+        item = only(held_items(rt))
+        @test (@atomic item.parent) === token         # held, and still holding its request
+        shutdown!(rt; drain_timeout = 0)
+        rec = get_task_info(rt.store, id)
+        @test rec.status == CANCELLED
+        @test rec.error == _cancel_message(:shutdown)
+        @test rec.started_at === nothing
+        @test (@atomic item.parent) === nothing
+        put!(gate, nothing)
+        sleep(0.2)
+        @test ran[] == 0
+    finally
+        foreach(_ -> isready(gate) || put!(gate, nothing), 1:2)
+        reset_runtime!(rt)
+    end
+end
+
+@testset "held while its request settles a cause: cancelled at dequeue once the pause ends" begin
+    rt = WorkerRuntime(InMemoryWorkerStore(); max_concurrent_runs = 1, queues = ["q"])
+    owner = Owner("u")
+    gate = Channel{Nothing}(2)
+    ran = Threads.Atomic{Int}(0)
+    try
+        saturate!(rt, owner, gate)
+        flag = ShutdownSignal()
+        id = submit_queued_task("q", "held", _ -> (Threads.atomic_add!(ran, 1); :ran), owner;
+                                runtime = rt, parent = Nitro.CancelToken(flag, nothing))
+        @test waitfor(() -> length(held_items(rt)) == 1)
+        signal_shutdown!(flag)                  # the request's server begins to drain
+        put!(gate, nothing)                     # the abandoned callback returns; the pause ends
+        @test waitfor(() -> get_task_info(rt.store, id).status == CANCELLED)
+        rec = get_task_info(rt.store, id)
+        @test rec.error == _cancel_message(:shutdown)
+        @test cancel_reason(rec) === :shutdown
+        @test rec.started_at === nothing
+        @test (@atomic rec.parent) === nothing
+        @test ran[] == 0
+    finally
+        foreach(_ -> isready(gate) || put!(gate, nothing), 1:2)
+        reset_runtime!(rt)
+    end
+end
+
+@testset "a throwing probe at dequeue is no cause: the item runs" begin
+    rt = WorkerRuntime(InMemoryWorkerStore(); queues = ["q"])
+    owner = Owner("u")
+    gate = Base.Event()
+    entered = Threads.Atomic{Bool}(false)
+    try
+        submit_queued_task("q", "blocker", _ -> (entered[] = true; wait(gate); :done), owner; runtime = rt)
+        @test waitfor(() -> entered[]; timeout = 30)
+        token = probe_now!(throwing_probe_token())
+        id = submit_queued_task("q", "probed", _ -> :ran, owner; runtime = rt, parent = token)
+        notify(gate)
+        @test waitfor(() -> get_task_info(rt.store, id).status == COMPLETED)
+        rec = get_task_info(rt.store, id)
+        @test rec.result == :ran
+        @test (@atomic rec.parent) === nothing
+        # The callback never checks, so the claimed probe interval is the dequeue check's.
+        @test (@atomic token.next_probe_ns) != zero(UInt64)
+    finally
+        notify(gate)
+        reset_runtime!(rt)
+    end
+end
+
+@testset "a drain's :shutdown on the run's own token alone: the item starts, then stops" begin
+    # A drain sets `:shutdown` on every published run, and `_claim_run!` publishes this one before
+    # the dequeue check. Its request has no cause, so the dequeue check reads none: the item takes
+    # the unlinked path, a start that stops at the callback's first check, not a cancel at dequeue.
+    # The token is set on the record before the call; on this store the claim hands back that same
+    # object, so the dequeue check sees exactly what a drain landing after the claim leaves.
+    store = InMemoryWorkerStore()
+    rt = WorkerRuntime(store; queues = ["q"])
+    owner = Owner("u")
+    entered = Threads.Atomic{Bool}(false)
+    try
+        key = scoped_task_key("drained", owner)
+        run = _register_or_watch!(rt, key, owner; queue_name = "q")
+        @test _request_cancel!(get_task_info(store, key), :shutdown)
+        item = QueueItem(key, run, function (task_info)
+            entered[] = true
+            checkpoint!(task_info)
+            return :unreachable
+        end, TaskOptions(), live_token())
+        _execute_queued_task(rt, item)
+        rec = get_task_info(store, key)
+        @test entered[]
+        @test rec.started_at !== nothing
+        @test rec.status == CANCELLED
+        @test cancel_reason(rec) === :shutdown
+        @test rec.error == _cancel_message(:shutdown)
+        @test (@atomic rec.parent) === nothing
+    finally
+        reset_runtime!(rt)
+    end
+end
+
+end
+
 @testitem "Workers -- named jobs (#514)" tags=[:core, :workers] setup=[NitroCommon] begin
 
 using Test

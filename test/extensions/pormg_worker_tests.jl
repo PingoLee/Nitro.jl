@@ -904,6 +904,17 @@ Base.codeunit(t::ExplodingText, ::Int) = throw(t.exc)
 Base.isvalid(::ExplodingText, ::Int) = true
 Base.iterate(t::ExplodingText, ::Int = 1) = throw(t.exc)
 
+# Every query raises `exc`, as the session tests' `ThrowingMockModel` does: for a Ctrl-C arriving
+# in PormG's wrapper on every task-store call (#904).
+struct ThrowingTaskModel
+    exc::Exception
+end
+function Base.getproperty(m::ThrowingTaskModel, name::Symbol)
+    name === :objects && return m
+    name === :db && return (_db_key::String) -> m
+    return (args...; kwargs...) -> throw(getfield(m, :exc))
+end
+
 function _load_pormg_worker_store_type()
     try
         @eval using PormG
@@ -2180,6 +2191,33 @@ else
             @test isempty(m._table[t.id]["result"])
         end
 
+        @testset "a Ctrl-C in PormG's wrapper leaves every task-store call bare (#904)" begin
+            # The task store's catches logged and rethrew PormG's wrapper, and one frame up a
+            # narrow catch still missed it: zombie recovery's `e isa InterruptException`, around
+            # `list_running_task_refs`, read it as a failed tick. Each now rethrows it bare.
+            wrapped = PormG.StatementError("SQLite", InterruptException())
+            store_i = RealPormGWorkerStore(model=ThrowingTaskModel(wrapped))
+            t = TaskInfo("alice::ctrl-c")
+            calls = (
+                () -> get_task_info(store_i, t.id),
+                () -> Nitro.Workers._may_read_durable(store_i, Owner("bob"), t.id),
+                () -> set_task!(store_i, t.id, t),
+                () -> delete_task!(store_i, t.id),
+                () -> get_all_tasks(store_i, System()),
+                () -> get_all_tasks(store_i, Owner("alice"); limit = 10),
+                () -> list_running_task_refs(store_i),
+                () -> cleanup_tasks!(store_i, 7),
+            )
+            logger = Test.TestLogger(; min_level = Base.CoreLogging.Warn)
+            Base.CoreLogging.with_logger(logger) do
+                for call in calls
+                    @test_throws InterruptException call()
+                end
+            end
+            # A Ctrl-C is not a store failure: none of them logs "failed to …" on the way out.
+            @test isempty(logger.logs)
+        end
+
         @testset "an unrecoverable error while decoding propagates (#254, #344)" begin
             parse_stored = getproperty(PormGExt, :_parse_stored_json)
             for exc in (InterruptException(), StackOverflowError(), OutOfMemoryError())
@@ -2727,6 +2765,40 @@ else
                 end
             finally
                 reset_runtime!(rt_store_err)
+            end
+        end
+
+        @testset "a queued item whose request timed out while buffered: CANCELLED at dequeue (#906, #910)" begin
+            # The dequeue check's CANCELLED is `_finish_task!`'s run-fenced CAS from PENDING, which
+            # on this store is an UPDATE of the row. Read the ROW back, not a cached object: the
+            # stored reason text, no start stamp, and a callback that never ran.
+            m = MockTaskModel()
+            store_dq = RealPormGWorkerStore(model=m)
+            rt_dq = WorkerRuntime(store_dq; queues = ["dq"])
+            owner = Owner("user-dq")
+            gate = Base.Event()
+            entered = Threads.Atomic{Bool}(false)
+            ran = Threads.Atomic{Int}(0)
+            try
+                blocker = submit_queued_task("dq", "blocker", _ -> (entered[] = true; wait(gate); :done),
+                                             owner; runtime=rt_dq)
+                @test timedwait(() -> entered[], 30.0) == :ok
+                # A request whose handler deadline has passed: its first check settles `:timeout`.
+                expired = Nitro.CancelToken(Nitro.Core.Constants.ShutdownSignal(), nothing,
+                                            time_ns() - UInt64(1))
+                id = submit_queued_task("dq", "timed-out", _ -> (Threads.atomic_add!(ran, 1); :ran),
+                                        owner; runtime=rt_dq, parent=expired)
+                notify(gate)
+                @test timedwait(() -> get_task_status(id, owner; runtime=rt_dq)[:status] == "CANCELLED", 10.0) == :ok
+                @test timedwait(() -> get_task_status(blocker, owner; runtime=rt_dq)[:status] == "COMPLETED", 10.0) == :ok
+                row = m._table[id]
+                @test row["status"] == "CANCELLED"
+                @test row["error"] == "Cancelled by timeout"
+                @test row["started_at"] === nothing
+                @test ran[] == 0
+            finally
+                notify(gate)
+                reset_runtime!(rt_dq)
             end
         end
 
@@ -3675,17 +3747,18 @@ else
 
             # A Ctrl-C during the probe propagates instead of reading as "missing" and running the
             # ALTER. It arrives in PormG's shape, not bare: `fetch` wraps every driver failure,
-            # an interrupt included, as a `DatabaseError` whose `cause` is the interrupt.
+            # an interrupt included, as a `DatabaseError` whose `cause` is the interrupt. It
+            # leaves bare, the ext's one shape for it (#904).
             interrupted = FakeSchemaPool(true;
                 probe_error=PormG.StatementError("SQLite", InterruptException()))
-            @test_throws PormG.StatementError ensure!(interrupted)
+            @test_throws InterruptException ensure!(interrupted)
             @test !any(is_alter, interrupted.sql)
 
             # The same for a Ctrl-C during the ALTER: it propagates without the re-probe, which
             # would otherwise run one more statement after the user asked to stop.
             ialter = FakeSchemaPool(false;
                 alter_error=PormG.StatementError("SQLite", InterruptException()))
-            @test_throws PormG.StatementError ensure!(ialter)
+            @test_throws InterruptException ensure!(ialter)
             @test length(ialter.sql) == 2   # probe, ALTER -- no re-probe
         end
 
