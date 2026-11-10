@@ -157,7 +157,6 @@ function _http_stream_request(stream::HTTP.Stream, max_body_bytes::Int64)::Union
         resize!(body_bytes, received)
     end
 
-    body = isempty(body_bytes) ? HTTP.EmptyBody() : HTTP.BytesBody(body_bytes)
     # The headers are COPIED and must stay so: `head` is what HTTP.jl itself checks after the
     # pipeline has run, and the WebSocket handshake's Origin check reads it. With the vector
     # shared, a middleware that rewrote `req`'s `Origin` in place would rewrite the head too and
@@ -165,9 +164,48 @@ function _http_stream_request(stream::HTTP.Stream, max_body_bytes::Int64)::Union
     # route pins (#374). The trailers are ADOPTED (#533): nothing in HTTP's server reads the
     # head's, and on this path they are always empty (HTTP keeps a chunked request's trailers on
     # its `ChunkedBody`, not on the head), so the default copy bought two allocations per request
-    # and no isolation. The constructor below stores both as given, which is why the
-    # headers are copied by hand.
-    #
+    # and no isolation. `_transport_request` stores both as given, which is why the headers are
+    # copied by hand here.
+    return _transport_request(
+        head.method,
+        head.target,
+        copy(head.headers),
+        head.trailers,
+        body_bytes,
+        head.host,
+        head.proto_major,
+        head.proto_minor,
+        head.close,
+        HTTP.get_request_context(head),
+    )
+end
+
+"""
+    _transport_request(method, target, headers, trailers, body_bytes, host,
+                       proto_major, proto_minor, close, context) -> Union{EmptyRequest, BytesRequest}
+
+The one place a request's type is decided: an empty body is an `HTTP.EmptyBody`, any other a
+`HTTP.BytesBody` over `body_bytes`, so a request is a `Types.EmptyRequest` or a
+`Types.BytesRequest` and nothing else. The transport (`_http_stream_request`) builds every served
+request through it, and so does `Nitro.precompile_request` (#921), which is how a workload's
+request has the served type by construction rather than by convention.
+
+Every argument is stored as given — `headers`, `trailers` and `body_bytes` are adopted, not
+copied — so each caller passes vectors that nothing else will mutate.
+"""
+function _transport_request(
+    method::String,
+    target::String,
+    headers::HTTP.Headers,
+    trailers::HTTP.Headers,
+    body_bytes::Vector{UInt8},
+    host::Union{Nothing, String},
+    proto_major::UInt8,
+    proto_minor::UInt8,
+    close::Bool,
+    context::HTTP.RequestContext,
+)::Union{Types.EmptyRequest, Types.BytesRequest}
+    body = isempty(body_bytes) ? HTTP.EmptyBody() : HTTP.BytesBody(body_bytes)
     # Built through HTTP's typed positional `_request_nocopy`, not `Request(method, target; …)`
     # (#856). The keyword call's `NamedTuple` holds two `Union`s, the body and `host`, so its type
     # is abstract and the call was static only while the compiler split or inlined it: Julia 1.13
@@ -175,20 +213,21 @@ function _http_stream_request(stream::HTTP.Stream, max_body_bytes::Int64)::Union
     # rebuilds a request through `_request_nocopy` for the same reason (`http_server.jl`). It sets
     # the same fields as the keyword form with `copyheaders = false`; what it skips is the keyword
     # form's checks of the method, target, length and version, all of which a head HTTP parsed
-    # has passed. `test/http_internals_contract_tests.jl` pins the name and its field-for-field
-    # equivalence on a served request.
+    # has passed, and which `precompile_request`'s callers are the authors of.
+    # `test/http_internals_contract_tests.jl` pins the name and its field-for-field equivalence on a
+    # served request.
     return HTTP._request_nocopy(
-        head.method,
-        head.target,
-        copy(head.headers),
-        head.trailers,
+        method,
+        target,
+        headers,
+        trailers,
         body,
-        head.host,
+        host,
         Int64(length(body_bytes)),
-        head.proto_major,
-        head.proto_minor,
-        head.close,
-        HTTP.get_request_context(head),
+        proto_major,
+        proto_minor,
+        close,
+        context,
     )
 end
 

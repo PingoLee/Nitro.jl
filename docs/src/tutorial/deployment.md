@@ -739,6 +739,33 @@ while your package precompiles, so it must not open a connection or read a secre
 built; one that does belongs in an `on_startup` hook. `revise = :lazy` or `:eager` changes the
 type too and is not worth warming: with it the call compiles nothing and returns `false`.
 
+### Warming your own routes
+
+`precompile_server` compiles the server, not your handlers. To cache a route's first request too,
+run it from the workload through `internalrequest`, and build the request with
+[`Nitro.precompile_request`](@ref):
+
+```julia
+@compile_workload begin
+    Nitro.precompile_server(app; server_options()...)
+    for req in (Nitro.precompile_request("GET", "/health"),
+                Nitro.precompile_request("POST", "/items";
+                                         headers = ["Content-Type" => "application/json"],
+                                         body = """{"name":"widget","quantity":3}"""))
+        Nitro.internalrequest(app, req)
+    end
+end
+```
+
+`precompile_request` builds the request with the function the transport uses, so it has exactly
+the type a served request has: a body is held as a `Vector{UInt8}`, and no body is
+`HTTP.EmptyBody`. `HTTP.Request("POST", "/items", headers, body)` with a `String` body is another
+type, one no socket delivers. The workload then compiles the body parsing, the typed extractors and
+the route's handler for that type, and the first real request compiles them again.
+
+A route whose first request needs a database connection stays out of the workload: the workload
+runs while your package precompiles, where no connection should be opened.
+
 ### Warming at deploy time
 
 Whatever no workload reached is compiled by the first request that needs it, which matters

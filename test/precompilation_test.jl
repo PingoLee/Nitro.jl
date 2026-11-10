@@ -222,3 +222,65 @@ end
     end
 end
 end
+
+@testitem "Nitro.precompile_request builds the request type the transport serves (#921)" tags=[:core, :network] setup=[NitroCommon] begin
+using Test
+using HTTP
+using Nitro
+
+# A workload's request must reach the code a served request reaches: the body parsing, the typed
+# extractors and the route's handler all specialize on the request's body type, and
+# `internalrequest` sends any type the transport does not build through an inference barrier
+# (`_run_pipeline`, src/core/pipeline.jl). So the helper is compared against requests REALLY
+# served over a socket, not only against the aliases: if the transport's type ever changed, this
+# fails, where a check against `BytesRequest` alone would keep passing.
+seen = Dict{String, Type}()
+app = App()
+urlpatterns(app, "",
+    path("/x", (req::HTTP.Request) -> (seen["POST"] = typeof(req); "post"); method = "POST"),
+    path("/x", (req::HTTP.Request) -> (seen["GET"] = typeof(req); "get"); method = "GET"))
+port = get_free_port()
+serve(app; host = HOST, port, async = true, show_banner = false, access_log = nothing)
+try
+    @test HTTP.post("http://$HOST:$port/x", ["Content-Type" => "application/json"], "{}").status == 200
+    @test HTTP.get("http://$HOST:$port/x").status == 200
+finally
+    terminate(app)
+end
+
+@testset "a body: the served POST's type, a BytesRequest" begin
+    req = Nitro.precompile_request("POST", "/x"; headers = ["Content-Type" => "application/json"],
+                                   body = "{}")
+    @test typeof(req) === seen["POST"]
+    @test seen["POST"] === Nitro.Core.Types.BytesRequest
+    @test req.content_length == 2 && String(copy(req.body.data)) == "{}"
+    @test HTTP.header(req, "Content-Type") == "application/json"
+end
+
+@testset "no body: the served GET's type, an EmptyRequest" begin
+    @test typeof(Nitro.precompile_request("GET", "/x")) === seen["GET"]
+    @test seen["GET"] === Nitro.Core.Types.EmptyRequest
+    # An empty body is no body, as the transport reads it.
+    @test typeof(Nitro.precompile_request("POST", "/x"; body = "")) === Nitro.Core.Types.EmptyRequest
+    @test typeof(Nitro.precompile_request("POST", "/x"; body = UInt8[])) === Nitro.Core.Types.EmptyRequest
+end
+
+@testset "the request shares nothing with the caller" begin
+    bytes = Vector{UInt8}("{}")
+    hs = HTTP.Headers(["Content-Type" => "application/json"])
+    req = Nitro.precompile_request("POST", "/x"; headers = hs, body = bytes)
+    @test typeof(req) === Nitro.Core.Types.BytesRequest
+    bytes[1] = UInt8('[')
+    HTTP.setheader(hs, "Content-Type" => "text/plain")
+    @test String(copy(req.body.data)) == "{}"
+    @test HTTP.header(req, "Content-Type") == "application/json"
+end
+
+@testset "it runs through internalrequest" begin
+    res = Nitro.internalrequest(app, Nitro.precompile_request("POST", "/x"; body = "{}"))
+    @test res.status == 200 && text(res) == "post"
+end
+
+@test Base.ispublic(Nitro, :precompile_request)
+@test !Base.isexported(Nitro, :precompile_request)
+end
