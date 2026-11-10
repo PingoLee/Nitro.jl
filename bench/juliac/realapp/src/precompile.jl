@@ -22,9 +22,14 @@ using PrecompileTools: @setup_workload, @compile_workload
             path("/me", MiscHandlers.me, method = "GET", middleware = [bearer]),
             path("/bad", MiscHandlers.bad, method = "GET"),
         ])
+        # The POSTs are built with `Nitro.precompile_request`, so their body is held as a socket's
+        # request holds it (#921). `HTTP.Request(…, ::String)` is a `BytesBody{CodeUnits}`
+        # request, and the first served POST compiled the `Json{ItemIn}` binder and the route's
+        # leaf again for the served type. The GETs carry no body and are that type already.
         for r in (HTTP.Request("GET", "/health"),
-                  HTTP.Request("POST", "/items/validated", json, item),
-                  HTTP.Request("POST", "/items/validated", json, replace(item, "3" => "-1")),
+                  Nitro.precompile_request("POST", "/items/validated"; headers = json, body = item),
+                  Nitro.precompile_request("POST", "/items/validated"; headers = json,
+                                           body = replace(item, "3" => "-1")),
                   HTTP.Request("GET", "/search/tools?limit=5&min_qty=1"),
                   HTTP.Request("GET", "/me", ["Authorization" => "Bearer " * token]),
                   HTTP.Request("GET", "/bad"))

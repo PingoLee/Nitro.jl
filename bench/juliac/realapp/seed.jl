@@ -3,7 +3,7 @@
 # worker tables need nothing here: the app's boot creates them (`ensure_table!` in
 # NitroPormGExt). Idempotent; re-running it adds rows only while there are fewer than 20.
 #
-#   julia +1.13 --project=bench/juliac/realapp bench/juliac/realapp/seed.jl
+#   PORMG_POSTGRES_DRIVER=Postgres julia +1.13 --project=bench/juliac/realapp bench/juliac/realapp/seed.jl
 #
 # It reads db/connection.yml (gitignored) exactly as `RealApp.main` does -- REALAPP_ROOT, else
 # this directory; `PORMG_ENV`/`NITRO_ENV`, else "dev" -- and prints only row counts. The
