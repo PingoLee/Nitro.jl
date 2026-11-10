@@ -264,6 +264,43 @@ using Test
 # `ratio_sum` on the `warmth:` line keeps the old quantity visible, and `caller_s` keeps a
 # thunk step visible, even though neither can fail the test any more.
 #
+# ── Every request in the served type, and what that did to the baseline (#921) ────────────
+#
+# The probe built its requests with `HTTP.Request(m, p, hs, b)`, so every shape, GETs included
+# (`b = ""`), sent a `Request{BytesBody{CodeUnits{…}}}`. No socket delivers that type, and
+# `internalrequest` runs it through the inference barrier in `_run_pipeline`; the workload kept it
+# warm only by sending the same type. Both now build requests with `Nitro.precompile_request`,
+# which gives exactly the served type: `dict_int` is an `EmptyRequest` GET, `json_ext` a
+# `BytesRequest` POST. That makes `json_ext` the "first served JSON POST into `Json{T}`" shape
+# #921 asked for, so it has no second shape.
+#
+# The denominator got faster, and the ratios above it rose with nothing else moving. Julia 1.13.2,
+# Linux, CI's flags (`-O0 --check-bounds=yes`), best of three, fresh process each:
+#
+#                        old probe (CodeUnits)   this probe (served type)
+#   dict_int             0.0248 s                0.0131 s
+#   json_ext (request)   0.132 s                 0.128 s     <- same work, about 5.7x -> 10.2x
+#
+# So `query_ext` and `json_ext` get limits of their own, set against cold readings taken under
+# the new denominator, with the extractor and typed-JSON blocks taken out of the workload:
+#
+#                  warm (this workload)   cold (no extractor blocks)
+#   query_ext            7.8x                    21.4x
+#   json_ext            10.2x                    43.7x
+#
+# 13 sits 1.67x above `query_ext`'s warm reading and 1.65x below its cold one; 20 sits 1.96x and
+# 2.2x from `json_ext`'s. `dict_any` and `formdata` keep 8: both read about 1x warm, and their
+# cold costs (1.5 s and more, above) are over 100x this denominator.
+#
+# `json_symdict` is `Res.json(::Vector{Dict{Symbol,Any}})`, the rows PormG's `list(:dict)` returns,
+# which the workload did not reach before #921. Same protocol:
+#
+#                  warm (this workload)   cold (workload before #921)
+#   json_symdict         2.1x                    5.6x
+#
+# 3.5 is 1.67x above warm and 1.6x below cold, the #551 shapes' margins. One developer box set
+# all three; the `warmth:` lines from CI are what move them.
+#
 # This is a `:slow` item — it spawns one Julia process per measurement. `--skip-tags slow`
 # drops it.
 
@@ -279,9 +316,10 @@ const MAX_RATIO = 8.0
 # sanity check on the measurement, not a tight bound, and the ratio is the real protection.
 const MAX_BASELINE_SECONDS = 1.0
 
-const SHAPES = ["dict_any" => MAX_RATIO, "query_ext" => MAX_RATIO, "json_ext" => MAX_RATIO,
+const SHAPES = ["dict_any" => MAX_RATIO, "query_ext" => 13.0, "json_ext" => 20.0,
                 "formdata" => MAX_RATIO, "multipart" => 1.2,
-                "cookie_ext" => 3.5, "files_ext" => 3.5, "payload" => 3.5, "url" => 1.8]
+                "cookie_ext" => 3.5, "files_ext" => 3.5, "payload" => 3.5, "url" => 1.8,
+                "json_symdict" => 3.5]
 
 probe = joinpath(@__DIR__, ".helpers", "precompile_warmth_probe.jl")
 @test isfile(probe)

@@ -68,7 +68,8 @@ end
     ])
     Core.internalrequest(
         ctx,
-        Request("POST", "/precompile/items", ["Content-Type" => "application/json"], "{\"name\":\"test\"}");
+        precompile_request("POST", "/precompile/items"; headers = ["Content-Type" => "application/json"],
+                           body = "{\"name\":\"test\"}");
         catch_errors=false,
     )
 
@@ -172,6 +173,22 @@ end
     Core.internalrequest(ctx, Request("GET", "/precompile/struct"); catch_errors=false)
     Core.internalrequest(ctx, Request("GET", "/precompile/namedtuple"); catch_errors=false)
 
+    # ── `Dict{Symbol,Any}` rows: what an ORM read returns (#921) ──────────────────────────
+    #
+    # PormG's `list(:dict)` hands rows back as `Dict{Symbol,Any}`, so an app that sends a read
+    # through `Res.json` compiled JSON's writer for that key type on its first request: 145 ms for
+    # a vector of rows and 101 ms for one row, in the #744 trace. Nothing in the type is
+    # app-specific, so it is warmed here. The values are an `Int`, a `String` and a `nothing`, so
+    # the dict is really `Any`-valued, as a row with a NULL column is. No PormG: the type is enough.
+    Core.Routing.urlpatterns(ctx, "", RouteDefinition[
+        path("/precompile/symrecord/<int:id>", (req::Request, id::Int) ->
+             Res.json(Dict{Symbol,Any}(:id => id, :name => "precompile", :note => nothing))),
+        path("/precompile/symrecords", (req::Request) ->
+             Res.json([Dict{Symbol,Any}(:id => i, :name => "precompile", :note => nothing) for i in 1:2])),
+    ])
+    Core.internalrequest(ctx, Request("GET", "/precompile/symrecord/1"); catch_errors=false)
+    Core.internalrequest(ctx, Request("GET", "/precompile/symrecords"); catch_errors=false)
+
     # ── The typed extractors, which had NO coverage at all (#242) ──────────────────────
     #
     # `Json{T}`, `Query{T}`, `Path{T}` and `Form{T}` are the Spring Boot lineage and a headline
@@ -198,14 +215,14 @@ end
     Core.internalrequest(ctx, Request("GET", "/precompile/extract/path/1/p"); catch_errors=false)
     Core.internalrequest(
         ctx,
-        Request("POST", "/precompile/extract/json", ["Content-Type" => "application/json"],
-                "{\"id\":1,\"name\":\"p\"}");
+        precompile_request("POST", "/precompile/extract/json";
+                           headers = ["Content-Type" => "application/json"], body = "{\"id\":1,\"name\":\"p\"}");
         catch_errors=false,
     )
     Core.internalrequest(
         ctx,
-        Request("POST", "/precompile/extract/form",
-                ["Content-Type" => "application/x-www-form-urlencoded"], "id=1&name=p");
+        precompile_request("POST", "/precompile/extract/form";
+                           headers = ["Content-Type" => "application/x-www-form-urlencoded"], body = "id=1&name=p");
         catch_errors=false,
     )
 
@@ -233,8 +250,8 @@ end
     # `PrecompileRecord`, so that time is the app's own `T`; likewise a `Json{T}` whose `T` nests
     # another `@kwdef` struct, and the `MultipartForm{T}` remainder above.
     #
-    # POST bodies are `Vector{UInt8}`, which is what a request read off a socket carries; see the
-    # typed-JSON block below.
+    # POST bodies are built with `precompile_request`, which holds them as a socket's request does,
+    # in a `Vector{UInt8}` (#921); see the typed-JSON block below.
     Core.Routing.urlpatterns(ctx, "", RouteDefinition[
         path("/precompile/extract/cookie", (req::Request, sid::Cookie{String}) -> Res.send(sid.value)),
         path("/precompile/extract/files", (req::Request, file::Files{FormFile}) ->
@@ -250,9 +267,9 @@ end
     ])
     Core.internalrequest(ctx, Request("GET", "/precompile/extract/cookie", ["Cookie" => "sid=p"]);
                          catch_errors=false)
-    Core.internalrequest(ctx, Request("POST", "/precompile/payload",
-                                      ["Content-Type" => "application/x-www-form-urlencoded"],
-                                      Vector{UInt8}("a=1")); catch_errors=false)
+    Core.internalrequest(ctx, precompile_request("POST", "/precompile/payload";
+                                                 headers = ["Content-Type" => "application/x-www-form-urlencoded"],
+                                                 body = "a=1"); catch_errors=false)
     Core.internalrequest(ctx, Request("GET", "/precompile/reverse"); catch_errors=false)
     let boundary = "precompileboundary"
         file_part = string("--", boundary, "\r\n",
@@ -265,8 +282,8 @@ end
                                ("/precompile/extract/upload", upload))
             Core.internalrequest(
                 ctx,
-                Request("POST", target, ["Content-Type" => "multipart/form-data; boundary=$boundary"],
-                        Vector{UInt8}(body));
+                precompile_request("POST", target;
+                                   headers = ["Content-Type" => "multipart/form-data; boundary=$boundary"], body);
                 catch_errors=false,
             )
         end
@@ -292,6 +309,7 @@ end
     # The bodies are `Vector{UInt8}`, not `String`: the server's stream reader hands every request
     # over as a byte vector, and the body is parsed in place (#327), so a `String` body -- which
     # reaches the parser as `CodeUnits` -- would warm a specialization production never calls.
+    # `precompile_request` makes that conversion, the same way for every block (#921).
     # Measured on `json_bind(Dict{String,Any}, ::Vector{UInt8})` alone: 7 s on the first request.
     for (target, body) in (
             ("/precompile/extract/json", "{\"id\":1,\"name\":\"p\"}"),
@@ -299,8 +317,8 @@ end
             ("/precompile/extract/jsondict", repeat("[", 600) * repeat("]", 600)),
             ("/precompile/extract/jsonplain", "{\"id\":1,\"score\":2.5}"),
             ("/precompile/extract/fragment", "{\"record\":{\"id\":1,\"name\":\"p\"}}"))
-        Core.internalrequest(ctx, Request("POST", target, ["Content-Type" => "application/json"],
-                                          Vector{UInt8}(body)))
+        Core.internalrequest(ctx, precompile_request("POST", target;
+                                                     headers = ["Content-Type" => "application/json"], body))
     end
 
     # ── The error path, at the setting production actually runs (#242) ──────────────────
@@ -320,8 +338,8 @@ end
     # is really called, not about reaching different code.
     Core.internalrequest(
         ctx,
-        Request("POST", "/precompile/extract/json", ["Content-Type" => "application/json"],
-                "{\"id\":\"nope\",\"name\":\"p\"}"),
+        precompile_request("POST", "/precompile/extract/json";
+                           headers = ["Content-Type" => "application/json"], body = "{\"id\":\"nope\",\"name\":\"p\"}"),
     )
 
     # ── A middleware exception, caught by the pipeline's error boundary (#256) ────────────
@@ -352,19 +370,17 @@ end
         path("/precompile/parse/multipart", (req::Request) ->
              Res.json(Dict{String,Any}("n" => length(multipart(req)))), method="POST"),
     ])
-    # Both body types (#551). A `String` body is a `Request{BytesBody{CodeUnits{…}}}`, which is
-    # what an `internalrequest` caller usually builds; a socket delivers a
-    # `Request{BytesBody{Vector{UInt8}}}`, and with only the first warmed, the first upload to a
-    # fresh server compiled `multipartbody` again (~175 ms). The #551 block above sends multipart
-    # as bytes; this one keeps the `String` form warm.
-    for body in ("a=1&b=2", Vector{UInt8}("a=1&b=2"))
-        Core.internalrequest(
-            ctx,
-            Request("POST", "/precompile/parse/form",
-                    ["Content-Type" => "application/x-www-form-urlencoded"], body);
-            catch_errors=false,
-        )
-    end
+    # In the served type only (#921). Until then this loop also sent a `String` body, a
+    # `Request{BytesBody{CodeUnits{…}}}`, to keep warm the `internalrequest` callers that build one.
+    # That type is not what a socket delivers, and `internalrequest` sends it through the inference
+    # barrier in `_run_pipeline`, so it is no longer warmed: a workload builds its requests with
+    # `precompile_request`, as every block here does.
+    Core.internalrequest(
+        ctx,
+        precompile_request("POST", "/precompile/parse/form";
+                           headers = ["Content-Type" => "application/x-www-form-urlencoded"], body = "a=1&b=2");
+        catch_errors=false,
+    )
     let boundary = "precompileboundary"
         body = string(
             "--", boundary, "\r\n",
@@ -375,8 +391,8 @@ end
             "--", boundary, "--\r\n")
         Core.internalrequest(
             ctx,
-            Request("POST", "/precompile/parse/multipart",
-                    ["Content-Type" => "multipart/form-data; boundary=$boundary"], body);
+            precompile_request("POST", "/precompile/parse/multipart";
+                               headers = ["Content-Type" => "multipart/form-data; boundary=$boundary"], body);
             catch_errors=false,
         )
     end
