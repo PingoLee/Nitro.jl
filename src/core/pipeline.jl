@@ -566,3 +566,46 @@ end
 _run_pipeline(pipeline, req::Types.EmptyRequest) = pipeline(req)::HTTP.Response
 _run_pipeline(pipeline, req::Types.BytesRequest) = pipeline(req)::HTTP.Response
 _run_pipeline(pipeline, req::HTTP.Request) = (Base.inferencebarrier(pipeline)(req))::HTTP.Response
+
+"""
+    Nitro.precompile_request(method, target; headers = [], body = nothing) -> HTTP.Request
+
+Build a request for a precompile workload: an `@compile_workload` block that runs requests
+through `internalrequest`. The request has exactly the type a served request has, because it is
+built by the same function the transport builds every request with: a `Request{HTTP.EmptyBody}`
+when there is no body (`nothing`, `""` or no bytes), a `Request{HTTP.BytesBody{Vector{UInt8}}}`
+otherwise.
+
+That type is the point. `HTTP.Request(method, target, headers, body::String)` gives a
+`Request{HTTP.BytesBody{Base.CodeUnits{UInt8, String}}}`, which no socket delivers: a workload
+that sends it compiles the body parsing, the typed extractors and the route's handler for that
+type, and the first served request compiles them again for the type the transport builds (#921).
+
+`headers` is anything `HTTP.Headers` accepts: a vector of pairs, a dict, or `HTTP.Headers`.
+`body` is a string or bytes, and is copied, as are the headers, so the request shares nothing
+with the caller.
+
+Public, not exported: call it as `Nitro.precompile_request`.
+
+# Example
+
+```julia
+@compile_workload begin
+    Nitro.precompile_server(app; server_options()...)
+    req = Nitro.precompile_request("POST", "/items/validated";
+                                   headers = ["Content-Type" => "application/json"],
+                                   body = \"\"\"{"name":"widget","category":"tools","quantity":3}\"\"\")
+    Nitro.internalrequest(app, req)
+end
+```
+"""
+function precompile_request(method::AbstractString, target::AbstractString;
+                            headers = Pair{String, String}[],
+                            body::Union{Nothing, AbstractString, AbstractVector{UInt8}} = nothing)::HTTP.Request
+    bytes = body === nothing ? UInt8[] :
+            body isa AbstractString ? Vector{UInt8}(String(body)) : Vector{UInt8}(body)
+    # `Vector{UInt8}(::String)` copies the string's bytes; a `Vector{UInt8}` argument is copied by
+    # the constructor too, so a caller that reuses its buffer cannot change a request it built.
+    return _transport_request(String(method), String(target), HTTP.Headers(headers), HTTP.Headers(),
+                              bytes, nothing, UInt8(1), UInt8(1), false, HTTP.RequestContext())
+end

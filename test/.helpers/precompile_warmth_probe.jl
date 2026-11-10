@@ -27,8 +27,12 @@ const SHAPE = ARGS[1]
 
 app = App()
 reg(p, h; kw...) = Nitro.Core.Routing.urlpatterns(app, "", RouteDefinition[path(p, h; kw...)])
+# Built with `Nitro.precompile_request`, so every shape sends the request type a socket delivers:
+# an `EmptyRequest` for `b = ""`, a `BytesRequest` otherwise (#921). `HTTP.Request(m, p, hs, b)`
+# gave a `BytesBody{CodeUnits}` request, even for a GET's `""`, which the workload warmed only
+# because it sent the same type, and which no served request has.
 hit(m, p, hs = Pair{String,String}[], b = ""; kw...) =
-    Nitro.Core.internalrequest(app, HTTP.Request(m, p, hs, b); kw...)
+    Nitro.Core.internalrequest(app, Nitro.precompile_request(m, p; headers = hs, body = b); kw...)
 
 # Each branch yields (request thunk, expected body fragment).
 #
@@ -91,6 +95,13 @@ elseif SHAPE == "payload"
     reg("/x", (r::HTTP.Request) -> Res.send(string(length(Nitro.payload(r)))), method = "POST")
     (() -> hit("POST", "/x", ["Content-Type" => "application/x-www-form-urlencoded"],
                Vector{UInt8}("a=1&b=2"); catch_errors = false)), "2"
+# The #921 shape. (`json_ext` above is #921's other one: since `hit` builds the request with
+# `precompile_request`, it is a JSON POST in the served type.)
+elseif SHAPE == "json_symdict"
+    # PormG's `list(:dict)` rows: `Dict{Symbol,Any}`, here with `Any`-typed contents.
+    reg("/x", (r::HTTP.Request) ->
+        Res.json([Dict{Symbol,Any}(:id => i, :name => "x", :note => nothing) for i in 1:2]))
+    (() -> hit("GET", "/x"; catch_errors = false)), "\"note\":null"
 elseif SHAPE == "url"
     reg("/item/<int:id>", (r::HTTP.Request, id::Int) -> Res.status(204); name = "item")
     reg("/x", (r::HTTP.Request) -> Res.send(Nitro.url(app, "item"; id = 3)))
@@ -102,7 +113,7 @@ end
 # `go` is the probe's own caller, not part of the shape, so it is compiled first and timed apart
 # from the request (#710). The test charges every shape the BASELINE's `caller`, not its own, so
 # a step in this compile cannot fail a shape while a cold path in the request still can.
-# `caller` is `go`, `hit`, the `HTTP.Request` constructor and the inference of
+# `caller` is `go`, `hit`, `precompile_request` and the inference of
 # `internalrequest`, the same work for every shape. The shape's own compiles stay in `request`:
 # `internalrequest` calls the pipeline through `_run_pipeline` (src/core/pipeline.jl), which a
 # caller's inference does not see past (#737), so the router, the route endpoint and the handler

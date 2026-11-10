@@ -24,10 +24,13 @@ Nitro.Core.Constants.DEFAULT_MAX_FIELDS
 A server with its own `middleware` compiles HTTP.jl's connection loop on its first request.
 Calling `Nitro.precompile_server` from your package's workload, with the keywords you pass to
 `serve`, caches that code in the package image. The recipe is in
-[Warming your own server shape](@ref).
+[Warming your own server shape](@ref). A workload that also runs requests through
+`internalrequest` builds them with `Nitro.precompile_request`, so they have the type a served
+request has; see [Warming your own routes](@ref).
 
 ```@docs
 Nitro.precompile_server
+Nitro.precompile_request
 ```
 
 ## Start-up Failures in a Compiled Executable

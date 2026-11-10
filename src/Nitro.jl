@@ -127,6 +127,12 @@ public newapp
 # `Nitro.precompile_server(app; …)`, and the bare name would read as HTTP.jl's own.
 public precompile_server
 
+# Public, not exported (#921): beside it in a workload, `Nitro.precompile_request(method, target;
+# …)` builds a request in the type the transport serves. It takes no `App`, so it lives in Core
+# beside `internalrequest`, not in methods.jl.
+using .Core: precompile_request
+public precompile_request
+
 # Public, not exported (#662): the type of `cancel_token(req)`, named so a signature can take one
 # (`parent::Union{Nothing, Nitro.CancelToken}`). Opaque: `cancel_requested`/`cancel_reason` read it.
 using .Core: CancelToken
