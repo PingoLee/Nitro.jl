@@ -31,8 +31,9 @@ ProtoBuf = "3349acd9-ac6a-5e09-bcdb-63829b23a429"
 Revise = "295af30f-e4ad-537b-8983-00126c2a3abe"
 TimeZones = "f269a46b-ccf7-5d73-abea-4c690281aa53"
 
-[sources]
-PormG = {url = "https://github.com/PingoLee/PormG.jl.git", rev = "6e8364f7fcc4773993e9553155a5dea0d6d57865"}
+[sources.PormG]
+rev = "6e8364f7fcc4773993e9553155a5dea0d6d57865"
+url = "https://github.com/PingoLee/PormG.jl.git"
 
 [extensions]
 MustacheExt = "Mustache"
@@ -61,7 +62,7 @@ Printf = "^1"
 ProtoBuf = "^1"
 Random = "^1"
 Reexport = "^1"
-Reseau = "~1.6"
+Reseau = "~1.6, 1"
 Revise = "^3"
 SHA = "^0.7, 1"
 SQLite = "^1.6.1"
