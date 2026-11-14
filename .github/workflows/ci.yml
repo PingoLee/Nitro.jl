@@ -191,7 +191,7 @@ jobs:
       # probe. Reproduce a CI red locally with `julia -O0`.
       #
       # `test_args` is empty on every leg but the shuffled one (the `include:` above, #755).
-      - uses: julia-actions/julia-runtest@6e050c8013b833b1195105ff2fce9cd802f53271 # v1.12.0
+      - uses: julia-actions/julia-runtest@e89ac6c957d7c4d7e0cb3162f12d8290a008f9d1 # v1.13.0
         with:
           coverage: ${{ matrix.os == 'ubuntu-latest' && matrix.threads == '1' && matrix.version == '~1.13.0-0' }}
           optimize: '0'
