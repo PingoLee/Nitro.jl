@@ -46,6 +46,29 @@
 #       cores. `multiq_check_empty` reads each heap's live count. `yield()`, pinned tasks and
 #       `:interactive` inserts go the stock way. The per-thread pop counter lives in a padded
 #       128-byte struct; the K-th successful pop resets it.
+#   M-f, M-l, M-h-f, M-h-l, M-none, O-f, O-l  stock's heaps untouched, plus one FIFO queue for the
+#       `:default` pool. Every task has a class, F or L, fixed when it is first made runnable; F tasks
+#       go to the queue's tail on every enqueue (the first one, a wake-up by `notify`, a `yield()`),
+#       L tasks take stock's path: the build's own `multiq_insert`, `multiq_deletemin` and
+#       `multiq_check_empty`, parsed from its partr.jl the way A0 takes `multiq_sift_down` and
+#       renamed `stock_multiq_*`, over the build's own heaps and sifts. Who is F: under M (M-f, M-l)
+#       the tasks the harness marks when it makes them (`spawn_marked`: spawn_order.jl marks every
+#       handler and every client), under M-h only the handlers, under M-none nothing (the control
+#       for the structure: every task L, the queue empty, what an unmarked program pays); under O
+#       a task whose first enqueue comes from a thread of another pool, with no mark. The suffix is
+#       the serve rule: `-f` pops the queue before the heaps, `-l` the heaps before the queue; M-none
+#       runs `-f`, the rule that reads the queue on every pop. The class is bit 15 of
+#       `Task.priority`: a new task starts at 0 and does not inherit its parent's, and an F task
+#       never enters the heaps, so they keep seeing priority 0 (an F task that would have to take
+#       stock's path, on an `:interactive` pool of two or more threads, has the bit cleared and is
+#       counted; never in the layouts measured). The queue is a ring under one spin lock, with a
+#       count read without it by the pops' fast path and by `multiq_check_empty`, which reports it,
+#       so a thread does not sleep with a task queued there; `enq_work`'s wake-up follows an F insert
+#       exactly as it follows a heap insert, since the insert is inside `multiq_insert`. The F pop
+#       meets the sticky-retry protocol: it scans at most nthreads entries from the head, takes the
+#       first one this thread may run (an unpinned task or its own), wakes the owners of those passed
+#       over and leaves them in place, so an owner always reaches its own task and nobody waits behind
+#       a pinned head.
 #
 # A0 and B are taken from the build's own `base/partr.jl` as parsed at load time, so they cannot
 # drift from it. C and E are hand copies, so they refuse to load on a build whose `partr.jl` they
@@ -67,7 +90,10 @@
 # pool runs one task pinned to it, which on 1.13+ also replaces that thread's scheduler task
 # (`_refresh_scheduler_world`). Neither old task is resumed once the thread switches away.
 #
-# VALIDATE=1 compiles a per-thread call counter into the new code, and under C and D an assert,
+# VALIDATE=1 compiles a per-thread call counter into the new code (under M and O: the pops), and
+# under M and O per-thread classification counts (F and L first enqueues, F re-enqueues, demotions,
+# F and L pops, pinned entries passed over), an order assert after every F pop, single-structure
+# asserts and two check_empty probes (`M_NEGATIVE=blind` is the negative control); under C and D an assert,
 # under the heap's lock, that every pop takes the (priority, sequence) minimum of its heap; under D
 # also per-thread counts of slot pops, steals, budget flushes, displaced and bounced tasks; under E
 # a shadow vector per bucket that every pop is checked against (the back is the newest entry, the
@@ -80,8 +106,10 @@
 const MULTIQ_VARIANT = get(ENV, "VARIANT", "A")
 const _D_MATCH = match(r"^D([0-9]+|-inf)$", MULTIQ_VARIANT)
 const _E_MATCH = match(r"^E([0-9]+|-inf)$", MULTIQ_VARIANT)
-MULTIQ_VARIANT in ("A", "A0", "B", "C") || _D_MATCH !== nothing || _E_MATCH !== nothing ||
-    error("VARIANT must be A, A0, B, C, D<K>, D-inf, E<K> or E-inf, not $(MULTIQ_VARIANT)")
+const _F_MATCH = match(r"^(M|M-h|O)-([fl])$|^M-none$", MULTIQ_VARIANT)
+MULTIQ_VARIANT in ("A", "A0", "B", "C") || _D_MATCH !== nothing || _E_MATCH !== nothing || _F_MATCH !== nothing ||
+    error("VARIANT must be A, A0, B, C, D<K>, D-inf, E<K>, E-inf, M-f, M-l, M-h-f, M-h-l, M-none, O-f or O-l, ",
+          "not $(MULTIQ_VARIANT)")
 # D's slot budget, or nothing for every other variant.
 const SLOT_BUDGET = _D_MATCH === nothing ? nothing :
                     _D_MATCH[1] == "-inf" ? typemax(Int) : parse(Int, _D_MATCH[1])
@@ -89,12 +117,27 @@ const SLOT_BUDGET = _D_MATCH === nothing ? nothing :
 const PERIODIC_K = _E_MATCH === nothing ? nothing :
                    _E_MATCH[1] == "-inf" ? typemax(Int) : parse(Int, _E_MATCH[1])
 PERIODIC_K === nothing || PERIODIC_K >= 2 || error("E's K must be at least 2")
+# M and O: stock's heaps plus one FIFO queue for the `:default` pool. FIFO_CLASS says who goes
+# there (`:mark`: the tasks the harness marks; `:origin`: a task first enqueued from another pool),
+# FIFO_SERVE which a pop looks at first (`:f` the queue, `:l` the heaps; M-none runs `:f`, the rule
+# that reads the queue on every pop). The marks are the harness's: M marks handlers and clients,
+# M-h handlers only, M-none and O nothing.
+const MULTIQ_FIFO = _F_MATCH !== nothing
+const FIFO_CLASS = !MULTIQ_FIFO ? :none : startswith(MULTIQ_VARIANT, "O") ? :origin : :mark
+const FIFO_SERVE = !MULTIQ_FIFO ? :none : MULTIQ_VARIANT == "M-none" ? :f : Symbol(_F_MATCH[2])
+const MARK_HANDLERS = MULTIQ_VARIANT in ("M-f", "M-l", "M-h-f", "M-h-l")
+const MARK_CLIENTS = MULTIQ_VARIANT in ("M-f", "M-l")
+# Optional, nested.jl only: every spawn marked (the cost of marking fine-grained fork-join).
+const MARK_ALL = FIFO_CLASS === :mark && get(ENV, "MARK_ALL", "0") == "1"
 # C's heaps: C, and D behind its slots.
 const MULTIQ_SEQ_HEAPS = MULTIQ_VARIANT == "C" || SLOT_BUDGET !== nothing
 const MULTIQ_VALIDATE = get(ENV, "VALIDATE", "0") == "1"
 
 # `Base._crc32c` of the `base/partr.jl` C was copied from.
-const PARTR_CRC = Dict(v"1.12.7" => 0xe7c9e7fd, v"1.13.2" => 0xa74d567b, v"1.14.0-DEV.3725" => 0xae19d8ec)
+# 1.13.4's partr.jl is byte-identical to 1.13.2's (and 1.13.3's): the same crc, checked when the
+# entry was added.
+const PARTR_CRC = Dict(v"1.12.7" => 0xe7c9e7fd, v"1.13.2" => 0xa74d567b, v"1.13.4" => 0xa74d567b,
+                       v"1.14.0-DEV.3725" => 0xae19d8ec)
 const PARTR_FILE = let base = joinpath(Sys.BINDIR, Base.DATAROOTDIR, "julia", "base")
     isfile(joinpath(base, "partr.jl")) ? joinpath(base, "partr.jl") : joinpath(base, "scheduler", "partr.jl")
 end
@@ -926,6 +969,297 @@ if PERIODIC_K !== nothing
     end
 end
 
+if MULTIQ_FIFO
+    # M and O. Stock's three entry points are the build's own, parsed from its partr.jl the way A0
+    # takes `multiq_sift_down`, renamed `stock_multiq_*`; the public names become wrappers that send
+    # a class-F task to one FIFO queue for the `:default` pool and everything else down stock's path.
+    function _renamed_partr_function(name::Symbol, new::Symbol)
+        block = _partr_function(name)
+        sig = block.args[2].args[1]
+        while sig.head in (:where, :(::))
+            sig = sig.args[1]
+        end
+        sig.args[1] === name || error("could not rename $name")
+        sig.args[1] = new
+        return block
+    end
+    for name in (:multiq_insert, :multiq_deletemin, :multiq_check_empty)
+        Core.eval(PARTR, _renamed_partr_function(name, Symbol(:stock_, name)))
+    end
+    # VALIDATE only: the negative control for the second check_empty probe. `blind` is a
+    # `multiq_check_empty` that ignores the F queue (a thread could sleep with a task queued there).
+    const _M_NEGATIVE = MULTIQ_VALIDATE ? get(ENV, "M_NEGATIVE", "") : ""
+    _M_NEGATIVE in ("", "blind") || error("M_NEGATIVE must be blind")
+    _fcount(field) = MULTIQ_VALIDATE ? :(fstates[Threads.threadid()].$field += 1) : nothing
+    @eval PARTR begin
+        # The class: bit 15 of `Task.priority`. Nothing in Base sets a priority (a new task starts at
+        # 0 and does not inherit its parent's), and a task with the bit never enters the heaps, so the
+        # heaps keep seeing 0. An F-bit task that would have to take stock's path (an `:interactive`
+        # pool of two or more threads; never in the layouts measured) has the bit cleared there and
+        # is counted as `demoted`.
+        const F_BIT = 0x8000
+        const f_class = $(QuoteNode(FIFO_CLASS))
+        const f_serve = $(QuoteNode(FIFO_SERVE))
+        const f_tpid = Int8(Threads._sym_to_tpid(:default))
+
+        # One per pool that has one (only `:default`). A ring of power-of-two capacity, oldest at
+        # `head`, under one spin lock; `n` is published under the lock and read without it by the
+        # pops' fast path and by `multiq_check_empty`. `seqs` (VALIDATE only) is each entry's
+        # insertion sequence, for the order asserts. The pad keeps the next allocation off its lines.
+        mutable struct fqueue
+            const lock::SpinLock
+            tasks::Vector{Task}
+            seqs::Vector{UInt64}
+            head::Int
+            @atomic n::Int32
+            next::UInt64
+            pad::NTuple{12,Int}
+            fqueue() = new(SpinLock(), Vector{Task}(undef, 256), Vector{UInt64}(undef, $(MULTIQ_VALIDATE ? 256 : 0)),
+                           1, zero(Int32), zero(UInt64), ntuple(_ -> 0, 12))
+        end
+        const fq = fqueue()
+
+        # VALIDATE only: per thread, 128 bytes of counts.
+        mutable struct fstate
+            f_first::Int    # F inserts of a task not yet started: its first enqueue
+            f_again::Int    # F inserts of a started task: a wake-up or a yield
+            l_first::Int    # L inserts of a task not yet started
+            demoted::Int    # F-bit tasks sent down stock's path (bit cleared)
+            f_pops::Int     # tasks popped from the F queue
+            l_pops::Int     # tasks popped from stock's heaps
+            skips::Int      # F entries passed over because they were pinned to another thread
+            own::Int        # F pops that took this thread's own task from behind the head
+            retries::Int    # failed F pops in a row with no pop by the head's owner (the stall check)
+            seen::Int       # the head's owner's pops when that run began
+            pad::NTuple{6,Int}
+            fstate() = new(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ntuple(_ -> 0, 6))
+        end
+        const fstates = [fstate() for _ in 1:Threads.maxthreadid()]
+
+        @noinline function f_fail(msg::String)
+            ccall(:jl_safe_printf, Cvoid, (Cstring, Cstring), "%s\n", msg)
+            ccall(:abort, Cvoid, ())
+        end
+
+        @inline f_idx(q::fqueue, k::Int) = ((q.head - 1 + k - 1) & (length(q.tasks) - 1)) + 1
+
+        function f_grow!(q::fqueue)
+            cap = length(q.tasks)
+            n = Int(q.n)
+            tasks = Vector{Task}(undef, 2 * cap)
+            seqs = Vector{UInt64}(undef, isempty(q.seqs) ? 0 : 2 * cap)
+            for k in 1:n
+                i = f_idx(q, k)
+                tasks[k] = q.tasks[i]
+                isempty(seqs) || (seqs[k] = q.seqs[i])
+            end
+            q.tasks = tasks
+            q.seqs = seqs
+            q.head = 1
+            return nothing
+        end
+
+        # At the tail, under the lock.
+        @inline function f_push!(q::fqueue, task::Task)
+            n = Int(q.n)
+            n == length(q.tasks) && f_grow!(q)
+            i = f_idx(q, n + 1)
+            q.tasks[i] = task
+            if !isempty(q.seqs)
+                q.seqs[i] = q.next
+                q.next += UInt64(1)
+            end
+            @atomic :monotonic q.n = Int32(n + 1)
+            return nothing
+        end
+
+        # Remove entry k (1 = the head), under the lock: the k - 1 entries ahead of it move one
+        # step toward the tail, so the others keep their order.
+        @inline function f_remove!(q::fqueue, k::Int)
+            for j in k:-1:2
+                q.tasks[f_idx(q, j)] = q.tasks[f_idx(q, j - 1)]
+                isempty(q.seqs) || (q.seqs[f_idx(q, j)] = q.seqs[f_idx(q, j - 1)])
+            end
+            $_UNSET(q.tasks, q.head)
+            q.head = (q.head & (length(q.tasks) - 1)) + 1
+            @atomic :monotonic q.n = q.n - Int32(1)
+            return nothing
+        end
+
+        # VALIDATE only, after a pop under the lock: the popped entry was older than the new head
+        # when it was the head, and the first entries are still in insertion order.
+        @inline function f_check_order(q::fqueue, popped_seq::UInt64, k::Int)
+            n = Int(q.n)
+            k == 1 && n > 0 && q.seqs[q.head] <= popped_seq &&
+                f_fail("F: popped seq $(popped_seq) from the head, but the new head has seq $(q.seqs[q.head])")
+            for j in 2:min(n, 32)
+                q.seqs[f_idx(q, j)] > q.seqs[f_idx(q, j - 1)] ||
+                    f_fail("F: entries $(j - 1) and $j are out of insertion order")
+            end
+            return nothing
+        end
+
+        # The F pop. The sticky-retry protocol: a task re-enqueued by `notify` before its own
+        # thread switched out of it keeps that thread's tid until the switch, and `jl_set_task_tid`
+        # fails for every other thread. So scan from the head over at most as many entries as the
+        # pool has threads (one current task each, so that bounds the entries pinned to another
+        # thread), take the first one this thread may run (an unpinned task or its own), wake the
+        # owner of each one passed over and leave those in place. The owner always reaches its own
+        # task, nobody waits behind a pinned head, and the order of the rest is unchanged.
+        # `nothing` when every scanned entry is pinned elsewhere: the caller tries the heaps, and
+        # `jl_task_get_next` spins on `multiq_check_empty` as it spins on stock's `@goto retry`.
+        function f_pop!(q::fqueue, tid::Int, nt::Int)
+            lock(q.lock)
+            n = Int(q.n)
+            lim = min(n, nt)
+            k = 0
+            local task::Task
+            wake = UInt64(0)
+            for j in 1:lim
+                t = q.tasks[f_idx(q, j)]
+                if ccall(:jl_set_task_tid, Cint, (Any, Cint), t, tid - 1) != 0
+                    k = j
+                    task = t
+                    break
+                end
+                owner = ccall(:jl_get_task_tid, Int16, (Any,), t)
+                if 0 <= owner < 64
+                    wake |= UInt64(1) << owner
+                end
+                $(_fcount(:skips))
+            end
+            $(MULTIQ_VALIDATE ? :(hd = k == 0 && n > 0 ? q.tasks[q.head] : nothing) : nothing)
+            if k > 0
+                $(MULTIQ_VALIDATE ? :(popped_seq = q.seqs[f_idx(q, k)]) : nothing)
+                f_remove!(q, k)
+                $(MULTIQ_VALIDATE ? :(f_check_order(q, popped_seq, k)) : nothing)
+            end
+            unlock(q.lock)
+            while wake != 0
+                owner = trailing_zeros(wake)
+                ccall(:jl_wakeup_thread, Cint, (Int16,), Int16(owner))
+                wake &= wake - UInt64(1)
+            end
+            if k == 0
+                $(MULTIQ_VALIDATE ? quote
+                    # A stall: every scanned entry pinned to a thread that never takes it. Not
+                    # every run of failed pops is one: a task that keeps yielding (a ping-pong over
+                    # an unbuffered Channel) is back at the head, pinned to its own thread, each
+                    # time an idle thread looks, while its owner pops it again and again (stock's
+                    # retry loop spins on it the same way). So count only while the head's owner
+                    # makes no pop at all: 10^6 failed pops with no pop by the owner is a stall.
+                    hd === nothing && return nothing   # the queue emptied before the lock: no verdict
+                    s = fstates[tid]
+                    o = Int(ccall(:jl_get_task_tid, Int16, (Any,), hd)) + 1
+                    progress = o >= 1 ? fstates[o].f_pops + fstates[o].l_pops : -1
+                    if s.retries == 0 || progress != s.seen
+                        s.retries = 1
+                        s.seen = progress
+                    else
+                        s.retries += 1
+                    end
+                    if s.retries == 1_000_000
+                        h = hd
+                        f_fail(string("F: 10^6 pops in a row on tid ", tid, " found only entries pinned to other ",
+                            "threads, and the head's owner made no pop meanwhile; ", n, " queued; the head: owner tid ", o,
+                            " (pool ", o >= 1 ? ccall(:jl_threadpoolid, Int8, (Int16,), o - 1) : -1, "), task pool ",
+                            ccall(:jl_get_task_threadpoolid, Int8, (Any,), h), ", sticky ", h.sticky, ", state ", h._state,
+                            ", priority ", h.priority, ", started ", ccall(:jl_is_task_started, Cint, (Any,), h),
+                            ", code ", typeof(h.code)))
+                    end
+                end : nothing)
+                return nothing
+            end
+            $(MULTIQ_VALIDATE ? quote
+                s = fstates[tid]
+                s.retries = 0
+                s.f_pops += 1
+                k > 1 && ccall(:jl_get_task_tid, Int16, (Any,), task) == tid - 1 && (s.own += 1)
+            end : nothing)
+            return task
+        end
+
+        function multiq_insert(task::Task, priority::UInt16)
+            if priority & F_BIT != 0
+                if ccall(:jl_get_task_threadpoolid, Int8, (Any,), task) == f_tpid
+                    $(MULTIQ_VALIDATE ? :(ccall(:jl_is_task_started, Cint, (Any,), task) == 0 ?
+                                           $(_fcount(:f_first)) : $(_fcount(:f_again))) : nothing)
+                    lock(fq.lock)
+                    f_push!(fq, task)
+                    unlock(fq.lock)
+                    return true
+                end
+                $(_fcount(:demoted))
+                return stock_multiq_insert(task, priority & ~F_BIT)
+            end
+            if f_class === :origin
+                tpid = ccall(:jl_get_task_threadpoolid, Int8, (Any,), task)
+                if tpid == f_tpid && ccall(:jl_threadpoolid, Int8, (Int16,), Threads.threadid() - 1) != tpid &&
+                        ccall(:jl_is_task_started, Cint, (Any,), task) == 0 &&
+                        ccall(:jl_get_task_tid, Int16, (Any,), task) == Int16(-1)
+                    task.priority = priority | F_BIT
+                    $(_fcount(:f_first))
+                    lock(fq.lock)
+                    f_push!(fq, task)
+                    unlock(fq.lock)
+                    return true
+                end
+            end
+            $(MULTIQ_VALIDATE ? :(ccall(:jl_is_task_started, Cint, (Any,), task) == 0 && $(_fcount(:l_first))) : nothing)
+            return stock_multiq_insert(task, priority)
+        end
+
+        function multiq_deletemin()
+            tid = Threads.threadid()
+            tpid = ccall(:jl_threadpoolid, Int8, (Int16,), tid - 1)
+            tpid == f_tpid || return stock_multiq_deletemin()   # a foreign thread gets nothing there
+            local task::Union{Nothing,Task}
+            if f_serve === :f
+                task = (@atomic :monotonic fq.n) == 0 ? nothing : f_pop!(fq, tid, Int(Threads._nthreads_in_pool(tpid)))
+                if task === nothing
+                    task = stock_multiq_deletemin()
+                    $(MULTIQ_VALIDATE ? :(task === nothing || $(_fcount(:l_pops))) : nothing)
+                end
+            else
+                task = stock_multiq_deletemin()
+                if task === nothing
+                    (@atomic :monotonic fq.n) == 0 ||
+                        (task = f_pop!(fq, tid, Int(Threads._nthreads_in_pool(tpid))))
+                else
+                    $(_fcount(:l_pops))
+                end
+            end
+            $(MULTIQ_VALIDATE ? :(task === nothing || $_COUNT) : nothing)
+            return task
+        end
+
+        function multiq_check_empty()
+            stock_multiq_check_empty() || return false
+            $(_M_NEGATIVE == "blind" ? :(return true) : nothing)
+            ccall(:jl_threadpoolid, Int8, (Int16,), Threads.threadid() - 1) == f_tpid || return true
+            return (@atomic :monotonic fq.n) == 0
+        end
+    end
+end
+
+# M and O: mark `t` (a task made by hand, not yet scheduled) class F. Under every other variant a
+# call is an error: the harness marks only under M.
+function multiq_mark!(t::Task)
+    FIFO_CLASS === :mark || error("multiq_mark! under VARIANT=$(MULTIQ_VARIANT)")
+    t.priority |= 0x8000
+    return t
+end
+
+# A task made the way `Threads.@spawn pool f()` makes one, marked F, then scheduled.
+function spawn_marked(f, pool::Symbol)
+    t = Task(f)
+    t.sticky = false
+    Threads._spawn_set_thrpool(t, pool)
+    multiq_mark!(t)
+    schedule(t)
+    return t
+end
+
 # The heap list the variant runs on: what nested.jl counts as "in heaps".
 const MULTIQ_HEAP_LISTS = PERIODIC_K !== nothing ? PARTR.e_heaps :
                           MULTIQ_SEQ_HEAPS ? PARTR.seq_heaps : PARTR.heaps
@@ -940,6 +1274,7 @@ function multiq_queued(tp::Int)
         for h in MULTIQ_HEAP_LISTS[tp]
             n += @atomic :monotonic h.ntasks
         end
+        MULTIQ_FIFO && tp == PARTR.f_tpid + 1 && (n += @atomic :monotonic PARTR.fq.n)   # M, O: the F queue too
     else
         WS = Base.Scheduler.ChosenScheduler
         for r in WS.Rings[tp]
@@ -1029,7 +1364,11 @@ println(stderr, "multiq_variant: VARIANT=", MULTIQ_VARIANT, MULTIQ_VALIDATE ? " 
         MULTIQ_SEQ_HEAPS || PERIODIC_K !== nothing ? ", partr.jl crc matches $(VERSION)" : "",
         SLOT_BUDGET === nothing ? "" : ", slot budget $(SLOT_BUDGET == typemax(Int) ? "none" : SLOT_BUDGET)",
         PERIODIC_K === nothing ? "" : ", periodic pop every $(PERIODIC_K == typemax(Int) ? "never" : PERIODIC_K)",
-        PERIODIC_K !== nothing && !isempty(_E_NEGATIVE) ? ", NEGATIVE CONTROL $(_E_NEGATIVE)" : "")
+        PERIODIC_K !== nothing && !isempty(_E_NEGATIVE) ? ", NEGATIVE CONTROL $(_E_NEGATIVE)" : "",
+        MULTIQ_FIFO ? ", F queue: class $(FIFO_CLASS), serve $(FIFO_SERVE), marks " *
+                      "$(MARK_HANDLERS ? "handlers" : "")$(MARK_CLIENTS ? "+clients" : "")$(MARK_ALL ? "all" : "")" *
+                      "$(!MARK_HANDLERS && !MARK_ALL ? "none" : "")" : "",
+        MULTIQ_FIFO && !isempty(_M_NEGATIVE) ? ", NEGATIVE CONTROL $(_M_NEGATIVE)" : "")
 
 # Calls into the new code, per thread (validation only).
 multiq_variant_calls() = [PARTR.variant_calls[64 * (tid - 1) + 1] for tid in 1:Threads.maxthreadid()]
@@ -1037,6 +1376,21 @@ multiq_variant_calls() = [PARTR.variant_calls[64 * (tid - 1) + 1] for tid in 1:T
 # End of a process: under C and E, nothing ever went into the build's own heaps, and the
 # variant's are empty (under E: every live count 0 and every bucket's ring and shadow empty).
 function multiq_variant_check()
+    if MULTIQ_FIFO
+        # M and O: stock's heaps and the F queue empty, and no F task ever sent down stock's path.
+        for tp in 1:2
+            n = sum((h.ntasks for h in PARTR.heaps[tp]); init = 0)
+            n == 0 || error("$MULTIQ_VARIANT: $n tasks left in the heaps of pool $tp")
+        end
+        q = @atomic PARTR.fq.n
+        q == 0 || error("$MULTIQ_VARIANT: $q tasks left in the F queue")
+        if MULTIQ_VALIDATE
+            c = multiq_fifo_counts()
+            c.demoted == 0 || error("$MULTIQ_VARIANT: $(c.demoted) F tasks were sent down stock's path")
+            println(stderr, "validate: F counts over the process: ", join(("$k $(getfield(c, k))" for k in _F_FIELDS), ", "))
+        end
+        return nothing
+    end
     MULTIQ_SEQ_HEAPS || PERIODIC_K !== nothing || return nothing
     for tp in 1:2
         n_old = sum((h.ntasks for h in PARTR.heaps[tp]); init = 0)
@@ -1501,7 +1855,148 @@ function _e_unit_asserts()
     return nothing
 end
 
+# M and O, VALIDATE only: the counts summed over threads.
+const _F_FIELDS = (:f_first, :f_again, :l_first, :demoted, :f_pops, :l_pops, :skips, :own)
+function multiq_fifo_counts()
+    MULTIQ_FIFO || return nothing
+    fs = PARTR.fstates
+    return NamedTuple{_F_FIELDS}(Tuple(sum(getfield(s, k) for s in fs) for k in _F_FIELDS))
+end
+
+# M and O, VALIDATE only: print the counts since `before` and check the classification: exactly
+# `f_first` tasks went to the F queue on their first enqueue (not checked when `nothing`), nothing was demoted, every F insert
+# was popped and the queue is empty (the cell or workload has ended, so nothing is runnable).
+function multiq_fifo_check(label, before; f_first::Union{Int,Nothing})
+    MULTIQ_FIFO || return nothing
+    now = multiq_fifo_counts()
+    d = NamedTuple{_F_FIELDS}(Tuple(getfield(now, k) - getfield(before, k) for k in _F_FIELDS))
+    println(stderr, "validate: F counts, ", label, ": ", join(("$k $(getfield(d, k))" for k in _F_FIELDS), ", "))
+    q = (@atomic PARTR.fq.n)
+    f_first === nothing || d.f_first == f_first || error("$MULTIQ_VARIANT: $label: $(d.f_first) tasks classified F at their first enqueue, expected $f_first")
+    d.demoted == 0 || error("$MULTIQ_VARIANT: $label: $(d.demoted) F tasks sent down stock's path")
+    q == 0 || error("$MULTIQ_VARIANT: $label: $q tasks left in the F queue")
+    d.f_pops == d.f_first + d.f_again ||
+        error("$MULTIQ_VARIANT: $label: $(d.f_pops) F pops for $(d.f_first + d.f_again) F inserts")
+    return d
+end
+
+# M and O, VALIDATE only, two probes of `multiq_check_empty` (as E's):
+# 1. Everything drained: it must say empty.
+# 2. An F task queued and no wake-up sent: it must say non-empty (`M_NEGATIVE=blind` fails it: a
+#    thread could sleep with a task in the F queue). The dummy is taken back out under the lock.
+function _f_probe(reps::Int = 20)
+    P = PARTR
+    seen_empty = false
+    for _ in 1:reps
+        sleep(0.05)
+        seen_empty = fetch(Threads.@spawn :default P.multiq_check_empty())
+        seen_empty && break
+    end
+    seen_empty || error("F: multiq_check_empty() said non-empty $reps times with everything drained")
+    println(stderr, "multiq_variant: F probe 1: multiq_check_empty() says empty with everything drained")
+    checked = 0
+    for _ in 1:reps
+        sleep(0.05)   # every other thread goes back to sleep
+        empty, got = fetch(Threads.@spawn :default begin
+            t0 = time_ns()   # hold without yielding until the threads this spawn woke are asleep again
+            while time_ns() - t0 < 5_000_000
+                GC.safepoint()
+            end
+            dummy = Task(() -> nothing)
+            Threads._spawn_set_thrpool(dummy, :default)
+            dummy.priority = P.F_BIT
+            P.multiq_insert(dummy, dummy.priority)
+            e = P.multiq_check_empty()
+            q = P.fq
+            lock(q.lock)
+            k = findfirst(j -> q.tasks[P.f_idx(q, j)] === dummy, 1:Int(q.n))
+            k === nothing || P.f_remove!(q, k)
+            unlock(q.lock)
+            (e, k !== nothing)
+        end)
+        got || continue   # a spinning thread popped it (and ran a no-op): no verdict this time
+        empty && error("F: multiq_check_empty() says empty while the F queue holds a task")
+        checked += 1
+    end
+    checked >= reps ÷ 2 || error("F: only $checked of $reps check_empty probes kept their task")
+    println(stderr, "multiq_variant: F probe 2: multiq_check_empty() saw a queued F task ", checked, " of ", reps,
+            " times (the rest were taken first)")
+    return nothing
+end
+
+# M and O, VALIDATE only: the F queue's own order, on a queue of its own with dummy tasks that
+# never run (`f_pop!` pins each popped dummy to the tid it is given; they are never scheduled).
+function _f_unit_asserts()
+    P = PARTR
+    nt = Threads.nthreads(:default)
+    # Pops are made as a `:default` tid would make them (`f_pop!` takes the tid); at most
+    # nthreads(:default) - 1 entries can be pinned to the others.
+    me, other = Threads.threadpooltids(:default)[1:2]
+    newq() = P.fqueue()
+    function push(q, ids, i)
+        t = Task(() -> nothing)
+        ids[t] = i
+        lock(q.lock); P.f_push!(q, t); unlock(q.lock)
+        return t
+    end
+    pop(q, ids, tid = me) = (t = P.f_pop!(q, tid, nt); t === nothing ? 0 : ids[t])
+    # Fill and drain, across ring growth (capacity 256).
+    q, ids = newq(), IdDict{Task,Int}()
+    foreach(i -> push(q, ids, i), 1:600)
+    fd = [pop(q, ids) for _ in 1:600]
+    @assert fd == collect(1:600) "F: fill/drain popped out of order"
+    @assert q.n == 0 "F: $(q.n) left after the drain"
+    # Random interleaved pushes and pops against a reference vector.
+    q, ids = newq(), IdDict{Task,Int}()
+    ref, popped, pushed = Int[], Int[], 0
+    state = UInt64(0x9e3779b97f4a7c15)
+    while length(popped) < 2000
+        state = state * 0x5851f42d4c957f2d + 1
+        if pushed < 2000 && (q.n == 0 || (state >> 33) % 3 != 0)
+            pushed += 1
+            push(q, ids, pushed)
+            push!(ref, pushed)
+        else
+            push!(popped, pop(q, ids))
+            @assert popped[end] == popfirst!(ref) "F: interleaved pop $(popped[end]) out of order"
+        end
+    end
+    # A head pinned to another thread: passed over without holding the rest, left at the head, and
+    # taken by its owner.
+    q, ids = newq(), IdDict{Task,Int}()
+    pinned = push(q, ids, 1)
+    ccall(:jl_set_task_tid, Cint, (Any, Cint), pinned, other - 1) == 1 || error("F: could not pin the dummy")
+    foreach(i -> push(q, ids, i), 2:5)
+    got = [pop(q, ids) for _ in 1:4]
+    @assert got == [2, 3, 4, 5] "F: with a pinned head this thread popped $got"
+    @assert q.n == 1 && q.tasks[q.head] === pinned "F: the pinned entry left the head"
+    @assert pop(q, ids) == 0 "F: this thread took a task pinned to tid $other"
+    @assert pop(q, ids, other) == 1 "F: the owner could not take its own task"
+    # Every scanned entry pinned elsewhere, the owner's task behind them: the owner still gets it.
+    q, ids = newq(), IdDict{Task,Int}()
+    others = [t for t in Threads.threadpooltids(:default) if t != me]
+    for (i, o) in enumerate(others)
+        t = push(q, ids, i)
+        ccall(:jl_set_task_tid, Cint, (Any, Cint), t, o - 1)
+    end
+    mine = push(q, ids, 100)
+    ccall(:jl_set_task_tid, Cint, (Any, Cint), mine, me - 1)
+    @assert pop(q, ids) == 100 "F: the owner's task behind $(length(others)) pinned entries was not reached"
+    # The L heap is the build's: A's fill/drain order.
+    lfd = _fill_drain(20)
+    @assert lfd == [1; 20:-1:2] "F: the stock heap's fill/drain popped $lfd"
+    println(stderr, "multiq_variant: single-structure asserts passed for ", MULTIQ_VARIANT,
+            ": F queue fill/drain of 600 in order, 2,000 interleaved in order, a pinned head passed over ",
+            "and taken by its owner, the owner's task found behind ", length(others), " pinned entries; ",
+            "stock heap fill/drain ", lfd)
+    multiq_watchdog(60)
+    _f_probe()
+    multiq_watchdog(0)
+    return nothing
+end
+
 function multiq_unit_asserts()
+    MULTIQ_FIFO && return _f_unit_asserts()
     PERIODIC_K === nothing || return _e_unit_asserts()
     if MULTIQ_BACKEND !== :partr
         println(stderr, "multiq_variant: single-heap asserts skipped: the build's scheduler is ", MULTIQ_BACKEND)

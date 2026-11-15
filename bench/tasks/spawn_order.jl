@@ -89,12 +89,23 @@
 # equal priorities, FIFO behind a LIFO slot per `:default` thread with a budget of K pops in a row,
 # or stock's order with every K-th pop taking the oldest task instead of the newest. The priority
 # mode runs under A only (its heap is the build's own).
+# VARIANT=M-f|M-l|M-h-f|M-h-l|M-none|O-f|O-l: stock's heaps plus one FIFO queue for the tasks of
+# class F. Under M the class is a mark this file puts on tasks it makes by hand (`spawn_marked`):
+# M marks every handler and every client, M-h the handlers only, M-none nothing; a handler's inner
+# children are never marked. Under O nothing is marked: a task is F when its first enqueue comes
+# from a thread of another pool (here: handlers spawned by `:interactive` clients, and at `8,1`
+# the `:default` clients, which the main task spawns from `:interactive`). An unmarked task is
+# spawned with the plain `Threads.@spawn` under every variant, so M-none runs A's harness code.
+# These variants run the `spawn` mode only (`pool` stays the reference, under A).
 # VALIDATE=1 is the instrumented check to run before timing a variant: single-heap order asserts,
 # every handler accounted for, the new code reached on every `:default` thread, and how far each
 # handler's start ran behind its spawn, counted in handlers (its start ordinal minus its spawn
 # ordinal); under D also the slot probe, the slot counts of each cell (slot pops required with
 # `:default` clients) and empty slots at exit; under E the check_empty probes, the pop counts of
-# each cell (periodic pops on every `:default` thread, none under E-inf) and empty deques at exit.
+# each cell (periodic pops on every `:default` thread, none under E-inf) and empty deques at exit;
+# under M and O the single-structure asserts and check_empty probes of the F queue, and per cell the
+# classification (exactly the expected tasks classified F at their first enqueue, none demoted,
+# every F insert popped, the queue empty after the cell).
 # With the modes here also: the handler count per `:default` tid in every mode; under sticky every
 # handler ran on its assigned tid, was still there at its end, the per-tid counts are within 10%
 # of each other, and the depth of the queue each handler joined is reported (p50/p90/p99/max, and
@@ -274,7 +285,7 @@ function client_spawn(slot::Slot, rec::Rec, deadline::UInt64, h::Float64, mode::
         t0 = time_ns()
         stamp_spawn!(slot)
         if mode == M_SPAWN
-            Threads.@spawn handle!(slot, inner)
+            MARK_HANDLERS ? spawn_marked(() -> handle!(slot, inner), :default) : Threads.@spawn handle!(slot, inner)
         elseif mode == M_STICKY
             spawn_sticky!(slot, inner)
         else
@@ -304,6 +315,7 @@ function run_cell(mode::String, clients::Symbol, c::Int, h::Float64, d::Float64,
     shape in ("plain", "hetero", "inner", "io") || error("unknown shape $shape")
     hetero, inner = shape == "hetero", shape == "inner"
     mode == "priority" && MULTIQ_VARIANT != "A" && error("the priority mode runs on the build's own heap only (VARIANT=A)")
+    MULTIQ_FIFO && mode != "spawn" && error("VARIANT=$(MULTIQ_VARIANT) runs the spawn mode only")
     slots = [Slot() for _ in 1:c]
     foreach(sl -> sl.io = shape == "io", slots)
     recs = [Rec() for _ in 1:c]
@@ -329,6 +341,8 @@ function run_cell(mode::String, clients::Symbol, c::Int, h::Float64, d::Float64,
             [Threads.@spawn :default client_pool(slots[i], recs[i], deadline, h, jobs, hetero, i) for i in 1:c]
     else
         m = MODE_CODE[mode]
+        MARK_CLIENTS && mode == "spawn" ?
+            [spawn_marked(() -> client_spawn(slots[i], recs[i], deadline, h, m, hetero, inner, i), clients) for i in 1:c] :
         clients === :interactive ?
             [Threads.@spawn :interactive client_spawn(slots[i], recs[i], deadline, h, m, hetero, inner, i) for i in 1:c] :
             [Threads.@spawn :default client_spawn(slots[i], recs[i], deadline, h, m, hetero, inner, i) for i in 1:c]
@@ -423,6 +437,7 @@ function measure()
         end
         slots0 = multiq_slot_counts()
         budget0 = multiq_budget_counts()
+        fifo0 = multiq_fifo_counts()
         multiq_watchdog(ceil(Int, d) + 60)
         recs, wall = run_cell(mode, cl, c, h, d, shape)
         multiq_watchdog(0)
@@ -438,9 +453,20 @@ function measure()
         # 8 workers from `take!`, so there some thread must.
         VALIDATE && multiq_budget_check("$mode/$cl C=$c H=$h", budget0;
                                         everywhere = mode == "spawn" || cl === :default)
+        VALIDATE && multiq_fifo_check("$mode/$cl C=$c H=$h $shape", fifo0;
+                                      f_first = expected_f_first(cl, c, sum(r -> length(r.lat), recs)))
     end
     VALIDATE && validate_threads()
     multiq_variant_check()
+end
+
+# M and O: how many tasks of a spawn cell with `n` requests go to the F queue at their first enqueue.
+function expected_f_first(cl::Symbol, c::Int, n::Int)
+    FIFO_CLASS === :mark && return (MARK_HANDLERS ? n : 0) + (MARK_CLIENTS && cl === :default ? c : 0)
+    # O: a handler spawned by an `:interactive` client; a `:default` client spawned by the main
+    # task, which runs on `:interactive` when there is one.
+    FIFO_CLASS === :origin && return cl === :interactive ? n : Threads.nthreads(:interactive) > 0 ? c : 0
+    return 0
 end
 
 # Every handler accounted for, how far starts ran behind spawns, the handler count per `:default`
