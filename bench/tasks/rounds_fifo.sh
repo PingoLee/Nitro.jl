@@ -30,8 +30,10 @@
 #   RETRIES       2
 #   VALIDATE=1    one validation pass instead, not behind the gate and not timed: every layout x
 #                 client pool x variant at D = 1 s over all four shapes, tasks.jl's rows, nested.jl
-#                 at FIB_FINE=36:12 and RUNS=1 (MARK_ALL too), and the check_empty negative control
-#                 (M_NEGATIVE=blind must fail), into <OUT>/validate-*.tsv and <OUT>/validate.log
+#                 at FIB_FINE=36:12 and RUNS=1 (MARK_ALL too), and the two negative controls
+#                 (M_NEGATIVE=blind fails the check_empty probe, M_NEGATIVE=stall trips the stall
+#                 check), into <OUT>/validate-*.tsv and <OUT>/validate.log; NEG_ONLY=1 runs only
+#                 the negative controls
 #   QUIET_LOAD, QUIET_WAIT_S, SAMPLE_S  pass through to quiet.sh
 # Afterwards: julia bench/tasks/aggregate_fifo.jl <OUT>
 set -uo pipefail
@@ -160,26 +162,40 @@ SELF=("$0" --run)
 if [ "$VALIDATE" = 1 ]; then
   export VALIDATE
   status=0
-  vlog="$OUT/validate.log"; : >"$vlog"
-  log "validation pass (not timed, no gate): $JL ($VER) -> $OUT/validate-*.tsv, stderr in $vlog"
-  rm -f "$OUT"/validate-*.tsv
-  {
-    cost_block 1 "$OUT/validate-cost-spawn.tsv" "$OUT/validate-micro.tsv" &&
-    fairness_block 1 "$OUT/validate-fairness-spawn.tsv" &&
-    nesting_block 1 "$OUT/validate-nested.tsv" "$NEST_V" FIB_FINE=36:12 &&
-    NEST_LAYOUTS="8,1 8,0" nesting_block 1 "$OUT/validate-markall.tsv" "M-f M-l" WORKLOADS=fib_fine FIB_FINE=36:12 MARK_ALL=1
-  } 2>>"$vlog" || status=1
-  # The negative control must fail: a check_empty blind to the F queue says empty with a task queued.
-  for layout in 8,1 8,0; do
-    if env VALIDATE=1 VARIANT=M-f M_NEGATIVE=blind CELLS=50:0.2 MODES=spawn D=1 timeout -s KILL 300 \
-         taskset -c "$CPUS" "$JL" --threads="$layout" "$HERE/spawn_order.jl" >/dev/null 2>>"$vlog"; then
-      log "NEGATIVE CONTROL at $layout passed, and it must fail"; status=1
-    elif grep -q "says empty while the F queue holds a task" "$vlog"; then
-      log "negative control at $layout failed as it must"
-    else
-      log "negative control at $layout failed for another reason; see $vlog"; status=1
-    fi
+  vlog="$OUT/validate.log"
+  if [ "${NEG_ONLY:-0}" = 1 ]; then
+    log "negative controls only, stderr appended to $vlog"
+  else
+    : >"$vlog"
+    log "validation pass (not timed, no gate): $JL ($VER) -> $OUT/validate-*.tsv, stderr in $vlog"
+    rm -f "$OUT"/validate-*.tsv
+    {
+      cost_block 1 "$OUT/validate-cost-spawn.tsv" "$OUT/validate-micro.tsv" &&
+      fairness_block 1 "$OUT/validate-fairness-spawn.tsv" &&
+      nesting_block 1 "$OUT/validate-nested.tsv" "$NEST_V" FIB_FINE=36:12 &&
+      NEST_LAYOUTS="8,1 8,0" nesting_block 1 "$OUT/validate-markall.tsv" "M-f M-l" WORKLOADS=fib_fine FIB_FINE=36:12 MARK_ALL=1
+    } 2>>"$vlog" || status=1
+  fi
+  # The negative controls must fail, each with its own message:
+  #   blind  a check_empty blind to the F queue says empty with a task queued (probe 2 fails);
+  #   stall  an F task pinned to a thread that never pops trips f_pop!'s stall check (abort, 134).
+  nlog="$OUT/negative-control.err"
+  for control in "blind:says empty while the F queue holds a task" "stall:made no pop meanwhile"; do
+    name="${control%%:*}" msg="${control#*:}"
+    for layout in 8,1 8,0; do
+      : >"$nlog"
+      if env VALIDATE=1 VARIANT=M-f M_NEGATIVE="$name" CELLS=50:0.2 MODES=spawn D=1 timeout -s KILL 300 \
+           taskset -c "$CPUS" "$JL" --threads="$layout" "$HERE/spawn_order.jl" >/dev/null 2>"$nlog"; then
+        log "NEGATIVE CONTROL $name at $layout passed, and it must fail"; status=1
+      elif grep -q "$msg" "$nlog"; then
+        log "negative control $name at $layout failed as it must: $(grep -m1 "$msg" "$nlog" | cut -c1-160)"
+      else
+        log "negative control $name at $layout failed for another reason; see $vlog"; status=1
+      fi
+      { echo "--- negative control $name at $layout"; cat "$nlog"; } >>"$vlog"
+    done
   done
+  rm -f "$nlog"
   log "validation pass done (status $status)"
   exit "$status"
 fi

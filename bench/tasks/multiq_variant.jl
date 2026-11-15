@@ -986,10 +986,12 @@ if MULTIQ_FIFO
     for name in (:multiq_insert, :multiq_deletemin, :multiq_check_empty)
         Core.eval(PARTR, _renamed_partr_function(name, Symbol(:stock_, name)))
     end
-    # VALIDATE only: the negative control for the second check_empty probe. `blind` is a
-    # `multiq_check_empty` that ignores the F queue (a thread could sleep with a task queued there).
+    # VALIDATE only, two negative controls. `blind` is a `multiq_check_empty` that ignores the F
+    # queue (a thread could sleep with a task queued there): the second check_empty probe must fail.
+    # `stall` queues an F task pinned to a thread that then never pops (`_f_stall_control`): the
+    # stall check in `f_pop!` must fire.
     const _M_NEGATIVE = MULTIQ_VALIDATE ? get(ENV, "M_NEGATIVE", "") : ""
-    _M_NEGATIVE in ("", "blind") || error("M_NEGATIVE must be blind")
+    _M_NEGATIVE in ("", "blind", "stall") || error("M_NEGATIVE must be blind or stall")
     _fcount(field) = MULTIQ_VALIDATE ? :(fstates[Threads.threadid()].$field += 1) : nothing
     @eval PARTR begin
         # The class: bit 15 of `Task.priority`. Nothing in Base sets a priority (a new task starts at
@@ -1924,6 +1926,33 @@ function _f_probe(reps::Int = 20)
     return nothing
 end
 
+# M and O, VALIDATE only, `M_NEGATIVE=stall`: the negative control of the stall check in `f_pop!`.
+# An F task that its owner never takes: a dummy pinned to this thread, which then computes without
+# yielding, so it never pops (neither its own task nor anything else) while the `:default` threads,
+# woken by a burst of plain spawns, find only that entry and fail every pop. The check must abort
+# the process (exit 134) with "made no pop meanwhile" well before the hold ends; returning is the
+# failure.
+function _f_stall_control(hold_s::Float64 = 60.0)
+    P = PARTR
+    dummy = Task(() -> nothing)
+    dummy.sticky = false
+    Threads._spawn_set_thrpool(dummy, :default)
+    ccall(:jl_set_task_tid, Cint, (Any, Cint), dummy, Threads.threadid() - 1) == 1 ||
+        error("F stall control: could not pin the dummy")
+    dummy.priority = P.F_BIT
+    P.multiq_insert(dummy, dummy.priority)
+    println(stderr, "multiq_variant: F stall control: a task pinned to tid ", Threads.threadid(),
+                    ", which now holds its thread for ", hold_s, " s without popping")
+    for _ in 1:Threads.nthreads(:default)
+        Threads.@spawn :default nothing   # wakes the :default threads; they find only the pinned entry
+    end
+    t0 = time()
+    while time() - t0 < hold_s
+        GC.safepoint()
+    end
+    error("F stall control: the stall check did not fire in $hold_s s")
+end
+
 # M and O, VALIDATE only: the F queue's own order, on a queue of its own with dummy tasks that
 # never run (`f_pop!` pins each popped dummy to the tid it is given; they are never scheduled).
 function _f_unit_asserts()
@@ -1989,6 +2018,7 @@ function _f_unit_asserts()
             ": F queue fill/drain of 600 in order, 2,000 interleaved in order, a pinned head passed over ",
             "and taken by its owner, the owner's task found behind ", length(others), " pinned entries; ",
             "stock heap fill/drain ", lfd)
+    _M_NEGATIVE == "stall" && _f_stall_control()
     multiq_watchdog(60)
     _f_probe()
     multiq_watchdog(0)
