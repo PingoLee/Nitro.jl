@@ -77,7 +77,7 @@ def main():
         svg.append(f'<text x="{X0 + PW + 28}" y="{py(m8) + LABEL_DY[label]:.1f}" font-size="12" fill="{INK}">{html.escape(label)}: '
                    f'{m8 / a[-1][0]:.2f}x A</text>')
     svg.append(f'<text x="30" y="{H - 20}" font-size="11" fill="{MUTED}">M-none (the same code, nothing marked) is within 2% of A at every count. '
-               f'Source: rings_sweep.py, the rings run on #618.</text>')
+               f'Source: rings_sweep.py; #618, comment 6930472472.</text>')
     svg.append('</svg>')
     out = os.path.join(os.path.dirname(os.path.abspath(__file__)), "rings-sweep.svg")
     with open(out, "w") as f:

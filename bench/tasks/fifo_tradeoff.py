@@ -18,7 +18,8 @@ E_COMMENT = ISSUE + "6289909490"      # variant E (A, C, E61 in the rounds; E2..
 D_COMMENT = ISSUE + "6258052506"      # variant D3
 B_NOTE = ISSUE + "6252406575"         # B under nesting
 THIS_RUN = "this run (variants M and O, 1.13.4)"
-RINGS_RUN = "the rings run (M-l-r2, 1.13.4, 3 rounds)"   # the comment on #618 that PR's rings_sweep.py names
+RINGS_RUN = "the rings run (M-l-r2, 1.13.4, 3 rounds)"
+RINGS_COMMENT = ISSUE + "6930472472"  # the rings run (M-l-r2, M-l-r4; Q1 and the sweep)
 
 # (label, p99 lo, p99 hi, fib_fine/A lo, hi, source, kind[, label dy in px]) per panel. kind: "now" (this run) or
 # "earlier". The earlier rows are the comments' ranges over builds (p99) and over build x layout
@@ -41,7 +42,7 @@ INTERACTIVE = [
     # the optional row: every fib_fine task marked (1 round, MARK_ALL=1), M-f 2.25x and M-l 2.28x
     ("M, every fib_fine task marked", 139, 139, 2.25, 2.28, THIS_RUN, "now", 18),
     # the rings run: M-l with a ring per stock heap, d = 2. p99 151 [151-151]; fib_fine / A 0.99 [0.98-0.99]
-    ("M-l-r2 (rings)", 151, 151, 0.98, 0.99, RINGS_RUN, "rings", 32),
+    ("M-l-r2 (rings)", 151, 151, 0.98, 0.99, RINGS_COMMENT, "rings", 32),
 ]
 DEFAULT = [
     # earlier runs: clients on :default at 8,1
@@ -60,7 +61,7 @@ DEFAULT = [
     ("M-f, M-l", 153, 174, 0.97, 1.02, THIS_RUN, "now", 16),
     ("M-h-l, O-l (one side F)", 126, 126, 0.97, 1.02, THIS_RUN, "now", -8),
     # the rings run: M-l-r2 142 [142-142] and M-h-l-r2 142 [142-142]; fib_fine / A as above
-    ("M-l-r2, M-h-l-r2 (rings)", 142, 142, 0.98, 0.99, RINGS_RUN, "rings", 34),
+    ("M-l-r2, M-h-l-r2 (rings)", 142, 142, 0.98, 0.99, RINGS_COMMENT, "rings", 34),
 ]
 B_TEXT = "B (`<=`, upstream's reverted patch): p99 470-770 ms, fib_fine 283-350x stock, off the scale"
 
