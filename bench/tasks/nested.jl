@@ -56,8 +56,11 @@
 # and steals in every workload (slot pops on every `:default` thread in fine-grain fib) and nothing
 # left in the slots at exit (the fan-out needs steals only); under E the check_empty probes, the
 # pop counts of every workload (periodic pops on every `:default` thread in fine-grain fib, none
-# under E-inf) and empty deques at exit. Each validated run is under `multiq_watchdog`: a stall
-# kills it.
+# under E-inf) and empty deques at exit; under M and O the F queue's asserts and probes and, per
+# workload, the classification: nothing F under M, and under O each root (spawned by the main task,
+# so F at `8,1` where the main task runs on `:interactive`) and nothing below it. MARK_ALL=1 (M
+# only) marks every spawn below the roots F: the cost of marking fine-grained fork-join. Each
+# validated run is under `multiq_watchdog`: a stall kills it.
 #
 # GUARD=1 (the default) holds one never-firing `Timer`, as spawn_order.jl does: on 1.13.0-rc3..1.13.2
 # a process with no live timer can miss wake-ups (JuliaLang/julia#63882), a different bug.
@@ -112,12 +115,15 @@ _peak(k::Int) = maximum(tid -> _get(tid, k), 1:NT)
 _reset_counters!() = fill!(CNT, 0)
 
 # The one spawn every workload goes through. `Val(false)` is the clean pass: a plain `@spawn`.
+# MARK_ALL=1 (M only) marks every one of them class F, the same task made by hand.
 @inline function spawn_task(f::F, ::Val{I}) where {F,I}
     if I
         _bump!(SPAWNED)
         _sample!()
+        MARK_ALL && return spawn_marked(() -> (_bump!(STARTED); r = f(); _bump!(FINISHED); r), :default)
         return Threads.@spawn (_bump!(STARTED); r = f(); _bump!(FINISHED); r)
     else
+        MARK_ALL && return spawn_marked(f, :default)
         return Threads.@spawn f()
     end
 end
@@ -337,9 +343,15 @@ function measure()
     for w in ws
         slots0 = multiq_slot_counts()
         budget0 = multiq_budget_counts()
+        fifo0 = multiq_fifo_counts()
         clean, digest = clean_runs(w, runs, min_runs, budget)
         cnt = counted_runs(w, counted, budget, digest)
         w.check(digest)
+        # Each run and each warm-up spawns one root from the main task (2 warm-ups).
+        roots = 2 + length(clean) + length(cnt)
+        VALIDATE && multiq_fifo_check(w.name, fifo0;
+            f_first = MARK_ALL ? nothing :
+                      FIFO_CLASS === :origin && Threads.nthreads(:interactive) > 0 ? roots : 0)
         # The fan-out's one spawner fills its own slot and the idle threads steal it: steals, few pops.
         VALIDATE && multiq_slot_check(w.name, slots0; pops = w.name != "fanout", steals = true,
                                       pops_everywhere = w.name == "fib_fine")
