@@ -311,7 +311,10 @@ function client_pool(slot::Slot, rec::Rec, deadline::UInt64, h::Float64, jobs::C
 end
 
 # One cell: C clients for D seconds. Returns the per-client records and the wall time.
-function run_cell(mode::String, clients::Symbol, c::Int, h::Float64, d::Float64, shape::String = "plain")
+# `onstart(deadline)`, when given, runs once the cell's clock has started, before the clients
+# (mixed_cell.jl starts its background load there).
+function run_cell(mode::String, clients::Symbol, c::Int, h::Float64, d::Float64, shape::String = "plain";
+                  onstart = nothing)
     shape in ("plain", "hetero", "inner", "io") || error("unknown shape $shape")
     hetero, inner = shape == "hetero", shape == "inner"
     mode == "priority" && MULTIQ_VARIANT != "A" && error("the priority mode runs on the build's own heap only (VARIANT=A)")
@@ -335,6 +338,7 @@ function run_cell(mode::String, clients::Symbol, c::Int, h::Float64, d::Float64,
     GC.gc()
     start = time_ns()
     deadline = start + round(UInt64, d * 1e9)
+    onstart === nothing || onstart(deadline)
     tasks = if startswith(mode, "pool")
         clients === :interactive ?
             [Threads.@spawn :interactive client_pool(slots[i], recs[i], deadline, h, jobs, hetero, i) for i in 1:c] :
@@ -551,7 +555,9 @@ function report(path::String)
     end
 end
 
-if length(ARGS) >= 2 && ARGS[1] == "--report"
+# Run as a script only: mixed_cell.jl includes this file for `run_cell` and `metrics`.
+if abspath(PROGRAM_FILE) != abspath(@__FILE__)
+elseif length(ARGS) >= 2 && ARGS[1] == "--report"
     report(ARGS[2])
 elseif length(ARGS) >= 1 && ARGS[1] == "--prio-bench"
     priority_drain_bench() === nothing && println(stderr, "prio bench: no stock heap to bench (variant ",
