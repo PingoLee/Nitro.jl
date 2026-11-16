@@ -13,6 +13,8 @@
 #                               in the one-thread `:interactive` pool, so only the handlers reach
 #                               the F queue; M-h-l marks the handlers only)
 #   C, H, D                     500, 2, 8;  FIB_FINE "42:12";  ALONE_RUNS 5;  ROUND 1
+#   BG=loops:<n>                the half-pool cell: n loops of short chunks instead of fib_fine (above
+#                               loop_run); run it with C small enough that C + n <= 8
 #   NOHEADER=1                  no header line
 #   VALIDATE=1                  as spawn_order.jl: the variant's asserts and probes, every handler
 #                               accounted for, the classification (F first-inserts = the handlers
@@ -38,6 +40,27 @@ function mix_pfib(n::Int, cut::Int)
 end
 const FIB_REF = mix_sfib(FIB_N)
 
+# BG=loops:<n> (the half-pool cell): instead of fib_fine, n unmarked loops on `:default`, each
+# running chunks of `sfib(24)` with a `yield()` between chunks, so each needs one thread and the
+# pool is not over capacity when C + n <= 8. One "run" is 400 chunks; its wall is what the fib_*
+# columns then report.
+const BG = get(ENV, "BG", "fib")
+const BG_LOOPS = BG == "fib" ? 0 : startswith(BG, "loops:") ? parse(Int, BG[7:end]) :
+                 error("mixed_cell: BG must be fib or loops:<n>")
+const UNIT_N, UNITS_PER_RUN = 24, 400
+const UNIT_REF = mix_sfib(UNIT_N)
+function loop_run()
+    t0 = time_ns()
+    acc = 0
+    for _ in 1:UNITS_PER_RUN
+        acc += mix_sfib(UNIT_N)
+        yield()
+    end
+    t1 = time_ns()
+    acc == UNITS_PER_RUN * UNIT_REF || error("mixed_cell: a loop computed $acc")
+    return (t1 - t0) / 1e9, t1
+end
+
 # One fib_fine run, rooted on `:default` as nested.jl roots it: (wall s, end stamp).
 function fib_once()
     t0 = time_ns()
@@ -59,27 +82,50 @@ function mixed()
     Threads.nthreads(:interactive) > 0 || error("mixed_cell: needs an :interactive thread (--threads=8,1)")
     println(stderr, "mixed_cell: julia ", VERSION, " (", Base.GIT_VERSION_INFO.commit_short, "), threads ",
             Threads.nthreads(:default), ",", Threads.nthreads(:interactive), ", variant ", MULTIQ_VARIANT,
-            ", C = ", MIX_C, ", H = ", MIX_H, " ms, D = ", MIX_D, " s, fib_fine ", FIB_N, ":", FIB_CUT,
+            ", C = ", MIX_C, ", H = ", MIX_H, " ms, D = ", MIX_D, " s, ",
+            BG_LOOPS == 0 ? "fib_fine $(FIB_N):$(FIB_CUT)" : "$(BG_LOOPS) loops of sfib($(UNIT_N)) x $(UNITS_PER_RUN)",
             " looping on :default")
     VALIDATE && multiq_unit_asserts()
     # Compile both halves before timing; not reported.
     run_cell("spawn", :interactive, 8, 0.1, 0.2)
     fetch(Threads.@spawn :default mix_pfib(min(FIB_N, FIB_CUT + 8), FIB_CUT))
     GC.gc()
-    alone = [fib_once()[1] for _ in 1:ALONE_RUNS]
     walls, ends = Float64[], UInt64[]
     bg = Ref{Task}()
-    loop = deadline -> (bg[] = Threads.@spawn :default begin
-        while time_ns() < deadline
-            w, e = fib_once()
-            push!(walls, w)
-            push!(ends, e)
-        end
-    end)
+    if BG_LOOPS == 0
+        alone = [fib_once()[1] for _ in 1:ALONE_RUNS]
+        loop = deadline -> (bg[] = Threads.@spawn :default begin
+            while time_ns() < deadline
+                w, e = fib_once()
+                push!(walls, w)
+                push!(ends, e)
+            end
+        end)
+    else
+        # BG=loops:<n>: n unmarked loops, each its own task, timed alone together first.
+        loop_run()
+        alone = reduce(vcat, fetch.([Threads.@spawn :default [loop_run()[1] for _ in 1:ALONE_RUNS] for _ in 1:BG_LOOPS]))
+        loop = deadline -> (bg[] = Threads.@spawn :default begin
+            parts = fetch.([Threads.@spawn :default begin
+                w, e = Float64[], UInt64[]
+                while time_ns() < deadline
+                    x, y = loop_run()
+                    push!(w, x)
+                    push!(e, y)
+                end
+                (w, e)
+            end for _ in 1:BG_LOOPS])
+            for (w, e) in parts
+                append!(walls, w)
+                append!(ends, e)
+            end
+        end)
+    end
     if VALIDATE
         HANDLED[] = 0; TID_MOVED[] = 0
     end
     fifo0 = multiq_fifo_counts()
+    share0, sfifo0 = multiq_share_counts(), share_fifo_pops()
     multiq_watchdog(ceil(Int, MIX_D) + 120)
     recs, wall = run_cell("spawn", :interactive, MIX_C, MIX_H, MIX_D; onstart = loop)
     clients_done = time_ns()
@@ -100,9 +146,11 @@ function mixed()
         validate_cell(recs, "spawn", :interactive, MIX_C, MIX_H, "mixed")
         multiq_fifo_check("mixed C=$(MIX_C) H=$(MIX_H)", fifo0;
                           f_first = expected_f_first(:interactive, MIX_C, sum(r -> length(r.lat), recs)))
+        # Under M-t (and M-h-t) the two sides' time must come out 40-60% on every :default thread.
+        multiq_share_check("mixed C=$(MIX_C) H=$(MIX_H)", share0, sfifo0; half = FIFO_SERVE === :t && BG_LOOPS == 0)
         validate_threads()
-        println(stderr, "validate: mixed: ", length(walls), " fib_fine runs during the cell (",
-                length(inside), " ended before the last client), every result fib($FIB_N)")
+        println(stderr, "validate: mixed: ", length(walls), BG_LOOPS == 0 ? " fib_fine" : " loop", " runs during the cell (",
+                length(inside), " ended before the last client), every result checked")
     end
     multiq_variant_check()
 end

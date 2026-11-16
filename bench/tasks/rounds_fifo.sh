@@ -22,6 +22,16 @@
 #             fib_fine, variants A M-none M-f M-l, one block
 #   mixed     mixed_cell.jl: the starved cell (clients on :interactive, 8,1) while fib_fine loops on
 #             :default for the whole D. Variants: A C M-l M-h-l (BLOCKS=mixed ROUNDS=3)
+#   halfmix   the mixed cell at half the pool: C = 4 clients beside 4 unmarked loops of short chunks
+#             (mixed_cell.jl BG=loops:4), so the pool is not over capacity; the MIX_V variants
+#
+#
+# PROFILE=share (the shares of 2026-11-16, M-t and M-p<K>) swaps the lists: cost at C = 500 only,
+# A A0 M-none M-l M-t; fairness A M-l M-t, plus M-h-t with :default clients; shapes inner and io for
+# A M-l M-t, inner only for M-p2 M-p1024; nesting fib_fine only, A M-none M-l M-t; mixed A C M-l
+# M-t M-t0 M-p2 M-p16 M-p128 M-p1024; the pilot is the starved cell with :default clients and the
+# mixed cell, A M-l M-t (aggregate_fifo.jl <OUT> sharepilot); VALIDATE adds the mixed cell for
+# every variant (C at FIB_FINE=36:12) and runs the negative controls under M-f and M-t.
 #
 # Usage: JL=<julia binary> MICRO_PROJECT=<env with BenchmarkTools> bench/tasks/rounds_fifo.sh [rounds]
 #   OUT           results directory (default bench/results/618-fifo)
@@ -56,14 +66,45 @@ VER="$("$JL" -e 'print(VERSION)')"
 
 log() { echo "[$(date +%H:%M:%S)] rounds_fifo: $*"; }
 
-# The variants of each cell. ROUND_ORDER reverses them in even rounds.
+# The variants of each cell. ROUND_ORDER reverses them in even rounds. PROFILE=share is the run of
+# 2026-11-16 (the shares, M-t and M-p<K>, against M-l); the default is the M/O run of 2026-11-15.
+PROFILE="${PROFILE:-mo}"
 COST_V="A A0 C M-none M-f M-l O-f O-l"
+COST_CELLS="50:0 500:0"
 FAIR_I81_V="A A0 C M-none M-f M-l O-f O-l"          # :interactive clients, 8,1
 FAIR_D_V="A A0 C M-none M-f M-l M-h-f M-h-l O-f O-l"  # :default clients, 8,1 and 8,0
 SHAPE_V="A C M-none M-f M-l"
+SHAPE_CELLS="500:2:inner 500:2:hetero 500:2:io"
+SHAPE_INNER_V=""                                    # variants run in 500:2:inner only
 NEST_V="A A0 C M-none M-f M-l O-f O-l"
+NEST_WORKLOADS=""                                   # nested.sh's default: all five
 PILOT_V="A M-none M-f M-l"
 MIX_V="A C M-l M-h-l"
+VAL_V=""            # VALIDATE: the variants of the cost and fairness cells, when not the lists above
+VAL_NEST_V="$NEST_V"
+VAL_MARKALL_V="M-f M-l"
+VAL_MIX_V=""        # VALIDATE: the mixed cell (C at FIB_FINE=36:12)
+NEG_V="M-f"         # VALIDATE: the variants the two negative controls run under
+if [ "$PROFILE" = share ]; then
+  COST_V="A A0 M-none M-l M-t"
+  COST_CELLS="500:0"
+  FAIR_I81_V="A M-l M-t"
+  FAIR_D_V="A M-l M-t M-h-t"
+  SHAPE_V="A M-l M-t"
+  SHAPE_CELLS="500:2:inner 500:2:io"
+  SHAPE_INNER_V="M-p2 M-p1024"
+  NEST_V="A M-none M-l M-t"
+  NEST_WORKLOADS="fib_fine"
+  PILOT_V="A M-l M-t"
+  MIX_V="A C M-l M-t M-t0 M-p2 M-p16 M-p128 M-p1024"
+  VAL_V="A A0 C M-none M-l M-t M-t0 M-p2 M-p16 M-p128 M-p1024 M-h-t"
+  VAL_NEST_V="A M-none M-l M-t M-t0 M-p2 M-p1024 M-h-t"
+  VAL_MARKALL_V=""
+  VAL_MIX_V="A C M-l M-t M-t0 M-p2 M-p16 M-p128 M-p1024 M-h-t"
+  NEG_V="M-f M-t"
+elif [ "$PROFILE" != mo ]; then
+  echo "rounds_fifo: PROFILE must be mo or share" >&2; exit 1
+fi
 ordered() {   # round, variants...
   local r="$1"; shift
   if [ $((r % 2)) = 0 ]; then printf '%s\n' "$@" | tac | tr '\n' ' '; else echo "$*"; fi
@@ -93,14 +134,14 @@ micro() {
 CLIENT_CELLS=("8,1 interactive" "8,1 default" "8,0 default")
 
 cost_block() {   # round, spawn tsv, micro tsv
-  local r="$1" tsv="$2" mtsv="$3" cells="50:0 500:0" d=8 cc layout clients v
-  [ "$VALIDATE" = 1 ] && d=1
+  local r="$1" tsv="$2" mtsv="$3" cells="$COST_CELLS" d=8 cc layout clients v vs="$COST_V"
+  [ "$VALIDATE" = 1 ] && { d=1; [ -n "$VAL_V" ] && vs="$VAL_V"; }
   for cc in "${CLIENT_CELLS[@]}"; do
     read -r layout clients <<<"$cc"
-    for v in $(ordered "$r" $COST_V); do spawn "$r" "$tsv" "$layout" "$clients" "$v" "$cells" spawn "$d" || return 1; done
+    for v in $(ordered "$r" $vs); do spawn "$r" "$tsv" "$layout" "$clients" "$v" "$cells" spawn "$d" || return 1; done
   done
   for layout in 8,1 8,0; do
-    for v in $(ordered "$r" $COST_V); do micro "$r" "$mtsv" "$layout" "$v" || return 1; done
+    for v in $(ordered "$r" $vs); do micro "$r" "$mtsv" "$layout" "$v" || return 1; done
   done
 }
 
@@ -110,6 +151,7 @@ fairness_block() {   # round, spawn tsv
   for cc in "${CLIENT_CELLS[@]}"; do
     read -r layout clients <<<"$cc"
     if [ "$clients" = interactive ]; then vs="$FAIR_I81_V"; else vs="$FAIR_D_V"; fi
+    [ "$VALIDATE" = 1 ] && [ -n "$VAL_V" ] && vs="$VAL_V"
     spawn "$r" "$tsv" "$layout" "$clients" A "$cells" pool "$d" || return 1
     for v in $(ordered "$r" $vs); do spawn "$r" "$tsv" "$layout" "$clients" "$v" "$cells" spawn "$d" || return 1; done
   done
@@ -117,8 +159,12 @@ fairness_block() {   # round, spawn tsv
 
 shapes_block() {   # round, spawn tsv
   local r="$1" tsv="$2" v
-  for v in $(ordered "$r" $SHAPE_V); do
-    spawn "$r" "$tsv" 8,1 interactive "$v" "500:2:inner 500:2:hetero 500:2:io" || return 1
+  for v in $(ordered "$r" $SHAPE_V $SHAPE_INNER_V); do
+    if [[ " $SHAPE_INNER_V " == *" $v "* ]]; then
+      spawn "$r" "$tsv" 8,1 interactive "$v" "500:2:inner" || return 1
+    else
+      spawn "$r" "$tsv" 8,1 interactive "$v" "$SHAPE_CELLS" || return 1
+    fi
   done
 }
 
@@ -128,19 +174,25 @@ nesting_block() {   # round, nested tsv, variants, extra env...
     CPUS="$CPUS" TIMEOUT_S="${TIMEOUT_S:-600}" "$HERE/nested.sh" "$r" "$tsv"
 }
 
-pilot_block() {   # spawn tsv, nested tsv
+pilot_block() {   # spawn tsv, nested tsv (PROFILE=share: the mixed tsv)
   local tsv="$1" ntsv="$2" v
+  if [ "$PROFILE" = share ]; then
+    # The share's gate: at 8,1 the starved cell with :default clients, then the mixed cell.
+    for v in $PILOT_V; do spawn 0 "$tsv" 8,1 default "$v" "500:2" || return 1; done
+    MIX_V="$PILOT_V" mixed_block 0 "$ntsv"
+    return
+  fi
   for clients in interactive default; do
     for v in $PILOT_V; do spawn 0 "$tsv" 8,1 "$clients" "$v" "500:2" || return 1; done
   done
   NEST_LAYOUTS=8,1 nesting_block 0 "$ntsv" "$PILOT_V" WORKLOADS=fib_fine
 }
 
-mixed_block() {   # round, tsv
-  local r="$1" tsv="$2" v header
+mixed_block() {   # round, tsv, extra env...
+  local r="$1" tsv="$2" v header; shift 2
   for v in $(ordered "$r" $MIX_V); do
     header=0; [ -s "$tsv" ] && header=1
-    env ROUND="$r" NOHEADER="$header" VARIANT="$v" timeout -s KILL "${TIMEOUT_S:-900}" taskset -c "$CPUS" \
+    env "$@" ROUND="$r" NOHEADER="$header" VARIANT="$v" timeout -s KILL "${TIMEOUT_S:-900}" taskset -c "$CPUS" \
       "$JL" --threads=8,1 "$HERE/mixed_cell.jl" >>"$tsv" ||
       { echo "rounds_fifo: mixed_cell VARIANT=$v failed or timed out" >&2; return 1; }
   done
@@ -185,8 +237,10 @@ if [ "$VALIDATE" = 1 ]; then
     {
       cost_block 1 "$OUT/validate-cost-spawn.tsv" "$OUT/validate-micro.tsv" &&
       fairness_block 1 "$OUT/validate-fairness-spawn.tsv" &&
-      nesting_block 1 "$OUT/validate-nested.tsv" "$NEST_V" FIB_FINE=36:12 &&
-      NEST_LAYOUTS="8,1 8,0" nesting_block 1 "$OUT/validate-markall.tsv" "M-f M-l" WORKLOADS=fib_fine FIB_FINE=36:12 MARK_ALL=1
+      nesting_block 1 "$OUT/validate-nested.tsv" "$VAL_NEST_V" FIB_FINE=36:12 &&
+      { [ -z "$VAL_MARKALL_V" ] ||
+        NEST_LAYOUTS="8,1 8,0" nesting_block 1 "$OUT/validate-markall.tsv" "$VAL_MARKALL_V" WORKLOADS=fib_fine FIB_FINE=36:12 MARK_ALL=1; } &&
+      { [ -z "$VAL_MIX_V" ] || MIX_V="$VAL_MIX_V" mixed_block 1 "$OUT/validate-mixed.tsv" FIB_FINE=36:12 D=4; }
     } 2>>"$vlog" || status=1
   fi
   # The negative controls must fail, each with its own message:
@@ -195,17 +249,19 @@ if [ "$VALIDATE" = 1 ]; then
   nlog="$OUT/negative-control.err"
   for control in "blind:says empty while the F queue holds a task" "stall:made no pop meanwhile"; do
     name="${control%%:*}" msg="${control#*:}"
+    for nv in $NEG_V; do
     for layout in 8,1 8,0; do
       : >"$nlog"
-      if env VALIDATE=1 VARIANT=M-f M_NEGATIVE="$name" CELLS=50:0.2 MODES=spawn D=1 timeout -s KILL 300 \
+      if env VALIDATE=1 VARIANT="$nv" M_NEGATIVE="$name" CELLS=50:0.2 MODES=spawn D=1 timeout -s KILL 300 \
            taskset -c "$CPUS" "$JL" --threads="$layout" "$HERE/spawn_order.jl" >/dev/null 2>"$nlog"; then
-        log "NEGATIVE CONTROL $name at $layout passed, and it must fail"; status=1
+        log "NEGATIVE CONTROL $name under $nv at $layout passed, and it must fail"; status=1
       elif grep -q "$msg" "$nlog"; then
-        log "negative control $name at $layout failed as it must: $(grep -m1 "$msg" "$nlog" | cut -c1-160)"
+        log "negative control $name under $nv at $layout failed as it must: $(grep -m1 "$msg" "$nlog" | cut -c1-160)"
       else
-        log "negative control $name at $layout failed for another reason; see $vlog"; status=1
+        log "negative control $name under $nv at $layout failed for another reason; see $vlog"; status=1
       fi
-      { echo "--- negative control $name at $layout"; cat "$nlog"; } >>"$vlog"
+      { echo "--- negative control $name under $nv at $layout"; cat "$nlog"; } >>"$vlog"
+    done
     done
   done
   rm -f "$nlog"
@@ -230,19 +286,25 @@ for r in $(seq 1 "$ROUNDS"); do
         else log "round $r $kind FAILED"; status=1; fi ;;
       nesting)
         a="$OUT/attempt-nested-r$r-$stamp.tsv"
-        if block "nesting-r$r" "$a" -- "${SELF[@]}" nesting_block "$r" "$a" "$NEST_V"; then
+        if block "nesting-r$r" "$a" -- "${SELF[@]}" nesting_block "$r" "$a" "$NEST_V" ${NEST_WORKLOADS:+WORKLOADS=$NEST_WORKLOADS}; then
           mv "$a" "$OUT/nested-r$r.tsv"; log "round $r nesting done"
         else log "round $r nesting FAILED"; status=1; fi ;;
       pilot)
         a="$OUT/attempt-pilot-spawn-$stamp.tsv" b="$OUT/attempt-pilot-nested-$stamp.tsv"
+        second=pilot-nested.tsv; [ "$PROFILE" = share ] && second=pilot-mixed.tsv
         if block "pilot" "$a" "$b" -- "${SELF[@]}" pilot_block "$a" "$b"; then
-          mv "$a" "$OUT/pilot-spawn.tsv"; mv "$b" "$OUT/pilot-nested.tsv"; log "pilot done"
+          mv "$a" "$OUT/pilot-spawn.tsv"; mv "$b" "$OUT/$second"; log "pilot done"
         else log "pilot FAILED"; status=1; fi ;;
       mixed)
         a="$OUT/attempt-mixed-r$r-$stamp.tsv"
         if block "mixed-r$r" "$a" -- "${SELF[@]}" mixed_block "$r" "$a"; then
           mv "$a" "$OUT/mixed-r$r.tsv"; log "round $r mixed done"
         else log "round $r mixed FAILED"; status=1; fi ;;
+      halfmix)
+        a="$OUT/attempt-halfmix-r$r-$stamp.tsv"
+        if block "halfmix-r$r" "$a" -- "${SELF[@]}" mixed_block "$r" "$a" BG=loops:4 C=4; then
+          mv "$a" "$OUT/halfmix-r$r.tsv"; log "round $r halfmix done"
+        else log "round $r halfmix FAILED"; status=1; fi ;;
       markall)
         a="$OUT/attempt-markall-$stamp.tsv"
         if block "markall" "$a" -- "${SELF[@]}" markall_block "$a"; then
