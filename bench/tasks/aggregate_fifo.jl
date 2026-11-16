@@ -9,6 +9,8 @@
 #   julia bench/tasks/aggregate_fifo.jl <dir> mixed      # the mixed cell (mixed_cell.jl): mixed-r<N>.tsv
 #   julia bench/tasks/aggregate_fifo.jl <dir> halfmix    # the half-pool mixed cell: halfmix-r<N>.tsv
 #   julia bench/tasks/aggregate_fifo.jl <dir> validate   # the validation pass's TSVs (not timings)
+#   julia bench/tasks/aggregate_fifo.jl <dir> q1         # PROFILE=rings: Q1's timed sweep round
+#   julia bench/tasks/aggregate_fifo.jl <dir> sweep      # PROFILE=rings: the sweep rounds (H = 0 by layout)
 
 const SPAWN_COLS = ["julia", "commit", "threads", "guard", "variant", "round", "mode", "clients", "c", "h_ms",
                     "rps", "p50_ms", "p90_ms", "p99_ms", "max_ms", "count_min", "count_p1",
@@ -24,10 +26,11 @@ const MIXED_COLS = ["julia", "commit", "threads", "guard", "variant", "round", "
                     "slow1_spawn_to_start_pct", "slow1_end_to_wake_pct",
                     "fib_alone_median_s", "fib_alone_min_s", "fib_alone_max_s",
                     "fib_runs", "fib_median_s", "fib_min_s", "fib_max_s", "fib_walls_s"]
-const ORDER = ["pool", "A", "A0", "C", "M-none", "M-f", "M-l", "M-t", "M-t0", "M-p2", "M-p16", "M-p128", "M-p1024",
-               "M-h-f", "M-h-l", "M-h-t", "O-f", "O-l"]
+const ORDER = ["pool", "A", "A0", "C", "M-none", "M-f", "M-l", "M-l-r2", "M-l-r4", "M-t", "M-t0", "M-p2", "M-p16",
+               "M-p128", "M-p1024", "M-h-f", "M-h-l", "M-h-l-r2", "M-h-l-r4", "M-h-t", "O-f", "O-l"]
 # The ratio columns a table shows: the pairs among these whose both series are in it.
-const RATIO_PAIRS = [("M-none", "A0"), ("M-f", "A"), ("M-l", "A"), ("M-t", "A"), ("M-t", "M-l"), ("O-f", "A"), ("C", "A")]
+const RATIO_PAIRS = [("M-none", "A0"), ("M-f", "A"), ("M-l", "A"), ("M-l-r2", "A"), ("M-l-r4", "A"),
+                     ("M-l-r2", "M-l"), ("M-l-r4", "M-l"), ("M-t", "A"), ("M-t", "M-l"), ("O-f", "A"), ("C", "A")]
 pairs_in(names; base_none = "A0") = [(a == "M-none" ? (a, base_none) : (a, b)) for (a, b) in RATIO_PAIRS
                                      if a in names && (a == "M-none" ? base_none : b) in names]
 pair_heads(ps) = join(("$a/$b" for (a, b) in ps), " | ")
@@ -267,6 +270,10 @@ function main(dir, what)
         mixed_rows(readtsv(pick(r"^mixed-r\d+\.tsv$"), MIXED_COLS))
     elseif what == "halfmix"   # C = 4 beside 4 loops: the fib_* columns are the loops' runs
         mixed_rows(readtsv(pick(r"^halfmix-r\d+\.tsv$"), MIXED_COLS); half = true)
+    elseif what == "q1"        # the rings run's Q1: one timed sweep round (H = 0, :default clients)
+        cost_rows(readtsv(pick(r"^q1-sweep\.tsv$"), SPAWN_COLS))
+    elseif what == "sweep"     # the sweep rounds
+        cost_rows(readtsv(pick(r"^sweep-r\d+\.tsv$"), SPAWN_COLS))
     elseif what == "markall"
         nested_rows(readtsv(pick(r"^markall-nested\.tsv$"), NESTED_COLS))
     elseif what == "validate"

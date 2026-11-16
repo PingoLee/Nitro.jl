@@ -83,6 +83,15 @@
 #       with the handlers marked only. The interval also covers what the thread ran from its own
 #       sticky workqueue between two multiq pops, and the first accounted pop after a run of
 #       M-none-path pops credits its (capped) interval to the side of the last accounted one.
+#     M-l-r<d> and M-h-l-r<d>, the rings (2026-11-16): the F queue split into one ring per stock
+#       heap (2 per thread), each an F queue of its own with its own lock. An insert takes a random
+#       ring and stamps the entry with rdtsc inside the lock (kept rising within the ring); a pop,
+#       after stock's comes back empty, samples d rings (racy reads of each count and head stamp)
+#       and runs M's F pop (sticky-retry scan, stall check) on the one with the older head, up to
+#       four samples, then one pass over every ring from a random one. A pool flag, set once at
+#       the first marked insert and never cleared, is all an unmarked program reads; check_empty
+#       reads every ring once it is set. No shared write per operation: no pool counter, no
+#       sequence (the stamps are the clock's).
 #
 # A0 and B are taken from the build's own `base/partr.jl` as parsed at load time, so they cannot
 # drift from it. C and E are hand copies, so they refuse to load on a build whose `partr.jl` they
@@ -122,10 +131,10 @@
 const MULTIQ_VARIANT = get(ENV, "VARIANT", "A")
 const _D_MATCH = match(r"^D([0-9]+|-inf)$", MULTIQ_VARIANT)
 const _E_MATCH = match(r"^E([0-9]+|-inf)$", MULTIQ_VARIANT)
-const _F_MATCH = match(r"^(M|M-h|O)-(f|l|t|t0|p[0-9]+)$|^M-none$", MULTIQ_VARIANT)
+const _F_MATCH = match(r"^(M|M-h|O)-(f|l|t|t0|p[0-9]+)(?:-r([0-9]+))?$|^M-none$", MULTIQ_VARIANT)
 MULTIQ_VARIANT in ("A", "A0", "B", "C") || _D_MATCH !== nothing || _E_MATCH !== nothing || _F_MATCH !== nothing ||
     error("VARIANT must be A, A0, B, C, D<K>, D-inf, E<K>, E-inf, M-f, M-l, M-t, M-t0, M-p<K>, M-h-f, M-h-l, ",
-          "M-h-t, M-none, O-f or O-l, not $(MULTIQ_VARIANT)")
+          "M-h-t, M-none, M-l-r<d>, M-h-l-r<d>, O-f or O-l, not $(MULTIQ_VARIANT)")
 _F_MATCH === nothing || _F_MATCH[2] === nothing || _F_MATCH[2] in ("f", "l") || _F_MATCH[1] != "O" ||
     error("the shares (-t, -t0, -p<K>) are built for M and M-h, not O")
 # D's slot budget, or nothing for every other variant.
@@ -151,6 +160,14 @@ const FIFO_SERVE = !MULTIQ_FIFO ? :none : MULTIQ_VARIANT == "M-none" ? :f :
 const FIFO_SHARE = FIFO_SERVE in (:t, :t0, :p)
 const SHARE_K = FIFO_SERVE === :p ? parse(Int, _F_MATCH[2][2:end]) : 0
 FIFO_SERVE !== :p || SHARE_K >= 2 || error("M-p<K> needs K >= 2")
+# The rings (run of 2026-11-16, agent-config #82 Idea 4): the F queue split into one ring beside
+# each of stock's heaps, each with its own lock, an insert into a random ring with a cycle-counter
+# stamp, and a pop that samples RINGS_D rings and takes the older head. Built on -l only (the serve
+# rule the share run left standing): M-l-r<d> and M-h-l-r<d>.
+const RINGS_D = MULTIQ_FIFO && MULTIQ_VARIANT != "M-none" && _F_MATCH[3] !== nothing ? parse(Int, _F_MATCH[3]) : 0
+const FIFO_RINGS = RINGS_D > 0
+FIFO_RINGS && !(FIFO_SERVE === :l && _F_MATCH[1] in ("M", "M-h")) &&
+    error("the rings are built for M-l and M-h-l only, not $(MULTIQ_VARIANT)")
 const MARK_HANDLERS = MULTIQ_FIFO && _F_MATCH[1] in ("M", "M-h")
 const MARK_CLIENTS = MULTIQ_FIFO && _F_MATCH[1] == "M"
 # Optional, nested.jl only: every spawn marked (the cost of marking fine-grained fork-join).
@@ -1019,8 +1036,8 @@ if MULTIQ_FIFO
     const _M_NEGATIVE = MULTIQ_VALIDATE ? get(ENV, "M_NEGATIVE", "") : ""
     _M_NEGATIVE in ("", "blind", "stall") || error("M_NEGATIVE must be blind or stall")
     _fcount(field) = MULTIQ_VALIDATE ? :(fstates[Threads.threadid()].$field += 1) : nothing
-    if FIFO_SHARE
-        # The shares' clock: rdtsc, as E's stamps. It is only ever differenced on one thread, pop to
+    if FIFO_SHARE || FIFO_RINGS
+        # The shares' clock (and the rings' stamps): rdtsc, as E's stamps. It is only ever differenced on one thread, pop to
         # pop, but a thread can move between cores, so it needs the TSC Linux trusts as its
         # clocksource (constant, nonstop, synchronized across cores).
         let cs = "/sys/devices/system/clocksource/clocksource0/current_clocksource"
@@ -1129,6 +1146,8 @@ if MULTIQ_FIFO
         # `head`, under one spin lock; `n` is published under the lock and read without it by the
         # pops' fast path and by `multiq_check_empty`. `seqs` (VALIDATE only) is each entry's
         # insertion sequence, for the order asserts. The pad keeps the next allocation off its lines.
+        # A ring (the rings) keeps `seqs` always: there it holds each entry's cycle-counter stamp, which
+        # the pop's sample compares, and `next` the last stamp given, so stamps rise within a ring.
         mutable struct fqueue
             const lock::SpinLock
             tasks::Vector{Task}
@@ -1137,10 +1156,25 @@ if MULTIQ_FIFO
             @atomic n::Int32
             next::UInt64
             pad::NTuple{12,Int}
-            fqueue() = new(SpinLock(), Vector{Task}(undef, 256), Vector{UInt64}(undef, $(MULTIQ_VALIDATE ? 256 : 0)),
-                           1, zero(Int32), zero(UInt64), ntuple(_ -> 0, 12))
+            fqueue(stamps::Bool = $(MULTIQ_VALIDATE)) =
+                new(SpinLock(), Vector{Task}(undef, 256), Vector{UInt64}(undef, stamps ? 256 : 0),
+                    1, zero(Int32), zero(UInt64), ntuple(_ -> 0, 12))
         end
         const fq = fqueue()
+
+        # The rings: one per stock heap of the pool (heap_c = 2 per thread), so 16 at 8 threads.
+        # `fl.on` is the pool flag: set once, at the first marked insert, and never cleared, on a
+        # line of its own. An unmarked program reads it and nothing else (a line nobody writes); a
+        # program that has marked anything samples the rings as stock samples its heaps.
+        const f_rings = $(FIFO_RINGS)
+        const r_d = $(RINGS_D)
+        mutable struct fflag
+            pad0::NTuple{8,Int}
+            @atomic on::Bool
+            pad1::NTuple{15,Int}
+        end
+        const fl = fflag(ntuple(_ -> 0, 8), false, ntuple(_ -> 0, 15))
+        const frings = [fqueue(true) for _ in 1:(f_rings ? 2 * Threads._nthreads_in_pool(f_tpid) : 0)]
 
         # VALIDATE only: per thread, 128 bytes of counts.
         mutable struct fstate
@@ -1154,8 +1188,10 @@ if MULTIQ_FIFO
             own::Int        # F pops that took this thread's own task from behind the head
             retries::Int    # failed F pops in a row with no pop by the head's owner (the stall check)
             seen::Int       # the head's owner's pops when that run began
-            pad::NTuple{6,Int}
-            fstate() = new(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ntuple(_ -> 0, 6))
+            acq::Int        # F-queue lock acquisitions made by this thread (inserts and pops)
+            held::Int       # of those, the ones that found the lock held (a failed trylock first)
+            pad::NTuple{4,Int}
+            fstate() = new(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ntuple(_ -> 0, 4))
         end
         const fstates = [fstate() for _ in 1:Threads.maxthreadid()]
 
@@ -1183,6 +1219,21 @@ if MULTIQ_FIFO
         @noinline function f_fail(msg::String)
             ccall(:jl_safe_printf, Cvoid, (Cstring, Cstring), "%s\n", msg)
             ccall(:abort, Cvoid, ())
+        end
+
+        # Every F-queue lock goes through here. Under VALIDATE it counts the acquisition and, with a
+        # trylock first, whether the lock was found held: the contention measure of the 2026-11-16
+        # rings run. Timed runs take the plain lock.
+        @inline function f_lock!(q::fqueue)
+            $(MULTIQ_VALIDATE ? quote
+                s = fstates[Threads.threadid()]
+                s.acq += 1
+                if !trylock(q.lock)
+                    s.held += 1
+                    lock(q.lock)
+                end
+            end : :(lock(q.lock)))
+            return nothing
         end
 
         @inline f_idx(q::fqueue, k::Int) = ((q.head - 1 + k - 1) & (length(q.tasks) - 1)) + 1
@@ -1215,6 +1266,88 @@ if MULTIQ_FIFO
             end
             @atomic :monotonic q.n = Int32(n + 1)
             return nothing
+        end
+
+        # The rings' insert, at the tail under the lock: the stamp is read inside the lock and kept
+        # above the ring's last one, so stamps rise strictly within a ring (the order assert holds).
+        @inline function f_push_stamped!(q::fqueue, task::Task)
+            n = Int(q.n)
+            n == length(q.tasks) && f_grow!(q)
+            i = f_idx(q, n + 1)
+            q.tasks[i] = task
+            st = s_stamp()
+            st > q.next || (st = q.next + UInt64(1))
+            q.seqs[i] = st
+            q.next = st
+            @atomic :monotonic q.n = Int32(n + 1)
+            return nothing
+        end
+
+        # The rings' sample: the stamp of a ring's head, read without the lock (a racy hint, as
+        # stock reads a heap's priority), typemax when the ring looks empty.
+        @inline function r_head(q::fqueue)
+            (@atomic :monotonic q.n) == 0 && return typemax(UInt64)
+            st, h = q.seqs, q.head
+            return 1 <= h <= length(st) ? @inbounds(st[h]) : typemax(UInt64) - UInt64(1)
+        end
+
+        # The index of the ring with the older head among r_d sampled, 0 when all looked empty.
+        @inline function r_pick()
+            nr = UInt32(length(frings))
+            best, bst = 0, typemax(UInt64)
+            for _ in 1:r_d
+                i = Int(cong(nr))
+                st = r_head(frings[i])
+                if st < bst
+                    best, bst = i, st
+                end
+            end
+            return best
+        end
+
+        # The rings' pop: up to four samples, each followed by M's F pop on the ring it picked (the
+        # sticky-retry scan and the stall check, per ring); then one pass over every ring from a
+        # random one, so a task alone in a ring no sample hit is still reached. `nothing` when all
+        # of that found nothing this thread may run: `jl_task_get_next` then spins on
+        # `multiq_check_empty`, which reads every ring.
+        function r_pop!(tid::Int, nt::Int)
+            for _ in 1:4
+                i = r_pick()
+                i == 0 && continue
+                task = f_pop!(frings[i], tid, nt)
+                task === nothing || return task
+            end
+            nr = length(frings)
+            i0 = Int(cong(UInt32(nr)))
+            for j in 0:nr-1
+                q = frings[(i0 - 1 + j) % nr + 1]
+                (@atomic :monotonic q.n) == 0 && continue
+                task = f_pop!(q, tid, nt)
+                task === nothing || return task
+            end
+            return nothing
+        end
+
+        # F tasks queued, all queues (the harness's view; racy).
+        function f_queued()
+            f_rings || return Int(@atomic :monotonic fq.n)
+            n = 0
+            for q in frings
+                n += @atomic :monotonic q.n
+            end
+            return n
+        end
+
+        # Remove `t` from whichever F queue holds it, under that queue's lock; whether it was found.
+        function f_take_back!(t::Task)
+            for q in (f_rings ? frings : (fq,))
+                lock(q.lock)
+                k = findfirst(j -> q.tasks[f_idx(q, j)] === t, 1:Int(q.n))
+                k === nothing || f_remove!(q, k)
+                unlock(q.lock)
+                k === nothing || return true
+            end
+            return false
         end
 
         # Remove entry k (1 = the head), under the lock: the k - 1 entries ahead of it move one
@@ -1253,7 +1386,7 @@ if MULTIQ_FIFO
         # `nothing` when every scanned entry is pinned elsewhere: the caller tries the heaps, and
         # `jl_task_get_next` spins on `multiq_check_empty` as it spins on stock's `@goto retry`.
         function f_pop!(q::fqueue, tid::Int, nt::Int)
-            lock(q.lock)
+            f_lock!(q)
             n = Int(q.n)
             lim = min(n, nt)
             k = 0
@@ -1328,9 +1461,17 @@ if MULTIQ_FIFO
                 if ccall(:jl_get_task_threadpoolid, Int8, (Any,), task) == f_tpid
                     $(MULTIQ_VALIDATE ? :(ccall(:jl_is_task_started, Cint, (Any,), task) == 0 ?
                                            $(_fcount(:f_first)) : $(_fcount(:f_again))) : nothing)
-                    lock(fq.lock)
-                    f_push!(fq, task)
-                    unlock(fq.lock)
+                    $(FIFO_RINGS ? quote
+                        (@atomic :monotonic fl.on) || (@atomic :release fl.on = true)
+                        q = frings[cong(UInt32(length(frings)))]
+                        f_lock!(q)
+                        f_push_stamped!(q, task)
+                        unlock(q.lock)
+                    end : quote
+                        f_lock!(fq)
+                        f_push!(fq, task)
+                        unlock(fq.lock)
+                    end)
                     return true
                 end
                 $(_fcount(:demoted))
@@ -1343,7 +1484,7 @@ if MULTIQ_FIFO
                         ccall(:jl_get_task_tid, Int16, (Any,), task) == Int16(-1)
                     task.priority = priority | F_BIT
                     $(_fcount(:f_first))
-                    lock(fq.lock)
+                    f_lock!(fq)
                     f_push!(fq, task)
                     unlock(fq.lock)
                     return true
@@ -1367,8 +1508,10 @@ if MULTIQ_FIFO
             elseif f_serve === :l
                 task = stock_multiq_deletemin()
                 if task === nothing
-                    (@atomic :monotonic fq.n) == 0 ||
-                        (task = f_pop!(fq, tid, Int(Threads._nthreads_in_pool(tpid))))
+                    $(FIFO_RINGS ?
+                      :((@atomic :monotonic fl.on) && (task = r_pop!(tid, Int(Threads._nthreads_in_pool(tpid))))) :
+                      :((@atomic :monotonic fq.n) == 0 ||
+                        (task = f_pop!(fq, tid, Int(Threads._nthreads_in_pool(tpid))))))
                 else
                     $(_fcount(:l_pops))
                 end
@@ -1387,7 +1530,13 @@ if MULTIQ_FIFO
             stock_multiq_check_empty() || return false
             $(_M_NEGATIVE == "blind" ? :(return true) : nothing)
             ccall(:jl_threadpoolid, Int8, (Int16,), Threads.threadid() - 1) == f_tpid || return true
-            return (@atomic :monotonic fq.n) == 0
+            $(FIFO_RINGS ? quote
+                (@atomic :acquire fl.on) || return true
+                for q in frings
+                    (@atomic :monotonic q.n) == 0 || return false
+                end
+                return true
+            end : :(return (@atomic :monotonic fq.n) == 0))
         end
     end
 end
@@ -1424,7 +1573,7 @@ function multiq_queued(tp::Int)
         for h in MULTIQ_HEAP_LISTS[tp]
             n += @atomic :monotonic h.ntasks
         end
-        MULTIQ_FIFO && tp == PARTR.f_tpid + 1 && (n += @atomic :monotonic PARTR.fq.n)   # M, O: the F queue too
+        MULTIQ_FIFO && tp == PARTR.f_tpid + 1 && (n += PARTR.f_queued())   # M, O: the F queue (or rings) too
     else
         WS = Base.Scheduler.ChosenScheduler
         for r in WS.Rings[tp]
@@ -1516,6 +1665,7 @@ println(stderr, "multiq_variant: VARIANT=", MULTIQ_VARIANT, MULTIQ_VALIDATE ? " 
         PERIODIC_K === nothing ? "" : ", periodic pop every $(PERIODIC_K == typemax(Int) ? "never" : PERIODIC_K)",
         PERIODIC_K !== nothing && !isempty(_E_NEGATIVE) ? ", NEGATIVE CONTROL $(_E_NEGATIVE)" : "",
         MULTIQ_FIFO ? ", F queue: class $(FIFO_CLASS), serve $(FIFO_SERVE)" *
+                      (FIFO_RINGS ? ", $(length(PARTR.frings)) rings, pop samples $(RINGS_D)" : "") *
                       (FIFO_SERVE === :p ? " (F first every $(SHARE_K)th accounted pop)" : "") *
                       (FIFO_SERVE in (:t, :t0) ? " (cap $(round(SHARE_CAP / SHARE_CYCLES_PER_MS; digits = 2)) ms, " *
                        "$(round(SHARE_CYCLES_PER_MS / 1000; digits = 1)) MHz TSC$(FIFO_SERVE === :t0 ? ", balance frozen" : ""))" : "") *
@@ -1536,7 +1686,7 @@ function multiq_variant_check()
             n = sum((h.ntasks for h in PARTR.heaps[tp]); init = 0)
             n == 0 || error("$MULTIQ_VARIANT: $n tasks left in the heaps of pool $tp")
         end
-        q = @atomic PARTR.fq.n
+        q = PARTR.f_queued()
         q == 0 || error("$MULTIQ_VARIANT: $q tasks left in the F queue")
         if MULTIQ_VALIDATE
             c = multiq_fifo_counts()
@@ -2010,7 +2160,7 @@ function _e_unit_asserts()
 end
 
 # M and O, VALIDATE only: the counts summed over threads.
-const _F_FIELDS = (:f_first, :f_again, :l_first, :demoted, :f_pops, :l_pops, :skips, :own)
+const _F_FIELDS = (:f_first, :f_again, :l_first, :demoted, :f_pops, :l_pops, :skips, :own, :acq, :held)
 function multiq_fifo_counts()
     MULTIQ_FIFO || return nothing
     fs = PARTR.fstates
@@ -2025,13 +2175,36 @@ function multiq_fifo_check(label, before; f_first::Union{Int,Nothing})
     now = multiq_fifo_counts()
     d = NamedTuple{_F_FIELDS}(Tuple(getfield(now, k) - getfield(before, k) for k in _F_FIELDS))
     println(stderr, "validate: F counts, ", label, ": ", join(("$k $(getfield(d, k))" for k in _F_FIELDS), ", "))
-    q = (@atomic PARTR.fq.n)
+    q = PARTR.f_queued()
     f_first === nothing || d.f_first == f_first || error("$MULTIQ_VARIANT: $label: $(d.f_first) tasks classified F at their first enqueue, expected $f_first")
     d.demoted == 0 || error("$MULTIQ_VARIANT: $label: $(d.demoted) F tasks sent down stock's path")
     q == 0 || error("$MULTIQ_VARIANT: $label: $q tasks left in the F queue")
     d.f_pops == d.f_first + d.f_again ||
         error("$MULTIQ_VARIANT: $label: $(d.f_pops) F pops for $(d.f_first + d.f_again) F inserts")
     return d
+end
+
+# M and O, VALIDATE only: per thread, the F-queue lock acquisitions and how many of them found the
+# lock held (`f_lock!`), since `before` (a `multiq_lock_counts()`), and the F operations (inserts
+# and successful pops, from the `multiq_fifo_check` difference `d`) per request of the cell.
+function multiq_lock_counts()
+    MULTIQ_FIFO && MULTIQ_VALIDATE || return nothing
+    return [(s.acq, s.held) for s in PARTR.fstates]
+end
+function multiq_lock_check(label, before, d, requests::Int)
+    MULTIQ_FIFO && MULTIQ_VALIDATE || return nothing
+    now = multiq_lock_counts()
+    parts = String[]
+    for tid in eachindex(now)
+        a, h = now[tid][1] - before[tid][1], now[tid][2] - before[tid][2]
+        a == 0 || push!(parts, "tid $tid $a ($(round(100 * h / a; digits = 1))% held)")
+    end
+    ops = d.f_first + d.f_again + d.f_pops
+    println(stderr, "validate: F lock, ", label, ": ", ops, " F operations for ", requests, " requests (",
+            requests == 0 ? "-" : round(ops / requests; digits = 2), " per request), ", d.acq, " acquisitions, ",
+            d.acq == 0 ? "-" : round(100 * d.held / d.acq; digits = 1), "% found it held; per tid: ",
+            isempty(parts) ? "none" : join(parts, ", "))
+    return nothing
 end
 
 # The shares, VALIDATE only: per-thread counts (a copy of every `:default` thread's sstate fields).
@@ -2102,12 +2275,7 @@ function _f_probe(reps::Int = 20)
             dummy.priority = P.F_BIT
             P.multiq_insert(dummy, dummy.priority)
             e = P.multiq_check_empty()
-            q = P.fq
-            lock(q.lock)
-            k = findfirst(j -> q.tasks[P.f_idx(q, j)] === dummy, 1:Int(q.n))
-            k === nothing || P.f_remove!(q, k)
-            unlock(q.lock)
-            (e, k !== nothing)
+            (e, P.f_take_back!(dummy))
         end)
         got || continue   # a spinning thread popped it (and ran a no-op): no verdict this time
         empty && error("F: multiq_check_empty() says empty while the F queue holds a task")
@@ -2204,13 +2372,28 @@ function _f_unit_asserts()
     mine = push(q, ids, 100)
     ccall(:jl_set_task_tid, Cint, (Any, Cint), mine, me - 1)
     @assert pop(q, ids) == 100 "F: the owner's task behind $(length(others)) pinned entries was not reached"
+    if FIFO_RINGS
+        # A ring: stamped fill/drain across growth comes out in order, its stamps rising strictly.
+        q, ids = P.fqueue(true), IdDict{Task,Int}()
+        for i in 1:600
+            t = Task(() -> nothing)
+            ids[t] = i
+            lock(q.lock); P.f_push_stamped!(q, t); unlock(q.lock)
+        end
+        sts = [q.seqs[P.f_idx(q, k)] for k in 1:600]
+        @assert all(diff(sts) .> 0) "rings: stamps within a ring do not rise"
+        rd = [pop(q, ids) for _ in 1:600]
+        @assert rd == collect(1:600) "rings: a ring's stamped fill/drain popped out of order"
+        @assert length(P.frings) == 2 * nt "rings: $(length(P.frings)) rings for $nt threads"
+    end
     # The L heap is the build's: A's fill/drain order.
     lfd = _fill_drain(20)
     @assert lfd == [1; 20:-1:2] "F: the stock heap's fill/drain popped $lfd"
     println(stderr, "multiq_variant: single-structure asserts passed for ", MULTIQ_VARIANT,
             ": F queue fill/drain of 600 in order, 2,000 interleaved in order, a pinned head passed over ",
             "and taken by its owner, the owner's task found behind ", length(others), " pinned entries; ",
-            "stock heap fill/drain ", lfd)
+            "stock heap fill/drain ", lfd,
+            FIFO_RINGS ? "; a ring's stamped fill/drain of 600 in order, $(length(P.frings)) rings" : "")
     _M_NEGATIVE == "stall" && _f_stall_control()
     multiq_watchdog(60)
     _f_probe()

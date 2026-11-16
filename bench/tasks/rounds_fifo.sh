@@ -24,6 +24,16 @@
 #             :default for the whole D. Variants: A C M-l M-h-l (BLOCKS=mixed ROUNDS=3)
 #   halfmix   the mixed cell at half the pool: C = 4 clients beside 4 unmarked loops of short chunks
 #             (mixed_cell.jl BG=loops:4), so the pool is not over capacity; the MIX_V variants
+#   sweep     the H = 0 cell (C = 500, :default clients) at each of SWEEP_LAYOUTS (2,0 on CPUs 0,1;
+#             4,0 on 0-3; 8,0 on the 8 CPUs), the SWEEP_V variants
+# PROFILE=rings (the rings of 2026-11-16, M-l-r<d>): Q1 is the q1 block; then cost (both cells, A
+# A0 C M-none M-l M-l-r2 M-l-r4), fairness (A C M-l M-l-r2 M-l-r4, plus M-h-l and its rings with
+# :default clients), shapes inner and io (A M-l M-l-r2), mixed (M-l M-l-r2), nesting fib_fine (A
+# M-none M-l M-l-r2) and sweep (A M-none M-l M-l-r2 M-l-r4); VALIDATE adds the sweep cells and runs
+# the negative controls under M-l and M-l-r2.
+#   q1        the rings run's first question, one block (BLOCKS=q1 ROUNDS=1): one sweep round, M-l
+#             under VALIDATE per layout for the F-lock counts, and a profile of the 8,0 cell per
+#             variant (A and M-l)
 #
 #
 # PROFILE=share (the shares of 2026-11-16, M-t and M-p<K>) swaps the lists: cost at C = 500 only,
@@ -60,6 +70,7 @@ CPUS="${CPUS:-0,1,2,3,6,7,8,9}"
 RETRIES="${RETRIES:-2}"
 VALIDATE="${VALIDATE:-0}"
 mkdir -p "$OUT"
+OUT="$(cd "$OUT" && pwd)"   # absolute: quiet.sh runs its command from elsewhere
 [ -x "$JL" ] || { echo "rounds_fifo: $JL is not an executable" >&2; exit 1; }
 export QUIET_LOAD="${QUIET_LOAD:-0.5}" QUIET_WAIT_S="${QUIET_WAIT_S:-1800}" SAMPLE_S="${SAMPLE_S:-5}"
 VER="$("$JL" -e 'print(VERSION)')"
@@ -102,9 +113,31 @@ if [ "$PROFILE" = share ]; then
   VAL_MARKALL_V=""
   VAL_MIX_V="A C M-l M-t M-t0 M-p2 M-p16 M-p128 M-p1024 M-h-t"
   NEG_V="M-f M-t"
-elif [ "$PROFILE" != mo ]; then
-  echo "rounds_fifo: PROFILE must be mo or share" >&2; exit 1
+elif [ "$PROFILE" = rings ]; then
+  # Q1 of the rings run: is the single F lock the cost? The H = 0 cell with :default clients, every
+  # task marked, against the thread count (SWEEP_LAYOUTS: layout:cpus, one thread per core up to 4,
+  # then the 8 CPUs, 4 cores x 2 SMT).
+  SWEEP_V="${SWEEP_V:-A M-none M-l M-l-r2 M-l-r4}"
+  # Q2, the rings against the single queue (M-l), in the cost, fairness, shapes, mixed, nesting
+  # and sweep blocks.
+  COST_V="A A0 C M-none M-l M-l-r2 M-l-r4"
+  COST_CELLS="50:0 500:0"
+  FAIR_I81_V="A C M-l M-l-r2 M-l-r4"
+  FAIR_D_V="A C M-l M-l-r2 M-l-r4 M-h-l M-h-l-r2 M-h-l-r4"
+  SHAPE_V="A M-l M-l-r2"
+  SHAPE_CELLS="500:2:inner 500:2:io"
+  SHAPE_INNER_V=""
+  NEST_V="A M-none M-l M-l-r2"
+  NEST_WORKLOADS="fib_fine"
+  MIX_V="M-l M-l-r2"
+  VAL_V="A A0 C M-none M-l M-l-r2 M-l-r4 M-h-l M-h-l-r2 M-h-l-r4"
+  VAL_NEST_V="A M-none M-l M-l-r2 M-l-r4"
+  VAL_MARKALL_V=""
+  VAL_MIX_V="M-l M-l-r2"
+  NEG_V="M-l M-l-r2"
 fi
+SWEEP_LAYOUTS="${SWEEP_LAYOUTS:-2,0:0,1 4,0:0,1,2,3 8,0:0,1,2,3,6,7,8,9}"
+case "$PROFILE" in mo|share|rings) ;; *) echo "rounds_fifo: PROFILE must be mo, share or rings" >&2; exit 1 ;; esac
 ordered() {   # round, variants...
   local r="$1"; shift
   if [ $((r % 2)) = 0 ]; then printf '%s\n' "$@" | tac | tr '\n' ' '; else echo "$*"; fi
@@ -198,6 +231,38 @@ mixed_block() {   # round, tsv, extra env...
   done
 }
 
+# The H = 0 cell (C = 500, :default clients) at each of SWEEP_LAYOUTS, on that layout's CPUs.
+sweep_block() {   # round, tsv, [variants]
+  local r="$1" tsv="$2" vs="${3:-$SWEEP_V}" lc layout cpus v d=8
+  [ "$VALIDATE" = 1 ] && d=1
+  for lc in $SWEEP_LAYOUTS; do
+    layout="${lc%%:*}" cpus="${lc#*:}"
+    for v in $(ordered "$r" $vs); do
+      ( CPUS="$cpus"; spawn "$r" "$tsv" "$layout" default "$v" "500:0" spawn "$d" ) || return 1
+    done
+  done
+}
+
+# Q1, one quiet block: the sweep timed (one round); then, per layout, M-l under VALIDATE at D = 4
+# for the F-lock counts (acquisitions, how many found the lock held, F operations per request:
+# "validate: F lock" lines in <OUT>/q1-validate.log); then one profile of the 8,0 cell per variant
+# in Q1_PROF_V (PROF=<OUT>/profile-<variant>-8,0.txt; their rows, perturbed by the profiler, go to
+# <OUT>/q1-profile-rows.tsv and are not measurements).
+q1_block() {   # timed tsv, VALIDATE tsv
+  local tsv="$1" vtsv="$2" lc layout cpus v
+  sweep_block 1 "$tsv" || return 1
+  for lc in $SWEEP_LAYOUTS; do
+    layout="${lc%%:*}" cpus="${lc#*:}"
+    for v in ${Q1_VAL_V:-M-l}; do
+      ( export VALIDATE=1; CPUS="$cpus"; spawn 1 "$vtsv" "$layout" default "$v" "500:0" spawn 4 ) \
+        2>>"$OUT/q1-validate.log" || return 1
+    done
+  done
+  for v in ${Q1_PROF_V:-A M-l}; do
+    ( export PROF="$OUT/profile-$v-8,0.txt"; spawn 1 "$OUT/q1-profile-rows.tsv" 8,0 default "$v" "500:0" ) || return 1
+  done
+}
+
 markall_block() {   # nested tsv
   NEST_LAYOUTS="8,1 8,0" nesting_block 1 "$1" "A M-f M-l" WORKLOADS=fib_fine MARK_ALL=1
 }
@@ -240,7 +305,8 @@ if [ "$VALIDATE" = 1 ]; then
       nesting_block 1 "$OUT/validate-nested.tsv" "$VAL_NEST_V" FIB_FINE=36:12 &&
       { [ -z "$VAL_MARKALL_V" ] ||
         NEST_LAYOUTS="8,1 8,0" nesting_block 1 "$OUT/validate-markall.tsv" "$VAL_MARKALL_V" WORKLOADS=fib_fine FIB_FINE=36:12 MARK_ALL=1; } &&
-      { [ -z "$VAL_MIX_V" ] || MIX_V="$VAL_MIX_V" mixed_block 1 "$OUT/validate-mixed.tsv" FIB_FINE=36:12 D=4; }
+      { [ -z "$VAL_MIX_V" ] || MIX_V="$VAL_MIX_V" mixed_block 1 "$OUT/validate-mixed.tsv" FIB_FINE=36:12 D=4; } &&
+      { [ "$PROFILE" != rings ] || sweep_block 1 "$OUT/validate-sweep.tsv"; }
     } 2>>"$vlog" || status=1
   fi
   # The negative controls must fail, each with its own message:
@@ -305,6 +371,16 @@ for r in $(seq 1 "$ROUNDS"); do
         if block "halfmix-r$r" "$a" -- "${SELF[@]}" mixed_block "$r" "$a" BG=loops:4 C=4; then
           mv "$a" "$OUT/halfmix-r$r.tsv"; log "round $r halfmix done"
         else log "round $r halfmix FAILED"; status=1; fi ;;
+      sweep)
+        a="$OUT/attempt-sweep-r$r-$stamp.tsv"
+        if block "sweep-r$r" "$a" -- "${SELF[@]}" sweep_block "$r" "$a"; then
+          mv "$a" "$OUT/sweep-r$r.tsv"; log "round $r sweep done"
+        else log "round $r sweep FAILED"; status=1; fi ;;
+      q1)
+        a="$OUT/attempt-q1-sweep-$stamp.tsv" b="$OUT/attempt-q1-validate-$stamp.tsv"
+        if block "q1" "$a" "$b" -- "${SELF[@]}" q1_block "$a" "$b"; then
+          mv "$a" "$OUT/q1-sweep.tsv"; mv "$b" "$OUT/q1-validate.tsv"; log "q1 done"
+        else log "q1 FAILED"; status=1; fi ;;
       markall)
         a="$OUT/attempt-markall-$stamp.tsv"
         if block "markall" "$a" -- "${SELF[@]}" markall_block "$a"; then
