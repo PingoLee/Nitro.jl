@@ -71,7 +71,7 @@ function cost_rows(rows)
     isempty(rows) && return
     names = byorder(unique(series(r) for r in rows))
     println("\n### Scheduler-bound throughput (H = 0), req/s, ", length(unique(r["round"] for r in rows)), " round(s)\n")
-    println("| clients | layout | C | ", join(names, " | "), " | M-none/A0 | M-f/A | M-l/A | O-f/A | C/A |")
+    println("| clients | layout | clients C | ", join(names, " | "), " | M-none/A0 | M-f/A | M-l/A | O-f/A | C/A |")
     println("|---|---|--:|", repeat("--:|", length(names) + 5))
     for (cl, t, c) in unique((r["clients"], r["threads"], r["c"]) for r in rows)
         rs = filter(r -> (r["clients"], r["threads"], r["c"]) == (cl, t, c), rows)
