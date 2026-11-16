@@ -4,8 +4,10 @@
 #
 #   julia bench/tasks/aggregate_fifo.jl <dir>            # the rounds: <block>-*-r<N>.tsv
 #   julia bench/tasks/aggregate_fifo.jl <dir> pilot      # the pilot, with its gate evaluated
+#   julia bench/tasks/aggregate_fifo.jl <dir> sharepilot # PROFILE=share: the share pilot and its gate
 #   julia bench/tasks/aggregate_fifo.jl <dir> markall    # the marked-fib_fine row
 #   julia bench/tasks/aggregate_fifo.jl <dir> mixed      # the mixed cell (mixed_cell.jl): mixed-r<N>.tsv
+#   julia bench/tasks/aggregate_fifo.jl <dir> halfmix    # the half-pool mixed cell: halfmix-r<N>.tsv
 #   julia bench/tasks/aggregate_fifo.jl <dir> validate   # the validation pass's TSVs (not timings)
 
 const SPAWN_COLS = ["julia", "commit", "threads", "guard", "variant", "round", "mode", "clients", "c", "h_ms",
@@ -22,10 +24,16 @@ const MIXED_COLS = ["julia", "commit", "threads", "guard", "variant", "round", "
                     "slow1_spawn_to_start_pct", "slow1_end_to_wake_pct",
                     "fib_alone_median_s", "fib_alone_min_s", "fib_alone_max_s",
                     "fib_runs", "fib_median_s", "fib_min_s", "fib_max_s", "fib_walls_s"]
-const ORDER = ["pool", "A", "A0", "C", "M-none", "M-f", "M-l", "M-h-f", "M-h-l", "O-f", "O-l"]
+const ORDER = ["pool", "A", "A0", "C", "M-none", "M-f", "M-l", "M-t", "M-t0", "M-p2", "M-p16", "M-p128", "M-p1024",
+               "M-h-f", "M-h-l", "M-h-t", "O-f", "O-l"]
+# The ratio columns a table shows: the pairs among these whose both series are in it.
+const RATIO_PAIRS = [("M-none", "A0"), ("M-f", "A"), ("M-l", "A"), ("M-t", "A"), ("M-t", "M-l"), ("O-f", "A"), ("C", "A")]
+pairs_in(names; base_none = "A0") = [(a == "M-none" ? (a, base_none) : (a, b)) for (a, b) in RATIO_PAIRS
+                                     if a in names && (a == "M-none" ? base_none : b) in names]
+pair_heads(ps) = join(("$a/$b" for (a, b) in ps), " | ")
 
 med(v) = (s = sort(v); n = length(s); isodd(n) ? s[(n + 1) ÷ 2] : (s[n ÷ 2] + s[n ÷ 2 + 1]) / 2)
-fmt(x) = isnan(x) ? "–" : abs(x) >= 1000 ? replace(string(round(Int, x)), r"(?<=\d)(?=(\d{3})+$)" => ",") :
+fmt(x) = !isfinite(x) ? "–" : abs(x) >= 1000 ? replace(string(round(Int, x)), r"(?<=\d)(?=(\d{3})+$)" => ",") :
          abs(x) >= 100 || x == round(x) ? string(round(Int, x)) : string(round(x; sigdigits = 3))
 cell(v) = isempty(v) ? "–" : length(v) == 1 ? fmt(v[1]) :
           string(fmt(med(v)), " [", fmt(minimum(v)), "–", fmt(maximum(v)), "]")
@@ -77,14 +85,14 @@ function cost_rows(rows)
     isempty(rows) && return
     names = byorder(unique(series(r) for r in rows))
     println("\n### Scheduler-bound throughput (H = 0), req/s, ", length(unique(r["round"] for r in rows)), " round(s)\n")
-    println("| clients | layout | clients C | ", join(names, " | "), " | M-none/A0 | M-f/A | M-l/A | O-f/A | C/A |")
-    println("|---|---|--:|", repeat("--:|", length(names) + 5))
+    ps = pairs_in(names)
+    println("| clients | layout | clients C | ", join(names, " | "), " | ", pair_heads(ps), " |")
+    println("|---|---|--:|", repeat("--:|", length(names) + length(ps)))
     for (cl, t, c) in unique((r["clients"], r["threads"], r["c"]) for r in rows)
         rs = filter(r -> (r["clients"], r["threads"], r["c"]) == (cl, t, c), rows)
         v(s) = vals(rs, s, "rps")
         println("| ", cl, " | ", t, " | ", c, " | ", join((cell(v(s)) for s in names), " | "), " | ",
-                ratios(v("M-none"), v("A0")), " | ", ratios(v("M-f"), v("A")), " | ", ratios(v("M-l"), v("A")), " | ",
-                ratios(v("O-f"), v("A")), " | ", ratios(v("C"), v("A")), " |")
+                join((ratios(v(a), v(b)) for (a, b) in ps), " | "), " |")
     end
 end
 
@@ -100,8 +108,9 @@ function micro_rows(paths)
     isempty(recs) && return
     names = byorder(unique(r.variant for r in recs))
     println("\n### tasks.jl micro and queued rows\n")
-    println("| row | unit | layout | ", join(names, " | "), " | M-none/A0 | M-f/A | O-f/A |")
-    println("|---|---|---|", repeat("--:|", length(names) + 3))
+    ps = pairs_in(names)
+    println("| row | unit | layout | ", join(names, " | "), " | ", pair_heads(ps), " |")
+    println("|---|---|---|", repeat("--:|", length(names) + length(ps)))
     for (name, key, unit) in (("SpawnWait", "ns_per_op", "ns/op"), ("PingPong", "ns_per_op", "ns/op"),
                               ("FanOut1000", "ns_per_task", "ns/task"), ("FanOut10000", "ns_per_task", "ns/task"),
                               ("Queued10000", "drain_ns_per_task", "drain ns/task"),
@@ -111,7 +120,7 @@ function micro_rows(paths)
         isempty(rs) && continue
         v(s) = [parse(Float64, r.kv[key]) for r in rs if r.variant == s]
         println("| ", name, " | ", unit, " | ", t, " | ", join((cell(v(s)) for s in names), " | "), " | ",
-                ratios(v("M-none"), v("A0")), " | ", ratios(v("M-f"), v("A")), " | ", ratios(v("O-f"), v("A")), " |")
+                join((ratios(v(a), v(b)) for (a, b) in ps), " | "), " |")
     end
 end
 
@@ -126,8 +135,9 @@ function nested_rows(rows)
     names = byorder(unique(r["variant"] for r in rows))
     println("\n### nested.jl, ", length(unique(r["round"] for r in rows)),
             " round(s); digests identical across variants and rounds for every workload\n")
-    println("| workload | layout | metric | ", join(names, " | "), " | M-none/A | M-f/A | M-l/A | O-f/A | C/A |")
-    println("|---|---|---|", repeat("--:|", length(names) + 5))
+    ps = pairs_in(names; base_none = "A")
+    println("| workload | layout | metric | ", join(names, " | "), " | ", pair_heads(ps), " |")
+    println("|---|---|---|", repeat("--:|", length(names) + length(ps)))
     for b in unique(r["bench"] for r in rows), t in unique(r["threads"] for r in rows)
         for (label, key) in (("wall s", "wall_median_s"), ("peak live", "peak_live_median"),
                              ("peak queued", "peak_queued_median"), ("peak in queues", "peak_heaps_median"),
@@ -137,8 +147,7 @@ function nested_rows(rows)
             isempty(rs) && continue
             v(s) = [num(r, key) for r in rs if r["variant"] == s]
             println("| ", b, " | ", t, " | ", label, " | ", join((cell(v(s)) for s in names), " | "), " | ",
-                    ratios(v("M-none"), v("A")), " | ", ratios(v("M-f"), v("A")), " | ", ratios(v("M-l"), v("A")), " | ",
-                    ratios(v("O-f"), v("A")), " | ", ratios(v("C"), v("A")), " |")
+                    join((ratios(v(a), v(b)) for (a, b) in ps), " | "), " |")
         end
     end
     isempty(killed) || println("\nKilled by nested.sh's timeout: ",
@@ -184,11 +193,16 @@ end
 
 # The mixed cell: the requests, and fib_fine's wall per run during the cell against the same
 # process's wall alone (every run of every round pooled for the per-run ratio).
-function mixed_rows(rows)
+function mixed_rows(rows; half = false)
     isempty(rows) && return
     rounds = length(unique(r["round"] for r in rows))
-    println("\n### The mixed cell: the starved cell (clients on :interactive, 8,1, C = 500, H = 2 ms, D = 8 s) ",
-            "with fib_fine looping on :default, ", rounds, " round(s)\n")
+    if half   # the fib_* columns are the four loops' runs (400 chunks of sfib(24) each)
+        println("\n### The half-pool mixed cell: C = 4 clients on :interactive, 8,1, H = 2 ms, D = 8 s, ",
+                "beside 4 unmarked loops on :default (fib_fine columns: the loops' runs), ", rounds, " round(s)\n")
+    else
+        println("\n### The mixed cell: the starved cell (clients on :interactive, 8,1, C = 500, H = 2 ms, D = 8 s) ",
+                "with fib_fine looping on :default, ", rounds, " round(s)\n")
+    end
     println("| variant | p99 ms | max ms | slowest client | Jain | req/s | slowest 1%: spawn→start | fib_fine alone s | fib_fine runs in the cell | fib_fine per run s | per run / alone |")
     println("|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|")
     for v in byorder(unique(r["variant"] for r in rows))
@@ -208,16 +222,51 @@ function mixed_rows(rows)
                                                      r["fib_alone_median_s"], ")") for r in rows), "; "))
 end
 
+# The share pilot's gate (PROFILE=share): M-t passes when, in the mixed cell, the requests' p99 is
+# under 0.6 s with no client starved and fib_fine per run is under 2.5x its standalone wall (median
+# of the runs in the cell over the same process's median alone). M-l must starve the requests
+# there (under 200 req/s), or the cell does not tell a share from strict precedence.
+function share_gate(mixed)
+    println("\n### Share pilot gate\n")
+    row(v) = (r = filter(r -> r["variant"] == v, mixed); isempty(r) ? nothing : r[1])
+    function fibratio(r)
+        w = isempty(r["fib_walls_s"]) ? Float64[] : parse.(Float64, split(r["fib_walls_s"], ','))
+        isempty(w) ? NaN : med(w) / num(r, "fib_alone_median_s")
+    end
+    l = row("M-l")
+    control = l !== nothing && num(l, "rps") < 200
+    l === nothing || println("- control M-l: ", fmt(num(l, "rps")), " req/s → ",
+                             control ? "starves the requests, as it must" : "DOES NOT STARVE: the cell tells nothing")
+    t = row("M-t")
+    pass = false
+    if t !== nothing
+        p99, slow, fr = num(t, "p99_ms"), num(t, "count_min"), fibratio(t)
+        pass = control && p99 < 600 && slow > 0 && fr < 2.5
+        println("- M-t: p99 ", fmt(p99), " ms (limit 600), slowest client ", fmt(slow), ", fib_fine ",
+                round(fr; digits = 2), "× alone (limit 2.5)")
+    end
+    a = row("A")
+    a === nothing || println("- A: p99 ", fmt(num(a, "p99_ms")), " ms, fib_fine ", round(fibratio(a); digits = 2), "× alone")
+    println("\n**Gate: ", pass ? "PASSES, go on to the rounds" : "FAILS: run the M-pK sweep once, then write it up", "**")
+end
+
 function main(dir, what)
     ls = readdir(dir)
     pick(re) = joinpath.(dir, sort(filter(f -> occursin(re, f), ls)))
-    if what == "pilot"
+    if what == "sharepilot"
+        spawn_rows(readtsv(pick(r"^pilot-spawn\.tsv$"), SPAWN_COLS), "Share pilot: the starved cell")
+        mixed = readtsv(pick(r"^pilot-mixed\.tsv$"), MIXED_COLS)
+        mixed_rows(mixed)
+        share_gate(mixed)
+    elseif what == "pilot"
         spawn, nested = readtsv(pick(r"^pilot-spawn\.tsv$"), SPAWN_COLS), readtsv(pick(r"^pilot-nested\.tsv$"), NESTED_COLS)
         spawn_rows(spawn, "Pilot: the starved cell")
         nested_rows(nested)
         pilot_gate(spawn, nested)
     elseif what == "mixed"
         mixed_rows(readtsv(pick(r"^mixed-r\d+\.tsv$"), MIXED_COLS))
+    elseif what == "halfmix"   # C = 4 beside 4 loops: the fib_* columns are the loops' runs
+        mixed_rows(readtsv(pick(r"^halfmix-r\d+\.tsv$"), MIXED_COLS); half = true)
     elseif what == "markall"
         nested_rows(readtsv(pick(r"^markall-nested\.tsv$"), NESTED_COLS))
     elseif what == "validate"
@@ -225,6 +274,7 @@ function main(dir, what)
         spawn_rows(readtsv(pick(r"^validate-fairness-spawn\.tsv$"), SPAWN_COLS), "Validation cells (D = 1 s, not timings)")
         micro_rows(pick(r"^validate-micro\.tsv$"))
         nested_rows(readtsv(pick(r"^validate-nested\.tsv$"), NESTED_COLS))
+        mixed_rows(readtsv(pick(r"^validate-mixed\.tsv$"), MIXED_COLS))
     else
         cost_rows(readtsv(pick(r"^cost-spawn-r\d+\.tsv$"), SPAWN_COLS))
         micro_rows(pick(r"^micro-r\d+\.tsv$"))

@@ -69,6 +69,20 @@
 #       first one this thread may run (an unpinned task or its own), wakes the owners of those passed
 #       over and leaves them in place, so an owner always reaches its own task and nobody waits behind
 #       a pinned head.
+#   M-t, M-t0, M-p<K>, M-h-t  M with a share between the F queue and the heaps instead of a strict
+#       order. All keep M-l's heaps-first default and act only on a pop that finds the F queue
+#       non-empty; with it empty the pop is M-none's (one relaxed load, then stock's pop: no clock,
+#       no account). -t, a share of time: each thread keeps, in a padded 128-byte struct of its own,
+#       a balance of cycles spent on F tasks minus cycles on L tasks, credited pop to pop with
+#       rdtsc (the interval since its last accounted pop goes to the side of the task that pop
+#       returned; none after a pop that found nothing), clamped to +-10 ms, and tries the F queue
+#       first when F has had less time (balance < 0), the heaps first otherwise; the other side is
+#       the fallback. -t0 is the same code with the balance never moved (always heaps first): the
+#       negative control, which must behave as M-l. -p<K>, a share of pops: the F queue first on
+#       every K-th successful accounted pop of a thread, the heaps first otherwise. M-h-t is -t
+#       with the handlers marked only. The interval also covers what the thread ran from its own
+#       sticky workqueue between two multiq pops, and the first accounted pop after a run of
+#       M-none-path pops credits its (capped) interval to the side of the last accounted one.
 #
 # A0 and B are taken from the build's own `base/partr.jl` as parsed at load time, so they cannot
 # drift from it. C and E are hand copies, so they refuse to load on a build whose `partr.jl` they
@@ -93,7 +107,9 @@
 # VALIDATE=1 compiles a per-thread call counter into the new code (under M and O: the pops), and
 # under M and O per-thread classification counts (F and L first enqueues, F re-enqueues, demotions,
 # F and L pops, pinned entries passed over), an order assert after every F pop, single-structure
-# asserts and two check_empty probes (`M_NEGATIVE=blind` is the negative control); under C and D an assert,
+# asserts and two check_empty probes (`M_NEGATIVE=blind` is the negative control), and under the shares
+# per-thread counts of the time credited to each side (overall and while the heaps had work too), the
+# cap's actions and the F-first choices; under C and D an assert,
 # under the heap's lock, that every pop takes the (priority, sequence) minimum of its heap; under D
 # also per-thread counts of slot pops, steals, budget flushes, displaced and bounced tasks; under E
 # a shadow vector per bucket that every pop is checked against (the back is the newest entry, the
@@ -106,10 +122,12 @@
 const MULTIQ_VARIANT = get(ENV, "VARIANT", "A")
 const _D_MATCH = match(r"^D([0-9]+|-inf)$", MULTIQ_VARIANT)
 const _E_MATCH = match(r"^E([0-9]+|-inf)$", MULTIQ_VARIANT)
-const _F_MATCH = match(r"^(M|M-h|O)-([fl])$|^M-none$", MULTIQ_VARIANT)
+const _F_MATCH = match(r"^(M|M-h|O)-(f|l|t|t0|p[0-9]+)$|^M-none$", MULTIQ_VARIANT)
 MULTIQ_VARIANT in ("A", "A0", "B", "C") || _D_MATCH !== nothing || _E_MATCH !== nothing || _F_MATCH !== nothing ||
-    error("VARIANT must be A, A0, B, C, D<K>, D-inf, E<K>, E-inf, M-f, M-l, M-h-f, M-h-l, M-none, O-f or O-l, ",
-          "not $(MULTIQ_VARIANT)")
+    error("VARIANT must be A, A0, B, C, D<K>, D-inf, E<K>, E-inf, M-f, M-l, M-t, M-t0, M-p<K>, M-h-f, M-h-l, ",
+          "M-h-t, M-none, O-f or O-l, not $(MULTIQ_VARIANT)")
+_F_MATCH === nothing || _F_MATCH[2] === nothing || _F_MATCH[2] in ("f", "l") || _F_MATCH[1] != "O" ||
+    error("the shares (-t, -t0, -p<K>) are built for M and M-h, not O")
 # D's slot budget, or nothing for every other variant.
 const SLOT_BUDGET = _D_MATCH === nothing ? nothing :
                     _D_MATCH[1] == "-inf" ? typemax(Int) : parse(Int, _D_MATCH[1])
@@ -124,9 +142,17 @@ PERIODIC_K === nothing || PERIODIC_K >= 2 || error("E's K must be at least 2")
 # M-h handlers only, M-none and O nothing.
 const MULTIQ_FIFO = _F_MATCH !== nothing
 const FIFO_CLASS = !MULTIQ_FIFO ? :none : startswith(MULTIQ_VARIANT, "O") ? :origin : :mark
-const FIFO_SERVE = !MULTIQ_FIFO ? :none : MULTIQ_VARIANT == "M-none" ? :f : Symbol(_F_MATCH[2])
-const MARK_HANDLERS = MULTIQ_VARIANT in ("M-f", "M-l", "M-h-f", "M-h-l")
-const MARK_CLIENTS = MULTIQ_VARIANT in ("M-f", "M-l")
+const FIFO_SERVE = !MULTIQ_FIFO ? :none : MULTIQ_VARIANT == "M-none" ? :f :
+                   startswith(_F_MATCH[2], "p") ? :p : Symbol(_F_MATCH[2])
+# The shares (run of 2026-11-16): both act only when a pop finds the F queue non-empty, and keep
+# M's heaps-first default. `:t` serves the side with less time (per-thread balance, capped);
+# `:t0` is its negative control, the same code with the balance never moved (so always heaps
+# first, as M-l); `:p` takes the F queue first on every SHARE_K-th such pop.
+const FIFO_SHARE = FIFO_SERVE in (:t, :t0, :p)
+const SHARE_K = FIFO_SERVE === :p ? parse(Int, _F_MATCH[2][2:end]) : 0
+FIFO_SERVE !== :p || SHARE_K >= 2 || error("M-p<K> needs K >= 2")
+const MARK_HANDLERS = MULTIQ_FIFO && _F_MATCH[1] in ("M", "M-h")
+const MARK_CLIENTS = MULTIQ_FIFO && _F_MATCH[1] == "M"
 # Optional, nested.jl only: every spawn marked (the cost of marking fine-grained fork-join).
 const MARK_ALL = FIFO_CLASS === :mark && get(ENV, "MARK_ALL", "0") == "1"
 # C's heaps: C, and D behind its slots.
@@ -993,6 +1019,101 @@ if MULTIQ_FIFO
     const _M_NEGATIVE = MULTIQ_VALIDATE ? get(ENV, "M_NEGATIVE", "") : ""
     _M_NEGATIVE in ("", "blind", "stall") || error("M_NEGATIVE must be blind or stall")
     _fcount(field) = MULTIQ_VALIDATE ? :(fstates[Threads.threadid()].$field += 1) : nothing
+    if FIFO_SHARE
+        # The shares' clock: rdtsc, as E's stamps. It is only ever differenced on one thread, pop to
+        # pop, but a thread can move between cores, so it needs the TSC Linux trusts as its
+        # clocksource (constant, nonstop, synchronized across cores).
+        let cs = "/sys/devices/system/clocksource/clocksource0/current_clocksource"
+            isfile(cs) && strip(read(cs, String)) == "tsc" ||
+                error("the shares time pops with rdtsc, which needs the TSC as the clocksource")
+        end
+        @eval PARTR @inline s_stamp() = Base.llvmcall(("""
+            declare i64 @llvm.readcyclecounter()
+            define i64 @s_stamp() #0 {
+              %t = call i64 @llvm.readcyclecounter()
+              ret i64 %t
+            }
+            attributes #0 = { alwaysinline }
+            """, "s_stamp"), UInt64, Tuple{})
+        # Cycles per millisecond, against the monotonic clock over 50 ms at load.
+        const SHARE_CYCLES_PER_MS = let t0 = time_ns(), c0 = PARTR.s_stamp()
+            while time_ns() - t0 < 50_000_000
+            end
+            c1, t1 = PARTR.s_stamp(), time_ns()
+            (c1 - c0) / ((t1 - t0) / 1e6)
+        end
+        # The cap on the balance (and on any one interval credited): 10 ms.
+        const SHARE_CAP = round(Int, 10 * SHARE_CYCLES_PER_MS)
+    end
+    _scount(field, by = 1) = MULTIQ_VALIDATE ? :(s.$field += $by) : nothing
+    # The shares' pop, reached only when the F queue is non-empty, so both sides may have work.
+    # -t and -t0 read the clock and credit the interval since this thread's last accounted pop to
+    # the side of the task that pop returned (none when it returned nothing: the thread was idle);
+    # -t moves the balance by it, -t0 does not (its balance stays 0, so it is always heaps first,
+    # the negative control). The side tried first: -t, F when F has had less time (bal < 0), ties
+    # to the heaps; -p, F on every K-th successful accounted pop. The other side is the fallback
+    # when the first comes back empty. Under VALIDATE every share reads the clock, for the counts.
+    _SHARE_CLOCK = FIFO_SERVE in (:t, :t0) || MULTIQ_VALIDATE
+    _SHARE_POP = !FIFO_SHARE ? nothing : quote
+        s = sstates[tid]
+        $(_SHARE_CLOCK ? quote
+            now = s_stamp()
+            if s.last != 0
+                d = now > s.stamp ? Int(now - s.stamp) : 0
+                if d > $(SHARE_CAP)
+                    d = $(SHARE_CAP)
+                    $(_scount(:clips))
+                end
+                $(FIFO_SERVE === :t ? quote
+                    b = s.last == 1 ? s.bal + d : s.bal - d
+                    if b > $(SHARE_CAP)
+                        b = $(SHARE_CAP)
+                        $(_scount(:caps))
+                    elseif b < $(-SHARE_CAP)
+                        b = $(-SHARE_CAP)
+                        $(_scount(:caps))
+                    end
+                    s.bal = b
+                end : nothing)
+                $(MULTIQ_VALIDATE ? quote
+                    if s.last == 1
+                        s.f_cyc += d
+                        stock_multiq_check_empty() || (s.both_f += d)
+                    else
+                        s.l_cyc += d
+                        stock_multiq_check_empty() || (s.both_l += d)
+                    end
+                end : nothing)
+            end
+        end : nothing)
+        ffirst = $(FIFO_SERVE === :p ? :(s.k >= $(SHARE_K - 1)) : :(s.bal < 0))
+        nt = Int(Threads._nthreads_in_pool(tpid))
+        side = 1
+        if ffirst
+            task = f_pop!(fq, tid, nt)
+            if task === nothing
+                task = stock_multiq_deletemin()
+                side = 2
+            end
+        else
+            task = stock_multiq_deletemin()
+            side = 2
+            if task === nothing
+                side = 1
+                (@atomic :monotonic fq.n) == 0 || (task = f_pop!(fq, tid, nt))
+            end
+        end
+        $(MULTIQ_VALIDATE ? quote
+            s.acct += 1
+            ffirst && (s.f_choice += 1)
+            side == 2 && task !== nothing && $(_fcount(:l_pops))
+        end : nothing)
+        $(_SHARE_CLOCK ? quote
+            s.stamp = now
+            s.last = task === nothing ? 0 : side
+        end : nothing)
+        $(FIFO_SERVE === :p ? :(task === nothing || (s.k = ffirst ? 0 : s.k + 1)) : nothing)
+    end
     @eval PARTR begin
         # The class: bit 15 of `Task.priority`. Nothing in Base sets a priority (a new task starts at
         # 0 and does not inherit its parent's), and a task with the bit never enters the heaps, so the
@@ -1037,6 +1158,27 @@ if MULTIQ_FIFO
             fstate() = new(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ntuple(_ -> 0, 6))
         end
         const fstates = [fstate() for _ in 1:Threads.maxthreadid()]
+
+        # The shares, per thread, 128 bytes, touched only by a pop that found the F queue non-empty
+        # (an unmarked program never reaches them). The timed code uses the first four fields; the
+        # rest are VALIDATE counts.
+        mutable struct sstate
+            bal::Int        # -t: cycles spent on F tasks minus cycles on L tasks, kept in [-cap, cap]
+            stamp::UInt64   # -t, -t0: the cycle counter at this thread's last accounted pop
+            last::Int       # -t, -t0: the side of the task that pop returned: 0 none, 1 F, 2 L
+            k::Int          # -p: successful accounted pops since the last one that tried F first
+            f_cyc::Int      # cycles credited to F (VALIDATE: every share variant times its pops)
+            l_cyc::Int      # cycles credited to L
+            both_f::Int     # the same two, only for intervals ending at a pop that found the heaps
+            both_l::Int     #   non-empty too: "while both sides have work"
+            caps::Int       # credits after which the balance was clamped to the cap
+            clips::Int      # intervals longer than the cap, credited as the cap
+            acct::Int       # accounted pops (the F queue non-empty)
+            f_choice::Int   # accounted pops that tried the F queue first
+            pad::NTuple{4,Int}
+            sstate() = new(0, zero(UInt64), 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ntuple(_ -> 0, 4))
+        end
+        const sstates = [sstate() for _ in 1:Threads.maxthreadid()]
 
         @noinline function f_fail(msg::String)
             ccall(:jl_safe_printf, Cvoid, (Cstring, Cstring), "%s\n", msg)
@@ -1222,7 +1364,7 @@ if MULTIQ_FIFO
                     task = stock_multiq_deletemin()
                     $(MULTIQ_VALIDATE ? :(task === nothing || $(_fcount(:l_pops))) : nothing)
                 end
-            else
+            elseif f_serve === :l
                 task = stock_multiq_deletemin()
                 if task === nothing
                     (@atomic :monotonic fq.n) == 0 ||
@@ -1230,6 +1372,12 @@ if MULTIQ_FIFO
                 else
                     $(_fcount(:l_pops))
                 end
+            elseif (@atomic :monotonic fq.n) == 0
+                # The shares with the F queue empty: M-none's code, no clock and no account.
+                task = stock_multiq_deletemin()
+                $(MULTIQ_VALIDATE ? :(task === nothing || $(_fcount(:l_pops))) : nothing)
+            else
+                $_SHARE_POP
             end
             $(MULTIQ_VALIDATE ? :(task === nothing || $_COUNT) : nothing)
             return task
@@ -1367,7 +1515,11 @@ println(stderr, "multiq_variant: VARIANT=", MULTIQ_VARIANT, MULTIQ_VALIDATE ? " 
         SLOT_BUDGET === nothing ? "" : ", slot budget $(SLOT_BUDGET == typemax(Int) ? "none" : SLOT_BUDGET)",
         PERIODIC_K === nothing ? "" : ", periodic pop every $(PERIODIC_K == typemax(Int) ? "never" : PERIODIC_K)",
         PERIODIC_K !== nothing && !isempty(_E_NEGATIVE) ? ", NEGATIVE CONTROL $(_E_NEGATIVE)" : "",
-        MULTIQ_FIFO ? ", F queue: class $(FIFO_CLASS), serve $(FIFO_SERVE), marks " *
+        MULTIQ_FIFO ? ", F queue: class $(FIFO_CLASS), serve $(FIFO_SERVE)" *
+                      (FIFO_SERVE === :p ? " (F first every $(SHARE_K)th accounted pop)" : "") *
+                      (FIFO_SERVE in (:t, :t0) ? " (cap $(round(SHARE_CAP / SHARE_CYCLES_PER_MS; digits = 2)) ms, " *
+                       "$(round(SHARE_CYCLES_PER_MS / 1000; digits = 1)) MHz TSC$(FIFO_SERVE === :t0 ? ", balance frozen" : ""))" : "") *
+                      ", marks " *
                       "$(MARK_HANDLERS ? "handlers" : "")$(MARK_CLIENTS ? "+clients" : "")$(MARK_ALL ? "all" : "")" *
                       "$(!MARK_HANDLERS && !MARK_ALL ? "none" : "")" : "",
         MULTIQ_FIFO && !isempty(_M_NEGATIVE) ? ", NEGATIVE CONTROL $(_M_NEGATIVE)" : "")
@@ -1881,6 +2033,47 @@ function multiq_fifo_check(label, before; f_first::Union{Int,Nothing})
         error("$MULTIQ_VARIANT: $label: $(d.f_pops) F pops for $(d.f_first + d.f_again) F inserts")
     return d
 end
+
+# The shares, VALIDATE only: per-thread counts (a copy of every `:default` thread's sstate fields).
+const _S_FIELDS = (:f_cyc, :l_cyc, :both_f, :both_l, :caps, :clips, :acct, :f_choice)
+function multiq_share_counts()
+    FIFO_SHARE && MULTIQ_VALIDATE || return nothing
+    return Dict(tid => NamedTuple{_S_FIELDS}(Tuple(getfield(PARTR.sstates[tid], k) for k in _S_FIELDS))
+                for tid in Threads.threadpooltids(:default))
+end
+
+# The shares, VALIDATE only: print, per `:default` thread, the pops by side, the time credited to
+# each side (and its F share, overall and while both sides had work), the cap's and the clip's
+# actions, since `before`. With `half = true` (the mixed cell under -t) every thread's F share
+# while both had work must be 40-60%, over at least 50 ms of such time.
+function multiq_share_check(label, before, fbefore; half::Bool = false)
+    FIFO_SHARE && MULTIQ_VALIDATE || return nothing
+    now = multiq_share_counts()
+    ms(c) = round(c / SHARE_CYCLES_PER_MS; digits = 1)
+    pct(a, b) = a + b == 0 ? NaN : round(100 * a / (a + b); digits = 1)
+    bad = String[]
+    println(stderr, "validate: share counts, ", label, " (", MULTIQ_VARIANT, ", cap ", ms(SHARE_CAP), " ms):")
+    for tid in Threads.threadpooltids(:default)
+        d = NamedTuple{_S_FIELDS}(Tuple(getfield(now[tid], k) - getfield(before[tid], k) for k in _S_FIELDS))
+        fs, f0 = PARTR.fstates[tid], fbefore[tid]
+        fp, lp = fs.f_pops - f0[1], fs.l_pops - f0[2]
+        both = pct(d.both_f, d.both_l)
+        println(stderr, "validate:   tid ", tid, ": pops F ", fp, " L ", lp, ", accounted ", d.acct, " (F tried first ",
+                d.f_choice, "), time F ", ms(d.f_cyc), " ms L ", ms(d.l_cyc), " ms (F ", pct(d.f_cyc, d.l_cyc),
+                "%), while both had work F ", ms(d.both_f), " ms L ", ms(d.both_l), " ms (F ", both, "%), cap ",
+                d.caps, ", clipped intervals ", d.clips)
+        if half
+            (d.both_f + d.both_l) / SHARE_CYCLES_PER_MS >= 50 ||
+                push!(bad, "tid $tid: only $(ms(d.both_f + d.both_l)) ms with both sides busy")
+            40 <= both <= 60 || push!(bad, "tid $tid: F's share while both had work is $both%")
+        end
+    end
+    isempty(bad) || error("$MULTIQ_VARIANT: $label: the time share is not 40-60% on every :default thread: ",
+                          join(bad, "; "))
+    return nothing
+end
+share_fifo_pops() = !(FIFO_SHARE && MULTIQ_VALIDATE) ? nothing : Dict(tid => (PARTR.fstates[tid].f_pops, PARTR.fstates[tid].l_pops)
+                         for tid in Threads.threadpooltids(:default))
 
 # M and O, VALIDATE only, two probes of `multiq_check_empty` (as E's):
 # 1. Everything drained: it must say empty.

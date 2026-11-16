@@ -1,0 +1,106 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1180" height="620" viewBox="0 0 1180 620" font-family="Helvetica, Arial, sans-serif">
+<rect width="1180" height="620" fill="#fcfcfb"/>
+<text x="40" y="34" font-size="18" font-weight="700" fill="#0b0b0b">A share between marked and unmarked work: who starves whom?</text>
+<text x="40" y="56" font-size="12" fill="#52514e">Julia 1.13.4, --threads=8,1, 500 clients on :interactive, 2 ms handlers, 8 s. Marked: handlers and clients (M). Medians of 3 rounds, whiskers [min-max].</text>
+<text x="110" y="92" font-size="15" font-weight="600" fill="#0b0b0b">The mixed cell: requests beside unmarked fib_fine</text>
+<line x1="141.0" y1="116" x2="141.0" y2="506" stroke="#e6e5e1"/>
+<text x="141.0" y="524" font-size="11" fill="#52514e" text-anchor="middle">125</text>
+<line x1="262.7" y1="116" x2="262.7" y2="506" stroke="#e6e5e1"/>
+<text x="262.7" y="524" font-size="11" fill="#52514e" text-anchor="middle">300</text>
+<line x1="359.0" y1="116" x2="359.0" y2="506" stroke="#e6e5e1"/>
+<text x="359.0" y="524" font-size="11" fill="#52514e" text-anchor="middle">600</text>
+<line x1="430.0" y1="116" x2="430.0" y2="506" stroke="#e6e5e1"/>
+<text x="430.0" y="524" font-size="11" fill="#52514e" text-anchor="middle">1,000</text>
+<line x1="582.7" y1="116" x2="582.7" y2="506" stroke="#e6e5e1"/>
+<text x="582.7" y="524" font-size="11" fill="#52514e" text-anchor="middle">3,000</text>
+<line x1="750.0" y1="116" x2="750.0" y2="506" stroke="#e6e5e1"/>
+<text x="750.0" y="524" font-size="11" fill="#52514e" text-anchor="middle">10,000</text>
+<line x1="110" y1="475.6" x2="750" y2="475.6" stroke="#e6e5e1"/>
+<text x="102" y="479.6" font-size="11" fill="#52514e" text-anchor="end">1×</text>
+<line x1="110" y1="420.3" x2="750" y2="420.3" stroke="#e6e5e1"/>
+<text x="102" y="424.3" font-size="11" fill="#52514e" text-anchor="end">1.5×</text>
+<line x1="110" y1="350.7" x2="750" y2="350.7" stroke="#e6e5e1"/>
+<text x="102" y="354.7" font-size="11" fill="#52514e" text-anchor="end">2.5×</text>
+<line x1="110" y1="286.7" x2="750" y2="286.7" stroke="#e6e5e1"/>
+<text x="102" y="290.7" font-size="11" fill="#52514e" text-anchor="end">4×</text>
+<line x1="110" y1="231.5" x2="750" y2="231.5" stroke="#e6e5e1"/>
+<text x="102" y="235.5" font-size="11" fill="#52514e" text-anchor="end">6×</text>
+<line x1="110" y1="161.8" x2="750" y2="161.8" stroke="#e6e5e1"/>
+<text x="102" y="165.8" font-size="11" fill="#52514e" text-anchor="end">10×</text>
+<rect x="110" y="350.7" width="249.0" height="155.3" fill="#2e8b57" fill-opacity="0.06" stroke="#c0651a" stroke-dasharray="6 3"/>
+<text x="355.0" y="344.7" font-size="11" fill="#c0651a" text-anchor="end">pass: p99 &lt; 0.6 s, fib_fine &lt; 2.5×</text>
+<line x1="141.0" y1="116" x2="141.0" y2="506" stroke="#2e8b57" stroke-dasharray="4 3"/>
+<text x="145.0" y="128" font-size="11" fill="#2e8b57">fair wait 125 ms</text>
+<line x1="110" y1="475.6" x2="750" y2="475.6" stroke="#2e8b57" stroke-dasharray="4 3"/>
+<text x="367.0" y="491.6" font-size="11" fill="#2e8b57">fib_fine at its standalone wall (y = 1)</text>
+<text x="430.0" y="544" font-size="12" fill="#52514e" text-anchor="middle">request p99, ms (log): lower is fairer to requests</text>
+<text x="64" y="311.0" font-size="12" fill="#52514e" text-anchor="middle" transform="rotate(-90 64 311.0)">fib_fine wall per run / standalone (log): lower is fairer to it</text>
+<line x1="640.7" y1="157.8" x2="721.0" y2="157.8" stroke="#2a78d6" stroke-width="1.5"/>
+<circle cx="719.5" cy="157.8" r="5" fill="#fcfcfb" stroke="#2a78d6" stroke-width="1.5"/>
+<line x1="719.5" y1="151.8" x2="719.5" y2="135.8" stroke="#2a78d6" stroke-width="1.5"/>
+<path d="M 715.5 139.8 L 719.5 132.8 L 723.5 139.8" fill="none" stroke="#2a78d6" stroke-width="1.5"/>
+<text x="727.5" y="147.8" font-size="12" fill="#0b0b0b">A (stock)</text>
+<line x1="440.3" y1="295.9" x2="457.3" y2="295.9" stroke="#2a78d6" stroke-width="1.5"/>
+<line x1="441.0" y1="315.8" x2="441.0" y2="292.6" stroke="#2a78d6" stroke-width="1.5"/>
+<circle cx="441.0" cy="295.9" r="5" fill="#2a78d6" stroke="#2a78d6" stroke-width="1.5"/>
+<text x="449.0" y="287.9" font-size="12" fill="#0b0b0b">C</text>
+<line x1="729.3" y1="472.9" x2="732.3" y2="472.9" stroke="#2a78d6" stroke-width="1.5"/>
+<line x1="729.5" y1="479.7" x2="729.5" y2="465.1" stroke="#2a78d6" stroke-width="1.5"/>
+<circle cx="729.5" cy="472.9" r="5" fill="#2a78d6" stroke="#2a78d6" stroke-width="1.5"/>
+<text x="693.5" y="464.9" font-size="12" fill="#0b0b0b">M-l</text>
+<line x1="730.1" y1="475.6" x2="731.9" y2="475.6" stroke="#2a78d6" stroke-width="1.5"/>
+<line x1="731.6" y1="482.6" x2="731.6" y2="466.4" stroke="#2a78d6" stroke-width="1.5"/>
+<circle cx="731.6" cy="475.6" r="5" fill="#2a78d6" stroke="#2a78d6" stroke-width="1.5"/>
+<text x="581.6" y="449.6" font-size="12" fill="#0b0b0b">M-t0 (accounting off)</text>
+<line x1="265.0" y1="397.0" x2="272.5" y2="397.0" stroke="#2a78d6" stroke-width="1.5"/>
+<line x1="266.3" y1="400.1" x2="266.3" y2="391.8" stroke="#2a78d6" stroke-width="1.5"/>
+<circle cx="266.3" cy="397.0" r="5" fill="#2a78d6" stroke="#2a78d6" stroke-width="1.5"/>
+<text x="274.3" y="413.0" font-size="12" fill="#0b0b0b">M-t (time share)</text>
+<circle cx="155.8" cy="155.2" r="5" fill="#fcfcfb" stroke="#2a78d6" stroke-width="1.5"/>
+<line x1="155.8" y1="149.2" x2="155.8" y2="133.2" stroke="#2a78d6" stroke-width="1.5"/>
+<path d="M 151.8 137.2 L 155.8 130.2 L 159.8 137.2" fill="none" stroke="#2a78d6" stroke-width="1.5"/>
+<text x="107.8" y="159.2" font-size="12" fill="#0b0b0b">M-p2</text>
+<line x1="157.8" y1="159.1" x2="159.7" y2="159.1" stroke="#2a78d6" stroke-width="1.5"/>
+<circle cx="158.7" cy="159.1" r="5" fill="#fcfcfb" stroke="#2a78d6" stroke-width="1.5"/>
+<line x1="158.7" y1="153.1" x2="158.7" y2="137.1" stroke="#2a78d6" stroke-width="1.5"/>
+<path d="M 154.7 141.1 L 158.7 134.1 L 162.7 141.1" fill="none" stroke="#2a78d6" stroke-width="1.5"/>
+<text x="138.7" y="183.1" font-size="12" fill="#0b0b0b">M-p16</text>
+<line x1="172.7" y1="160.5" x2="176.2" y2="160.5" stroke="#2a78d6" stroke-width="1.5"/>
+<line x1="174.4" y1="160.5" x2="174.4" y2="156.5" stroke="#2a78d6" stroke-width="1.5"/>
+<circle cx="174.4" cy="160.5" r="5" fill="#2a78d6" stroke="#2a78d6" stroke-width="1.5"/>
+<text x="184.4" y="165.5" font-size="12" fill="#0b0b0b">M-p128</text>
+<line x1="243.9" y1="375.1" x2="244.9" y2="375.1" stroke="#2a78d6" stroke-width="1.5"/>
+<line x1="244.4" y1="377.1" x2="244.4" y2="371.9" stroke="#2a78d6" stroke-width="1.5"/>
+<circle cx="244.4" cy="375.1" r="5" fill="#2a78d6" stroke="#2a78d6" stroke-width="1.5"/>
+<text x="252.4" y="367.1" font-size="12" fill="#0b0b0b">M-p1024</text>
+<text x="830" y="92" font-size="15" font-weight="600" fill="#0b0b0b">The inner shape: request p99</text>
+<line x1="844.5" y1="116" x2="844.5" y2="506" stroke="#e6e5e1"/>
+<text x="844.5" y="524" font-size="11" fill="#52514e" text-anchor="middle">125</text>
+<line x1="875.2" y1="116" x2="875.2" y2="506" stroke="#e6e5e1"/>
+<text x="875.2" y="524" font-size="11" fill="#52514e" text-anchor="middle">200</text>
+<line x1="980.0" y1="116" x2="980.0" y2="506" stroke="#e6e5e1"/>
+<text x="980.0" y="524" font-size="11" fill="#52514e" text-anchor="middle">1,000</text>
+<line x1="1051.6" y1="116" x2="1051.6" y2="506" stroke="#e6e5e1"/>
+<text x="1051.6" y="524" font-size="11" fill="#52514e" text-anchor="middle">3,000</text>
+<line x1="1130.0" y1="116" x2="1130.0" y2="506" stroke="#e6e5e1"/>
+<text x="1130.0" y="524" font-size="11" fill="#52514e" text-anchor="middle">10,000</text>
+<rect x="830" y="116" width="45.2" height="390" fill="#2e8b57" fill-opacity="0.06" stroke="#c0651a" stroke-dasharray="6 3"/>
+<text x="879.2" y="128" font-size="11" fill="#c0651a">pass: &lt; 0.2 s</text>
+<text x="980.0" y="544" font-size="12" fill="#52514e" text-anchor="middle">request p99, ms (log)</text>
+<line x1="1017.8" y1="181.0" x2="1019.0" y2="181.0" stroke="#b8322a" stroke-width="1.5"/>
+<circle cx="1018.5" cy="181.0" r="5" fill="#b8322a"/>
+<text x="1009.8" y="185.0" font-size="12" fill="#0b0b0b" text-anchor="end">A (stock)</text>
+<line x1="849.6" y1="246.0" x2="851.0" y2="246.0" stroke="#2a78d6" stroke-width="1.5"/>
+<circle cx="850.5" cy="246.0" r="5" fill="#2a78d6"/>
+<text x="859.0" y="250.0" font-size="12" fill="#0b0b0b" text-anchor="start">M-l</text>
+<line x1="1036.1" y1="311.0" x2="1053.5" y2="311.0" stroke="#b8322a" stroke-width="1.5"/>
+<circle cx="1040.1" cy="311.0" r="5" fill="#b8322a"/>
+<text x="1028.1" y="315.0" font-size="12" fill="#0b0b0b" text-anchor="end">M-t</text>
+<line x1="1030.4" y1="376.0" x2="1038.9" y2="376.0" stroke="#b8322a" stroke-width="1.5"/>
+<circle cx="1036.2" cy="376.0" r="5" fill="#b8322a"/>
+<text x="1022.4" y="380.0" font-size="12" fill="#0b0b0b" text-anchor="end">M-p2</text>
+<circle cx="850.5" cy="441.0" r="5" fill="#2a78d6"/>
+<text x="858.5" y="445.0" font-size="12" fill="#0b0b0b" text-anchor="start">M-p1024</text>
+<text x="40" y="580" font-size="11" fill="#8a8984">M-t: each thread serves the side (F queue or heaps) with less time since the two last balanced, capped at 10 ms. M-pK: heaps first, every K-th pop F first. M-l: heaps first, always.</text>
+<text x="40" y="598" font-size="11" fill="#8a8984">Hollow points with an arrow: no fib_fine run ended inside the 8 s cell; drawn at 8 s / standalone, a lower bound. Red: fails the inner shape's 0.2 s limit.</text>
+</svg>
