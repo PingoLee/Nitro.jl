@@ -3,7 +3,8 @@ per client pool: x is the starved cell's request p99 (C = 500 clients, H = 2 ms,
 y is fine-grain `pfib`'s (nested.jl `fib_fine`) wall time over stock's. Whiskers are [min-max] (over
 rounds, or over builds and layouts for the earlier runs, as their comments report them). The fair wait
 (125 ms: 500 clients x 2 ms / 8 threads) and y = 1 are drawn in, so the corner "fair and cheap" is the
-lower left. A variant that failed stays on the plot.
+lower left. A variant that failed stays on the plot. The rings run's M-l-r2 (a ring per stock heap,
+2026-11-16) is drawn as orange diamonds; its cost is at H = 0, in rings_sweep.py's figure.
 
 Every number is a literal, with the #618 comment it came from. Plain Python, no dependencies; writes
 fifo-tradeoff.svg beside this file (the PNG is converted from it; see the PR).
@@ -17,6 +18,8 @@ E_COMMENT = ISSUE + "6289909490"      # variant E (A, C, E61 in the rounds; E2..
 D_COMMENT = ISSUE + "6258052506"      # variant D3
 B_NOTE = ISSUE + "6252406575"         # B under nesting
 THIS_RUN = "this run (variants M and O, 1.13.4)"
+RINGS_RUN = "the rings run (M-l-r2, 1.13.4, 3 rounds)"
+RINGS_COMMENT = ISSUE + "6930472472"  # the rings run (M-l-r2, M-l-r4; Q1 and the sweep)
 
 # (label, p99 lo, p99 hi, fib_fine/A lo, hi, source, kind[, label dy in px]) per panel. kind: "now" (this run) or
 # "earlier". The earlier rows are the comments' ranges over builds (p99) and over build x layout
@@ -38,6 +41,8 @@ INTERACTIVE = [
     ("M-f, M-l, O-f, O-l", 139, 139, 0.97, 1.02, THIS_RUN, "now", -8),
     # the optional row: every fib_fine task marked (1 round, MARK_ALL=1), M-f 2.25x and M-l 2.28x
     ("M, every fib_fine task marked", 139, 139, 2.25, 2.28, THIS_RUN, "now", 18),
+    # the rings run: M-l with a ring per stock heap, d = 2. p99 151 [151-151]; fib_fine / A 0.99 [0.98-0.99]
+    ("M-l-r2 (rings)", 151, 151, 0.98, 0.99, RINGS_COMMENT, "rings", 32),
 ]
 DEFAULT = [
     # earlier runs: clients on :default at 8,1
@@ -55,13 +60,15 @@ DEFAULT = [
     ("C", 331, 354, 2.39, 2.51, THIS_RUN, "now"),
     ("M-f, M-l", 153, 174, 0.97, 1.02, THIS_RUN, "now", 16),
     ("M-h-l, O-l (one side F)", 126, 126, 0.97, 1.02, THIS_RUN, "now", -8),
+    # the rings run: M-l-r2 142 [142-142] and M-h-l-r2 142 [142-142]; fib_fine / A as above
+    ("M-l-r2, M-h-l-r2 (rings)", 142, 142, 0.98, 0.99, RINGS_COMMENT, "rings", 34),
 ]
 B_TEXT = "B (`<=`, upstream's reverted patch): p99 470-770 ms, fib_fine 283-350x stock, off the scale"
 
 FAIR_MS = 125.0
-W, H = 1180, 640
+W, H = 1180, 656
 BG, INK, INK2, MUTED, GRID = "#fcfcfb", "#0b0b0b", "#52514e", "#8a8984", "#e6e5e1"
-NOW, EARLIER, FAIR = "#2a78d6", "#8a8984", "#2e8b57"
+NOW, EARLIER, FAIR, RINGS = "#2a78d6", "#8a8984", "#2e8b57", "#c0651a"
 X_LO, X_HI = 100.0, 10000.0          # log
 Y_LO, Y_HI = 0.8, 3.0                # log
 X_TICKS = [125, 300, 1000, 3000, 10000]
@@ -89,14 +96,19 @@ def panel(svg, x0, y0, w, h, title, rows):
     for row in rows:
         label, a, b, c, d, src, kind = row[:7]
         dy = row[7] if len(row) > 7 else -6
-        col = NOW if kind == "now" else EARLIER
+        col = {"now": NOW, "rings": RINGS}.get(kind, EARLIER)
         xm, ym = math.sqrt(a * b), math.sqrt(c * d)
         if b > a:
             svg.append(f'<line x1="{px(a):.1f}" y1="{py(ym):.1f}" x2="{px(b):.1f}" y2="{py(ym):.1f}" stroke="{col}" stroke-width="1.5"/>')
         if d > c:
             svg.append(f'<line x1="{px(xm):.1f}" y1="{py(c):.1f}" x2="{px(xm):.1f}" y2="{py(d):.1f}" stroke="{col}" stroke-width="1.5"/>')
-        svg.append(f'<circle cx="{px(xm):.1f}" cy="{py(ym):.1f}" r="{5 if kind == "now" else 4}" fill="{col if kind == "now" else BG}" stroke="{col}" stroke-width="1.5"/>')
-        svg.append(f'<text x="{px(xm) + 8:.1f}" y="{py(ym) + dy:.1f}" font-size="12" fill="{INK if kind == "now" else MUTED}">{html.escape(label)}</text>')
+        if kind == "rings":   # a diamond, so it reads apart from the M/O run's points without color
+            x, y = px(xm), py(ym)
+            svg.append(f'<path d="M {x:.1f} {y - 6:.1f} L {x + 6:.1f} {y:.1f} L {x:.1f} {y + 6:.1f} L {x - 6:.1f} {y:.1f} Z" fill="{col}" stroke="{BG}" stroke-width="1.5"/>')
+            svg.append(f'<line x1="{x:.1f}" y1="{y + 7:.1f}" x2="{x + 6:.1f}" y2="{y + dy - 12:.1f}" stroke="{col}" stroke-width="1"/>')
+        else:
+            svg.append(f'<circle cx="{px(xm):.1f}" cy="{py(ym):.1f}" r="{5 if kind == "now" else 4}" fill="{col if kind == "now" else BG}" stroke="{col}" stroke-width="1.5"/>')
+        svg.append(f'<text x="{px(xm) + 8:.1f}" y="{py(ym) + dy:.1f}" font-size="12" fill="{MUTED if kind == "earlier" else INK}">{html.escape(label)}</text>')
 
 
 def main():
@@ -104,9 +116,11 @@ def main():
            f'<rect width="{W}" height="{H}" fill="{BG}"/>',
            f'<text x="40" y="34" font-size="18" font-weight="700" fill="{INK}">Julia multiqueue order variants: fair to requests, and cheap for fork-join?</text>',
            f'<text x="40" y="56" font-size="12" fill="{INK2}">Starved cell: 500 clients, 2 ms tasks, 8 s, --threads=8,1. fib_fine: nested.jl pfib(42) cut at 12. '
-           f'Filled: {html.escape(THIS_RUN)}; hollow: earlier runs on #618. Whiskers: [min-max].</text>']
-    panel(svg, 110, 120, 460, 380, "Clients on :interactive (where HTTP.jl runs connections)", INTERACTIVE)
-    panel(svg, 680, 120, 460, 380, "Clients on :default", DEFAULT)
+           f'Filled: {html.escape(THIS_RUN)}; hollow: earlier runs on #618. Whiskers: [min-max].</text>',
+           f'<text x="40" y="74" font-size="12" fill="{INK2}">Orange diamonds: {html.escape(RINGS_RUN)}, a ring per stock heap; '
+           f'its cost at H = 0 is in rings-sweep.svg (it does not show on this y axis).</text>']
+    panel(svg, 110, 136, 460, 380, "Clients on :interactive (where HTTP.jl runs connections)", INTERACTIVE)
+    panel(svg, 680, 136, 460, 380, "Clients on :default", DEFAULT)
     svg.append(f'<text x="40" y="{H - 58}" font-size="11" fill="{MUTED}">M and O: x with the marks (or O\'s rule) in the request program; y with nothing in fib_fine marked, '
                f'except the row "every fib_fine task marked".</text>')
     svg.append(f'<text x="40" y="{H - 40}" font-size="11" fill="{MUTED}">One side F: M-h marks only the handlers; O at 8,1 makes only the clients F '

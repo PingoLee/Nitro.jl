@@ -117,6 +117,13 @@
 
 include(joinpath(@__DIR__, "multiq_variant.jl"))
 const VALIDATE = MULTIQ_VALIDATE
+# PROF=<file>: profile the first measured cell (Profile, with the C frames, 1 ms sampling) and write
+# a flat listing by count and a tree to <file>. For one cell per process (CELLS=...); the profiler's
+# own signals perturb the cell, so its row is not a measurement.
+const PROF = get(ENV, "PROF", "")
+if !isempty(PROF)
+    using Profile
+end
 
 const GUARD_TIMER = get(ENV, "GUARD", "1") == "1" ? Timer(typemax(Int32)) : nothing
 
@@ -441,10 +448,31 @@ function measure()
         end
         slots0 = multiq_slot_counts()
         budget0 = multiq_budget_counts()
-        fifo0 = multiq_fifo_counts()
+        fifo0, lock0 = multiq_fifo_counts(), multiq_lock_counts()
         share0, sfifo0 = multiq_share_counts(), share_fifo_pops()
         multiq_watchdog(ceil(Int, d) + 60)
-        recs, wall = run_cell(mode, cl, c, h, d, shape)
+        if isempty(PROF)
+            recs, wall = run_cell(mode, cl, c, h, d, shape)
+        else
+            Profile.init(n = 20_000_000, delay = 0.001)
+            Profile.clear()
+            Profile.start_timer()   # what `@profile` expands to; a macro would need Profile at load
+            recs, wall = try
+                run_cell(mode, cl, c, h, d, shape)
+            finally
+                Profile.stop_timer()
+            end
+            open(PROF, "w") do io
+                println(io, "# PROF: VARIANT=", MULTIQ_VARIANT, ", threads ", labels[3], ", ", mode, "/", cl,
+                        " C=", c, " H=", h, " ", shape, ", D = ", d, " s; julia ", VERSION)
+                ctx = IOContext(io, :displaysize => (100_000, 300))
+                println(io, "\n## flat, C frames, by count\n")
+                Profile.print(ctx; C = true, format = :flat, sortedby = :count, mincount = 50)
+                println(io, "\n## tree, C frames\n")
+                Profile.print(ctx; C = true, format = :tree, mincount = 200, noisefloor = 2.0)
+            end
+            println(stderr, "spawn_order: profile written to ", PROF)
+        end
         multiq_watchdog(0)
         m = metrics(recs, wall)
         println(join((labels..., mode, cl, c, h, m.rps, m.p50, m.p90, m.p99, m.max, m.cmin, m.cp1, m.cmed,
@@ -458,8 +486,9 @@ function measure()
         # 8 workers from `take!`, so there some thread must.
         VALIDATE && multiq_budget_check("$mode/$cl C=$c H=$h", budget0;
                                         everywhere = mode == "spawn" || cl === :default)
-        VALIDATE && multiq_fifo_check("$mode/$cl C=$c H=$h $shape", fifo0;
-                                      f_first = expected_f_first(cl, c, sum(r -> length(r.lat), recs)))
+        fd = VALIDATE ? multiq_fifo_check("$mode/$cl C=$c H=$h $shape", fifo0;
+                                          f_first = expected_f_first(cl, c, sum(r -> length(r.lat), recs))) : nothing
+        VALIDATE && multiq_lock_check("$mode/$cl C=$c H=$h $shape", lock0, fd, sum(r -> length(r.lat), recs))
         VALIDATE && multiq_share_check("$mode/$cl C=$c H=$h $shape", share0, sfifo0)
     end
     VALIDATE && validate_threads()
