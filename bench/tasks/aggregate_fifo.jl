@@ -5,6 +5,7 @@
 #   julia bench/tasks/aggregate_fifo.jl <dir>            # the rounds: <block>-*-r<N>.tsv
 #   julia bench/tasks/aggregate_fifo.jl <dir> pilot      # the pilot, with its gate evaluated
 #   julia bench/tasks/aggregate_fifo.jl <dir> markall    # the marked-fib_fine row
+#   julia bench/tasks/aggregate_fifo.jl <dir> mixed      # the mixed cell (mixed_cell.jl): mixed-r<N>.tsv
 #   julia bench/tasks/aggregate_fifo.jl <dir> validate   # the validation pass's TSVs (not timings)
 
 const SPAWN_COLS = ["julia", "commit", "threads", "guard", "variant", "round", "mode", "clients", "c", "h_ms",
@@ -16,6 +17,11 @@ const NESTED_COLS = ["julia", "commit", "threads", "guard", "variant", "round", 
                      "gc_ms_median", "gc_pct_median", "gc_pauses_median", "gc_full_median",
                      "hwm_mib_max", "peak_queued_median", "peak_live_median", "peak_heaps_median",
                      "peak_queued_max", "counted_wall_median_s", "digest"]
+const MIXED_COLS = ["julia", "commit", "threads", "guard", "variant", "round", "c", "h_ms", "d_s",
+                    "rps", "p50_ms", "p99_ms", "max_ms", "count_min", "count_median", "jain",
+                    "slow1_spawn_to_start_pct", "slow1_end_to_wake_pct",
+                    "fib_alone_median_s", "fib_alone_min_s", "fib_alone_max_s",
+                    "fib_runs", "fib_median_s", "fib_min_s", "fib_max_s", "fib_walls_s"]
 const ORDER = ["pool", "A", "A0", "C", "M-none", "M-f", "M-l", "M-h-f", "M-h-l", "O-f", "O-l"]
 
 med(v) = (s = sort(v); n = length(s); isodd(n) ? s[(n + 1) ÷ 2] : (s[n ÷ 2] + s[n ÷ 2 + 1]) / 2)
@@ -176,6 +182,32 @@ function pilot_gate(spawn, nested)
     println("\n**Gate: ", any_pass ? "PASSES, go on to the rounds" : "FAILS under both serve rules: stop", "**")
 end
 
+# The mixed cell: the requests, and fib_fine's wall per run during the cell against the same
+# process's wall alone (every run of every round pooled for the per-run ratio).
+function mixed_rows(rows)
+    isempty(rows) && return
+    rounds = length(unique(r["round"] for r in rows))
+    println("\n### The mixed cell: the starved cell (clients on :interactive, 8,1, C = 500, H = 2 ms, D = 8 s) ",
+            "with fib_fine looping on :default, ", rounds, " round(s)\n")
+    println("| variant | p99 ms | max ms | slowest client | Jain | req/s | slowest 1%: spawn→start | fib_fine alone s | fib_fine runs in the cell | fib_fine per run s | per run / alone |")
+    println("|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|")
+    for v in byorder(unique(r["variant"] for r in rows))
+        rs = sort(filter(r -> r["variant"] == v, rows); by = r -> r["round"])
+        x(k) = [num(r, k) for r in rs]
+        per = Float64[]; rel = Float64[]
+        for r in rs
+            w = isempty(r["fib_walls_s"]) ? Float64[] : parse.(Float64, split(r["fib_walls_s"], ','))
+            append!(per, w); append!(rel, w ./ num(r, "fib_alone_median_s"))
+        end
+        println("| ", v, " | ", cell(x("p99_ms")), " | ", cell(x("max_ms")), " | ", cell(x("count_min")), " | ",
+                cell(x("jain")), " | ", cell(x("rps")), " | ", cell(x("slow1_spawn_to_start_pct")), "% | ",
+                cell(x("fib_alone_median_s")), " | ", join(Int.(x("fib_runs")), ", "), " | ", cell(per), " | ",
+                cell(round.(rel; digits = 2)), " |")
+    end
+    println("\nPer run, every round: ", join((string(r["variant"], " r", r["round"], ": ", r["fib_walls_s"], " (alone ",
+                                                     r["fib_alone_median_s"], ")") for r in rows), "; "))
+end
+
 function main(dir, what)
     ls = readdir(dir)
     pick(re) = joinpath.(dir, sort(filter(f -> occursin(re, f), ls)))
@@ -184,6 +216,8 @@ function main(dir, what)
         spawn_rows(spawn, "Pilot: the starved cell")
         nested_rows(nested)
         pilot_gate(spawn, nested)
+    elseif what == "mixed"
+        mixed_rows(readtsv(pick(r"^mixed-r\d+\.tsv$"), MIXED_COLS))
     elseif what == "markall"
         nested_rows(readtsv(pick(r"^markall-nested\.tsv$"), NESTED_COLS))
     elseif what == "validate"

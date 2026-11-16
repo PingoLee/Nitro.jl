@@ -20,6 +20,8 @@
 #   markall   optional: fib_fine with every spawn marked (MARK_ALL=1) under M-f and M-l, A beside
 #   pilot     the gate before the rounds: at 8,1 the starved cell with both client pools and
 #             fib_fine, variants A M-none M-f M-l, one block
+#   mixed     mixed_cell.jl: the starved cell (clients on :interactive, 8,1) while fib_fine loops on
+#             :default for the whole D. Variants: A C M-l M-h-l (BLOCKS=mixed ROUNDS=3)
 #
 # Usage: JL=<julia binary> MICRO_PROJECT=<env with BenchmarkTools> bench/tasks/rounds_fifo.sh [rounds]
 #   OUT           results directory (default bench/results/618-fifo)
@@ -61,6 +63,7 @@ FAIR_D_V="A A0 C M-none M-f M-l M-h-f M-h-l O-f O-l"  # :default clients, 8,1 an
 SHAPE_V="A C M-none M-f M-l"
 NEST_V="A A0 C M-none M-f M-l O-f O-l"
 PILOT_V="A M-none M-f M-l"
+MIX_V="A C M-l M-h-l"
 ordered() {   # round, variants...
   local r="$1"; shift
   if [ $((r % 2)) = 0 ]; then printf '%s\n' "$@" | tac | tr '\n' ' '; else echo "$*"; fi
@@ -131,6 +134,16 @@ pilot_block() {   # spawn tsv, nested tsv
     for v in $PILOT_V; do spawn 0 "$tsv" 8,1 "$clients" "$v" "500:2" || return 1; done
   done
   NEST_LAYOUTS=8,1 nesting_block 0 "$ntsv" "$PILOT_V" WORKLOADS=fib_fine
+}
+
+mixed_block() {   # round, tsv
+  local r="$1" tsv="$2" v header
+  for v in $(ordered "$r" $MIX_V); do
+    header=0; [ -s "$tsv" ] && header=1
+    env ROUND="$r" NOHEADER="$header" VARIANT="$v" timeout -s KILL "${TIMEOUT_S:-900}" taskset -c "$CPUS" \
+      "$JL" --threads=8,1 "$HERE/mixed_cell.jl" >>"$tsv" ||
+      { echo "rounds_fifo: mixed_cell VARIANT=$v failed or timed out" >&2; return 1; }
+  done
 }
 
 markall_block() {   # nested tsv
@@ -225,6 +238,11 @@ for r in $(seq 1 "$ROUNDS"); do
         if block "pilot" "$a" "$b" -- "${SELF[@]}" pilot_block "$a" "$b"; then
           mv "$a" "$OUT/pilot-spawn.tsv"; mv "$b" "$OUT/pilot-nested.tsv"; log "pilot done"
         else log "pilot FAILED"; status=1; fi ;;
+      mixed)
+        a="$OUT/attempt-mixed-r$r-$stamp.tsv"
+        if block "mixed-r$r" "$a" -- "${SELF[@]}" mixed_block "$r" "$a"; then
+          mv "$a" "$OUT/mixed-r$r.tsv"; log "round $r mixed done"
+        else log "round $r mixed FAILED"; status=1; fi ;;
       markall)
         a="$OUT/attempt-markall-$stamp.tsv"
         if block "markall" "$a" -- "${SELF[@]}" markall_block "$a"; then
