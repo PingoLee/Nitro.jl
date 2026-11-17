@@ -14,6 +14,9 @@
 #             servers
 #   cell3     /sleep?ms=2 at 8,1, PROBE=1: bare_spawn and bare_pool under $A, bare_marked under
 #             M-l-r2 and M-g-r2 (a handler that waits instead of computing)
+#   cell4     /aggregate at 8,1, PROBE=1, MIX=1: unmarked fib_fine runs loop on :default during each
+#             server's window (bench/tasks/mixed_cell.jl's load, in the server): bare_spawn with no
+#             VARIANT, bare_pool under $A, bare_marked under M-l-r2 and M-g-r2
 #   cell5     the reduced harness, requests in flight (INFLIGHT=1), one round at 8,1: spawn_order.jl
 #             500:2:inner with :interactive clients, and mixed_cell.jl SHAPE=inner, for A, M-l-r2,
 #             M-it-r2 and M-g-r2
@@ -23,7 +26,7 @@
 # no-include process instead, for when the pilot shows the include itself costs something.
 # ROUNDS (default 3) and DUR (default 8s) set the server cells; D (default 8) the harness cells.
 # fairness.sh writes bench/results/fairness-<stamp>.tsv and its raw directory; the harness cells
-# write bench/results/618-mark/<cell>-<variant>.tsv. Each block's stdout goes to
+# write bench/results/618-mark/<cell>-{spawn,mixed}-<variant>.tsv. Each block's stdout goes to
 # bench/results/618-mark/<block>.log.
 #
 # Usage: PATH=<go on it>:$PATH bench/socket/mark_server.sh <block> [layout]
@@ -33,7 +36,7 @@ ROOT="$(cd "$HERE/../.." && pwd)"
 BLOCK="$1"; LAYOUT="${2:-8,1}"
 ROUNDS="${ROUNDS:-3}"; DUR="${DUR:-8s}"; D="${D:-8}"
 A_SUFFIX="@A"; [ "${A:-@A}" = none ] && A_SUFFIX=""
-OUT="$ROOT/bench/results/618-mark"; mkdir -p "$OUT"
+MARK_OUT="$ROOT/bench/results/618-mark"; mkdir -p "$MARK_OUT"   # quiet.sh sets its own OUT
 AGG="/aggregate?n=100000&op=groupby"
 CPUS="0,1,2,3,6,7,8,9"
 
@@ -47,10 +50,10 @@ harness() {   # cell label, shape
   for v in A M-l-r2 M-it-r2 M-g-r2; do
     VARIANT="$v" INFLIGHT=1 D="$D" CELLS="500:2:$shape" MODES=spawn CLIENTS=interactive ROUND=1 \
       timeout -s KILL 900 taskset -c "$CPUS" julia --threads=8,1 "$ROOT/bench/tasks/spawn_order.jl" \
-      > "$OUT/$cell-spawn-$v.tsv" || return 1
+      > "$MARK_OUT/$cell-spawn-$v.tsv" || return 1
     VARIANT="$v" INFLIGHT=1 D="$D" SHAPE="$shape" ROUND=1 \
       timeout -s KILL 900 taskset -c "$CPUS" julia --threads=8,1 "$ROOT/bench/tasks/mixed_cell.jl" \
-      > "$OUT/$cell-mixed-$v.tsv" || return 1
+      > "$MARK_OUT/$cell-mixed-$v.tsv" || return 1
   done
 }
 
@@ -67,9 +70,12 @@ case "$BLOCK" in
   cell3)
     "$HERE/quiet.sh" 618mark-cell3 env PROBE=1 ROUTE="/sleep?ms=2" "$HERE/fairness.sh" \
       "bare_spawn@8,1$A_SUFFIX bare_pool@8,1$A_SUFFIX bare_marked@8,1@M-l-r2 bare_marked@8,1@M-g-r2" "$ROUNDS" "$DUR" ;;
+  cell4)
+    "$HERE/quiet.sh" 618mark-cell4 env MIX=1 PROBE=1 ROUTE="$AGG" "$HERE/fairness.sh" \
+      "bare_spawn@8,1 bare_pool@8,1$A_SUFFIX bare_marked@8,1@M-l-r2 bare_marked@8,1@M-g-r2" "$ROUNDS" "$DUR" ;;
   cell5|cell6)
     shape=inner; [ "$BLOCK" = cell6 ] && shape=inner20
-    export -f harness; export OUT D CPUS ROOT
+    export -f harness; export MARK_OUT D CPUS ROOT
     "$HERE/quiet.sh" "618mark-$BLOCK" bash -c "harness $BLOCK $shape" ;;
   *) echo "mark_server.sh: unknown block $BLOCK" >&2; exit 2 ;;
-esac 2>&1 | tee "$OUT/$BLOCK${2:+-${LAYOUT/,/_}}.log"
+esac 2>&1 | tee "$MARK_OUT/$BLOCK${2:+-${LAYOUT/,/_}}.log"

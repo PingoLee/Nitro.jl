@@ -134,6 +134,11 @@
 #                       queued) with the variant's own checks' verdict.
 #   `/sleep?ms=<m>`     Every bare mode: the handler sleeps m ms (a handler that waits instead of
 #                       computing).
+#   MIX=1               Every bare mode (cell 4): `/mix?on=1` starts unmarked fib_fine runs (fib(42)
+#                       with tasks down to 12, bench/tasks/mixed_cell.jl's) looping on `:default`,
+#                       `/mix?on=0` stops them, waits for the run in progress, and answers the runs
+#                       that ended in between and their walls. A controller task started before
+#                       serving spawns the loop, so it is unmarked even when the `/mix` request is.
 
 const VARIANT_SET = haskey(ENV, "VARIANT")
 const LOAD_ORDER  = get(ENV, "LOAD_ORDER", "variant_first")
@@ -393,6 +398,45 @@ const BARE_SCOPED       = MODE == "bare_scoped"
 const BENCH_SCOPE       = ScopedValue{BenchScope}(BenchScope(0))
 const BENCH_SCOPE_VALUE = BenchScope(1)
 
+# MIX=1 (cell 4, #618): the unmarked background load of bench/tasks/mixed_cell.jl, in the server.
+const MIX = get(ENV, "MIX", "0") == "1"
+mix_sfib(n::Int) = n <= 1 ? n : mix_sfib(n - 1) + mix_sfib(n - 2)
+function mix_pfib(n::Int, cut::Int)
+    n <= max(cut, 1) && return mix_sfib(n)
+    t = Threads.@spawn mix_pfib(n - 2, cut)
+    return mix_pfib(n - 1, cut) + fetch(t)::Int
+end
+const MIX_CTL = Channel{Tuple{Bool,Channel{String}}}(1)
+# Runs in a task the main task spawns before serving: everything it spawns is unmarked.
+function mix_controller()
+    running = Threads.Atomic{Bool}(false)
+    walls = Float64[]
+    loop = nothing
+    for (on, reply) in MIX_CTL
+        if on && loop === nothing
+            running[] = true
+            empty!(walls)
+            loop = Threads.@spawn :default while running[]
+                t0 = time_ns()
+                r = fetch(Threads.@spawn :default mix_pfib(42, 12))::Int
+                push!(walls, (time_ns() - t0) / 1e9)
+                r == 267914296 || error("mix: fib_fine returned $r")
+            end
+            put!(reply, "{\"on\":true}")
+        elseif !on && loop !== nothing
+            running[] = false
+            wait(loop)
+            loop = nothing
+            w = sort(walls)
+            put!(reply, JSON.json(Dict("runs" => length(w), "median_s" => isempty(w) ? NaN : w[cld(length(w), 2)],
+                                       "walls_s" => walls)))
+        else
+            put!(reply, "{\"noop\":true}")
+        end
+    end
+end
+MIX && errormonitor(Threads.@spawn :default mix_controller())
+
 function bare_handler(req::HTTP.Request)::HTTP.Response
     target = req.target
     target == "/plaintext" && return HTTP.Response(200, ["Content-Type" => "text/plain; charset=utf-8"], PLAINTEXT)
@@ -404,6 +448,11 @@ function bare_handler(req::HTTP.Request)::HTTP.Response
     target == "/gc"        && return HTTP.Response(200, ["Content-Type" => "application/json"], gc_body())
     target == "/probe"     && return HTTP.Response(200, ["Content-Type" => "text/tab-separated-values"], probe_body())
     target == "/mq"        && return HTTP.Response(200, ["Content-Type" => "application/json"], mq_body())
+    if MIX && startswith(target, "/mix")
+        reply = Channel{String}(1)
+        put!(MIX_CTL, (occursin("on=1", target), reply))
+        return HTTP.Response(200, ["Content-Type" => "application/json"], take!(reply))
+    end
     if startswith(target, "/sleep")
         ms = tryparse(Float64, something(get(HTTP.URIs.queryparams(HTTP.URIs.URI(target)), "ms", nothing), ""))
         (ms === nothing || !(ms > 0)) && return HTTP.Response(400, "bad ms")

@@ -33,6 +33,10 @@
 # OHA=1 (cell 2, #618): after the client's run, `oha` drives the same route for the same duration
 # and connections, and its throughput is the TSV's oha_rps (otherwise -).
 #
+# MIX=1 (cell 4, #618): the Julia servers start with MIX=1, and each run of a bare mode is
+# bracketed by `/mix?on=1` and `/mix?on=0`, so unmarked fib_fine runs loop on `:default` only during
+# that server's own window; the runs and their walls are kept as `<stem>-mix.json`.
+#
 # Usage: bench/socket/fairness.sh [modes] [rounds] [duration]
 #   ROUTE="/aggregate?n=100000&op=groupby" CONNS=500 bench/socket/fairness.sh "nitro bare_spawn go" 3 8s
 #   PROBE=1 bench/socket/fairness.sh "nitro bare_spawn bare_nospawn bare_pool" 3 8s
@@ -88,7 +92,7 @@ for mode in "${MODE_LIST[@]}"; do
     GOMAXPROCS="$(taskset -c "$SERVER_CPUS" nproc)" PORT="$port" AGG_ROWS="$AGG_ROWS" taskset -c "$SERVER_CPUS" "$GO_BIN" >"$log" 2>&1 &
   else
     variant="$(mode_variant "$mode")"
-    env MODE="$(mode_name "$mode")" PORT="$port" AGG_ROWS="$AGG_ROWS" PROBE="$PROBE" VALIDATE="${VALIDATE:-0}" \
+    env MODE="$(mode_name "$mode")" PORT="$port" AGG_ROWS="$AGG_ROWS" PROBE="$PROBE" VALIDATE="${VALIDATE:-0}" MIX="${MIX:-0}" \
       ${variant:+VARIANT="$variant"} taskset -c "$SERVER_CPUS" \
       "${JULIA_CMD[@]}" --project="$ROOT/bench" --threads="$(mode_threads "$mode")" "$HERE/server.jl" >"$log" 2>&1 &
   fi
@@ -118,8 +122,12 @@ for round in $(seq 1 "$ROUNDS"); do
     [ "$julia_server" = 1 ] && curl -fsS -m 30 -o "$stem-gc0.json" "http://127.0.0.1:${PORT_OF[$mode]}/gc"
     read -r swin0 swout0 < <(swap_counts)
     lo0="$(listen_ovf)"
+    mixing=0
+    [ "${MIX:-0}" = 1 ] && case "$(mode_name "$mode")" in bare_*) mixing=1 ;; esac
+    [ "$mixing" = 1 ] && curl -fsS -m 60 -o /dev/null "http://127.0.0.1:${PORT_OF[$mode]}/mix?on=1"
     GOMAXPROCS="$(taskset -c "$CLIENT_CPUS" nproc)" taskset -c "$CLIENT_CPUS" "$CLIENT" \
       -url "http://127.0.0.1:${PORT_OF[$mode]}$ROUTE" -c "$CONNS" -d "$DUR" ${probe_args[@]+"${probe_args[@]}"} >"$js"
+    [ "$mixing" = 1 ] && curl -fsS -m 600 -o "$stem-mix.json" "http://127.0.0.1:${PORT_OF[$mode]}/mix?on=0"
     # The client has waited for every response, so no request is still in flight.
     [ "$PROBE" = 1 ] && [ "$(mode_name "$mode")" != go ] &&
       curl -fsS -m 60 -o "$stem-server.tsv" "http://127.0.0.1:${PORT_OF[$mode]}/probe"

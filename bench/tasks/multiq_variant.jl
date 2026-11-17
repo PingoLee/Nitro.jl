@@ -140,7 +140,10 @@
 #
 # VALIDATE=1 compiles a per-thread call counter into the new code (under M and O: the pops), and
 # under M and O per-thread classification counts (F and L first enqueues, F re-enqueues, demotions,
-# F and L pops, pinned entries passed over), an order assert after every F pop, single-structure
+# F and L pops, pinned entries passed over, inserts made by a thread outside the pools (`foreign`: in
+# a server, Reseau's poller, adopted after this file loaded, counted in a spare slot), and tasks
+# stock's heaps gave out with a class bit (`stock_bit`: an insert by unpatched code, which
+# `multiq_fifo_check` refuses)), an order assert after every F pop, single-structure
 # asserts and two check_empty probes (`M_NEGATIVE=blind` is the negative control), and under the shares
 # per-thread counts of the time credited to each side (overall and while the heaps had work too), the
 # cap's actions and the F-first choices; under C and D an assert,
