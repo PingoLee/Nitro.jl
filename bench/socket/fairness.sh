@@ -15,7 +15,8 @@
 # its log, its TSV rows and its probe files are its own. Without the third field the server gets
 # no VARIANT at all and never includes the variant file. VALIDATE=1 passes through to every Julia
 # server, and `/mq` (the classification counts) is saved after each of its runs as
-# `<stem>-mq.json`. Rounds are interleaved.
+# `<stem>-mq.json`, with one read just before the run as `<stem>-mq0.json`, so the read after
+# covers the run alone. Rounds are interleaved.
 #
 # PROBE=1 (#618) starts the Julia servers with PROBE=1 and runs the client with `-stamp`, then
 # keeps, per run, the client's per-request trace and the server's `/probe` rows under the raw
@@ -120,6 +121,13 @@ for round in $(seq 1 "$ROUNDS"); do
     [ "$PROBE" = 1 ] && probe_args=(-stamp -trace "$stem-client.tsv")
     julia_server=0; [ "$(mode_name "$mode")" != go ] && julia_server=1
     [ "$julia_server" = 1 ] && curl -fsS -m 30 -o "$stem-gc0.json" "http://127.0.0.1:${PORT_OF[$mode]}/gc"
+    # VALIDATE: a `/mq` just before the window (#618, the `8,0` diagnostic), so the one after it
+    # covers this run alone, not the start-up, the warm-up or the previous rounds.
+    if [ "$julia_server" = 1 ] && [ "${VALIDATE:-0}" = 1 ]; then
+      case "$(mode_name "$mode")" in bare_*)
+        curl -fsS -m 60 -o "$stem-mq0.json" "http://127.0.0.1:${PORT_OF[$mode]}/mq" ;;
+      esac
+    fi
     read -r swin0 swout0 < <(swap_counts)
     lo0="$(listen_ovf)"
     mixing=0

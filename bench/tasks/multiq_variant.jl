@@ -115,6 +115,11 @@
 #         line); when both have work, M-t's time share decides, with the time of an R task credited to
 #         the request side and a weight w for it (g: 1/2, g25: 1/4, g75: 3/4; g0: the balance never
 #         moves, so L first, the negative control). The interval cap stays 10 ms.
+#       M-gc-r<d> (#618, the `8,0` diagnostic): -g at w = 1/2 with honest accounts. -g reads the clock
+#         only at a two-sided pop and credits the whole interval since the previous one to the side
+#         of the last pop, which in a server is often a short one-sided L pop that followed a request
+#         task's run. -gc reads the clock at every pop and credits each interval to the side of the
+#         task that ran in it, when that task was popped while both sides had work.
 #     M-a<T>-r<d>: the rings with an age rule instead of a share: the heaps first unless the older
 #       of the d sampled ring heads has waited more than T ms (the sweep cut first).
 #
@@ -159,12 +164,12 @@
 const MULTIQ_VARIANT = get(ENV, "VARIANT", "A")
 const _D_MATCH = match(r"^D([0-9]+|-inf)$", MULTIQ_VARIANT)
 const _E_MATCH = match(r"^E([0-9]+|-inf)$", MULTIQ_VARIANT)
-const _F_MATCH = match(r"^(M|M-h|O)-(f|l|t|t0|p[0-9]+|il|it|g|g0|g25|g75|a[0-9]+)(?:-r([0-9]+)(o?))?$|^M-none$",
+const _F_MATCH = match(r"^(M|M-h|O)-(f|l|t|t0|p[0-9]+|il|it|g|g0|g25|g75|gc|a[0-9]+)(?:-r([0-9]+)(o?))?$|^M-none$",
                        MULTIQ_VARIANT)
 MULTIQ_VARIANT in ("A", "A0", "B", "C") || _D_MATCH !== nothing || _E_MATCH !== nothing || _F_MATCH !== nothing ||
     error("VARIANT must be A, A0, B, C, D<K>, D-inf, E<K>, E-inf, M-f, M-l, M-t, M-t0, M-p<K>, M-h-f, M-h-l, ",
           "M-h-t, M-none, M-l-r<d>[o], M-h-l-r<d>, M-t-r<d>, M-t0-r<d>, M-il-r<d>, M-it-r<d>, M-g-r<d>, ",
-          "M-g25-r<d>, M-g75-r<d>, M-g0-r<d>, M-h-g-r<d>, M-a<T>-r<d>, O-f or O-l, not $(MULTIQ_VARIANT)")
+          "M-g25-r<d>, M-g75-r<d>, M-g0-r<d>, M-gc-r<d>, M-h-g-r<d>, M-a<T>-r<d>, O-f or O-l, not $(MULTIQ_VARIANT)")
 _F_MATCH === nothing || _F_MATCH[2] === nothing || _F_MATCH[2] in ("f", "l") || _F_MATCH[1] != "O" ||
     error("the shares (-t, -t0, -p<K>) are built for M and M-h, not O")
 # D's slot budget, or nothing for every other variant.
@@ -184,8 +189,14 @@ const FIFO_CLASS = !MULTIQ_FIFO ? :none : startswith(MULTIQ_VARIANT, "O") ? :ori
 const _F_RULE = !MULTIQ_FIFO || MULTIQ_VARIANT == "M-none" ? "" : String(_F_MATCH[2])
 const FIFO_SERVE = !MULTIQ_FIFO ? :none : MULTIQ_VARIANT == "M-none" ? :f :
                    startswith(_F_RULE, "p") ? :p : startswith(_F_RULE, "a") ? :a :
-                   _F_RULE == "il" ? :l : _F_RULE == "it" ? :t : _F_RULE in ("g", "g25", "g75") ? :g :
+                   _F_RULE == "il" ? :l : _F_RULE == "it" ? :t : _F_RULE in ("g", "g25", "g75", "gc") ? :g :
                    Symbol(_F_RULE)
+# -gc (#618, the `8,0` diagnostic): -g with the clock read at every pop, each interval credited to
+# the side of the task that ran in it, and only when that task was popped while both sides had work.
+# -g reads the clock only at a two-sided pop and credits the whole interval since the previous one
+# to the side of the LAST pop, so a request task's run followed by a short one-sided L pop is
+# charged to L (measured: the request side credited 0.4% of the time it ran 100% of, at `8,0`).
+const GROUP_CLOCK = _F_RULE == "gc"
 # The classes (agent-config #82 Idea 5): who a descendant becomes. `:i` F (into the rings), `:g` R
 # (into the R heaps); `:none` no inheritance (every variant before them).
 const FIFO_INHERIT = _F_RULE in ("il", "it") ? :i : FIFO_SERVE in (:g, :g0) ? :g : :none
@@ -1219,42 +1230,122 @@ if MULTIQ_FIFO
     # subtract d * W, and the request side goes first while the balance is negative; g0 never moves
     # it. The request side is the R heaps, then the rings: started work before a new root.
     _GROUP_CAP = FIFO_GROUP ? 2 * SHARE_CAP : 0
+    # VALIDATE only (#618, the `8,0` diagnostic): after a stock pop that came back empty, re-probe
+    # stock's heaps; non-empty means the two-choice sample missed a queued task (or another thread
+    # took it in between: the count is an upper bound on the misses).
+    _G_LMISS = MULTIQ_VALIDATE ? :(task === nothing && !stock_multiq_check_empty() && (lmiss = true)) : nothing
+    # VALIDATE only: the pop's shape, the misses, the time actually run on each side (a clock read
+    # at EVERY -g pop, credited to the side of the task the previous pop returned, and separately
+    # when that pop had found both sides with work), and the queues' depth every 64th pop.
+    _G_COUNT = !MULTIQ_VALIDATE ? nothing : quote
+        let two = lw && (rr || rf)
+            if two
+                g.two += 1
+            elseif rr || rf
+                g.one_r += 1
+            elseif lw
+                g.one_l += 1
+            else
+                g.none += 1
+            end
+            if lmiss
+                g.l_miss += 1
+                if task === nothing
+                    g.l_miss_none += 1
+                elseif side == 1
+                    g.l_miss_r += 1
+                end
+            end
+            vnow = s_stamp()
+            if g.vlast != 0
+                dd = vnow > g.vstamp ? Int(vnow - g.vstamp) : 0
+                if g.vlast == 1
+                    g.run_r += dd
+                    g.vtwo != 0 && (g.run_r2 += dd)
+                else
+                    g.run_l += dd
+                    g.vtwo != 0 && (g.run_l2 += dd)
+                end
+            end
+            g.vstamp = vnow
+            g.vlast = task === nothing ? 0 : side
+            g.vtwo = two ? 1 : 0
+            g.k += 1
+            if g.k & 63 == 0
+                g.nsamp += 1
+                dl = 0
+                for h in heaps[f_tpid + 1]
+                    dl += Int(@atomic :monotonic h.ntasks)
+                end
+                dq = f_queued()
+                dh = r_queued()
+                g.dl_sum += dl; dl > g.dl_peak && (g.dl_peak = dl)
+                g.dq_sum += dq; dq > g.dq_peak && (g.dq_peak = dq)
+                g.dh_sum += dh; dh > g.dh_peak && (g.dh_peak = dh)
+            end
+        end
+    end
+    # -g's credit of an interval `d` (cycles) to `s.last`'s side: the balance (g, g25, g75, gc; g0
+    # never moves it) and, under VALIDATE, the time credited while both sides had work.
+    _G_CREDIT = quote
+        $(FIFO_SERVE === :g ? quote
+            b = s.last == 1 ? s.bal + d * $(4 - GROUP_W4) : s.bal - d * $(GROUP_W4)
+            if b > $(_GROUP_CAP)
+                b = $(_GROUP_CAP)
+                $(_scount(:caps))
+            elseif b < $(-_GROUP_CAP)
+                b = $(-_GROUP_CAP)
+                $(_scount(:caps))
+            end
+            s.bal = b
+        end : nothing)
+        $(MULTIQ_VALIDATE ? quote
+            if s.last == 1
+                s.f_cyc += d
+                s.both_f += d
+            else
+                s.l_cyc += d
+                s.both_l += d
+            end
+        end : nothing)
+    end
     _GROUP_POP = !FIFO_GROUP ? nothing : quote
         s = sstates[tid]
+        $(MULTIQ_VALIDATE ? :(g = gstates[tid]; lmiss = false) : nothing)
         nt = Int(Threads._nthreads_in_pool(tpid))
         lw = !stock_multiq_check_empty()
         rr = !r_multiq_check_empty()
         rf = r_any()
         side = 0
-        if lw && (rr || rf)
+        $(GROUP_CLOCK ? quote
+            # -gc: the clock at every pop. The interval since this thread's previous pop is the run
+            # of the task that pop returned (`s.last`'s side); it is credited only when that pop
+            # found both sides with work (`s.k`), so a task run while the other side was empty is
+            # not charged against it. The credit itself is -g's.
             now = s_stamp()
-            if s.last != 0
+            if s.last != 0 && s.k != 0
                 d = now > s.stamp ? Int(now - s.stamp) : 0
                 if d > $(SHARE_CAP)
                     d = $(SHARE_CAP)
                     $(_scount(:clips))
                 end
-                $(FIFO_SERVE === :g ? quote
-                    b = s.last == 1 ? s.bal + d * $(4 - GROUP_W4) : s.bal - d * $(GROUP_W4)
-                    if b > $(_GROUP_CAP)
-                        b = $(_GROUP_CAP)
-                        $(_scount(:caps))
-                    elseif b < $(-_GROUP_CAP)
-                        b = $(-_GROUP_CAP)
-                        $(_scount(:caps))
-                    end
-                    s.bal = b
-                end : nothing)
-                $(MULTIQ_VALIDATE ? quote
-                    if s.last == 1
-                        s.f_cyc += d
-                        s.both_f += d
-                    else
-                        s.l_cyc += d
-                        s.both_l += d
-                    end
-                end : nothing)
+                $_G_CREDIT
             end
+            s.stamp = now
+            s.k = lw && (rr || rf) ? 1 : 0
+        end : nothing)
+        if lw && (rr || rf)
+            $(GROUP_CLOCK ? nothing : quote
+                now = s_stamp()
+                if s.last != 0
+                    d = now > s.stamp ? Int(now - s.stamp) : 0
+                    if d > $(SHARE_CAP)
+                        d = $(SHARE_CAP)
+                        $(_scount(:clips))
+                    end
+                    $_G_CREDIT
+                end
+            end)
             rfirst = s.bal < 0
             if rfirst
                 task = g_req_pop(rr, rf, tid, nt)
@@ -1262,10 +1353,12 @@ if MULTIQ_FIFO
                 if task === nothing
                     task = stock_multiq_deletemin()
                     side = 2
+                    $_G_LMISS
                 end
             else
                 task = stock_multiq_deletemin()
                 side = 2
+                $_G_LMISS
                 if task === nothing
                     task = g_req_pop(true, true, tid, nt)
                     side = 1
@@ -1275,21 +1368,24 @@ if MULTIQ_FIFO
                 s.acct += 1
                 rfirst && (s.f_choice += 1)
             end : nothing)
-            s.stamp = now
+            $(GROUP_CLOCK ? nothing : :(s.stamp = now))
         elseif rr || rf
             task = g_req_pop(rr, rf, tid, nt)
             side = 1
             if task === nothing
                 task = stock_multiq_deletemin()
                 side = 2
+                $_G_LMISS
             end
         elseif lw
             task = stock_multiq_deletemin()
             side = 2
+            $_G_LMISS
         else
             task = nothing
         end
         $(MULTIQ_VALIDATE ? :(side == 2 && task !== nothing && $(_fcount(:l_pops))) : nothing)
+        $_G_COUNT
         s.last = task === nothing ? 0 : side
     end
     # M-a<T>: the heaps first unless the older of the d sampled ring heads has waited past T ms.
@@ -1414,6 +1510,38 @@ if MULTIQ_FIFO
             sstate() = new(0, zero(UInt64), 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ntuple(_ -> 0, 4))
         end
         const sstates = [sstate() for _ in 1:Threads.maxthreadid()]
+
+        # -g, VALIDATE only (#618, the `8,0` diagnostic), per thread, 256 bytes: what -g's pop saw
+        # and where the time went, independent of the share's own accounts (which read the clock
+        # only at a pop that finds both sides with work).
+        mutable struct gstate
+            two::Int        # pops that found both sides with work (L heaps and R heaps or rings)
+            one_r::Int      # pops that found only the request side with work
+            one_l::Int      # pops that found only L with work
+            none::Int       # pops that found nothing
+            l_miss::Int     # stock pops that came back empty while the re-probe saw a task in L's heaps
+            l_miss_r::Int   #   of those, the pop then returned a request-side task
+            l_miss_none::Int #  of those, the pop returned nothing
+            vstamp::UInt64  # the cycle counter at this thread's last -g pop
+            vlast::Int      # the side of the task that pop returned: 0 none, 1 request, 2 L
+            vtwo::Int       # 1 when that pop found both sides with work
+            run_r::Int      # cycles from a pop that returned a request-side task to the next pop
+            run_l::Int      # the same for an L task
+            run_r2::Int     # the same two, only for intervals starting at a two-sided pop
+            run_l2::Int
+            k::Int          # pops seen (the depth sampler's stride)
+            nsamp::Int      # depth samples taken
+            dl_sum::Int     # L heaps' depth (tasks in stock's `:default` heaps), sum and peak
+            dl_peak::Int
+            dq_sum::Int     # the rings' depth
+            dq_peak::Int
+            dh_sum::Int     # the R heaps' depth
+            dh_peak::Int
+            pad::NTuple{10,Int}
+            gstate() = new(0, 0, 0, 0, 0, 0, 0, zero(UInt64), 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                           ntuple(_ -> 0, 10))
+        end
+        const gstates = [gstate() for _ in 1:Threads.maxthreadid()]
 
         @noinline function f_fail(msg::String)
             ccall(:jl_safe_printf, Cvoid, (Cstring, Cstring), "%s\n", msg)
@@ -2602,6 +2730,25 @@ function multiq_share_check(label, before, fbefore; half::Bool = false)
                           join(bad, "; "))
     return nothing
 end
+# -g, VALIDATE only (#618, the `8,0` diagnostic): per `:default` thread, the gstate counts, the
+# share's accounts (`_S_FIELDS`) and the pops by structure (R heaps, rings, L heaps), as one flat
+# NamedTuple per thread; the caller differences two calls.
+const _G_FIELDS = (:two, :one_r, :one_l, :none, :l_miss, :l_miss_r, :l_miss_none, :run_r, :run_l,
+                   :run_r2, :run_l2, :nsamp, :dl_sum, :dl_peak, :dq_sum, :dq_peak, :dh_sum, :dh_peak)
+const _G_POPS = (:r_pops, :f_pops, :l_pops)
+function multiq_group_counts()
+    FIFO_GROUP && MULTIQ_VALIDATE || return nothing
+    P = PARTR
+    keys = (_G_FIELDS..., _S_FIELDS..., _G_POPS...)
+    return Dict(tid => NamedTuple{keys}((Tuple(getfield(P.gstates[tid], k) for k in _G_FIELDS)...,
+                                         Tuple(getfield(P.sstates[tid], k) for k in _S_FIELDS)...,
+                                         Tuple(getfield(P.fstates[tid], k) for k in _G_POPS)...))
+                for tid in Threads.threadpooltids(:default))
+end
+# The peaks are not differenced (a running maximum); reset them after a read.
+multiq_group_reset_peaks!() = FIFO_GROUP && MULTIQ_VALIDATE &&
+    foreach(g -> (g.dl_peak = 0; g.dq_peak = 0; g.dh_peak = 0), PARTR.gstates)
+
 share_fifo_pops() = !(FIFO_ACCOUNTS && MULTIQ_VALIDATE) ? nothing : Dict(tid => (PARTR.fstates[tid].f_pops + PARTR.fstates[tid].r_pops, PARTR.fstates[tid].l_pops)
                          for tid in Threads.threadpooltids(:default))
 

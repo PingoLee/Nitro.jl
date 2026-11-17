@@ -73,6 +73,30 @@ case "$BLOCK" in
   cell4)
     "$HERE/quiet.sh" 618mark-cell4 env MIX=1 PROBE=1 ROUTE="$AGG" "$HERE/fairness.sh" \
       "bare_spawn@8,1 bare_pool@8,1$A_SUFFIX bare_marked@8,1@M-l-r2 bare_marked@8,1@M-g-r2" "$ROUNDS" "$DUR" ;;
+  # The `8,0` diagnostic (#618, agent-config #82 Idea 7). diag80: cell 1 at 8,0, A and bare_marked
+  # under M-l-r2, M-g0-r2 (the accounts off: L always first), M-g25-r2, M-g-r2 and M-g75-r2.
+  # diag80v: one VALIDATE round of each -g variant (group_report.jl <raw dir> reads its /mq files).
+  diag80)
+    "$HERE/quiet.sh" 618diag-80 env PROBE=1 ROUTE="$AGG" "$HERE/fairness.sh" \
+      "bare_spawn@8,0 bare_marked@8,0@M-l-r2 bare_marked@8,0@M-g0-r2 bare_marked@8,0@M-g25-r2 bare_marked@8,0@M-g-r2 bare_marked@8,0@M-g75-r2" "$ROUNDS" "$DUR" ;;
+  diag80v)
+    "$HERE/quiet.sh" 618diag-80v env VALIDATE=1 PROBE=1 ROUTE="$AGG" "$HERE/fairness.sh" \
+      "bare_marked@8,0@M-g0-r2 bare_marked@8,0@M-g25-r2 bare_marked@8,0@M-g-r2 bare_marked@8,0@M-g75-r2" 1 "$DUR" ;;
+  # The listener's mark: A, bare_marked and bare_marked_listen under M-g-r2, and bare_marked under M-gc-r2. listen: cell 1 at the
+  # layout; listen4: cell 4 (MIX=1) at 8,0; listen2: cell 2 (/plaintext) at 8,0; listenv: one
+  # VALIDATE round of bare_marked_listen (and bare_marked beside it) at the layout.
+  listen)
+    "$HERE/quiet.sh" "618listen-cell1-${LAYOUT/,/_}" env PROBE=1 ROUTE="$AGG" "$HERE/fairness.sh" \
+      "bare_spawn@$LAYOUT bare_marked@$LAYOUT@M-g-r2 bare_marked_listen@$LAYOUT@M-g-r2 bare_marked@$LAYOUT@M-gc-r2" "$ROUNDS" "$DUR" ;;
+  listen4)
+    "$HERE/quiet.sh" 618listen-cell4-8_0 env MIX=1 PROBE=1 ROUTE="$AGG" "$HERE/fairness.sh" \
+      "bare_spawn@8,0 bare_marked@8,0@M-g-r2 bare_marked_listen@8,0@M-g-r2 bare_marked@8,0@M-gc-r2" "$ROUNDS" "$DUR" ;;
+  listen2)
+    "$HERE/quiet.sh" 618listen-cell2-8_0 env OHA=1 PROBE=0 ROUTE="/plaintext" "$HERE/fairness.sh" \
+      "bare_spawn@8,0 bare_marked@8,0@M-g-r2 bare_marked_listen@8,0@M-g-r2 bare_marked@8,0@M-gc-r2" "$ROUNDS" "$DUR" ;;
+  listenv)
+    "$HERE/quiet.sh" "618listen-v-${LAYOUT/,/_}" env VALIDATE=1 PROBE=1 ROUTE="$AGG" "$HERE/fairness.sh" \
+      "bare_marked@$LAYOUT@M-g-r2 bare_marked_listen@$LAYOUT@M-g-r2 bare_marked@$LAYOUT@M-gc-r2" 1 "$DUR" ;;
   cell5|cell6)
     shape=inner; [ "$BLOCK" = cell6 ] && shape=inner20
     export -f harness; export MARK_OUT D CPUS ROOT

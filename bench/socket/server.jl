@@ -127,11 +127,19 @@
 #                       the request task is marked (class F) and nothing else is, not the connection
 #                       tasks, not anything HTTP.jl creates. Under a VARIANT that marks no handler
 #                       (A, M-none, C, unset) it starts `bare_spawn`'s own code.
+#   MODE=bare_marked_listen  `bare_marked` with `HTTP.listen!` called from a marked task (#618, the
+#                       `8,0` diagnostic): at `N,0` the accept loop and every connection task are
+#                       then descendants of a marked task (class R under -g); at `N,1` they are
+#                       interactive-pool tasks, which are never classed, so it is `bare_marked`.
+#                       Under VALIDATE `/mq` reports the descendants (`desc`) instead of asserting 0.
 #   VALIDATE=1          With VARIANT: the variant's asserts and probes run before serving, and
 #                       `/mq` answers the classification counts since its previous call (marked
 #                       spawns, how many carried the probe's `X-Conn`, the F and R counts, inserts by
 #                       a thread outside the pools (Reseau's poller), class bits seen in stock's heaps, what is left
-#                       queued) with the variant's own checks' verdict.
+#                       queued) with the variant's own checks' verdict. Under a -g variant also
+#                       `group_per_tid`: per `:default` thread, what -g's pop saw (two-sided and
+#                       one-sided pops, missed L pops), the time run on each side against the
+#                       share's credited time, pops by structure, and the queues' sampled depth.
 #   `/sleep?ms=<m>`     Every bare mode: the handler sleeps m ms (a handler that waits instead of
 #                       computing).
 #   MIX=1               Every bare mode (cell 4): `/mix?on=1` starts unmarked fib_fine runs (fib(42)
@@ -514,6 +522,11 @@ const MQ_MARKED  = Threads.Atomic{Int}(0)
 const MQ_STAMPED = Threads.Atomic{Int}(0)
 const MQ_LAST    = Ref((marked = 0, stamped = 0))
 const MQ_BEFORE  = Ref{Any}(nothing)
+# bare_marked_listen: the listener's marked task is one more root, counted by the first `/mq`.
+const LISTEN_MARKED   = MODE == "bare_marked_listen" && MARK_REQ
+const MQ_LISTEN_ROOTS = Ref(LISTEN_MARKED ? 1 : 0)
+# -g under VALIDATE: the per-thread counts at the previous `/mq` (`multiq_group_counts`).
+const MQ_GBEFORE = Ref{Any}(nothing)
 
 # `/mq`: the counts since the previous `/mq`, and the variant's own verdict on them. Called once
 # the client has every response, so nothing but this request is in flight: the request is marked
@@ -553,8 +566,30 @@ function mq_body()::String
     d["overflow_tids"] = Int(Threads.maxthreadid()) - P.f_nslots
     d["variant"] = MULTIQ_VARIANT
     d["load_order"] = LOAD_ORDER
+    d["mode"] = MODE
+    roots = MQ_LISTEN_ROOTS[]
+    MQ_LISTEN_ROOTS[] = 0
+    d["listen_roots"] = roots
+    # -g under VALIDATE (#618, the `8,0` diagnostic): per `:default` thread, the counts since the
+    # previous `/mq` (peaks: since then, not differenced), with the clock's cycles per ms and the
+    # weight, so the reader converts cycles and reads the share against w = GROUP_W4/4.
+    if FIFO_GROUP
+        gnow = multiq_group_counts()
+        gb = MQ_GBEFORE[]
+        MQ_GBEFORE[] = gnow
+        peaks = (:dl_peak, :dq_peak, :dh_peak)
+        d["group_per_tid"] = Dict(string(tid) => Dict(string(k) => (k in peaks || gb === nothing) ? getfield(v, k) :
+                                                      getfield(v, k) - getfield(gb[tid], k) for k in keys(v))
+                                  for (tid, v) in gnow)
+        multiq_group_reset_peaks!()
+        d["cycles_per_ms"] = SHARE_CYCLES_PER_MS
+        d["group_w4"] = GROUP_W4
+    end
     verdict = try
-        multiq_fifo_check("server /mq", before; f_first = MARK_REQ ? d["marked_spawns"] : 0, desc = 0)
+        # bare_marked_listen: the descendants (the accept loop, one per connection, whatever else
+        # `listen!` spawns) are reported in `desc`, not asserted; the listener is one more root.
+        multiq_fifo_check("server /mq", before; f_first = MARK_REQ ? d["marked_spawns"] + roots : 0,
+                          desc = LISTEN_MARKED ? nothing : 0)
         multiq_variant_check()
         "ok"
     catch e
@@ -588,6 +623,13 @@ function start_bare_marked()
             end, :default))
         end
     end
+    # MODE=bare_marked_listen (#618, the `8,0` diagnostic): `listen!` is called from a marked task,
+    # so by the class rule the accept loop and every connection task HTTP.jl spawns from it are
+    # descendants (class R under -g) whenever they land on `:default` (at `N,0`: HTTP.jl spawns
+    # them with `Threads.@spawn :interactive`, which falls back to `:default` with no interactive
+    # thread). At `N,1` they are interactive-pool tasks, which the rule never classes, so this mode
+    # is `bare_marked` there. Each request task keeps its own mark and stays a root.
+    LISTEN_MARKED && return fetch(spawn_marked(() -> HTTP.listen!(handler, "127.0.0.1", PORT), :default))
     return HTTP.listen!(handler, "127.0.0.1", PORT)
 end
 
@@ -983,15 +1025,16 @@ end
 if VARIANT_SET && MULTIQ_VALIDATE
     multiq_unit_asserts()
     MQ_VALIDATE && (MQ_BEFORE[] = multiq_fifo_counts())
+    MQ_VALIDATE && FIFO_GROUP && (MQ_GBEFORE[] = multiq_group_counts(); multiq_group_reset_peaks!())
 end
 
 handle = NITRO_MODE ? start_nitro() :
          MODE in ("bare_spawn", "bare_scoped") ? start_bare(true) :
-         MODE == "bare_marked" ? (MARK_REQ ? start_bare_marked() : start_bare(true)) :
+         MODE in ("bare_marked", "bare_marked_listen") ? (MARK_REQ ? start_bare_marked() : start_bare(true)) :
          MODE == "bare_timeouts" ? start_bare(true; timeouts = true) :
          MODE == "bare_nospawn" ? start_bare(false) :
          MODE == "bare_pool"    ? start_bare_pool() :
-         error("unknown MODE=$(MODE): expected nitro, nitro_log, nitro_notimeouts, bare_spawn, bare_marked, bare_scoped, bare_timeouts, bare_nospawn or bare_pool")
+         error("unknown MODE=$(MODE): expected nitro, nitro_log, nitro_notimeouts, bare_spawn, bare_marked, bare_marked_listen, bare_scoped, bare_timeouts, bare_nospawn or bare_pool")
 
 @info "bench: serving" MODE PORT threads = Threads.nthreads() interactive = Threads.nthreads(:interactive) variant = get(ENV, "VARIANT", "") marked = MARK_REQ load_order = LOAD_ORDER
 PROFILE_S > 0 && Threads.@spawn profile_window()
