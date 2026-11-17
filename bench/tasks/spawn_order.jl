@@ -107,7 +107,8 @@
 # from a thread of another pool (here: handlers spawned by `:interactive` clients, and at `8,1`
 # the `:default` clients, which the main task spawns from `:interactive`). An unmarked task is
 # spawned with the plain `Threads.@spawn` under every variant, so M-none runs A's harness code.
-# These variants run the `spawn` mode only (`pool` stays the reference, under A).
+# These variants run the `spawn` mode only (`pool` stays the reference, under A); under M the pool
+# modes also run, with nothing marked, which measures what the variant's code costs a worker pool.
 # VALIDATE=1 is the instrumented check to run before timing a variant: single-heap order asserts,
 # every handler accounted for, the new code reached on every `:default` thread, and how far each
 # handler's start ran behind its spawn, counted in handlers (its start ordinal minus its spawn
@@ -360,7 +361,10 @@ function run_cell(mode::String, clients::Symbol, c::Int, h::Float64, d::Float64,
     shape in ("plain", "hetero", "inner", "io", "inner20") || error("unknown shape $shape")
     hetero, inner = shape == "hetero", shape in ("inner", "inner20")
     mode == "priority" && MULTIQ_VARIANT != "A" && error("the priority mode runs on the build's own heap only (VARIANT=A)")
-    MULTIQ_FIFO && mode != "spawn" && error("VARIANT=$(MULTIQ_VARIANT) runs the spawn mode only")
+    # Under M the pool modes run unmarked (nothing in them is spawned with `spawn_marked`): what the
+    # variant's code costs a worker pool that does not use the mark (#618, the stall repro's part 2).
+    MULTIQ_FIFO && mode != "spawn" && !(FIFO_CLASS === :mark && startswith(mode, "pool")) &&
+        error("VARIANT=$(MULTIQ_VARIANT) runs the spawn mode only (under M, also pool, unmarked)")
     slots = [Slot() for _ in 1:c]
     foreach(sl -> (sl.io = shape == "io"; sl.sem = shape == "inner20"), slots)
     recs = [Rec() for _ in 1:c]
@@ -530,8 +534,8 @@ function measure()
         VALIDATE && multiq_budget_check("$mode/$cl C=$c H=$h", budget0;
                                         everywhere = mode == "spawn" || cl === :default)
         fd = VALIDATE ? multiq_fifo_check("$mode/$cl C=$c H=$h $shape", fifo0;
-                                          f_first = expected_f_first(cl, c, sum(r -> length(r.lat), recs)),
-                                          desc = expected_desc(shape, sum(r -> length(r.lat), recs))) : nothing
+                                          f_first = startswith(mode, "pool") ? 0 : expected_f_first(cl, c, sum(r -> length(r.lat), recs)),
+                                          desc = startswith(mode, "pool") ? 0 : expected_desc(shape, sum(r -> length(r.lat), recs))) : nothing
         VALIDATE && multiq_lock_check("$mode/$cl C=$c H=$h $shape", lock0, fd, sum(r -> length(r.lat), recs))
         VALIDATE && multiq_share_check("$mode/$cl C=$c H=$h $shape", share0, sfifo0)
     end
