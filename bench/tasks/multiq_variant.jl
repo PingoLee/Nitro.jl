@@ -91,7 +91,32 @@
 #       four samples, then one pass over every ring from a random one. A pool flag, set once at
 #       the first marked insert and never cleared, is all an unmarked program reads; check_empty
 #       reads every ring once it is set. No shared write per operation: no pool counter, no
-#       sequence (the stamps are the clock's).
+#       sequence (the stamps are the clock's). M-l-r<d>o inserts into one of the inserting thread's
+#       own two rings instead (a random one from a thread of another pool).
+#     M-t-r<d>, M-t0-r<d>: M-t's share moved onto the rings, nothing else changed (the share acts
+#       when some ring is non-empty, with the flag set). The controls of the classes run.
+#     The classes (2026-11-16, agent-config #82 Idea 5): a request's children count as the
+#       request's. Three classes in `Task.priority`: F (bit 15, a marked root not yet admitted), R
+#       (bit 14, request work in flight) and L (no bit: stock). A task gets its class once, at its
+#       first enqueue, from the task that enqueues it: one with no mark of its own whose first
+#       enqueue is made by a task of class F or R is a descendant (read from the enqueuer's own
+#       field, written to the new task's own field; with the flag unset nothing is read). A mark put
+#       on a spawn is always a new root. A wake-up never moves a task between L and the request side.
+#       All on the rings (d = 2):
+#       M-il-r<d>, M-it-r<d> (-i, inherit into the queue): a descendant is F and goes to the rings, a
+#         woken marked task goes back to the rings; serve rules M-l's and M-t's.
+#       M-g-r<d>, M-g25-r<d>, M-g75-r<d>, M-g0-r<d>, M-h-g-r<d> (-g, groups): a descendant is R, and a
+#         marked task that has started is R from then on, so the rings hold only roots that never ran.
+#         R tasks go to a second set of stock heaps (`r_heaps`: the build's own insert, two-choice pop,
+#         sticky retry and sifts, parsed from its partr.jl and renamed), with the class bits stripped
+#         before the priority reaches a heap and R written back on the popped task. The request side
+#         is the R heaps, then the rings. With the flag set a pop probes the three structures; when
+#         only one side has work it pops that side and reads no clock (it records the side on its own
+#         line); when both have work, M-t's time share decides, with the time of an R task credited to
+#         the request side and a weight w for it (g: 1/2, g25: 1/4, g75: 3/4; g0: the balance never
+#         moves, so L first, the negative control). The interval cap stays 10 ms.
+#     M-a<T>-r<d>: the rings with an age rule instead of a share: the heaps first unless the older
+#       of the d sampled ring heads has waited more than T ms (the sweep cut first).
 #
 # A0 and B are taken from the build's own `base/partr.jl` as parsed at load time, so they cannot
 # drift from it. C and E are hand copies, so they refuse to load on a build whose `partr.jl` they
@@ -131,10 +156,12 @@
 const MULTIQ_VARIANT = get(ENV, "VARIANT", "A")
 const _D_MATCH = match(r"^D([0-9]+|-inf)$", MULTIQ_VARIANT)
 const _E_MATCH = match(r"^E([0-9]+|-inf)$", MULTIQ_VARIANT)
-const _F_MATCH = match(r"^(M|M-h|O)-(f|l|t|t0|p[0-9]+)(?:-r([0-9]+))?$|^M-none$", MULTIQ_VARIANT)
+const _F_MATCH = match(r"^(M|M-h|O)-(f|l|t|t0|p[0-9]+|il|it|g|g0|g25|g75|a[0-9]+)(?:-r([0-9]+)(o?))?$|^M-none$",
+                       MULTIQ_VARIANT)
 MULTIQ_VARIANT in ("A", "A0", "B", "C") || _D_MATCH !== nothing || _E_MATCH !== nothing || _F_MATCH !== nothing ||
     error("VARIANT must be A, A0, B, C, D<K>, D-inf, E<K>, E-inf, M-f, M-l, M-t, M-t0, M-p<K>, M-h-f, M-h-l, ",
-          "M-h-t, M-none, M-l-r<d>, M-h-l-r<d>, O-f or O-l, not $(MULTIQ_VARIANT)")
+          "M-h-t, M-none, M-l-r<d>[o], M-h-l-r<d>, M-t-r<d>, M-t0-r<d>, M-il-r<d>, M-it-r<d>, M-g-r<d>, ",
+          "M-g25-r<d>, M-g75-r<d>, M-g0-r<d>, M-h-g-r<d>, M-a<T>-r<d>, O-f or O-l, not $(MULTIQ_VARIANT)")
 _F_MATCH === nothing || _F_MATCH[2] === nothing || _F_MATCH[2] in ("f", "l") || _F_MATCH[1] != "O" ||
     error("the shares (-t, -t0, -p<K>) are built for M and M-h, not O")
 # D's slot budget, or nothing for every other variant.
@@ -151,13 +178,26 @@ PERIODIC_K === nothing || PERIODIC_K >= 2 || error("E's K must be at least 2")
 # M-h handlers only, M-none and O nothing.
 const MULTIQ_FIFO = _F_MATCH !== nothing
 const FIFO_CLASS = !MULTIQ_FIFO ? :none : startswith(MULTIQ_VARIANT, "O") ? :origin : :mark
+const _F_RULE = !MULTIQ_FIFO || MULTIQ_VARIANT == "M-none" ? "" : String(_F_MATCH[2])
 const FIFO_SERVE = !MULTIQ_FIFO ? :none : MULTIQ_VARIANT == "M-none" ? :f :
-                   startswith(_F_MATCH[2], "p") ? :p : Symbol(_F_MATCH[2])
+                   startswith(_F_RULE, "p") ? :p : startswith(_F_RULE, "a") ? :a :
+                   _F_RULE == "il" ? :l : _F_RULE == "it" ? :t : _F_RULE in ("g", "g25", "g75") ? :g :
+                   Symbol(_F_RULE)
+# The classes (agent-config #82 Idea 5): who a descendant becomes. `:i` F (into the rings), `:g` R
+# (into the R heaps); `:none` no inheritance (every variant before them).
+const FIFO_INHERIT = _F_RULE in ("il", "it") ? :i : FIFO_SERVE in (:g, :g0) ? :g : :none
+const FIFO_GROUP = FIFO_INHERIT === :g
+# -g's weight for the request side, in quarters (w = GROUP_W4 / 4); g0 keeps the balance at 0.
+const GROUP_W4 = _F_RULE == "g25" ? 1 : _F_RULE == "g75" ? 3 : 2
+# M-a<T>: the age, in ms, past which the older sampled ring head goes before the heaps.
+const AGE_MS = FIFO_SERVE === :a ? parse(Int, _F_RULE[2:end]) : 0
 # The shares (run of 2026-11-16): both act only when a pop finds the F queue non-empty, and keep
 # M's heaps-first default. `:t` serves the side with less time (per-thread balance, capped);
 # `:t0` is its negative control, the same code with the balance never moved (so always heaps
 # first, as M-l); `:p` takes the F queue first on every SHARE_K-th such pop.
 const FIFO_SHARE = FIFO_SERVE in (:t, :t0, :p)
+# -g's accounts are the shares' (per-thread sstate, the same clock and cap), on its own pop.
+const FIFO_ACCOUNTS = FIFO_SHARE || FIFO_GROUP
 const SHARE_K = FIFO_SERVE === :p ? parse(Int, _F_MATCH[2][2:end]) : 0
 FIFO_SERVE !== :p || SHARE_K >= 2 || error("M-p<K> needs K >= 2")
 # The rings (run of 2026-11-16, agent-config #82 Idea 4): the F queue split into one ring beside
@@ -166,8 +206,13 @@ FIFO_SERVE !== :p || SHARE_K >= 2 || error("M-p<K> needs K >= 2")
 # rule the share run left standing): M-l-r<d> and M-h-l-r<d>.
 const RINGS_D = MULTIQ_FIFO && MULTIQ_VARIANT != "M-none" && _F_MATCH[3] !== nothing ? parse(Int, _F_MATCH[3]) : 0
 const FIFO_RINGS = RINGS_D > 0
-FIFO_RINGS && !(FIFO_SERVE === :l && _F_MATCH[1] in ("M", "M-h")) &&
-    error("the rings are built for M-l and M-h-l only, not $(MULTIQ_VARIANT)")
+# M-l-r<d>o: an insert goes to one of the inserting thread's own two rings.
+const RING_OWN = FIFO_RINGS && _F_MATCH[4] == "o"
+FIFO_RINGS && !(FIFO_SERVE in (:l, :t, :t0, :g, :g0, :a) && _F_MATCH[1] in ("M", "M-h")) &&
+    error("the rings are built for M and M-h with -l, -t, -t0, -i, -g and -a, not $(MULTIQ_VARIANT)")
+RING_OWN && !(FIFO_SERVE === :l && FIFO_INHERIT === :none) && error("the own-ring insert is built for M-l-r<d>o only")
+(FIFO_INHERIT !== :none || FIFO_SERVE === :a) && !FIFO_RINGS &&
+    error("the classes and the age rule are built on the rings: $(MULTIQ_VARIANT)-r2")
 const MARK_HANDLERS = MULTIQ_FIFO && _F_MATCH[1] in ("M", "M-h")
 const MARK_CLIENTS = MULTIQ_FIFO && _F_MATCH[1] == "M"
 # Optional, nested.jl only: every spawn marked (the cost of marking fine-grained fork-join).
@@ -1029,12 +1074,28 @@ if MULTIQ_FIFO
     for name in (:multiq_insert, :multiq_deletemin, :multiq_check_empty)
         Core.eval(PARTR, _renamed_partr_function(name, Symbol(:stock_, name)))
     end
+    # -g: the R heaps, a second set of stock heaps. The build's own `multiq_size`, `multiq_insert`,
+    # `multiq_deletemin` and `multiq_check_empty`, every reference to `heaps`, `heaps_lock` and the
+    # four names renamed (`r_heaps`, `r_heaps_lock`, `r_multiq_*`): stock's insert, two-choice pop,
+    # sticky retry and sifts over heaps of their own.
+    if FIFO_GROUP
+        _R_SUBS = Dict(:heaps => :r_heaps, :heaps_lock => :r_heaps_lock, :multiq_size => :r_multiq_size,
+                       :multiq_insert => :r_multiq_insert, :multiq_deletemin => :r_multiq_deletemin,
+                       :multiq_check_empty => :r_multiq_check_empty)
+        _rsubst(x) = x isa Symbol ? get(_R_SUBS, x, x) :
+                     x isa Expr ? Expr(x.head, map(_rsubst, x.args)...) : x
+        Core.eval(PARTR, :(const r_heaps = [Vector{taskheap}(undef, 0), Vector{taskheap}(undef, 0)]))
+        Core.eval(PARTR, :(const r_heaps_lock = [SpinLock(), SpinLock()]))
+        for name in (:multiq_size, :multiq_insert, :multiq_deletemin, :multiq_check_empty)
+            Core.eval(PARTR, _rsubst(_partr_function(name)))
+        end
+    end
     # VALIDATE only, two negative controls. `blind` is a `multiq_check_empty` that ignores the F
     # queue (a thread could sleep with a task queued there): the second check_empty probe must fail.
     # `stall` queues an F task pinned to a thread that then never pops (`_f_stall_control`): the
     # stall check in `f_pop!` must fire.
     const _M_NEGATIVE = MULTIQ_VALIDATE ? get(ENV, "M_NEGATIVE", "") : ""
-    _M_NEGATIVE in ("", "blind", "stall") || error("M_NEGATIVE must be blind or stall")
+    _M_NEGATIVE in ("", "blind", "stall", "rblind") || error("M_NEGATIVE must be blind, stall or rblind")
     _fcount(field) = MULTIQ_VALIDATE ? :(fstates[Threads.threadid()].$field += 1) : nothing
     if FIFO_SHARE || FIFO_RINGS
         # The shares' clock (and the rings' stamps): rdtsc, as E's stamps. It is only ever differenced on one thread, pop to
@@ -1107,7 +1168,7 @@ if MULTIQ_FIFO
         nt = Int(Threads._nthreads_in_pool(tpid))
         side = 1
         if ffirst
-            task = f_pop!(fq, tid, nt)
+            task = $(FIFO_RINGS ? :(r_pop!(tid, nt)) : :(f_pop!(fq, tid, nt)))
             if task === nothing
                 task = stock_multiq_deletemin()
                 side = 2
@@ -1117,7 +1178,8 @@ if MULTIQ_FIFO
             side = 2
             if task === nothing
                 side = 1
-                (@atomic :monotonic fq.n) == 0 || (task = f_pop!(fq, tid, nt))
+                $(FIFO_RINGS ? :(task = r_pop!(tid, nt)) :
+                  :((@atomic :monotonic fq.n) == 0 || (task = f_pop!(fq, tid, nt))))
             end
         end
         $(MULTIQ_VALIDATE ? quote
@@ -1131,6 +1193,105 @@ if MULTIQ_FIFO
         end : nothing)
         $(FIFO_SERVE === :p ? :(task === nothing || (s.k = ffirst ? 0 : s.k + 1)) : nothing)
     end
+    # -g's pop, reached only with the pool flag set. A probe of the three structures (racy reads of
+    # their counts, as stock reads its heaps): L's heaps (`lw`), the R heaps (`rr`), the rings
+    # (`rf`). One side with work: pop it, no clock, and record the side (`s.last`, the thread's own
+    # line) so that the next two-sided pop credits a one-sided stretch to the side that ran it. Both
+    # sides: M-t's crediting (the interval since the last clock read, capped, to `s.last`'s side),
+    # with weight GROUP_W4/4 for the request side (side 1): its intervals add d * (4 - W), L's
+    # subtract d * W, and the request side goes first while the balance is negative; g0 never moves
+    # it. The request side is the R heaps, then the rings: started work before a new root.
+    _GROUP_CAP = FIFO_GROUP ? 2 * SHARE_CAP : 0
+    _GROUP_POP = !FIFO_GROUP ? nothing : quote
+        s = sstates[tid]
+        nt = Int(Threads._nthreads_in_pool(tpid))
+        lw = !stock_multiq_check_empty()
+        rr = !r_multiq_check_empty()
+        rf = r_any()
+        side = 0
+        if lw && (rr || rf)
+            now = s_stamp()
+            if s.last != 0
+                d = now > s.stamp ? Int(now - s.stamp) : 0
+                if d > $(SHARE_CAP)
+                    d = $(SHARE_CAP)
+                    $(_scount(:clips))
+                end
+                $(FIFO_SERVE === :g ? quote
+                    b = s.last == 1 ? s.bal + d * $(4 - GROUP_W4) : s.bal - d * $(GROUP_W4)
+                    if b > $(_GROUP_CAP)
+                        b = $(_GROUP_CAP)
+                        $(_scount(:caps))
+                    elseif b < $(-_GROUP_CAP)
+                        b = $(-_GROUP_CAP)
+                        $(_scount(:caps))
+                    end
+                    s.bal = b
+                end : nothing)
+                $(MULTIQ_VALIDATE ? quote
+                    if s.last == 1
+                        s.f_cyc += d
+                        s.both_f += d
+                    else
+                        s.l_cyc += d
+                        s.both_l += d
+                    end
+                end : nothing)
+            end
+            rfirst = s.bal < 0
+            if rfirst
+                task = g_req_pop(rr, rf, tid, nt)
+                side = 1
+                if task === nothing
+                    task = stock_multiq_deletemin()
+                    side = 2
+                end
+            else
+                task = stock_multiq_deletemin()
+                side = 2
+                if task === nothing
+                    task = g_req_pop(true, true, tid, nt)
+                    side = 1
+                end
+            end
+            $(MULTIQ_VALIDATE ? quote
+                s.acct += 1
+                rfirst && (s.f_choice += 1)
+            end : nothing)
+            s.stamp = now
+        elseif rr || rf
+            task = g_req_pop(rr, rf, tid, nt)
+            side = 1
+            if task === nothing
+                task = stock_multiq_deletemin()
+                side = 2
+            end
+        elseif lw
+            task = stock_multiq_deletemin()
+            side = 2
+        else
+            task = nothing
+        end
+        $(MULTIQ_VALIDATE ? :(side == 2 && task !== nothing && $(_fcount(:l_pops))) : nothing)
+        s.last = task === nothing ? 0 : side
+    end
+    # M-a<T>: the heaps first unless the older of the d sampled ring heads has waited past T ms.
+    _AGE_POP = FIFO_SERVE !== :a ? nothing : quote
+        nt = Int(Threads._nthreads_in_pool(tpid))
+        i = (@atomic :monotonic fl.on) ? r_pick() : 0
+        old = i != 0 && (st = r_head(frings[i]); now = s_stamp(); now > st && now - st > $(UInt64(round(Int, AGE_MS * SHARE_CYCLES_PER_MS))))
+        if old
+            task = r_pop!(tid, nt)
+            task === nothing && (task = stock_multiq_deletemin(); $(MULTIQ_VALIDATE ? :(task === nothing || $(_fcount(:l_pops))) : nothing))
+        else
+            task = stock_multiq_deletemin()
+            if task === nothing
+                (@atomic :monotonic fl.on) && (task = r_pop!(tid, nt))
+            else
+                $(_fcount(:l_pops))
+            end
+        end
+    end
     @eval PARTR begin
         # The class: bit 15 of `Task.priority`. Nothing in Base sets a priority (a new task starts at
         # 0 and does not inherit its parent's), and a task with the bit never enters the heaps, so the
@@ -1138,6 +1299,12 @@ if MULTIQ_FIFO
         # pool of two or more threads; never in the layouts measured) has the bit cleared there and
         # is counted as `demoted`.
         const F_BIT = 0x8000
+        # The classes: R is bit 14 (request work in flight). Both bits are stripped before a
+        # priority reaches a heap (the R heaps get 0); R is written back on a task the R heaps pop.
+        const R_BIT = 0x4000
+        const C_BITS = F_BIT | R_BIT
+        const f_inherit = $(QuoteNode(FIFO_INHERIT))
+        const f_group = $(FIFO_GROUP)
         const f_class = $(QuoteNode(FIFO_CLASS))
         const f_serve = $(QuoteNode(FIFO_SERVE))
         const f_tpid = Int8(Threads._sym_to_tpid(:default))
@@ -1190,8 +1357,13 @@ if MULTIQ_FIFO
             seen::Int       # the head's owner's pops when that run began
             acq::Int        # F-queue lock acquisitions made by this thread (inserts and pops)
             held::Int       # of those, the ones that found the lock held (a failed trylock first)
-            pad::NTuple{4,Int}
-            fstate() = new(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ntuple(_ -> 0, 4))
+            desc::Int       # the classes: tasks classified as descendants at their first enqueue
+            r_first::Int    # -g: R-heap inserts of a task not yet started (a descendant)
+            r_again::Int    # -g: R-heap inserts of a started task (a wake-up or a yield, roots too)
+            r_pops::Int     # -g: tasks popped from the R heaps
+            r_peak::Int     # -g: the most tasks this thread saw in the R heaps after one of its inserts
+            pad::NTuple{15,Int}
+            fstate() = new(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ntuple(_ -> 0, 15))
         end
         const fstates = [fstate() for _ in 1:Threads.maxthreadid()]
 
@@ -1338,6 +1510,65 @@ if MULTIQ_FIFO
             return n
         end
 
+        # Some ring non-empty (racy counts, as `multiq_check_empty` reads them): the gate of M-t on
+        # the rings and one leg of -g's probe. Only reached with the pool flag set.
+        @inline function r_any()
+            for q in frings
+                (@atomic :monotonic q.n) == 0 || return true
+            end
+            return false
+        end
+
+        # -g: the request side's pop, the R heaps (when `rr` says they have work) and then the rings
+        # (when `rf` says so). A task the R heaps pop gets its R bit back: it is out of the heap
+        # and this thread's from here, and its class is what its children and its next wake read.
+        @inline function g_req_pop(rr::Bool, rf::Bool, tid::Int, nt::Int)
+            $(FIFO_GROUP ? quote
+                if rr
+                    t = r_multiq_deletemin()
+                    if t !== nothing
+                        t.priority |= R_BIT
+                        $(_fcount(:r_pops))
+                        return t
+                    end
+                end
+            end : nothing)
+            rf && return r_pop!(tid, nt)
+            return nothing
+        end
+
+        # -g: tasks queued in the R heaps of the `:default` pool (racy).
+        function r_queued()
+            $(FIFO_GROUP ? quote
+                n = 0
+                for h in r_heaps[f_tpid + 1]
+                    n += @atomic :monotonic h.ntasks
+                end
+                return n
+            end : :(return 0))
+        end
+
+        # -g, VALIDATE only: remove `t` from the R heap that holds it, under that heap's lock. Every
+        # priority in the R heaps is 0, so the heap's last entry can take its place.
+        function r_take_back!(t::Task)
+            $(FIFO_GROUP ? quote
+                for h in r_heaps[f_tpid + 1]
+                    lock(h.lock)
+                    n = Int(h.ntasks)
+                    k = findfirst(j -> h.tasks[j] === t, 1:n)
+                    if k !== nothing
+                        h.tasks[k] = h.tasks[n]
+                        $_UNSET(h.tasks, n)
+                        @atomic :monotonic h.ntasks = Int32(n - 1)
+                        n == 1 && (@atomic :monotonic h.priority = typemax(UInt16))
+                    end
+                    unlock(h.lock)
+                    k === nothing || return true
+                end
+            end : nothing)
+            return false
+        end
+
         # Remove `t` from whichever F queue holds it, under that queue's lock; whether it was found.
         function f_take_back!(t::Task)
             for q in (f_rings ? frings : (fq,))
@@ -1456,14 +1687,61 @@ if MULTIQ_FIFO
             return task
         end
 
+        # The own-ring insert (M-l-r<d>o): one of the inserting thread's two rings, a random one
+        # from a thread of another pool.
+        const f_first_tid = Int(Threads.nthreads(:interactive)) + 1
+        @inline function r_insert_ring()
+            $(RING_OWN ? quote
+                k = Threads.threadid() - f_first_tid
+                if 0 <= k && 2k + 2 <= length(frings)
+                    return frings[2k + Int(cong(UInt32(2)))]
+                end
+            end : nothing)
+            return frings[cong(UInt32(length(frings)))]
+        end
+
         function multiq_insert(task::Task, priority::UInt16)
+            $(FIFO_INHERIT === :none ? nothing : quote
+                # The classes: a task with no class of its own, at its first enqueue, made by a task of
+                # class F or R, is a descendant. With the flag unset nothing past the flag is read.
+                if priority & C_BITS == 0 && (@atomic :monotonic fl.on) &&
+                        ccall(:jl_is_task_started, Cint, (Any,), task) == 0 &&
+                        current_task().priority & C_BITS != 0 &&
+                        ccall(:jl_get_task_threadpoolid, Int8, (Any,), task) == f_tpid
+                    priority = $(FIFO_INHERIT === :i ? :F_BIT : :R_BIT)
+                    task.priority = priority
+                    $(_fcount(:desc))
+                end
+            end)
+            $(FIFO_GROUP ? quote
+                # -g: an F task that has started (a root's wake or yield) is R from here on.
+                if priority & F_BIT != 0 && ccall(:jl_is_task_started, Cint, (Any,), task) != 0
+                    priority = (priority & ~F_BIT) | R_BIT
+                end
+                if priority & R_BIT != 0
+                    if ccall(:jl_get_task_threadpoolid, Int8, (Any,), task) == f_tpid
+                        $(MULTIQ_VALIDATE ? quote
+                            ccall(:jl_is_task_started, Cint, (Any,), task) == 0 ? $(_fcount(:r_first)) : $(_fcount(:r_again))
+                        end : nothing)
+                        r_multiq_insert(task, priority & ~C_BITS)
+                        $(MULTIQ_VALIDATE ? quote
+                            let s = fstates[Threads.threadid()], n = r_queued()
+                                n > s.r_peak && (s.r_peak = n)
+                            end
+                        end : nothing)
+                        return true
+                    end
+                    $(_fcount(:demoted))
+                    return stock_multiq_insert(task, priority & ~C_BITS)
+                end
+            end : nothing)
             if priority & F_BIT != 0
                 if ccall(:jl_get_task_threadpoolid, Int8, (Any,), task) == f_tpid
                     $(MULTIQ_VALIDATE ? :(ccall(:jl_is_task_started, Cint, (Any,), task) == 0 ?
                                            $(_fcount(:f_first)) : $(_fcount(:f_again))) : nothing)
                     $(FIFO_RINGS ? quote
                         (@atomic :monotonic fl.on) || (@atomic :release fl.on = true)
-                        q = frings[cong(UInt32(length(frings)))]
+                        q = r_insert_ring()
                         f_lock!(q)
                         f_push_stamped!(q, task)
                         unlock(q.lock)
@@ -1515,8 +1793,18 @@ if MULTIQ_FIFO
                 else
                     $(_fcount(:l_pops))
                 end
-            elseif (@atomic :monotonic fq.n) == 0
-                # The shares with the F queue empty: M-none's code, no clock and no account.
+            elseif f_serve === :g || f_serve === :g0
+                # -g: with the flag unset, stock's pop and nothing else.
+                if !(@atomic :monotonic fl.on)
+                    task = stock_multiq_deletemin()
+                    $(MULTIQ_VALIDATE ? :(task === nothing || $(_fcount(:l_pops))) : nothing)
+                else
+                    $_GROUP_POP
+                end
+            elseif f_serve === :a
+                $_AGE_POP
+            elseif $(FIFO_RINGS ? :(!((@atomic :monotonic fl.on) && r_any())) : :((@atomic :monotonic fq.n) == 0))
+                # The shares with the F queue (the rings) empty: M-none's code, no clock and no account.
                 task = stock_multiq_deletemin()
                 $(MULTIQ_VALIDATE ? :(task === nothing || $(_fcount(:l_pops))) : nothing)
             else
@@ -1535,6 +1823,8 @@ if MULTIQ_FIFO
                 for q in frings
                     (@atomic :monotonic q.n) == 0 || return false
                 end
+                # -g: the R heaps too (`M_NEGATIVE=rblind` leaves them out: its probe must fail).
+                $(FIFO_GROUP && _M_NEGATIVE != "rblind" ? :(r_multiq_check_empty() || return false) : nothing)
                 return true
             end : :(return (@atomic :monotonic fq.n) == 0))
         end
@@ -1573,7 +1863,7 @@ function multiq_queued(tp::Int)
         for h in MULTIQ_HEAP_LISTS[tp]
             n += @atomic :monotonic h.ntasks
         end
-        MULTIQ_FIFO && tp == PARTR.f_tpid + 1 && (n += PARTR.f_queued())   # M, O: the F queue (or rings) too
+        MULTIQ_FIFO && tp == PARTR.f_tpid + 1 && (n += PARTR.f_queued() + PARTR.r_queued())   # M, O: the F queue (or rings), and -g's R heaps, too
     else
         WS = Base.Scheduler.ChosenScheduler
         for r in WS.Rings[tp]
@@ -1665,7 +1955,11 @@ println(stderr, "multiq_variant: VARIANT=", MULTIQ_VARIANT, MULTIQ_VALIDATE ? " 
         PERIODIC_K === nothing ? "" : ", periodic pop every $(PERIODIC_K == typemax(Int) ? "never" : PERIODIC_K)",
         PERIODIC_K !== nothing && !isempty(_E_NEGATIVE) ? ", NEGATIVE CONTROL $(_E_NEGATIVE)" : "",
         MULTIQ_FIFO ? ", F queue: class $(FIFO_CLASS), serve $(FIFO_SERVE)" *
-                      (FIFO_RINGS ? ", $(length(PARTR.frings)) rings, pop samples $(RINGS_D)" : "") *
+                      (FIFO_RINGS ? ", $(length(PARTR.frings)) rings, pop samples $(RINGS_D)" *
+                                    (RING_OWN ? ", insert into the thread's own rings" : "") : "") *
+                      (FIFO_INHERIT === :none ? "" : ", descendants $(FIFO_INHERIT === :i ? "F (into the rings)" : "R (into the R heaps)")") *
+                      (FIFO_SERVE === :g ? ", request-side weight $(GROUP_W4)/4" : FIFO_SERVE === :g0 ? ", balance never moved (L first)" : "") *
+                      (FIFO_SERVE === :a ? ", ring head first past $(AGE_MS) ms" : "") *
                       (FIFO_SERVE === :p ? " (F first every $(SHARE_K)th accounted pop)" : "") *
                       (FIFO_SERVE in (:t, :t0) ? " (cap $(round(SHARE_CAP / SHARE_CYCLES_PER_MS; digits = 2)) ms, " *
                        "$(round(SHARE_CYCLES_PER_MS / 1000; digits = 1)) MHz TSC$(FIFO_SERVE === :t0 ? ", balance frozen" : ""))" : "") *
@@ -1688,6 +1982,8 @@ function multiq_variant_check()
         end
         q = PARTR.f_queued()
         q == 0 || error("$MULTIQ_VARIANT: $q tasks left in the F queue")
+        r = PARTR.r_queued()
+        r == 0 || error("$MULTIQ_VARIANT: $r tasks left in the R heaps")
         if MULTIQ_VALIDATE
             c = multiq_fifo_counts()
             c.demoted == 0 || error("$MULTIQ_VARIANT: $(c.demoted) F tasks were sent down stock's path")
@@ -2160,7 +2456,8 @@ function _e_unit_asserts()
 end
 
 # M and O, VALIDATE only: the counts summed over threads.
-const _F_FIELDS = (:f_first, :f_again, :l_first, :demoted, :f_pops, :l_pops, :skips, :own, :acq, :held)
+const _F_FIELDS = (:f_first, :f_again, :l_first, :demoted, :f_pops, :l_pops, :skips, :own, :acq, :held,
+                   :desc, :r_first, :r_again, :r_pops)
 function multiq_fifo_counts()
     MULTIQ_FIFO || return nothing
     fs = PARTR.fstates
@@ -2170,13 +2467,38 @@ end
 # M and O, VALIDATE only: print the counts since `before` and check the classification: exactly
 # `f_first` tasks went to the F queue on their first enqueue (not checked when `nothing`), nothing was demoted, every F insert
 # was popped and the queue is empty (the cell or workload has ended, so nothing is runnable).
-function multiq_fifo_check(label, before; f_first::Union{Int,Nothing})
+#
+# The classes: `f_first` is the roots; `desc` the descendants expected (not checked when
+# `nothing`). Under -i a descendant is an F first insert too (f_first + desc of them); under -g it
+# is an R first insert, no started task enters a ring, and every R insert was popped from the R
+# heaps, which are empty. The R heaps' peak depth (per thread, after its own inserts) is printed.
+function multiq_fifo_check(label, before; f_first::Union{Int,Nothing}, desc::Union{Int,Nothing} = 0)
     MULTIQ_FIFO || return nothing
     now = multiq_fifo_counts()
     d = NamedTuple{_F_FIELDS}(Tuple(getfield(now, k) - getfield(before, k) for k in _F_FIELDS))
-    println(stderr, "validate: F counts, ", label, ": ", join(("$k $(getfield(d, k))" for k in _F_FIELDS), ", "))
+    println(stderr, "validate: F counts, ", label, ": ", join(("$k $(getfield(d, k))" for k in _F_FIELDS), ", "),
+            FIFO_GROUP ? ", R heaps peak $(maximum(s.r_peak for s in PARTR.fstates))" : "")
     q = PARTR.f_queued()
-    f_first === nothing || d.f_first == f_first || error("$MULTIQ_VARIANT: $label: $(d.f_first) tasks classified F at their first enqueue, expected $f_first")
+    if FIFO_INHERIT === :none
+        d.desc == 0 || error("$MULTIQ_VARIANT: $label: $(d.desc) descendants without inheritance")
+    else
+        desc === nothing || d.desc == desc || error("$MULTIQ_VARIANT: $label: $(d.desc) descendants, expected $desc")
+    end
+    if FIFO_INHERIT === :i
+        f_first === nothing || desc === nothing || d.f_first == f_first + desc ||
+            error("$MULTIQ_VARIANT: $label: $(d.f_first) F first inserts, expected $f_first roots + $desc descendants")
+    else
+        f_first === nothing || d.f_first == f_first || error("$MULTIQ_VARIANT: $label: $(d.f_first) tasks classified F at their first enqueue, expected $f_first")
+    end
+    if FIFO_GROUP
+        d.f_again == 0 || error("$MULTIQ_VARIANT: $label: $(d.f_again) started tasks went into a ring")
+        d.r_first == d.desc || error("$MULTIQ_VARIANT: $label: $(d.r_first) R first inserts for $(d.desc) descendants")
+        r = PARTR.r_queued()
+        r == 0 || error("$MULTIQ_VARIANT: $label: $r tasks left in the R heaps")
+        d.r_pops == d.r_first + d.r_again ||
+            error("$MULTIQ_VARIANT: $label: $(d.r_pops) R pops for $(d.r_first + d.r_again) R inserts")
+        foreach(s -> s.r_peak = 0, PARTR.fstates)
+    end
     d.demoted == 0 || error("$MULTIQ_VARIANT: $label: $(d.demoted) F tasks sent down stock's path")
     q == 0 || error("$MULTIQ_VARIANT: $label: $q tasks left in the F queue")
     d.f_pops == d.f_first + d.f_again ||
@@ -2210,7 +2532,7 @@ end
 # The shares, VALIDATE only: per-thread counts (a copy of every `:default` thread's sstate fields).
 const _S_FIELDS = (:f_cyc, :l_cyc, :both_f, :both_l, :caps, :clips, :acct, :f_choice)
 function multiq_share_counts()
-    FIFO_SHARE && MULTIQ_VALIDATE || return nothing
+    FIFO_ACCOUNTS && MULTIQ_VALIDATE || return nothing
     return Dict(tid => NamedTuple{_S_FIELDS}(Tuple(getfield(PARTR.sstates[tid], k) for k in _S_FIELDS))
                 for tid in Threads.threadpooltids(:default))
 end
@@ -2219,8 +2541,12 @@ end
 # each side (and its F share, overall and while both sides had work), the cap's and the clip's
 # actions, since `before`. With `half = true` (the mixed cell under -t) every thread's F share
 # while both had work must be 40-60%, over at least 50 ms of such time.
+#
+# Under -g the "F" side is the request side (the R heaps and the rings: pops F counts both), and
+# `half` checks the weight's band instead: GROUP_W4/4 of the time +-10 points (g0: not checked).
 function multiq_share_check(label, before, fbefore; half::Bool = false)
-    FIFO_SHARE && MULTIQ_VALIDATE || return nothing
+    FIFO_ACCOUNTS && MULTIQ_VALIDATE || return nothing
+    lo, hi = FIFO_GROUP ? (25 * GROUP_W4 - 10, 25 * GROUP_W4 + 10) : (40, 60)
     now = multiq_share_counts()
     ms(c) = round(c / SHARE_CYCLES_PER_MS; digits = 1)
     pct(a, b) = a + b == 0 ? NaN : round(100 * a / (a + b); digits = 1)
@@ -2229,7 +2555,7 @@ function multiq_share_check(label, before, fbefore; half::Bool = false)
     for tid in Threads.threadpooltids(:default)
         d = NamedTuple{_S_FIELDS}(Tuple(getfield(now[tid], k) - getfield(before[tid], k) for k in _S_FIELDS))
         fs, f0 = PARTR.fstates[tid], fbefore[tid]
-        fp, lp = fs.f_pops - f0[1], fs.l_pops - f0[2]
+        fp, lp = fs.f_pops + fs.r_pops - f0[1], fs.l_pops - f0[2]
         both = pct(d.both_f, d.both_l)
         println(stderr, "validate:   tid ", tid, ": pops F ", fp, " L ", lp, ", accounted ", d.acct, " (F tried first ",
                 d.f_choice, "), time F ", ms(d.f_cyc), " ms L ", ms(d.l_cyc), " ms (F ", pct(d.f_cyc, d.l_cyc),
@@ -2238,14 +2564,14 @@ function multiq_share_check(label, before, fbefore; half::Bool = false)
         if half
             (d.both_f + d.both_l) / SHARE_CYCLES_PER_MS >= 50 ||
                 push!(bad, "tid $tid: only $(ms(d.both_f + d.both_l)) ms with both sides busy")
-            40 <= both <= 60 || push!(bad, "tid $tid: F's share while both had work is $both%")
+            lo <= both <= hi || push!(bad, "tid $tid: F's share while both had work is $both%")
         end
     end
-    isempty(bad) || error("$MULTIQ_VARIANT: $label: the time share is not 40-60% on every :default thread: ",
+    isempty(bad) || error("$MULTIQ_VARIANT: $label: the time share is not $lo-$hi% on every :default thread: ",
                           join(bad, "; "))
     return nothing
 end
-share_fifo_pops() = !(FIFO_SHARE && MULTIQ_VALIDATE) ? nothing : Dict(tid => (PARTR.fstates[tid].f_pops, PARTR.fstates[tid].l_pops)
+share_fifo_pops() = !(FIFO_ACCOUNTS && MULTIQ_VALIDATE) ? nothing : Dict(tid => (PARTR.fstates[tid].f_pops + PARTR.fstates[tid].r_pops, PARTR.fstates[tid].l_pops)
                          for tid in Threads.threadpooltids(:default))
 
 # M and O, VALIDATE only, two probes of `multiq_check_empty` (as E's):
@@ -2284,6 +2610,40 @@ function _f_probe(reps::Int = 20)
     checked >= reps ÷ 2 || error("F: only $checked of $reps check_empty probes kept their task")
     println(stderr, "multiq_variant: F probe 2: multiq_check_empty() saw a queued F task ", checked, " of ", reps,
             " times (the rest were taken first)")
+    return nothing
+end
+
+# -g, VALIDATE only: the R heaps' probe of `multiq_check_empty`. An R task queued and no wake-up
+# sent: it must say non-empty (`M_NEGATIVE=rblind`, a check blind to the R heaps, fails it). The
+# dummy is taken back out under its heap's lock. Then the R heaps are stock's size: 2 per thread.
+function _r_probe(reps::Int = 20)
+    P = PARTR
+    @atomic :release P.fl.on = true
+    checked = 0
+    for _ in 1:reps
+        sleep(0.05)
+        empty, got = fetch(Threads.@spawn :default begin
+            t0 = time_ns()
+            while time_ns() - t0 < 5_000_000
+                GC.safepoint()
+            end
+            dummy = Task(() -> nothing)
+            Threads._spawn_set_thrpool(dummy, :default)
+            dummy.priority = P.R_BIT
+            P.multiq_insert(dummy, dummy.priority)
+            e = P.multiq_check_empty()
+            (e, P.r_take_back!(dummy))
+        end)
+        got || continue
+        empty && error("R: multiq_check_empty() says empty while the R heaps hold a task")
+        checked += 1
+    end
+    checked >= reps ÷ 2 || error("R: only $checked of $reps check_empty probes kept their task")
+    nh = length(P.r_heaps[P.f_tpid + 1])
+    nh == 2 * Threads.nthreads(:default) || error("R: $nh R heaps for $(Threads.nthreads(:default)) threads")
+    P.r_queued() == 0 || error("R: $(P.r_queued()) tasks left in the R heaps after the probe")
+    println(stderr, "multiq_variant: R probe: multiq_check_empty() saw a queued R task ", checked, " of ", reps,
+            " times (the rest were taken first); ", nh, " R heaps")
     return nothing
 end
 
@@ -2397,6 +2757,7 @@ function _f_unit_asserts()
     _M_NEGATIVE == "stall" && _f_stall_control()
     multiq_watchdog(60)
     _f_probe()
+    FIFO_GROUP && _r_probe()
     multiq_watchdog(0)
     return nothing
 end

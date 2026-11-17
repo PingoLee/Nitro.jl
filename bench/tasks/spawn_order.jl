@@ -487,7 +487,8 @@ function measure()
         VALIDATE && multiq_budget_check("$mode/$cl C=$c H=$h", budget0;
                                         everywhere = mode == "spawn" || cl === :default)
         fd = VALIDATE ? multiq_fifo_check("$mode/$cl C=$c H=$h $shape", fifo0;
-                                          f_first = expected_f_first(cl, c, sum(r -> length(r.lat), recs))) : nothing
+                                          f_first = expected_f_first(cl, c, sum(r -> length(r.lat), recs)),
+                                          desc = expected_desc(shape, sum(r -> length(r.lat), recs))) : nothing
         VALIDATE && multiq_lock_check("$mode/$cl C=$c H=$h $shape", lock0, fd, sum(r -> length(r.lat), recs))
         VALIDATE && multiq_share_check("$mode/$cl C=$c H=$h $shape", share0, sfifo0)
     end
@@ -503,6 +504,10 @@ function expected_f_first(cl::Symbol, c::Int, n::Int)
     FIFO_CLASS === :origin && return cl === :interactive ? n : Threads.nthreads(:interactive) > 0 ? c : 0
     return 0
 end
+
+# The classes: how many tasks of a cell with `n` requests are descendants (a marked handler's four
+# inner children), under inheritance.
+expected_desc(shape::String, n::Int) = FIFO_INHERIT !== :none && MARK_HANDLERS && shape == "inner" ? 4n : 0
 
 # Every handler accounted for, how far starts ran behind spawns, the handler count per `:default`
 # tid, and the mode's own invariants: sticky ran where it was pinned and evenly, priority started

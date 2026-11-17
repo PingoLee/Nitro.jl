@@ -31,6 +31,19 @@
 # :default clients), shapes inner and io (A M-l M-l-r2), mixed (M-l M-l-r2), nesting fib_fine (A
 # M-none M-l M-l-r2) and sweep (A M-none M-l M-l-r2 M-l-r4); VALIDATE adds the sweep cells and runs
 # the negative controls under M-l and M-l-r2.
+# PROFILE=inherit (the classes of 2026-11-16, agent-config #82 Idea 5: -i and -g on the rings):
+# BLOCKS=step0b ROUNDS=1 first (the own-ring insert timed once: the sweep for A M-l-r2 M-l-r2o, then
+# the three starved cells for M-l-r2 and M-l-r2o); BLOCKS=pilot ROUNDS=1 is the gate (8,1: the inner
+# shape, the mixed cell and the mixed-inner cell for A M-l-r2 M-t-r2 M-il-r2 M-it-r2 M-g-r2; julia
+# bench/tasks/aggregate_fifo.jl <OUT> inheritpilot); then the rounds: mixed and mixedinner (A C
+# M-l-r2 M-t-r2 M-g-r2 M-g25-r2 M-g75-r2 M-g0-r2 and I_RULE, the -i rule the pilot kept, default
+# M-il-r2), fairness (A M-l-r2 M-g-r2, plus M-h-g-r2 with :default clients), shapes (inner and io
+# for A M-l-r2 M-t-r2 M-g-r2, inner for I_RULE), nesting (fib_fine alone, A M-none M-l-r2 M-g-r2),
+# markroot (fib_fine under one marked root, A M-g-r2 I_RULE) and cost (A A0 M-none M-l-r2 M-g-r2);
+# BLOCKS=age ROUNDS=1 is the age sweep (mixed and inner, M-a10-r2 M-a100-r2 M-a1000-r2). VALIDATE
+# adds the mixed-inner and marked-root cells and the R heaps' negative control (rblind).
+#   mixedinner  mixed_cell.jl SHAPE=inner: the mixed cell with the inner shape
+#   markroot    nested.sh MARK_ROOT=1, fib_fine only
 #   q1        the rings run's first question, one block (BLOCKS=q1 ROUNDS=1): one sweep round, M-l
 #             under VALIDATE per layout for the F-lock counts, and a profile of the 8,0 cell per
 #             variant (A and M-l)
@@ -96,6 +109,9 @@ VAL_NEST_V="$NEST_V"
 VAL_MARKALL_V="M-f M-l"
 VAL_MIX_V=""        # VALIDATE: the mixed cell (C at FIB_FINE=36:12)
 NEG_V="M-f"         # VALIDATE: the variants the two negative controls run under
+NEG_R_V=""          # VALIDATE: the variants the R heaps' negative control (rblind) runs under
+MARKROOT_V=""       # markroot: fib_fine under one marked root
+AGE_V=""            # age: the age rule's sweep
 if [ "$PROFILE" = share ]; then
   COST_V="A A0 M-none M-l M-t"
   COST_CELLS="500:0"
@@ -135,9 +151,32 @@ elif [ "$PROFILE" = rings ]; then
   VAL_MARKALL_V=""
   VAL_MIX_V="M-l M-l-r2"
   NEG_V="M-l M-l-r2"
+elif [ "$PROFILE" = inherit ]; then
+  I_RULE="${I_RULE:-M-il-r2}"
+  COST_V="A A0 M-none M-l-r2 M-g-r2"
+  COST_CELLS="50:0 500:0"
+  FAIR_I81_V="A M-l-r2 M-g-r2"
+  FAIR_D_V="A M-l-r2 M-g-r2 M-h-g-r2"
+  SHAPE_V="A M-l-r2 M-t-r2 M-g-r2"
+  SHAPE_CELLS="500:2:inner 500:2:io"
+  SHAPE_INNER_V="$I_RULE"
+  NEST_V="A M-none M-l-r2 M-g-r2"
+  NEST_WORKLOADS="fib_fine"
+  MARKROOT_V="A M-g-r2 $I_RULE"
+  PILOT_V="A M-l-r2 M-t-r2 M-il-r2 M-it-r2 M-g-r2"
+  MIX_V="A C M-l-r2 M-t-r2 M-g-r2 M-g25-r2 M-g75-r2 M-g0-r2 $I_RULE"
+  AGE_V="M-a10-r2 M-a100-r2 M-a1000-r2"
+  SWEEP_V="${SWEEP_V:-A M-l-r2 M-l-r2o}"
+  VAL_V="A A0 C M-none M-l-r2 M-l-r2o M-t-r2 M-t0-r2 M-il-r2 M-it-r2 M-g-r2 M-g25-r2 M-g75-r2 M-g0-r2 M-h-g-r2 M-a100-r2"
+  VAL_NEST_V="A M-none M-l-r2 M-il-r2 M-g-r2 M-g0-r2"
+  VAL_MARKALL_V=""
+  VAL_MARKROOT_V="M-il-r2 M-it-r2 M-g-r2"
+  VAL_MIX_V="A C M-l-r2 M-t-r2 M-t0-r2 M-il-r2 M-it-r2 M-g-r2 M-g25-r2 M-g75-r2 M-g0-r2 M-h-g-r2 M-a100-r2"
+  NEG_V="M-l-r2 M-g-r2"
+  NEG_R_V="M-g-r2"
 fi
 SWEEP_LAYOUTS="${SWEEP_LAYOUTS:-2,0:0,1 4,0:0,1,2,3 8,0:0,1,2,3,6,7,8,9}"
-case "$PROFILE" in mo|share|rings) ;; *) echo "rounds_fifo: PROFILE must be mo, share or rings" >&2; exit 1 ;; esac
+case "$PROFILE" in mo|share|rings|inherit) ;; *) echo "rounds_fifo: PROFILE must be mo, share, rings or inherit" >&2; exit 1 ;; esac
 ordered() {   # round, variants...
   local r="$1"; shift
   if [ $((r % 2)) = 0 ]; then printf '%s\n' "$@" | tac | tr '\n' ' '; else echo "$*"; fi
@@ -207,8 +246,15 @@ nesting_block() {   # round, nested tsv, variants, extra env...
     CPUS="$CPUS" TIMEOUT_S="${TIMEOUT_S:-600}" "$HERE/nested.sh" "$r" "$tsv"
 }
 
-pilot_block() {   # spawn tsv, nested tsv (PROFILE=share: the mixed tsv)
+pilot_block() {   # spawn tsv, nested tsv (PROFILE=share: the mixed tsv; inherit: mixed, mixed-inner)
   local tsv="$1" ntsv="$2" v
+  if [ "$PROFILE" = inherit ]; then
+    # The classes' gate, at 8,1: the inner shape, the mixed cell, the mixed-inner cell.
+    for v in $PILOT_V; do spawn 0 "$tsv" 8,1 interactive "$v" "500:2:inner" || return 1; done
+    MIX_V="$PILOT_V" mixed_block 0 "$ntsv" || return 1
+    MIX_V="$PILOT_V" mixed_block 0 "$3" SHAPE=inner
+    return
+  fi
   if [ "$PROFILE" = share ]; then
     # The share's gate: at 8,1 the starved cell with :default clients, then the mixed cell.
     for v in $PILOT_V; do spawn 0 "$tsv" 8,1 default "$v" "500:2" || return 1; done
@@ -263,6 +309,29 @@ q1_block() {   # timed tsv, VALIDATE tsv
   done
 }
 
+# PROFILE=inherit, step 0's timing, one quiet block: the sweep (A M-l-r2 M-l-r2o), then the three
+# starved cells for M-l-r2 and M-l-r2o.
+step0b_block() {   # sweep tsv, fairness tsv
+  local tsv="$1" ftsv="$2" cc layout clients v
+  sweep_block 1 "$tsv" || return 1
+  for cc in "${CLIENT_CELLS[@]}"; do
+    read -r layout clients <<<"$cc"
+    for v in M-l-r2 M-l-r2o; do spawn 1 "$ftsv" "$layout" "$clients" "$v" "500:2" || return 1; done
+  done
+}
+
+# PROFILE=inherit, the age sweep, one round: the mixed cell and the inner shape for AGE_V.
+age_block() {   # mixed tsv, spawn tsv
+  local v
+  MIX_V="$AGE_V" mixed_block 1 "$1" || return 1
+  for v in $AGE_V; do spawn 1 "$2" 8,1 interactive "$v" "500:2:inner" || return 1; done
+}
+
+markroot_block() {   # round, nested tsv, variants, extra env...
+  local r="$1" tsv="$2" vs="$3"; shift 3
+  NEST_LAYOUTS="${NEST_LAYOUTS:-8,1 8,0}" nesting_block "$r" "$tsv" "$vs" WORKLOADS=fib_fine MARK_ROOT=1 "$@"
+}
+
 markall_block() {   # nested tsv
   NEST_LAYOUTS="8,1 8,0" nesting_block 1 "$1" "A M-f M-l" WORKLOADS=fib_fine MARK_ALL=1
 }
@@ -306,16 +375,23 @@ if [ "$VALIDATE" = 1 ]; then
       { [ -z "$VAL_MARKALL_V" ] ||
         NEST_LAYOUTS="8,1 8,0" nesting_block 1 "$OUT/validate-markall.tsv" "$VAL_MARKALL_V" WORKLOADS=fib_fine FIB_FINE=36:12 MARK_ALL=1; } &&
       { [ -z "$VAL_MIX_V" ] || MIX_V="$VAL_MIX_V" mixed_block 1 "$OUT/validate-mixed.tsv" FIB_FINE=36:12 D=4; } &&
-      { [ "$PROFILE" != rings ] || sweep_block 1 "$OUT/validate-sweep.tsv"; }
+      { [ "$PROFILE" != rings ] || sweep_block 1 "$OUT/validate-sweep.tsv"; } &&
+      { [ "$PROFILE" != inherit ] || {
+          MIX_V="$VAL_MIX_V" mixed_block 1 "$OUT/validate-mixedinner.tsv" FIB_FINE=36:12 D=4 SHAPE=inner &&
+          markroot_block 1 "$OUT/validate-markroot.tsv" "$VAL_MARKROOT_V" FIB_FINE=36:12 &&
+          sweep_block 1 "$OUT/validate-sweep.tsv"; }; }
     } 2>>"$vlog" || status=1
   fi
   # The negative controls must fail, each with its own message:
   #   blind  a check_empty blind to the F queue says empty with a task queued (probe 2 fails);
   #   stall  an F task pinned to a thread that never pops trips f_pop!'s stall check (abort, 134).
   nlog="$OUT/negative-control.err"
-  for control in "blind:says empty while the F queue holds a task" "stall:made no pop meanwhile"; do
+  #   rblind (PROFILE=inherit) a check_empty blind to the R heaps says empty with an R task queued.
+  for control in "blind:says empty while the F queue holds a task" "stall:made no pop meanwhile" \
+                 ${NEG_R_V:+"rblind:says empty while the R heaps hold a task"}; do
     name="${control%%:*}" msg="${control#*:}"
-    for nv in $NEG_V; do
+    nvs="$NEG_V"; [ "$name" = rblind ] && nvs="$NEG_R_V"
+    for nv in $nvs; do
     for layout in 8,1 8,0; do
       : >"$nlog"
       if env VALIDATE=1 VARIANT="$nv" M_NEGATIVE="$name" CELLS=50:0.2 MODES=spawn D=1 timeout -s KILL 300 \
@@ -356,11 +432,32 @@ for r in $(seq 1 "$ROUNDS"); do
           mv "$a" "$OUT/nested-r$r.tsv"; log "round $r nesting done"
         else log "round $r nesting FAILED"; status=1; fi ;;
       pilot)
-        a="$OUT/attempt-pilot-spawn-$stamp.tsv" b="$OUT/attempt-pilot-nested-$stamp.tsv"
-        second=pilot-nested.tsv; [ "$PROFILE" = share ] && second=pilot-mixed.tsv
-        if block "pilot" "$a" "$b" -- "${SELF[@]}" pilot_block "$a" "$b"; then
-          mv "$a" "$OUT/pilot-spawn.tsv"; mv "$b" "$OUT/$second"; log "pilot done"
+        a="$OUT/attempt-pilot-spawn-$stamp.tsv" b="$OUT/attempt-pilot-nested-$stamp.tsv" c="$OUT/attempt-pilot-mixedinner-$stamp.tsv"
+        second=pilot-nested.tsv; [ "$PROFILE" = share ] || [ "$PROFILE" = inherit ] && second=pilot-mixed.tsv
+        if block "pilot" "$a" "$b" "$c" -- "${SELF[@]}" pilot_block "$a" "$b" "$c"; then
+          mv "$a" "$OUT/pilot-spawn.tsv"; mv "$b" "$OUT/$second"
+          [ -s "$c" ] && mv "$c" "$OUT/pilot-mixedinner.tsv"; log "pilot done"
         else log "pilot FAILED"; status=1; fi ;;
+      mixedinner)
+        a="$OUT/attempt-mixedinner-r$r-$stamp.tsv"
+        if block "mixedinner-r$r" "$a" -- "${SELF[@]}" mixed_block "$r" "$a" SHAPE=inner; then
+          mv "$a" "$OUT/mixedinner-r$r.tsv"; log "round $r mixedinner done"
+        else log "round $r mixedinner FAILED"; status=1; fi ;;
+      markroot)
+        a="$OUT/attempt-markroot-r$r-$stamp.tsv"
+        if block "markroot-r$r" "$a" -- "${SELF[@]}" markroot_block "$r" "$a" "$MARKROOT_V"; then
+          mv "$a" "$OUT/markroot-r$r.tsv"; log "round $r markroot done"
+        else log "round $r markroot FAILED"; status=1; fi ;;
+      step0b)
+        a="$OUT/attempt-step0b-sweep-$stamp.tsv" b="$OUT/attempt-step0b-fairness-$stamp.tsv"
+        if block "step0b" "$a" "$b" -- "${SELF[@]}" step0b_block "$a" "$b"; then
+          mv "$a" "$OUT/step0b-sweep.tsv"; mv "$b" "$OUT/step0b-fairness.tsv"; log "step0b done"
+        else log "step0b FAILED"; status=1; fi ;;
+      age)
+        a="$OUT/attempt-age-mixed-$stamp.tsv" b="$OUT/attempt-age-spawn-$stamp.tsv"
+        if block "age" "$a" "$b" -- "${SELF[@]}" age_block "$a" "$b"; then
+          mv "$a" "$OUT/age-mixed.tsv"; mv "$b" "$OUT/age-spawn.tsv"; log "age done"
+        else log "age FAILED"; status=1; fi ;;
       mixed)
         a="$OUT/attempt-mixed-r$r-$stamp.tsv"
         if block "mixed-r$r" "$a" -- "${SELF[@]}" mixed_block "$r" "$a"; then
