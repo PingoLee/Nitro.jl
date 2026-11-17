@@ -13,7 +13,8 @@ drawn hollow, with an arrow up, at the median of the rounds whose run did end (A
 3; A and M-t-r2 in the mixed-inner cell: 1 of 3), a lower bound. M-g0-r2 never moves the balance (L
 first), the negative control.
 
-Every number is a literal from this run's tables (aggregate_fifo.jl mixed and mixedinner). Plain
+Every number is a literal from this run's tables (aggregate_fifo.jl mixed and mixedinner), reported on
+#618 in comment 6939721840. Plain
 Python, no dependencies; writes inherit-tradeoff.svg beside this file (the PNG is converted from it;
 see the PR).
 
@@ -106,7 +107,7 @@ def main():
     panel(svg, 720, 116, 500, 400, "The mixed-inner cell (four children of 0.5 ms)", MIXED_INNER)
     svg.append(f'<text x="40" y="{H - 58}" font-size="11" fill="{MUTED}">-g: a marked request\'s children and its wakes go to a second set of stock heaps; the request side (those heaps, then the rings of roots) '
                f'and unmarked work share time,</text>')
-    svg.append(f'<text x="40" y="{H - 40}" font-size="11" fill="{MUTED}">w to the request side. -i: the children are marked and queue with the roots.</text>')
+    svg.append(f'<text x="40" y="{H - 40}" font-size="11" fill="{MUTED}">w to the request side. -i: the children are marked and queue with the roots. Source: inherit_tradeoff.py; #618, comment 6939721840.</text>')
     svg.append(f'<text x="40" y="{H - 22}" font-size="11" fill="{MUTED}">Hollow points with an arrow: in some rounds no fib_fine run ended inside the 8 s cell; a lower bound. M-g0-r2: the balance never moves (L first). '
                f'Orange: the classes; blue: the controls.</text>')
     svg.append('</svg>')

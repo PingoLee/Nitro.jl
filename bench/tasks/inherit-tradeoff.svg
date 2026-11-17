@@ -145,6 +145,6 @@
 <circle cx="801.1" cy="317.5" r="5" fill="#c0651a" stroke="#c0651a" stroke-width="1.5"/>
 <text x="810.1" y="310.5" font-size="12" fill="#0b0b0b">M-g75 (w 3/4)</text>
 <text x="40" y="582" font-size="11" fill="#8a8984">-g: a marked request's children and its wakes go to a second set of stock heaps; the request side (those heaps, then the rings of roots) and unmarked work share time,</text>
-<text x="40" y="600" font-size="11" fill="#8a8984">w to the request side. -i: the children are marked and queue with the roots.</text>
+<text x="40" y="600" font-size="11" fill="#8a8984">w to the request side. -i: the children are marked and queue with the roots. Source: inherit_tradeoff.py; #618, comment 6939721840.</text>
 <text x="40" y="618" font-size="11" fill="#8a8984">Hollow points with an arrow: in some rounds no fib_fine run ended inside the 8 s cell; a lower bound. M-g0-r2: the balance never moves (L first). Orange: the classes; blue: the controls.</text>
 </svg>
