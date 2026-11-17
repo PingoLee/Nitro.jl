@@ -13,6 +13,10 @@
 #                               in the one-thread `:interactive` pool, so only the handlers reach
 #                               the F queue; M-h-l marks the handlers only)
 #   C, H, D                     500, 2, 8;  FIB_FINE "42:12";  ALONE_RUNS 5;  ROUND 1
+#   SHAPE=plain|inner           inner: the mixed-inner cell (2026-11-16, agent-config #82 Idea 5): the
+#                               handlers spawn four `:default` children of H/4 and fetch them, the
+#                               inner shape of spawn_order.jl, while fib_fine loops beside them; the
+#                               row gains the shape and the handler wall p50/p99 (ms) at its end
 #   BG=loops:<n>                the half-pool cell: n loops of short chunks instead of fib_fine (above
 #                               loop_run); run it with C small enough that C + n <= 8
 #   NOHEADER=1                  no header line
@@ -31,6 +35,8 @@ const MIX_H = parse(Float64, get(ENV, "H", "2"))
 const MIX_D = parse(Float64, get(ENV, "D", "8"))
 const FIB_N, FIB_CUT = parse.(Int, split(get(ENV, "FIB_FINE", "42:12"), ':'))
 const ALONE_RUNS = parse(Int, get(ENV, "ALONE_RUNS", "5"))
+const MIX_SHAPE = get(ENV, "SHAPE", "plain")
+MIX_SHAPE in ("plain", "inner") || error("mixed_cell: SHAPE must be plain or inner")
 
 mix_sfib(n::Int) = n <= 1 ? n : mix_sfib(n - 1) + mix_sfib(n - 2)
 function mix_pfib(n::Int, cut::Int)
@@ -74,7 +80,8 @@ const MIX_COLUMNS = ["julia", "commit", "threads", "guard", "variant", "round", 
                      "rps", "p50_ms", "p99_ms", "max_ms", "count_min", "count_median", "jain",
                      "slow1_spawn_to_start_pct", "slow1_end_to_wake_pct",
                      "fib_alone_median_s", "fib_alone_min_s", "fib_alone_max_s",
-                     "fib_runs", "fib_median_s", "fib_min_s", "fib_max_s", "fib_walls_s"]
+                     "fib_runs", "fib_median_s", "fib_min_s", "fib_max_s", "fib_walls_s",
+                     "shape", "hw_p50_ms", "hw_p99_ms"]
 
 med(v) = (s = sort(v); n = length(s); n == 0 ? NaN : isodd(n) ? s[(n + 1) ÷ 2] : (s[n ÷ 2] + s[n ÷ 2 + 1]) / 2)
 
@@ -84,10 +91,10 @@ function mixed()
             Threads.nthreads(:default), ",", Threads.nthreads(:interactive), ", variant ", MULTIQ_VARIANT,
             ", C = ", MIX_C, ", H = ", MIX_H, " ms, D = ", MIX_D, " s, ",
             BG_LOOPS == 0 ? "fib_fine $(FIB_N):$(FIB_CUT)" : "$(BG_LOOPS) loops of sfib($(UNIT_N)) x $(UNITS_PER_RUN)",
-            " looping on :default")
+            " looping on :default, shape ", MIX_SHAPE)
     VALIDATE && multiq_unit_asserts()
     # Compile both halves before timing; not reported.
-    run_cell("spawn", :interactive, 8, 0.1, 0.2)
+    run_cell("spawn", :interactive, 8, 0.1, 0.2, MIX_SHAPE)
     fetch(Threads.@spawn :default mix_pfib(min(FIB_N, FIB_CUT + 8), FIB_CUT))
     GC.gc()
     walls, ends = Float64[], UInt64[]
@@ -122,12 +129,12 @@ function mixed()
         end)
     end
     if VALIDATE
-        HANDLED[] = 0; TID_MOVED[] = 0
+        HANDLED[] = 0; TID_MOVED[] = 0; INNER_RUN[] = 0; INNER_BAD[] = 0
     end
     fifo0 = multiq_fifo_counts()
     share0, sfifo0 = multiq_share_counts(), share_fifo_pops()
     multiq_watchdog(ceil(Int, MIX_D) + 120)
-    recs, wall = run_cell("spawn", :interactive, MIX_C, MIX_H, MIX_D; onstart = loop)
+    recs, wall = run_cell("spawn", :interactive, MIX_C, MIX_H, MIX_D, MIX_SHAPE; onstart = loop)
     clients_done = time_ns()
     wait(bg[])
     multiq_watchdog(0)
@@ -140,14 +147,18 @@ function mixed()
     println(join((labels..., MIX_C, MIX_H, MIX_D, m.rps, m.p50, m.p99, m.max, m.cmin, m.cmed, m.jain,
                   m.s2s_share, m.e2w_share, r6(med(alone)), r6(minimum(alone)), r6(maximum(alone)),
                   length(inside), r6(med(inside)), isempty(inside) ? NaN : r6(minimum(inside)),
-                  isempty(inside) ? NaN : r6(maximum(inside)), join(r6.(inside), ",")), '\t'))
+                  isempty(inside) ? NaN : r6(maximum(inside)), join(r6.(inside), ","),
+                  MIX_SHAPE, m.hw_p50, m.hw_p99), '\t'))
     flush(stdout)
     if VALIDATE
-        validate_cell(recs, "spawn", :interactive, MIX_C, MIX_H, "mixed")
-        multiq_fifo_check("mixed C=$(MIX_C) H=$(MIX_H)", fifo0;
-                          f_first = expected_f_first(:interactive, MIX_C, sum(r -> length(r.lat), recs)))
-        # Under M-t (and M-h-t) the two sides' time must come out 40-60% on every :default thread.
-        multiq_share_check("mixed C=$(MIX_C) H=$(MIX_H)", share0, sfifo0; half = FIFO_SERVE === :t && BG_LOOPS == 0)
+        validate_cell(recs, "spawn", :interactive, MIX_C, MIX_H, MIX_SHAPE == "inner" ? "inner" : "mixed")
+        multiq_fifo_check("mixed C=$(MIX_C) H=$(MIX_H) $(MIX_SHAPE)", fifo0;
+                          f_first = expected_f_first(:interactive, MIX_C, sum(r -> length(r.lat), recs)),
+                          desc = expected_desc(MIX_SHAPE, sum(r -> length(r.lat), recs)))
+        # Under M-t (and M-h-t) the two sides' time must come out 40-60% on every :default thread;
+        # under -g the request side's weight, +-10 points (not under g0, whose balance never moves).
+        multiq_share_check("mixed C=$(MIX_C) H=$(MIX_H) $(MIX_SHAPE)", share0, sfifo0;
+                           half = FIFO_SERVE in (:t, :g) && BG_LOOPS == 0)
         validate_threads()
         println(stderr, "validate: mixed: ", length(walls), BG_LOOPS == 0 ? " fib_fine" : " loop", " runs during the cell (",
                 length(inside), " ended before the last client), every result checked")

@@ -128,6 +128,11 @@ _reset_counters!() = fill!(CNT, 0)
     end
 end
 
+# MARK_ROOT=1 (M only; the classes, 2026-11-16): each workload's root is spawned marked, and
+# nothing below it, so every task under it is a descendant (-i: F, -g: R). A plain spawn otherwise.
+const MARK_ROOT = FIFO_CLASS === :mark && get(ENV, "MARK_ROOT", "0") == "1"
+root_spawn(f) = MARK_ROOT ? spawn_marked(f, :default) : Threads.@spawn :default f()
+
 # ── workloads ───────────────────────────────────────────────────────────────────────────────
 
 sfib(n::Int) = n <= 1 ? n : sfib(n - 1) + sfib(n - 2)
@@ -223,8 +228,8 @@ function workloads()
     for (name, var, def) in (("fib_fine", "FIB_FINE", "42:12"), ("fib_coarse", "FIB_COARSE", "45:25"))
         n, cut = parse_pair(get(ENV, var, def))
         push!(ws, Workload(name, n, cut, n - max(cut, 1), () -> nothing,
-                           v -> UInt64(fetch(Threads.@spawn :default pfib(n, cut, v))),
-                           v -> fetch(Threads.@spawn :default pfib(min(n, max(cut, 1) + 6), cut, v)),
+                           v -> UInt64(fetch(root_spawn(() -> pfib(n, cut, v)))),
+                           v -> fetch(root_spawn(() -> pfib(min(n, max(cut, 1) + 6), cut, v))),
                            d -> (d == sfib(n) || error("$name: pfib($n) = $d, sfib = $(sfib(n))"))))
     end
     let (n, cut) = parse_pair(get(ENV, "MSORT", "10000000:4096"))
@@ -233,26 +238,26 @@ function workloads()
         ref = Ref{UInt64}(0)
         push!(ws, Workload("msort", n, cut, ceil(Int, log2(n / cut)), () -> copyto!(v, src),
                            function (val)
-                               fetch(Threads.@spawn :default psort!(v, tmp, 1, n, cut, val))
+                               fetch(root_spawn(() -> psort!(v, tmp, 1, n, cut, val)))
                                return UInt64(GC.@preserve v Base._crc32c(
                                    unsafe_wrap(Array, Ptr{UInt8}(pointer(v)), sizeof(v))))
                            end,
-                           val -> fetch(Threads.@spawn :default psort!(copy(src[1:8cut]), similar(tmp, 8cut),
-                                                                       1, 8cut, cut, val)),
+                           val -> fetch(root_spawn(() -> psort!(copy(src[1:8cut]), similar(tmp, 8cut),
+                                                                       1, 8cut, cut, val))),
                            d -> (v == sort(src) || error("msort: result differs from sort"))))
     end
     let (n, cut) = parse_pair(get(ENV, "REDUCE", "100000000:16384"))
         x = rand(Random.Xoshiro(35589), n)
         push!(ws, Workload("reduce", n, cut, ceil(Int, log2(n / cut)), () -> nothing,
-                           v -> reinterpret(UInt64, fetch(Threads.@spawn :default psum(x, 1, n, cut, v))),
-                           v -> fetch(Threads.@spawn :default psum(x, 1, 8cut, cut, v)),
+                           v -> reinterpret(UInt64, fetch(root_spawn(() -> psum(x, 1, n, cut, v)))),
+                           v -> fetch(root_spawn(() -> psum(x, 1, 8cut, cut, v))),
                            d -> (d == reinterpret(UInt64, ssum(x, 1, n, cut)) ||
                                  error("reduce: sum differs from the serial recursion's"))))
     end
     let (n, reps) = parse_pair(get(ENV, "FANOUT", "10000:50"))
         push!(ws, Workload("fanout", n, reps, 1, () -> nothing,
-                           v -> UInt64(fetch(Threads.@spawn :default fan_out(n, reps, v))),
-                           v -> fetch(Threads.@spawn :default fan_out(n, 1, v)),
+                           v -> UInt64(fetch(root_spawn(() -> fan_out(n, reps, v)))),
+                           v -> fetch(root_spawn(() -> fan_out(n, 1, v))),
                            d -> (d == 4 * n * reps || error("fanout: total $d"))))
     end
     what = split(get(ENV, "WHAT", join((w.name for w in ws), ' ')))
@@ -350,7 +355,8 @@ function measure()
         # Each run and each warm-up spawns one root from the main task (2 warm-ups).
         roots = 2 + length(clean) + length(cnt)
         VALIDATE && multiq_fifo_check(w.name, fifo0;
-            f_first = MARK_ALL ? nothing :
+            desc = MARK_ROOT && FIFO_INHERIT !== :none ? nothing : 0,
+            f_first = MARK_ALL ? nothing : MARK_ROOT ? roots :
                       FIFO_CLASS === :origin && Threads.nthreads(:interactive) > 0 ? roots : 0)
         # The fan-out's one spawner fills its own slot and the idle threads steal it: steals, few pops.
         VALIDATE && multiq_slot_check(w.name, slots0; pops = w.name != "fanout", steals = true,
