@@ -169,5 +169,5 @@
 <circle cx="1182.0" cy="147.3" r="3.5" fill="#c0651a"/>
 <text x="40" y="602" font-size="11" fill="#8a8984">bare_spawn (A): the variant file never included (stock). bare_pool: 8 workers fed by a channel. bare_marked: the request task made by spawn_marked, the only marked task; -l serves</text>
 <text x="40" y="620" font-size="11" fill="#8a8984">unmarked work first, -g shares time between the request side and unmarked work (w 1/2). At 8,0 the slow requests under -g and bare_pool wait before their connection task runs.</text>
-<text x="40" y="638" font-size="11" fill="#8a8984">Max near 1.1 s: a first request whose connect the listen backlog dropped. Source: bench/socket/mark_latency.py; #618.</text>
+<text x="40" y="638" font-size="11" fill="#8a8984">Max near 1.1 s: a first request whose connect the listen backlog dropped. Source: bench/socket/mark_latency.py; #618, comment 6955532071.</text>
 </svg>

@@ -15,8 +15,8 @@ The single max near 1.1 s in some rounds is a connection's first request: a conn
 backlog (128) dropped, retried by the client's kernel a second later.
 
 Every number is a literal from this run's fairness.sh tables (bench/results/618-mark/cell1-8_1.log
-and cell1-8_0.log), reported on #618. Plain Python, no dependencies; writes mark-latency.svg beside
-this file.
+and cell1-8_0.log), reported on #618 in comment 6955532071. Plain Python, no dependencies; writes
+mark-latency.svg beside this file.
 
     python3 bench/socket/mark_latency.py
 """
@@ -104,7 +104,7 @@ def main():
     svg.append(f'<text x="40" y="{H - 40}" font-size="11" fill="{MUTED}">unmarked work first, -g shares time between the request side and unmarked work (w 1/2). '
                f'At 8,0 the slow requests under -g and bare_pool wait before their connection task runs.</text>')
     svg.append(f'<text x="40" y="{H - 22}" font-size="11" fill="{MUTED}">Max near 1.1 s: a first request whose connect the listen backlog dropped. '
-               f'Source: bench/socket/mark_latency.py; #618.</text>')
+               f'Source: bench/socket/mark_latency.py; #618, comment 6955532071.</text>')
     svg.append('</svg>')
     out = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mark-latency.svg")
     with open(out, "w") as f:
