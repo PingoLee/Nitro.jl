@@ -224,7 +224,7 @@ function main()
     pid = getpid()
     idle = start_idle_side()
     t_before = thread_ticks()
-    say("READY pid=$pid arming=$ARMING N=$N deadline_s=$DEADLINE_S W=$W threads=$(Threads.nthreads(:default)),$(Threads.nthreads(:interactive))")
+    say("READY pid=$pid arming=$ARMING N=$N deadline_s=$DEADLINE_S W=$W threads=$(Threads.nthreads(:default)),$(Threads.nthreads(:interactive)) reseau=$(pkgversion(Reseau))")
     t_wait = time()
     while HELD[] < N
         time() - t_wait > 120 && (say("ERROR held $(HELD[]) of $N after 120 s"); exit(2))
@@ -291,9 +291,11 @@ function main()
         tot = sum(delta, both)
         closed_in_window = CLOSED[]
         rt = c1 - c0
+        # The last field: contended locks per second in the window (LOCK_PROFILE=1), else `-`.
         say("RESULT\t$LABEL\t$ARMING\t$N\t$DEADLINE_S\t$W\t$k,$(Threads.nthreads(:interactive))\t$rt\t",
             round(span; digits = 3), "\t", round(rt / span; digits = 0), "\t$tot\t$dflt\t$(delta(poller))\t",
-            "$(delta(pid))\t$poller\t$sc\t$closed_in_window\t$(length(both))\t", round(Int, 1000t0), "\t", round(Int, 1000t1))
+            "$(delta(pid))\t$poller\t$sc\t$closed_in_window\t$(length(both))\t", round(Int, 1000t0), "\t", round(Int, 1000t1),
+            "\t", LOCK_PROFILE ? string(round(Int, (k1 - k0) / (t1 - t0))) : "-")
     end
     PHASE_RUN[] = false
     foreach(wait, tasks)
