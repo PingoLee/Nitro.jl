@@ -13,10 +13,13 @@
 #                               in the one-thread `:interactive` pool, so only the handlers reach
 #                               the F queue; M-h-l marks the handlers only)
 #   C, H, D                     500, 2, 8;  FIB_FINE "42:12";  ALONE_RUNS 5;  ROUND 1
-#   SHAPE=plain|inner           inner: the mixed-inner cell (2026-11-16, agent-config #82 Idea 5): the
+#   SHAPE=plain|inner|inner20   inner: the mixed-inner cell (2026-11-16, agent-config #82 Idea 5): the
 #                               handlers spawn four `:default` children of H/4 and fetch them, the
 #                               inner shape of spawn_order.jl, while fib_fine loops beside them; the
 #                               row gains the shape and the handler wall p50/p99 (ms) at its end
+#                               (inner20: the same with the fork-join inside one of SLOTS = 20
+#                               semaphore slots, see spawn_order.jl; the row also carries the
+#                               requests in flight and the slot wait)
 #   BG=loops:<n>                the half-pool cell: n loops of short chunks instead of fib_fine (above
 #                               loop_run); run it with C small enough that C + n <= 8
 #   NOHEADER=1                  no header line
@@ -36,7 +39,7 @@ const MIX_D = parse(Float64, get(ENV, "D", "8"))
 const FIB_N, FIB_CUT = parse.(Int, split(get(ENV, "FIB_FINE", "42:12"), ':'))
 const ALONE_RUNS = parse(Int, get(ENV, "ALONE_RUNS", "5"))
 const MIX_SHAPE = get(ENV, "SHAPE", "plain")
-MIX_SHAPE in ("plain", "inner") || error("mixed_cell: SHAPE must be plain or inner")
+MIX_SHAPE in ("plain", "inner", "inner20") || error("mixed_cell: SHAPE must be plain, inner or inner20")
 
 mix_sfib(n::Int) = n <= 1 ? n : mix_sfib(n - 1) + mix_sfib(n - 2)
 function mix_pfib(n::Int, cut::Int)
@@ -81,7 +84,8 @@ const MIX_COLUMNS = ["julia", "commit", "threads", "guard", "variant", "round", 
                      "slow1_spawn_to_start_pct", "slow1_end_to_wake_pct",
                      "fib_alone_median_s", "fib_alone_min_s", "fib_alone_max_s",
                      "fib_runs", "fib_median_s", "fib_min_s", "fib_max_s", "fib_walls_s",
-                     "shape", "hw_p50_ms", "hw_p99_ms"]
+                     "shape", "hw_p50_ms", "hw_p99_ms",
+                     "inflight_mean", "inflight_peak", "slot_wait_p50_ms", "slot_wait_p99_ms"]
 
 med(v) = (s = sort(v); n = length(s); n == 0 ? NaN : isodd(n) ? s[(n + 1) ÷ 2] : (s[n ÷ 2] + s[n ÷ 2 + 1]) / 2)
 
@@ -148,10 +152,10 @@ function mixed()
                   m.s2s_share, m.e2w_share, r6(med(alone)), r6(minimum(alone)), r6(maximum(alone)),
                   length(inside), r6(med(inside)), isempty(inside) ? NaN : r6(minimum(inside)),
                   isempty(inside) ? NaN : r6(maximum(inside)), join(r6.(inside), ","),
-                  MIX_SHAPE, m.hw_p50, m.hw_p99), '\t'))
+                  MIX_SHAPE, m.hw_p50, m.hw_p99, m.inflight_mean, m.inflight_peak, m.sw_p50, m.sw_p99), '\t'))
     flush(stdout)
     if VALIDATE
-        validate_cell(recs, "spawn", :interactive, MIX_C, MIX_H, MIX_SHAPE == "inner" ? "inner" : "mixed")
+        validate_cell(recs, "spawn", :interactive, MIX_C, MIX_H, MIX_SHAPE == "plain" ? "mixed" : MIX_SHAPE)
         multiq_fifo_check("mixed C=$(MIX_C) H=$(MIX_H) $(MIX_SHAPE)", fifo0;
                           f_first = expected_f_first(:interactive, MIX_C, sum(r -> length(r.lat), recs)),
                           desc = expected_desc(MIX_SHAPE, sum(r -> length(r.lat), recs)))

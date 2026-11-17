@@ -49,6 +49,17 @@
 #             and the handler, woken by its last child, goes to the back of its own queue.
 #   io        the handler `sleep`s its H ms instead of burning them: a request that waits on I/O
 #             and holds no thread meanwhile, the case a pool wider than the threads is for
+#   inner20   inner, with the fork-join inside one of SLOTS (default 20) slots of one
+#             `Base.Semaphore`: the handler takes a slot after it starts, before its first spawn,
+#             and gives it back after its last fetch, the role of a database connection held
+#             across the request's work (#618, the bounded resource). The cell also reports the
+#             time a handler waited for its slot (p50, p99)
+#
+# Requests in flight (#618), every cell: a handler counts from its start to its return. The
+# time-weighted mean is exact without a counter, the summed handler walls over the cell's wall
+# (every request of a cell starts and ends inside it); the peak needs one: INFLIGHT=1 counts
+# them with one shared atomic up at the start and down at the return, off by default so the H = 0
+# cost cells carry no shared write (the peak column is -1 then).
 #
 # Clients run on `:interactive`, where HTTP.jl runs its connection tasks, or on `:default`. With no
 # interactive thread (`--threads=8,0`) only `default` runs, which is where HTTP.jl's connection
@@ -152,7 +163,9 @@ mutable struct Slot
     prio::UInt16     # priority: the priority the handler was given
     depth::Int32     # sticky: handlers pinned to that tid and not yet started, at the pin
     io::Bool         # io shape: the handler sleeps its h ms instead of burning them
-    Slot() = new(Base.Event(true), 0.0, 0, 0, 0.0, 0, 0, 0, 0, 0, 0, false)   # autoreset: one notify, one wake
+    sem::Bool        # inner20: the fork-join holds one of SEM's slots
+    t_acq::UInt64    # inner20: when the handler got its slot
+    Slot() = new(Base.Event(true), 0.0, 0, 0, 0.0, 0, 0, 0, 0, 0, 0, false, false, 0)   # autoreset: one notify, one wake
 end
 
 const SPAWNED = Threads.Atomic{Int}(0)
@@ -163,6 +176,12 @@ const TID_MOVED = Threads.Atomic{Int}(0)     # ended on a tid other than the one
 const PRIO_BAD = Threads.Atomic{Int}(0)      # priority: started with a priority other than the one set
 const INNER_RUN = Threads.Atomic{Int}(0)     # inner: children that ran
 const INNER_BAD = Threads.Atomic{Int}(0)     # inner: children that ran sticky, or off `:default`
+# inner20's slots, and the requests-in-flight counter and its peak (INFLIGHT=1 only).
+const SLOTS = parse(Int, get(ENV, "SLOTS", "20"))
+const SEM = Base.Semaphore(SLOTS)
+const COUNT_INFLIGHT = get(ENV, "INFLIGHT", "0") == "1"
+const INFL = Threads.Atomic{Int}(0)
+const INFL_PEAK = Threads.Atomic{Int}(0)
 
 # sticky: the `:default` tids and the shared round-robin counter; priority: the arrival sequence.
 # Both counters are reset when a cell starts.
@@ -186,8 +205,9 @@ struct Rec
     lag::Vector{Int64}   # VALIDATE only: start ordinal minus spawn ordinal
     tid::Vector{Int16}   # VALIDATE only: the tid the handler started on
     depth::Vector{Int32} # VALIDATE only, sticky: the assigned tid's queue depth at the pin
+    sw::Vector{Int64}    # inner20: start -> slot taken
     Rec() = new(sizehint!(Int64[], 4096), sizehint!(Int64[], 4096), sizehint!(Int64[], 4096),
-                sizehint!(Int64[], 4096), Int64[], Int16[], Int32[])
+                sizehint!(Int64[], 4096), Int64[], Int16[], Int32[], Int64[])
 end
 
 @inline function stamp_spawn!(slot::Slot)
@@ -204,6 +224,15 @@ function inner_child(q::Float64)
     return burn(q)
 end
 
+# inner's fork-join: four children of q ms each, fetched in order.
+function fork_join(q::Float64)
+    t1 = Threads.@spawn :default inner_child(q)
+    t2 = Threads.@spawn :default inner_child(q)
+    t3 = Threads.@spawn :default inner_child(q)
+    t4 = Threads.@spawn :default inner_child(q)
+    return fetch(t1) + fetch(t2) + fetch(t3) + fetch(t4)
+end
+
 function handle!(slot::Slot, inner::Bool)
     if VALIDATE
         slot.start_ord = Threads.atomic_add!(STARTED, 1)
@@ -213,19 +242,24 @@ function handle!(slot::Slot, inner::Bool)
         slot.prio != current_task().priority && Threads.atomic_add!(PRIO_BAD, 1)
     end
     slot.t_start = time_ns()
-    if inner
-        q = slot.h / 4
-        t1 = Threads.@spawn :default inner_child(q)
-        t2 = Threads.@spawn :default inner_child(q)
-        t3 = Threads.@spawn :default inner_child(q)
-        t4 = Threads.@spawn :default inner_child(q)
-        slot.sink += fetch(t1) + fetch(t2) + fetch(t3) + fetch(t4)
+    COUNT_INFLIGHT && Threads.atomic_max!(INFL_PEAK, Threads.atomic_add!(INFL, 1) + 1)
+    if inner && slot.sem
+        Base.acquire(SEM)
+        slot.t_acq = time_ns()
+        try
+            slot.sink += fork_join(slot.h / 4)
+        finally
+            Base.release(SEM)
+        end
+    elseif inner
+        slot.sink += fork_join(slot.h / 4)
     elseif slot.io
         sleep(slot.h / 1000)
     else
         slot.sink += burn(slot.h)
     end
     slot.t_end = time_ns()
+    COUNT_INFLIGHT && Threads.atomic_sub!(INFL, 1)
     if VALIDATE
         Threads.threadid() != slot.rtid && Threads.atomic_add!(TID_MOVED, 1)
         Threads.atomic_add!(HANDLED, 1)
@@ -239,6 +273,7 @@ function record!(rec::Rec, slot::Slot, t0::UInt64, t1::UInt64)
     push!(rec.s2s, Int64(slot.t_start - t0))
     push!(rec.e2w, Int64(t1 - slot.t_end))
     push!(rec.hw, Int64(slot.t_end - slot.t_start))
+    slot.sem && push!(rec.sw, Int64(slot.t_acq - slot.t_start))
     if VALIDATE
         push!(rec.lag, slot.start_ord - slot.spawn_ord)
         push!(rec.tid, slot.rtid)
@@ -322,12 +357,12 @@ end
 # (mixed_cell.jl starts its background load there).
 function run_cell(mode::String, clients::Symbol, c::Int, h::Float64, d::Float64, shape::String = "plain";
                   onstart = nothing)
-    shape in ("plain", "hetero", "inner", "io") || error("unknown shape $shape")
-    hetero, inner = shape == "hetero", shape == "inner"
+    shape in ("plain", "hetero", "inner", "io", "inner20") || error("unknown shape $shape")
+    hetero, inner = shape == "hetero", shape in ("inner", "inner20")
     mode == "priority" && MULTIQ_VARIANT != "A" && error("the priority mode runs on the build's own heap only (VARIANT=A)")
     MULTIQ_FIFO && mode != "spawn" && error("VARIANT=$(MULTIQ_VARIANT) runs the spawn mode only")
     slots = [Slot() for _ in 1:c]
-    foreach(sl -> sl.io = shape == "io", slots)
+    foreach(sl -> (sl.io = shape == "io"; sl.sem = shape == "inner20"), slots)
     recs = [Rec() for _ in 1:c]
     jobs = Channel{Slot}(Inf)
     workers = Task[]
@@ -342,6 +377,8 @@ function run_cell(mode::String, clients::Symbol, c::Int, h::Float64, d::Float64,
     end
     RR[] = 0
     SEQ[] = 0
+    INFL[] == 0 || error("requests in flight before the cell: $(INFL[])")
+    INFL_PEAK[] = 0
     GC.gc()
     start = time_ns()
     deadline = start + round(UInt64, d * 1e9)
@@ -372,6 +409,7 @@ function metrics(recs::Vector{Rec}, wall::Float64)
     s2s = reduce(vcat, (r.s2s for r in recs))
     e2w = reduce(vcat, (r.e2w for r in recs))
     hw = sort!(reduce(vcat, (r.hw for r in recs)))
+    sw = sort!(reduce(vcat, (r.sw for r in recs)))
     counts = sort!([length(r.lat) for r in recs])
     order = sortperm(lat)
     sorted = lat[order]
@@ -386,13 +424,17 @@ function metrics(recs::Vector{Rec}, wall::Float64)
             jain = round(jain; digits = 3),
             s2s_share = round(100 * sum(s2s[slow]) / slow_lat; digits = 1),
             e2w_share = round(100 * sum(e2w[slow]) / slow_lat; digits = 1),
-            hw_p50 = ms(q(hw, 0.5)), hw_p99 = ms(q(hw, 0.99)), hw_max = ms(hw[end]))
+            hw_p50 = ms(q(hw, 0.5)), hw_p99 = ms(q(hw, 0.99)), hw_max = ms(hw[end]),
+            inflight_mean = round(sum(hw) / (wall * 1e9); sigdigits = 4),
+            inflight_peak = COUNT_INFLIGHT ? INFL_PEAK[] : -1,
+            sw_p50 = isempty(sw) ? NaN : ms(q(sw, 0.5)), sw_p99 = isempty(sw) ? NaN : ms(q(sw, 0.99)))
 end
 
 const COLUMNS = ["julia", "commit", "threads", "guard", "variant", "round", "mode", "clients", "c", "h_ms",
                  "rps", "p50_ms", "p90_ms", "p99_ms", "max_ms", "count_min", "count_p1",
                  "count_median", "count_max", "jain", "slow1_spawn_to_start_pct",
-                 "slow1_end_to_wake_pct", "shape", "hw_p50_ms", "hw_p99_ms", "hw_max_ms"]
+                 "slow1_end_to_wake_pct", "shape", "hw_p50_ms", "hw_p99_ms", "hw_max_ms",
+                 "inflight_mean", "inflight_peak", "slot_wait_p50_ms", "slot_wait_p99_ms"]
 
 # The P microbench and its gate: true when the priority cells may run.
 function prio_gate()
@@ -437,7 +479,7 @@ function measure()
         filter!(!=("priority"), modes)
     end
     # Compile every path before measuring; the warm-up cells are not reported.
-    for mode in modes, cl in clients, shape in ("plain", "hetero", "inner", "io")
+    for mode in modes, cl in clients, shape in ("plain", "hetero", "inner", "io", "inner20")
         run_cell(mode, cl, 8, 0.1, 0.2, shape)
     end
     get(ENV, "NOHEADER", "0") == "1" || println(join(COLUMNS, '\t'))
@@ -476,7 +518,8 @@ function measure()
         multiq_watchdog(0)
         m = metrics(recs, wall)
         println(join((labels..., mode, cl, c, h, m.rps, m.p50, m.p90, m.p99, m.max, m.cmin, m.cp1, m.cmed,
-                      m.cmax, m.jain, m.s2s_share, m.e2w_share, shape, m.hw_p50, m.hw_p99, m.hw_max), '\t'))
+                      m.cmax, m.jain, m.s2s_share, m.e2w_share, shape, m.hw_p50, m.hw_p99, m.hw_max,
+                      m.inflight_mean, m.inflight_peak, m.sw_p50, m.sw_p99), '\t'))
         flush(stdout)
         VALIDATE && validate_cell(recs, mode, cl, c, h, shape)
         # Under D a `:default` client spawns or wakes its handler from a `:default` thread: the slot.
@@ -507,7 +550,7 @@ end
 
 # The classes: how many tasks of a cell with `n` requests are descendants (a marked handler's four
 # inner children), under inheritance.
-expected_desc(shape::String, n::Int) = FIFO_INHERIT !== :none && MARK_HANDLERS && shape == "inner" ? 4n : 0
+expected_desc(shape::String, n::Int) = FIFO_INHERIT !== :none && MARK_HANDLERS && shape in ("inner", "inner20") ? 4n : 0
 
 # Every handler accounted for, how far starts ran behind spawns, the handler count per `:default`
 # tid, and the mode's own invariants: sticky ran where it was pinned and evenly, priority started
@@ -541,7 +584,7 @@ function validate_cell(recs::Vector{Rec}, mode::String, cl::Symbol, c::Int, h::F
     if mode == "priority"
         PRIO_BAD[] == 0 || error("validate: priority: $(PRIO_BAD[]) handlers started with a priority other than the one set")
     end
-    if shape == "inner"
+    if shape in ("inner", "inner20")
         INNER_RUN[] == 4n || error("validate: inner: $(INNER_RUN[]) children ran for $n requests")
         INNER_BAD[] == 0 || error("validate: inner: $(INNER_BAD[]) children ran sticky or off :default")
         println(stderr, "validate: ", label, ": ", INNER_RUN[], " children ran, all non-sticky on :default")
