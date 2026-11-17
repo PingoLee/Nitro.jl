@@ -1074,6 +1074,20 @@ if MULTIQ_FIFO
     for name in (:multiq_insert, :multiq_deletemin, :multiq_check_empty)
         Core.eval(PARTR, _renamed_partr_function(name, Symbol(:stock_, name)))
     end
+    # VALIDATE only: stock's pop behind a check. This file never lets a class bit into stock's heaps
+    # (`stock_multiq_insert` is always given a priority with the bits cleared, and it writes that
+    # priority to the task), so a task they give out with a bit set was put there by the build's own
+    # `multiq_insert`: a thread whose world predates the patch. `stock_bit` counts them.
+    if MULTIQ_VALIDATE
+        Core.eval(PARTR, _renamed_partr_function(:multiq_deletemin, :stock_multiq_deletemin_raw))
+        Core.eval(PARTR, quote
+            function stock_multiq_deletemin()
+                task = stock_multiq_deletemin_raw()
+                task === nothing || task.priority & C_BITS == 0 || (fstates[f_slot()].stock_bit += 1)
+                return task
+            end
+        end)
+    end
     # -g: the R heaps, a second set of stock heaps. The build's own `multiq_size`, `multiq_insert`,
     # `multiq_deletemin` and `multiq_check_empty`, every reference to `heaps`, `heaps_lock` and the
     # four names renamed (`r_heaps`, `r_heaps_lock`, `r_multiq_*`): stock's insert, two-choice pop,
@@ -1096,7 +1110,7 @@ if MULTIQ_FIFO
     # stall check in `f_pop!` must fire.
     const _M_NEGATIVE = MULTIQ_VALIDATE ? get(ENV, "M_NEGATIVE", "") : ""
     _M_NEGATIVE in ("", "blind", "stall", "rblind") || error("M_NEGATIVE must be blind, stall or rblind")
-    _fcount(field) = MULTIQ_VALIDATE ? :(fstates[Threads.threadid()].$field += 1) : nothing
+    _fcount(field) = MULTIQ_VALIDATE ? :(fstates[f_slot()].$field += 1) : nothing
     if FIFO_SHARE || FIFO_RINGS
         # The shares' clock (and the rings' stamps): rdtsc, as E's stamps. It is only ever differenced on one thread, pop to
         # pop, but a thread can move between cores, so it needs the TSC Linux trusts as its
@@ -1362,10 +1376,20 @@ if MULTIQ_FIFO
             r_again::Int    # -g: R-heap inserts of a started task (a wake-up or a yield, roots too)
             r_pops::Int     # -g: tasks popped from the R heaps
             r_peak::Int     # -g: the most tasks this thread saw in the R heaps after one of its inserts
-            pad::NTuple{15,Int}
-            fstate() = new(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ntuple(_ -> 0, 15))
+            foreign::Int    # inserts made by a thread outside the pools (a foreign thread: in a server, Reseau's poller)
+            stock_bit::Int  # tasks stock's heaps gave a pop with a class bit set: an insert by stock's
+                            #   own code (a thread still in the world before the patch), never this file's
+            pad::NTuple{13,Int}
+            fstate() = new(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ntuple(_ -> 0, 13))
         end
-        const fstates = [fstate() for _ in 1:Threads.maxthreadid()]
+        # One slot per thread that existed when this file loaded, plus one overflow slot for every
+        # thread adopted later: a foreign thread that enters Julia after the patch (Reseau's poller,
+        # which wakes the socket waiters of an HTTP.jl server, is one) gets a tid past the pools, and
+        # an insert it makes would otherwise index past the end. Validation only, like every count
+        # here; the timed code indexes nothing by tid on the insert side.
+        const f_nslots = Int(Threads.maxthreadid())
+        const fstates = [fstate() for _ in 1:(f_nslots + 1)]
+        @inline f_slot() = (t = Int(Threads.threadid()); t <= f_nslots ? t : f_nslots + 1)
 
         # The shares, per thread, 128 bytes, touched only by a pop that found the F queue non-empty
         # (an unmarked program never reaches them). The timed code uses the first four fields; the
@@ -1398,7 +1422,7 @@ if MULTIQ_FIFO
         # rings run. Timed runs take the plain lock.
         @inline function f_lock!(q::fqueue)
             $(MULTIQ_VALIDATE ? quote
-                s = fstates[Threads.threadid()]
+                s = fstates[f_slot()]
                 s.acq += 1
                 if !trylock(q.lock)
                     s.held += 1
@@ -1701,6 +1725,7 @@ if MULTIQ_FIFO
         end
 
         function multiq_insert(task::Task, priority::UInt16)
+            $(MULTIQ_VALIDATE ? :(ccall(:jl_threadpoolid, Int8, (Int16,), Threads.threadid() - 1) == Int8(-1) && $(_fcount(:foreign))) : nothing)
             $(FIFO_INHERIT === :none ? nothing : quote
                 # The classes: a task with no class of its own, at its first enqueue, made by a task of
                 # class F or R, is a descendant. With the flag unset nothing past the flag is read.
@@ -1725,7 +1750,7 @@ if MULTIQ_FIFO
                         end : nothing)
                         r_multiq_insert(task, priority & ~C_BITS)
                         $(MULTIQ_VALIDATE ? quote
-                            let s = fstates[Threads.threadid()], n = r_queued()
+                            let s = fstates[f_slot()], n = r_queued()
                                 n > s.r_peak && (s.r_peak = n)
                             end
                         end : nothing)
@@ -1969,7 +1994,9 @@ println(stderr, "multiq_variant: VARIANT=", MULTIQ_VARIANT, MULTIQ_VALIDATE ? " 
         MULTIQ_FIFO && !isempty(_M_NEGATIVE) ? ", NEGATIVE CONTROL $(_M_NEGATIVE)" : "")
 
 # Calls into the new code, per thread (validation only).
-multiq_variant_calls() = [PARTR.variant_calls[64 * (tid - 1) + 1] for tid in 1:Threads.maxthreadid()]
+# Only the threads that existed when this file loaded have a counter (a foreign thread adopted later, such as
+# Reseau's poller in a server, never reaches the counted code: the pops return first on a foreign thread).
+multiq_variant_calls() = [PARTR.variant_calls[64 * (tid - 1) + 1] for tid in 1:(length(PARTR.variant_calls) ÷ 64)]
 
 # End of a process: under C and E, nothing ever went into the build's own heaps, and the
 # variant's are empty (under E: every live count 0 and every bucket's ring and shadow empty).
@@ -2457,7 +2484,7 @@ end
 
 # M and O, VALIDATE only: the counts summed over threads.
 const _F_FIELDS = (:f_first, :f_again, :l_first, :demoted, :f_pops, :l_pops, :skips, :own, :acq, :held,
-                   :desc, :r_first, :r_again, :r_pops)
+                   :desc, :r_first, :r_again, :r_pops, :foreign, :stock_bit)
 function multiq_fifo_counts()
     MULTIQ_FIFO || return nothing
     fs = PARTR.fstates
@@ -2500,6 +2527,7 @@ function multiq_fifo_check(label, before; f_first::Union{Int,Nothing}, desc::Uni
         foreach(s -> s.r_peak = 0, PARTR.fstates)
     end
     d.demoted == 0 || error("$MULTIQ_VARIANT: $label: $(d.demoted) F tasks sent down stock's path")
+    d.stock_bit == 0 || error("$MULTIQ_VARIANT: $label: stock's heaps gave out $(d.stock_bit) tasks with a class bit (an insert by the unpatched code)")
     q == 0 || error("$MULTIQ_VARIANT: $label: $q tasks left in the F queue")
     d.f_pops == d.f_first + d.f_again ||
         error("$MULTIQ_VARIANT: $label: $(d.f_pops) F pops for $(d.f_first + d.f_again) F inserts")

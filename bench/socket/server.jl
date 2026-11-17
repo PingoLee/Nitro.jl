@@ -114,8 +114,39 @@
 # records (0 where a build has no such field) and of the whole `App`, and the size of the Nitro
 # package image the process loaded. It collects, so read `VmRSS` before calling it.
 
+#   VARIANT=<v>         Include `bench/tasks/multiq_variant.jl` with that VARIANT (#618): a runtime patch
+#                       of Base's scheduler, loaded by this process only (see that file's header).
+#                       Unset (the default), the file is never included. It is included BEFORE
+#                       `using HTTP`, and has to be: Reseau's `__init__` starts its poller as a foreign
+#                       thread that enters Julia once and loops for the life of the process, so its
+#                       world is the one current when it started, and it wakes every socket waiter
+#                       with `schedule(task)`. Started before the patch, it would insert with the
+#                       build's own `multiq_insert` for good. `LOAD_ORDER=http_first` loads HTTP.jl
+#                       first anyway, only as the negative control of that claim.
+#   MODE=bare_marked    `bare_spawn` with the per-request task made by `spawn_marked(…, :default)`:
+#                       the request task is marked (class F) and nothing else is, not the connection
+#                       tasks, not anything HTTP.jl creates. Under a VARIANT that marks no handler
+#                       (A, M-none, C, unset) it starts `bare_spawn`'s own code.
+#   VALIDATE=1          With VARIANT: the variant's asserts and probes run before serving, and
+#                       `/mq` answers the classification counts since its previous call (marked
+#                       spawns, how many carried the probe's `X-Conn`, the F and R counts, inserts by
+#                       a thread outside the pools (Reseau's poller), class bits seen in stock's heaps, what is left
+#                       queued) with the variant's own checks' verdict.
+#   `/sleep?ms=<m>`     Every bare mode: the handler sleeps m ms (a handler that waits instead of
+#                       computing).
+
+const VARIANT_SET = haskey(ENV, "VARIANT")
+const LOAD_ORDER  = get(ENV, "LOAD_ORDER", "variant_first")
+LOAD_ORDER in ("variant_first", "http_first") || error("LOAD_ORDER must be variant_first or http_first")
+VARIANT_SET && LOAD_ORDER == "variant_first" && include(joinpath(@__DIR__, "..", "tasks", "multiq_variant.jl"))
+
 using HTTP
 using JSON
+
+VARIANT_SET && LOAD_ORDER == "http_first" && include(joinpath(@__DIR__, "..", "tasks", "multiq_variant.jl"))
+# Whether `bare_marked` marks its request task, and whether `/mq` has counts to answer.
+const MARK_REQ    = VARIANT_SET && MARK_HANDLERS
+const MQ_VALIDATE = VARIANT_SET && MULTIQ_VALIDATE && MULTIQ_FIFO
 
 const MODE       = get(ENV, "MODE", "nitro")
 const NITRO_MODE = MODE in ("nitro", "nitro_log", "nitro_notimeouts")
@@ -372,6 +403,13 @@ function bare_handler(req::HTTP.Request)::HTTP.Response
     target == "/lag"       && return HTTP.Response(200, ["Content-Type" => "application/json"], lag_body())
     target == "/gc"        && return HTTP.Response(200, ["Content-Type" => "application/json"], gc_body())
     target == "/probe"     && return HTTP.Response(200, ["Content-Type" => "text/tab-separated-values"], probe_body())
+    target == "/mq"        && return HTTP.Response(200, ["Content-Type" => "application/json"], mq_body())
+    if startswith(target, "/sleep")
+        ms = tryparse(Float64, something(get(HTTP.URIs.queryparams(HTTP.URIs.URI(target)), "ms", nothing), ""))
+        (ms === nothing || !(ms > 0)) && return HTTP.Response(400, "bad ms")
+        sleep(ms / 1000)
+        return HTTP.Response(200, ["Content-Type" => "text/plain; charset=utf-8"], PLAINTEXT)
+    end
     if startswith(target, "/aggregate")
         query = HTTP.URIs.queryparams(HTTP.URIs.URI(target))
         parsed = agg_params(get(query, "n", nothing), get(query, "op", nothing))
@@ -418,6 +456,89 @@ function start_bare(spawn::Bool; timeouts::Bool = false)
         end
     end
     timeouts && return HTTP.listen!(handler, "127.0.0.1", PORT; read_header_timeout = 15.0, idle_timeout = 120.0)
+    return HTTP.listen!(handler, "127.0.0.1", PORT)
+end
+
+# VALIDATE only (#618): the marked spawns `bare_marked` made, and how many of them were requests the
+# probe stamped (they carried `X-Conn`). Timed runs touch neither.
+const MQ_MARKED  = Threads.Atomic{Int}(0)
+const MQ_STAMPED = Threads.Atomic{Int}(0)
+const MQ_LAST    = Ref((marked = 0, stamped = 0))
+const MQ_BEFORE  = Ref{Any}(nothing)
+
+# `/mq`: the counts since the previous `/mq`, and the variant's own verdict on them. Called once
+# the client has every response, so nothing but this request is in flight: the request is marked
+# too, and its spawn, its insert and its pop are all counted before this runs, so it balances.
+function mq_body()::String
+    if !MQ_VALIDATE
+        d = Dict{String, Any}("counts" => false, "variant" => get(ENV, "VARIANT", ""),
+                              "validate" => get(ENV, "VALIDATE", "0"))
+        # C (and the other variants without classes) under VALIDATE: its own end check (nothing
+        # in the build's heaps, its own heaps empty) and the calls into the new code per `:default`
+        # tid. Its order assert runs inside every pop, and aborts the process if it fails.
+        if VARIANT_SET && MULTIQ_VALIDATE
+            d["calls_per_default_tid"] = multiq_variant_calls()[Threads.threadpooltids(:default)]
+            d["verdict"] = try
+                multiq_variant_check()
+                "ok"
+            catch e
+                sprint(showerror, e)
+            end
+        end
+        return JSON.json(d)
+    end
+    P = PARTR
+    marked, stamped = MQ_MARKED[], MQ_STAMPED[]
+    last = MQ_LAST[]
+    MQ_LAST[] = (; marked, stamped)
+    before = MQ_BEFORE[]
+    now = multiq_fifo_counts()
+    MQ_BEFORE[] = now
+    d = Dict{String, Any}(string(k) => getfield(now, k) - getfield(before, k) for k in _F_FIELDS)
+    d["marked_spawns"] = marked - last.marked
+    d["marked_stamped"] = stamped - last.stamped
+    d["f_queued"] = P.f_queued()
+    d["r_queued"] = P.r_queued()
+    d["stock_default_queued"] = sum((h.ntasks for h in P.heaps[P.f_tpid + 1]); init = 0)
+    d["foreign_tids"] = [t for t in 1:Int(Threads.maxthreadid()) if Threads.threadpool(t) === :foreign]
+    d["overflow_tids"] = Int(Threads.maxthreadid()) - P.f_nslots
+    d["variant"] = MULTIQ_VARIANT
+    d["load_order"] = LOAD_ORDER
+    verdict = try
+        multiq_fifo_check("server /mq", before; f_first = MARK_REQ ? d["marked_spawns"] : 0, desc = 0)
+        multiq_variant_check()
+        "ok"
+    catch e
+        sprint(showerror, e)
+    end
+    d["verdict"] = verdict
+    return JSON.json(d)
+end
+
+# MODE=bare_marked under a variant that marks handlers: `start_bare(true)`'s two closures with the
+# spawn made by `spawn_marked(…, :default)`, which builds the task as `Threads.@spawn` does
+# (`Task(f)`, not sticky, the `:default` pool) and sets the mark. Nothing else changes.
+function start_bare_marked()
+    inner = HTTP.streamhandler(PROBE ? probed_bare_handler : bare_handler)
+    handler = if !PROBE
+        function (stream)
+            MQ_VALIDATE && Threads.atomic_add!(MQ_MARKED, 1)
+            wait(spawn_marked(() -> inner(stream), :default))
+        end
+    else
+        function (stream)
+            rec = probe_begin(stream, true)
+            if MQ_VALIDATE
+                Threads.atomic_add!(MQ_MARKED, 1)
+                rec === nothing || Threads.atomic_add!(MQ_STAMPED, 1)
+            end
+            wait(spawn_marked(() -> begin
+                probe_started!(rec)
+                inner(stream)
+                probe_done!(rec)
+            end, :default))
+        end
+    end
     return HTTP.listen!(handler, "127.0.0.1", PORT)
 end
 
@@ -808,14 +929,22 @@ function sched_share(io::IO, interactive::Vector{Int})
 end
 end
 
+# VALIDATE with a variant: its asserts and probes (watchdog-armed) before anything is served, and
+# the baseline `/mq` counts from after them.
+if VARIANT_SET && MULTIQ_VALIDATE
+    multiq_unit_asserts()
+    MQ_VALIDATE && (MQ_BEFORE[] = multiq_fifo_counts())
+end
+
 handle = NITRO_MODE ? start_nitro() :
          MODE in ("bare_spawn", "bare_scoped") ? start_bare(true) :
+         MODE == "bare_marked" ? (MARK_REQ ? start_bare_marked() : start_bare(true)) :
          MODE == "bare_timeouts" ? start_bare(true; timeouts = true) :
          MODE == "bare_nospawn" ? start_bare(false) :
          MODE == "bare_pool"    ? start_bare_pool() :
-         error("unknown MODE=$(MODE): expected nitro, nitro_log, nitro_notimeouts, bare_spawn, bare_scoped, bare_timeouts, bare_nospawn or bare_pool")
+         error("unknown MODE=$(MODE): expected nitro, nitro_log, nitro_notimeouts, bare_spawn, bare_marked, bare_scoped, bare_timeouts, bare_nospawn or bare_pool")
 
-@info "bench: serving" MODE PORT threads = Threads.nthreads() interactive = Threads.nthreads(:interactive)
+@info "bench: serving" MODE PORT threads = Threads.nthreads() interactive = Threads.nthreads(:interactive) variant = get(ENV, "VARIANT", "") marked = MARK_REQ load_order = LOAD_ORDER
 PROFILE_S > 0 && Threads.@spawn profile_window()
 LAG && Threads.@spawn lag_probe()
 

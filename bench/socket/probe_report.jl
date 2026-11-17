@@ -21,6 +21,16 @@
 # joined, the slowest 1%'s latency threshold, how many of them came from the most starved tenth of
 # connections (fewest completed requests), and the smallest `before` segment seen, which would go
 # negative if the two clocks disagreed.
+#
+# Also per run, below each table: the requests in flight (handler started, not yet returned), from
+# the joined rows' `start` and `hend` stamps, as a time-weighted mean over the run's window (the
+# first send to the last response the client got) and its peak; the fair wait, the connections
+# divided by the throughput (what a perfectly fair server would make every request wait); and,
+# when `fairness.sh` saved them (`<stem>-gc0.json`, `-gc1.json`), the collections and their time
+# in the window. And the client latency's p99 and p99.9 with each connection's first request left
+# out, beside how many first requests waited over 500 ms before their connection task: the client
+# dials on its first request, after stamping it, so a connect the accept queue dropped and the
+# client's kernel retried a second later reads as a ~1 s wait in that segment, and only there.
 
 raw = ARGS[1]
 
@@ -82,6 +92,34 @@ for (label, rs) in sort!(collect(runs); by = first)
         push_foot!(:cut, cut)
         push_foot!(:starved, 100 * count(i -> joined[i][1][1] in starved, slow) / length(slow))
         push_foot!(:clock, minimum(p[1] for p in parts))
+        # Requests in flight: +1 at a handler's start, -1 at its return, over the client's window.
+        t0 = minimum(c[3] for (c, _) in joined)
+        t1 = maximum(c[4] for (c, _) in joined)
+        ev = sort!(vcat([(s[5], 1) for (_, s) in joined], [(s[6], -1) for (_, s) in joined]))
+        live, peak, area, last = 0, 0, 0.0, t0
+        for (t, step) in ev
+            tc = clamp(t, t0, t1)
+            area += live * (tc - last)
+            last = tc
+            live += step
+            peak = max(peak, live)
+        end
+        area += live * (t1 - last)
+        rest = sort([(c[4] - c[3]) / 1e6 for (c, _) in joined if c[2] != 0])
+        push_foot!(:p99_rest, q(rest, 0.99))
+        push_foot!(:p999_rest, q(rest, 0.999))
+        push_foot!(:first_late, count(((c, s),) -> c[2] == 0 && s[4] != 0 && s[4] - c[3] > 500e6, joined))
+        push_foot!(:inflight_mean, area / (t1 - t0))
+        push_foot!(:inflight_peak, peak)
+        rps = length(joined) / ((t1 - t0) / 1e9)
+        push_foot!(:rps, rps)
+        push_foot!(:fair_ms, 1000 * length(counts) / rps)
+        g0, g1 = stem * "-gc0.json", stem * "-gc1.json"
+        if isfile(g0) && isfile(g1)
+            field(f, k) = parse(Int, match(Regex("\"" * k * "\":(-?\\d+)"), read(f, String))[1])
+            push_foot!(:gc_n, field(g1, "pause") - field(g0, "pause"))
+            push_foot!(:gc_ms, (field(g1, "total_time") - field(g0, "total_time")) / 1e6)
+        end
     end
     segs === nothing && continue
     println("\n**$label** ($(length(rs)) rounds)\n")
@@ -95,4 +133,11 @@ for (label, rs) in sort!(collect(runs); by = first)
             "%; slowest 1% are >= ", cell(footer[:cut]), " ms, of which ", cell(footer[:starved]),
             "% came from the most starved tenth of connections; smallest `", segs[1], "` ",
             cell(footer[:clock]), " ms")
+    println("\nrequests in flight (handler started, not returned): time-weighted mean ", cell(footer[:inflight_mean]),
+            ", peak ", cell(footer[:inflight_peak]), "; joined throughput ", cell(footer[:rps]), " req/s, fair wait ",
+            cell(footer[:fair_ms]), " ms",
+            haskey(footer, :gc_n) ? "; GC in the window: $(cell(footer[:gc_n])) collections, $(cell(footer[:gc_ms])) ms" : "")
+    println("\nwithout each connection's first request: p99 ", cell(footer[:p99_rest]), " ms, p99.9 ",
+            cell(footer[:p999_rest]), " ms; first requests that waited > 500 ms before their connection task ",
+            cell(footer[:first_late]))
 end
