@@ -9,6 +9,8 @@
 #   bench/socket/deadlines.sh probe-c2                          # a 2 s deadline on each worker's c2 (A7's target)
 #   bench/socket/deadlines.sh block <threads> "<cells>" [rounds=3] [passes=2]
 #   bench/socket/deadlines.sh strace "<cells>"                  # syscall counts, outside any timed window
+#   bench/socket/deadlines.sh summary <results.tsv>...          # the table of earlier blocks again
+#   DEADLINES_PROJECTS="r166=<env> r170=<env>" bench/socket/deadlines.sh block 8,1 "r166/L1:A0 r170/L1:A0"
 #
 #   bench/socket/quiet.sh deadlines-8-1 bench/socket/deadlines.sh block 8,1 "L1:A0 L1:A1 L1:A2 L1:A3"
 #
@@ -38,10 +40,18 @@
 #
 # Pinning: SERVER_CPUS (0,1,2,6,7,8) the process under test, PEER_CPUS (3,4,9,10) the echo peer with
 # PEER_THREADS (4), CLIENT_CPUS (5,11) the idle client.
+#
+# The environment of the process under test (#782, Reseau 1.7): DEADLINES_PROJECT, default
+# bench/socket/db (Reseau through Nitro's pin). DEADLINES_PROJECTS="<label>=<dir> ..." names others,
+# and a cell spec `<label>/L1:A6` runs that cell in <label>'s environment, so two Reseau versions
+# interleave inside one block (L1 only: a Reseau-only env has no HTTP.jl). The echo peer and the
+# idle client always run in bench/socket/db, so only the process under test changes. Each log's
+# READY line names the Reseau version it loaded. `summary <results.tsv>...` re-prints the table of
+# earlier blocks, one row per cell spec.
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
-CMD="${1:?usage: deadlines.sh validate | block <threads> \"<cells>\" [rounds] [passes] | strace \"<cells>\"}"; shift
+CMD="${1:?usage: deadlines.sh validate | block <threads> \"<cells>\" [rounds] [passes] | strace \"<cells>\" | summary <results.tsv>...}"; shift
 JULIA="${JULIA:-julia}"
 SERVER_CPUS="${SERVER_CPUS:-0,1,2,6,7,8}"
 PEER_CPUS="${PEER_CPUS:-3,4,9,10}"
@@ -50,7 +60,11 @@ PEER_THREADS="${PEER_THREADS:-4}"
 export PEER_PORT="${PEER_PORT:-9190}" IDLE_PORT="${IDLE_PORT:-9191}"
 export WARM_S="${WARM_S:-5}" WINDOW_S="${WINDOW_S:-6}"
 OUT="$ROOT/bench/results/deadlines-$(date +%Y%m%d-%H%M%S)-$CMD"; mkdir -p "$OUT"
-JL=("$JULIA" --startup-file=no --project="$HERE/db")
+JL=("$JULIA" --startup-file=no --project="$HERE/db")                 # the peer and the idle client
+DEADLINES_PROJECT="${DEADLINES_PROJECT:-$HERE/db}"
+JP=("$JULIA" --startup-file=no --project="$DEADLINES_PROJECT")        # the process under test
+declare -A PROJ_OF
+for kv in ${DEADLINES_PROJECTS:-}; do PROJ_OF["${kv%%=*}"]="${kv#*=}"; done
 RESULTS="$OUT/results.tsv"
 
 PIDS=()
@@ -102,15 +116,19 @@ wait_exit() {   # pid timeout_s
 # run_one <threads> <cell> <pass> <round> [VAR=value...]: one process, one window; appends a row.
 run_one() {
   local threads="$1" spec="$2" pass="$3" round="$4"; shift 4
-  local arming cell wspec w
-  IFS=: read -r arming cell wspec <<<"$spec"
+  local arming cell wspec w proj="$DEADLINES_PROJECT" cellspec="$spec"
+  if [[ $spec == */* ]]; then
+    proj="${PROJ_OF[${spec%%/*}]:-}"; [ -n "$proj" ] || die "cell $spec: no DEADLINES_PROJECTS entry for ${spec%%/*}"
+    cellspec="${spec#*/}"
+  fi
+  IFS=: read -r arming cell wspec <<<"$cellspec"
   w="${wspec#w}"; w="${w:-50}"
   cell_env "$cell"
-  local tag="p$pass-r$round-${spec//:/_}-t${threads/,/_}"
+  local tag="p$pass-r$round-${spec//[:\/]/_}-t${threads/,/_}"
   local log="$OUT/$tag.log" ilog="$OUT/$tag.idle.log"
   wait_port_free
   env ARMING="$arming" N="$N" DEADLINE_S="$D" CHURN_EVERY="$C" CHURN_C2="$X" W="$w" LABEL="$tag" "$@" \
-    taskset -c "$SERVER_CPUS" "${JL[@]}" --threads="$threads" "$HERE/deadlines.jl" > "$log" 2>&1 &
+    taskset -c "$SERVER_CPUS" "$JULIA" --startup-file=no --project="$proj" --threads="$threads" "$HERE/deadlines.jl" > "$log" 2>&1 &
   local pid=$! ipid=""
   wait_for "$log" '^READY' 120 || { kill "$pid"; die "$tag: no READY"; }
   if [ "$N" -gt 0 ]; then
@@ -160,20 +178,22 @@ summary() {
       k = $1 "@" $9; if (!(k in n)) order[++nk] = k; i = ++n[k]
       v["rate", k, i] = $12; v["tot", k, i] = $13 * 1e4 / $10; v["dflt", k, i] = $14 * 1e4 / $10
       v["poll", k, i] = $15 * 1e4 / $10; v["main", k, i] = $16 * 1e4 / $10
-      v["pollpct", k, i] = $15 / $11; v["dfltpct", k, i] = $14 / $11; v["totpct", k, i] = $13 / $11 }
+      v["pollpct", k, i] = $15 / $11; v["dfltpct", k, i] = $14 / $11; v["totpct", k, i] = $13 / $11
+      if ($23 == "-" || $23 == "") nolocks[k] = 1; else v["locks", k, i] = $23 }
     NR > 1 && $NF != "ok" { bad++ }
     END {
-      print "| cell | threads | n | rt/s | total µs/rt | default µs/rt | poller µs/rt | main µs/rt | poller % | default % | total % |"
-      print "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|"
+      print "| cell | threads | n | rt/s | total µs/rt | default µs/rt | poller µs/rt | main µs/rt | poller % | default % | total % | contended locks/s |"
+      print "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"
       for (j = 1; j <= nk; j++) { k = order[j]; split(k, kk, "@")
-        printf "| %s | %s | %d | %s | %s | %s | %s | %s | %s | %s | %s |\n", kk[1], kk[2], n[k],
+        printf "| %s | %s | %d | %s | %s | %s | %s | %s | %s | %s | %s | %s |\n", kk[1], kk[2], n[k],
           cell("rate", k, "%.0f"), cell("tot", k, "%.2f"), cell("dflt", k, "%.2f"), cell("poll", k, "%.3f"),
-          cell("main", k, "%.3f"), cell("pollpct", k, "%.1f"), cell("dfltpct", k, "%.0f"), cell("totpct", k, "%.0f") }
-      printf "runs failing a check: %d\n", bad + 0 }' "$RESULTS"
+          cell("main", k, "%.3f"), cell("pollpct", k, "%.1f"), cell("dfltpct", k, "%.0f"), cell("totpct", k, "%.0f"),
+          (k in nolocks) ? "-" : cell("locks", k, "%.0f") }
+      printf "runs failing a check: %d\n", bad + 0 }' "$@"
 }
 
 header() {
-  printf 'cell\tpass\tround\tlabel\tarming\tN\tdeadline_s\tW\tthreads\trt\tspan_s\trt_per_s\ttotal_ticks\tdefault_ticks\tpoller_ticks\tmain_ticks\tpoller_tid\tpoller_syscall\tidle_closed\tthreads_seen\tt0_ms\tt1_ms\tprocess_total\tpeer_total\tcheck\n' > "$RESULTS"
+  printf 'cell\tpass\tround\tlabel\tarming\tN\tdeadline_s\tW\tthreads\trt\tspan_s\trt_per_s\ttotal_ticks\tdefault_ticks\tpoller_ticks\tmain_ticks\tpoller_tid\tpoller_syscall\tidle_closed\tthreads_seen\tt0_ms\tt1_ms\tlocks_per_s\tprocess_total\tpeer_total\tcheck\n' > "$RESULTS"
 }
 
 # probe <arming> <deadline_s> [SILENT=1]: 5 idle sockets, report when the process closes them.
@@ -181,7 +201,7 @@ probe() {
   local arming="$1" d="$2" silent="${3:-}" log="$OUT/probe-$1-$2${3:+-silent}.log"
   wait_port_free
   env ARMING="$arming" N=5 DEADLINE_S="$d" W=0 HOLD_S=15 \
-    taskset -c "$SERVER_CPUS" "${JL[@]}" --threads=8,1 "$HERE/deadlines.jl" > "$log" 2>&1 &
+    taskset -c "$SERVER_CPUS" "${JP[@]}" --threads=8,1 "$HERE/deadlines.jl" > "$log" 2>&1 &
   local pid=$!
   wait_for "$log" '^READY' 120 || die "probe: no READY"
   env PROBE=1 ${silent:+SILENT=1} taskset -c "$CLIENT_CPUS" "${JL[@]}" --threads=1 "$HERE/deadlines_peer.jl" \
@@ -195,15 +215,19 @@ probe() {
 
 case "$CMD" in
   validate)
-    say "validate -> $OUT"
-    probe L1 2; probe L2 2; probe L2 2 SILENT=1         # negative control: closed at 2.0 ± 0.2 s
-    probe L1 0; probe L2 0; probe L2 0 SILENT=1         # off: still open at 12 s
+    # Another DEADLINES_PROJECT is a Reseau-only environment: no HTTP.jl, so L1 only.
+    l2=1; [ "$DEADLINES_PROJECT" != "$HERE/db" ] && l2=0
+    say "validate -> $OUT (process under test in $DEADLINES_PROJECT$([ $l2 = 0 ] && printf ', L1 only'))"
+    probe L1 2; [ $l2 = 1 ] && { probe L2 2; probe L2 2 SILENT=1; }   # negative control: closed at 2.0 ± 0.2 s
+    probe L1 0; [ $l2 = 1 ] && { probe L2 0; probe L2 0 SILENT=1; }   # off: still open at 12 s
     header; start_peer
-    for spec in L1:A0:w1 L1:A2:w1 L1:A0 L2:A0 L1:A1 L1:A2 L1:A3 L2:A2 L2:A3 L1:A4 L2:A4; do
+    specs=(L1:A0:w1 L1:A2:w1 L1:A0 L2:A0 L1:A1 L1:A2 L1:A3 L2:A2 L2:A3 L1:A4 L2:A4)
+    for spec in "${specs[@]}"; do
+      [ $l2 = 0 ] && [[ $spec == L2:* ]] && continue
       run_one 8,1 "$spec" 0 0
     done
     grep -h '^HELD' "$OUT"/p0-r0-L?_A3-*.log | sed 's/^/A3 setup: /'
-    summary ;;
+    summary "$RESULTS" ;;
   probe)
     probe "$@" ;;
   probe-c2)
@@ -213,7 +237,7 @@ case "$CMD" in
     log="$OUT/probe-c2.log"
     wait_port_free
     env ARMING=L1 N=0 DEADLINE_S=0 W=50 C2_DEADLINE_S=2 WARM_S=1 WINDOW_S=3 \
-      taskset -c "$SERVER_CPUS" "${JL[@]}" --threads=8,1 "$HERE/deadlines.jl" > "$log" 2>&1 &
+      taskset -c "$SERVER_CPUS" "${JP[@]}" --threads=8,1 "$HERE/deadlines.jl" > "$log" 2>&1 &
     pid=$!
     wait_exit "$pid" 120
     ppid="$(sed -n 's/^READY pid=\([0-9]*\) .*/\1/p' "$log")"
@@ -241,7 +265,13 @@ case "$CMD" in
         for spec in "${order[@]}"; do run_one "$threads" "$spec" "$pass" "$round"; done
       done
     done
-    summary ;;
+    summary "$RESULTS" ;;
+  summary)
+    # summary <results.tsv>...: the table again, over the rows of earlier blocks (one header kept).
+    rmdir "$OUT" 2>/dev/null
+    tmp="$(mktemp)"
+    { head -1 "$1"; for f in "$@"; do tail -n +2 "$f"; done; } > "$tmp"
+    summary "$tmp"; rm -f "$tmp" ;;
   strace)
     read -ra cells <<<"${1:?cells}"
     say "strace: ${cells[*]} -> $OUT"
@@ -251,7 +281,7 @@ case "$CMD" in
       tag="strace-${spec//:/_}"; log="$OUT/$tag.log"
       wait_port_free
       env ARMING="$arming" N="$N" DEADLINE_S="$D" CHURN_EVERY="$C" CHURN_C2="$X" W=50 STRACE_S=18 LABEL="$tag" \
-        taskset -c "$SERVER_CPUS" "${JL[@]}" --threads=8,1 "$HERE/deadlines.jl" > "$log" 2>&1 &
+        taskset -c "$SERVER_CPUS" "${JP[@]}" --threads=8,1 "$HERE/deadlines.jl" > "$log" 2>&1 &
       pid=$!
       wait_for "$log" '^READY' 120 || die "$tag: no READY"
       ipid=""
