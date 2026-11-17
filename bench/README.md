@@ -337,7 +337,12 @@ HTTP.jl's keep-alive loop does per request: +120 s, then +15 s, then 0. `A7` (ev
 (every round trip) send that churn to a second connection each worker owns and never reads, so the
 socket the round trips wait on carries no deadline (`deadlines.sh probe-c2` checks that the deadline
 reaches it). `LOCK_PROFILE=1` adds the
-window's count of contended `ReentrantLock` acquisitions to each log. Each cell and round is a fresh
+window's count of contended `ReentrantLock` acquisitions to each log and to the table.
+`DEADLINES_PROJECT` runs the process under test in another environment (default `bench/socket/db`,
+Reseau through Nitro's pin). With `DEADLINES_PROJECTS="<label>=<dir> ..."`, a cell spec
+`<label>/L1:A6` runs that cell in that environment, so two Reseau versions interleave inside one
+block (L1 only: a Reseau-only environment has no HTTP.jl). The echo peer and the idle client stay in
+`bench/socket/db`. Each cell and round is a fresh
 process with one 6 s window, because a 120 s deadline must not expire inside a pass. Per-thread CPU
 is read from `/proc` at the window's edges, split into the default threads, the poller and the main
 thread as in #782 run 3. A run is discarded unless every echo matches, the peer's count equals the
