@@ -38,6 +38,10 @@
 # bracketed by `/mix?on=1` and `/mix?on=0`, so unmarked fib_fine runs loop on `:default` only during
 # that server's own window; the runs and their walls are kept as `<stem>-mix.json`.
 #
+# JULIAS="<label>=<julia binary>,<project dir> ..." with a mode spec ending in `%<label>`
+# (`bare_spawn@8,0%ws`) starts that server on another Julia build and environment, so servers of
+# several builds interleave in one block (#618, the stall repro's part 2).
+#
 # Usage: bench/socket/fairness.sh [modes] [rounds] [duration]
 #   ROUTE="/aggregate?n=100000&op=groupby" CONNS=500 bench/socket/fairness.sh "nitro bare_spawn go" 3 8s
 #   PROBE=1 bench/socket/fairness.sh "nitro bare_spawn bare_nospawn bare_pool" 3 8s
@@ -73,10 +77,18 @@ GO_BIN="$OUT/go-server"; CLIENT="$OUT/fairness"
 
 # `nitro@8,0` -> name `nitro`, threads `8,0`, file label `nitro-8_0`;
 # `bare_marked@8,1@M-g-r2` -> variant `M-g-r2` too, label `bare_marked-8_1-M-g-r2`.
-mode_name()    { printf '%s' "${1%%@*}"; }
-mode_threads() { case "$1" in *@*) local t="${1#*@}"; printf '%s' "${t%%@*}" ;; *) printf '%s' "$THREADS" ;; esac; }
-mode_variant() { case "$1" in *@*@*) printf '%s' "${1##*@}" ;; esac; }
-mode_label()   { printf '%s' "$1" | tr '@,' '-_'; }
+# `bare_spawn@8,0%ws` -> the server runs on the build labelled `ws` in JULIAS (#618, the stall repro's
+# part 2), label `bare_spawn-8_0-ws`.
+mode_core()    { printf '%s' "${1%%\%*}"; }
+mode_build()   { case "$1" in *%*) printf '%s' "${1##*%}" ;; esac; }
+mode_name()    { local m; m="$(mode_core "$1")"; printf '%s' "${m%%@*}"; }
+mode_threads() { local m; m="$(mode_core "$1")"; case "$m" in *@*) local t="${m#*@}"; printf '%s' "${t%%@*}" ;; *) printf '%s' "$THREADS" ;; esac; }
+mode_variant() { local m; m="$(mode_core "$1")"; case "$m" in *@*@*) printf '%s' "${m##*@}" ;; esac; }
+mode_label()   { printf '%s' "$1" | tr '@,%' '-_-'; }
+declare -A BUILD_BIN BUILD_PROJECT
+for kv in ${JULIAS:-}; do   # "<label>=<julia binary>,<project dir>"
+  v="${kv#*=}"; BUILD_BIN["${kv%%=*}"]="${v%%,*}"; BUILD_PROJECT["${kv%%=*}"]="${v#*,}"
+done
 listen_ovf()   { awk '/^TcpExt:/ { if (!h) { for (i = 1; i <= NF; i++) if ($i == "ListenOverflows") c = i; h = 1 } else print $c }' /proc/net/netstat; }
 swap_counts()  { awk '$1 == "pswpin" { i = $2 } $1 == "pswpout" { o = $2 } END { print i, o }' /proc/vmstat; }
 rss_mb()       { awk '$1 == "VmRSS:" { printf "%d", $2 / 1024 }' "/proc/$1/status" 2>/dev/null || printf -- '-'; }
@@ -93,9 +105,15 @@ for mode in "${MODE_LIST[@]}"; do
     GOMAXPROCS="$(taskset -c "$SERVER_CPUS" nproc)" PORT="$port" AGG_ROWS="$AGG_ROWS" taskset -c "$SERVER_CPUS" "$GO_BIN" >"$log" 2>&1 &
   else
     variant="$(mode_variant "$mode")"
+    build="$(mode_build "$mode")"
+    jcmd=("${JULIA_CMD[@]}"); jproject="$ROOT/bench"
+    if [ -n "$build" ]; then
+      [ -n "${BUILD_BIN[$build]:-}" ] || { echo "fairness.sh: $mode: no JULIAS entry for $build" >&2; exit 1; }
+      jcmd=("${BUILD_BIN[$build]}"); jproject="${BUILD_PROJECT[$build]}"
+    fi
     env MODE="$(mode_name "$mode")" PORT="$port" AGG_ROWS="$AGG_ROWS" PROBE="$PROBE" VALIDATE="${VALIDATE:-0}" MIX="${MIX:-0}" \
       ${variant:+VARIANT="$variant"} taskset -c "$SERVER_CPUS" \
-      "${JULIA_CMD[@]}" --project="$ROOT/bench" --threads="$(mode_threads "$mode")" "$HERE/server.jl" >"$log" 2>&1 &
+      "${jcmd[@]}" --project="$jproject" --threads="$(mode_threads "$mode")" "$HERE/server.jl" >"$log" 2>&1 &
   fi
   PIDS+=("$!")
   PID_OF[$mode]=$!
