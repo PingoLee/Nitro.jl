@@ -108,12 +108,12 @@ end
 
 const CONSUMER_DEFAULT_LEASE = Dates.Second(60)
 
-# JuliaLang/julia#63882 (#586): on Julia 1.13.0-rc3 through 1.13.x, a task parked on a `Timer`
+# JuliaLang/julia#63882 (#586): on Julia 1.13.0-rc3 through 1.13.3, a task parked on a `Timer`
 # does not wake while every `:default` thread runs a `yield()`ing loop, as long as its timer is the
 # only live libuv handle. A consumer parks both its loops on one-shot `Timer`s, and its jobs are
 # exactly those loops when they follow the "yield every few ms" advice. A consumer never calls
 # `serve`, so it does not get `serve`'s guard (#604): it holds its own never-firing `Timer`, under
-# the same gate, so lowering that gate when a fixed 1.13.x ships retires both.
+# the same gate, so the gate's upper bound, 1.13.4 since #609, is one line for both.
 _consumer_wake_guard() = (_WAKE_GUARD_FORCED[] || _needs_wake_guard()) ? Timer(typemax(Int32)) : nothing
 
 # An interrupt, however a store wrapped it. PormG hands back a Ctrl-C that landed inside a query as

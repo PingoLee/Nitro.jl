@@ -750,7 +750,7 @@ two-process test, which adds SQLite.jl as a test dependency. Where it departs fr
 - **Timeouts are still the queue's**, from `External(…; options)` (§13). A timed-out callback keeps
   its consumer slot until it returns, as in-process (`_RunHandoff`), but stops being renewed once
   its run is recorded.
-- **A consumer holds #604's wake guard** (maintainer, #605). On Julia 1.13.0-rc3 through 1.13.x, a
+- **A consumer holds #604's wake guard** (maintainer, #605). On Julia 1.13.0-rc3 through 1.13.3, a
   task parked on a `Timer` does not wake while every `:default` thread runs a `yield()`ing loop,
   as long as its timer is the only live libuv handle in the process
   ([#586](https://github.com/PingoLee/Nitro.jl/issues/586),
@@ -760,8 +760,8 @@ two-process test, which adds SQLite.jl as a test dependency. Where it departs fr
   `:interactive` is affected at all was not tested (#586's repro parked on `:default`), so this is
   a cheap precaution, not a measured fix. A consumer never calls `serve`, so it holds its own
   never-firing `Timer(typemax(Int32))` for its lifetime, under the same `_needs_wake_guard()` gate,
-  and the drain closes it once both loops are done. One gate means one place to lower when a fixed
-  1.13.x ships.
+  and the drain closes it once both loops are done. One gate meant one place to lower when the
+  fixed release shipped: since #609 its upper bound is 1.13.4, where a consumer holds no guard.
 - **Every hand-back costs an attempt** (maintainer, #605). Claiming increments `attempt`, and a
   hand-back keeps it (§4, #603), including the hand-back of a run that completed during the drain
   and of one the drain reached before it started. Under `:requeue` with the default

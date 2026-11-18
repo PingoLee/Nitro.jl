@@ -248,9 +248,9 @@ julia --project=. --threads=2 bench/socket/swallow.jl control0   # what a reset 
   (`SPIN_MS`, default 1500) the yielding ones, and `/lag`'s max is the answer, with and without
   `/plaintext` traffic beside them. Each of `CONFIGS` is `<juliaup channel>/<PARK>/<GUARD>`
   (`server.jl`'s two knobs): `event/0` is a server with no `Timer` of the bench's own, the shape
-  JuliaLang/julia#63882 stalls on 1.13.0-rc3..1.13.2 (#586). Since #598 `serve()` holds the guard
-  itself on those versions, so `event/0` there measures that guard; run it against an older
-  checkout's `src/` to see the stall.
+  JuliaLang/julia#63882 stalls on 1.13.0-rc3..1.13.3 (#586; 1.13.4 is fixed, #609). Since #598
+  `serve()` holds the guard itself on the affected versions, so `event/0` there measures that
+  guard; set `NITRO_WAKE_GUARD=0` (#828) to see the stall.
 - `slow_stream.sh [rounds] [duration]` keeps K downloads of `TARGETS` (default `/hold/file_stream`
   and `/hold/file`) in flight with curl, each capped at one of `RATES` bytes per second (`0` is
   uncapped), while `/plaintext` is measured: whether a streamed body gives its thread up once the

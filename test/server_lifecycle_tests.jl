@@ -2013,7 +2013,7 @@ end
 using Test
 using Nitro
 
-# JuliaLang/julia#63882: on 1.13.0-rc3 through 1.13.x a task parked on a `Timer` does not wake
+# JuliaLang/julia#63882: on 1.13.0-rc3 through 1.13.3 a task parked on a `Timer` does not wake
 # while every default thread runs a yielding handler, unless another libuv handle is alive.
 # `serve` holds one never-firing `Timer` there. The stall itself is measured by
 # `bench/socket/wake.sh`, not here: it needs every default thread busy and no other live timer
@@ -2027,8 +2027,11 @@ using Nitro.Core.AppContext: _needs_wake_guard, _hold_wake_guard!, _release_wake
     @test _needs_wake_guard(v"1.13.0-rc3")          # its first bad one
     @test _needs_wake_guard(v"1.13.0")
     @test _needs_wake_guard(v"1.13.2")
-    @test _needs_wake_guard(v"1.13.9")
+    @test _needs_wake_guard(v"1.13.3")              # the last affected release
+    @test !_needs_wake_guard(v"1.13.4")             # the first fixed one, measured (#609)
+    @test !_needs_wake_guard(v"1.13.9")
     @test !_needs_wake_guard(v"1.14.0-DEV.3725")    # master is not affected
+    @test !_needs_wake_guard(v"1.14.0-beta1")       # measured too (#609)
     @test !_needs_wake_guard(v"1.14.0")
 end
 
