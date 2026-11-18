@@ -23,6 +23,9 @@
 #   cell6     the same with the fork-join inside one of 20 semaphore slots (shape inner20)
 #   both L, both4 L, both2, bothv L   the two fixes of the `8,0` diagnostic together (agent-config #82
 #             Idea 8): bare_marked_listen under M-gc-r2; see the blocks below
+#   a0oha L, a0v L, burst L, burst4, burstdeep, burstv   the two loose ends of 2026-11-18 (agent-config
+#             #82 Idea 9): whose the 4% oha reads under M-none is (A0 beside it), and the accept
+#             queue at the connect burst; see the blocks below
 #
 # A defaults to `@A` (bare_spawn under VARIANT=A, the variant file included); A=none runs the
 # no-include process instead, for when the pilot shows the include itself costs something.
@@ -36,6 +39,7 @@ set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
 BLOCK="$1"; LAYOUT="${2:-8,1}"
+ROUNDS_GIVEN="${ROUNDS:-}"; DUR_GIVEN="${DUR:-}"   # the blocks with their own defaults (a0oha, burst*)
 ROUNDS="${ROUNDS:-3}"; DUR="${DUR:-8s}"; D="${D:-8}"
 A_SUFFIX="@A"; [ "${A:-@A}" = none ] && A_SUFFIX=""
 MARK_OUT="$ROOT/bench/results/618-mark"; mkdir -p "$MARK_OUT"   # quiet.sh sets its own OUT
@@ -115,6 +119,34 @@ case "$BLOCK" in
   bothv)
     "$HERE/quiet.sh" "618both-v-${LAYOUT/,/_}" env VALIDATE=1 PROBE=1 ROUTE="$AGG" "$HERE/fairness.sh" \
       "bare_marked@$LAYOUT@M-gc-r2 bare_marked_listen@$LAYOUT@M-g-r2 bare_marked_listen@$LAYOUT@M-gc-r2" 1 "$DUR" ;;
+  # The loose ends of 2026-11-18 (#618, agent-config #82 Idea 9). Q1, whose the 4% is: a0oha is
+  # /plaintext at the layout with oha after the client in every window (OHA=1), A (no VARIANT), A0
+  # (stock's sift re-evaluated: the patch's load with no change of order), M-none (the patch, nothing
+  # marked) and bare_marked_listen under M-gc-r2; the client's and oha's CPU share (CLIENT_CPU=1);
+  # even rounds reversed. ROUNDS defaults to 6 here, so each server runs as often in each
+  # position. a0v: one VALIDATE start of each.
+  # Q2, the accept queue at the connect burst: burst is cell 1 at the layout in short windows
+  # (DUR 3s) over many rounds (ROUNDS 10), A, bare_marked and bare_marked_listen under M-gc-r2;
+  # burst4 the same with MIX=1 at 8,0; burstdeep the burst block at 8,0 with a backlog of 1024
+  # (BACKLOG, every bare server). burstv: one VALIDATE start of each Q2 server at 8,0 and 8,1.
+  a0oha)
+    "$HERE/quiet.sh" "618a0-oha-${LAYOUT/,/_}" env OHA=1 PROBE=0 CLIENT_CPU=1 REVERSE_EVEN=1 ROUTE="/plaintext" "$HERE/fairness.sh" \
+      "bare_spawn@$LAYOUT bare_spawn@$LAYOUT@A0 bare_spawn@$LAYOUT@M-none bare_marked_listen@$LAYOUT@M-gc-r2" "${ROUNDS_GIVEN:-6}" "$DUR" ;;
+  a0v)
+    "$HERE/quiet.sh" "618a0-v-${LAYOUT/,/_}" env VALIDATE=1 PROBE=0 ROUTE="/plaintext" "$HERE/fairness.sh" \
+      "bare_spawn@$LAYOUT@A0 bare_spawn@$LAYOUT@M-none bare_marked_listen@$LAYOUT@M-gc-r2" 1 3s ;;
+  burst)
+    "$HERE/quiet.sh" "618burst-cell1-${LAYOUT/,/_}" env PROBE=1 REVERSE_EVEN=1 ROUTE="$AGG" "$HERE/fairness.sh" \
+      "bare_spawn@$LAYOUT bare_marked@$LAYOUT@M-gc-r2 bare_marked_listen@$LAYOUT@M-gc-r2" "${ROUNDS_GIVEN:-10}" "${DUR_GIVEN:-3s}" ;;
+  burst4)
+    "$HERE/quiet.sh" 618burst-cell4-8_0 env MIX=1 PROBE=1 REVERSE_EVEN=1 ROUTE="$AGG" "$HERE/fairness.sh" \
+      "bare_spawn@8,0 bare_marked@8,0@M-gc-r2 bare_marked_listen@8,0@M-gc-r2" "${ROUNDS_GIVEN:-10}" "${DUR_GIVEN:-3s}" ;;
+  burstdeep)
+    "$HERE/quiet.sh" 618burst-deep-8_0 env BACKLOG=1024 PROBE=1 REVERSE_EVEN=1 ROUTE="$AGG" "$HERE/fairness.sh" \
+      "bare_spawn@8,0 bare_marked@8,0@M-gc-r2 bare_marked_listen@8,0@M-gc-r2" "${ROUNDS_GIVEN:-10}" "${DUR_GIVEN:-3s}" ;;
+  burstv)
+    "$HERE/quiet.sh" 618burst-v env VALIDATE=1 PROBE=1 ROUTE="$AGG" "$HERE/fairness.sh" \
+      "bare_marked@8,0@M-gc-r2 bare_marked_listen@8,0@M-gc-r2 bare_marked@8,1@M-gc-r2 bare_marked_listen@8,1@M-gc-r2" 1 3s ;;
   cell5|cell6)
     shape=inner; [ "$BLOCK" = cell6 ] && shape=inner20
     export -f harness; export MARK_OUT D CPUS ROOT

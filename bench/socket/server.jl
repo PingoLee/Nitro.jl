@@ -27,6 +27,9 @@
 #
 #   POOL=<n>            bare_pool only: how many pooled handler tasks.
 #   PORT=8080           Loopback port.
+#   BACKLOG=<n>         Every bare mode: the listen backlog passed to `HTTP.listen!` (default 128,
+#                       HTTP.jl's own). The kernel caps it at net.core.somaxconn (#618, the accept
+#                       queue at the connect burst). The Nitro modes keep `serve()`'s.
 #   ACCESS_LOG=0|1      Nitro only: `serve(access_log = …)`. Default 0.
 #   PROFILE=<seconds>   After WARMUP seconds, sample every thread for this long and write three
 #                       reports under bench/results/: `-flat` (all threads), `-threads` (flat,
@@ -178,6 +181,8 @@ end
 NITRO_MODE && include(joinpath(@__DIR__, "..", "route_table.jl"))
 
 const PORT      = parse(Int, get(ENV, "PORT", "8080"))
+# BACKLOG: the bare modes' accept queue, `HTTP.listen!(…; backlog)`, default HTTP.jl's own 128 (#618).
+const BACKLOG   = parse(Int, get(ENV, "BACKLOG", "128"))
 const ACCESS_LOG = get(ENV, "ACCESS_LOG", "0") == "1" || MODE == "nitro_log"
 const PROFILE_S  = parse(Float64, get(ENV, "PROFILE", "0"))
 const WARMUP_S   = parse(Float64, get(ENV, "WARMUP", "8"))
@@ -512,8 +517,8 @@ function start_bare(spawn::Bool; timeouts::Bool = false)
             probe_done!(rec)
         end
     end
-    timeouts && return HTTP.listen!(handler, "127.0.0.1", PORT; read_header_timeout = 15.0, idle_timeout = 120.0)
-    return HTTP.listen!(handler, "127.0.0.1", PORT)
+    timeouts && return HTTP.listen!(handler, "127.0.0.1", PORT; backlog = BACKLOG, read_header_timeout = 15.0, idle_timeout = 120.0)
+    return HTTP.listen!(handler, "127.0.0.1", PORT; backlog = BACKLOG)
 end
 
 # VALIDATE only (#618): the marked spawns `bare_marked` made, and how many of them were requests the
@@ -629,8 +634,8 @@ function start_bare_marked()
     # them with `Threads.@spawn :interactive`, which falls back to `:default` with no interactive
     # thread). At `N,1` they are interactive-pool tasks, which the rule never classes, so this mode
     # is `bare_marked` there. Each request task keeps its own mark and stays a root.
-    LISTEN_MARKED && return fetch(spawn_marked(() -> HTTP.listen!(handler, "127.0.0.1", PORT), :default))
-    return HTTP.listen!(handler, "127.0.0.1", PORT)
+    LISTEN_MARKED && return fetch(spawn_marked(() -> HTTP.listen!(handler, "127.0.0.1", PORT; backlog = BACKLOG), :default))
+    return HTTP.listen!(handler, "127.0.0.1", PORT; backlog = BACKLOG)
 end
 
 # One reusable hand-off per CONNECTION (a connection serves one request at a time), kept in the
@@ -672,7 +677,7 @@ function start_bare_pool()
         slot.err === nothing || throw(slot.err)
         return nothing
     end
-    return HTTP.listen!(handler, "127.0.0.1", PORT)
+    return HTTP.listen!(handler, "127.0.0.1", PORT; backlog = BACKLOG)
 end
 
 function start_nitro()

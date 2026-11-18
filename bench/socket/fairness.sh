@@ -42,6 +42,17 @@
 # (`bare_spawn@8,0%ws`) starts that server on another Julia build and environment, so servers of
 # several builds interleave in one block (#618, the stall repro's part 2).
 #
+# Every window is a fresh connect burst: the client is a new process each run, and its exit closes
+# its connections. The TSV's est0 is the count of established connections on the server's port
+# just before the client starts, which says so (0) for each run (#618, the accept queue).
+#
+# REVERSE_EVEN=1 (#618): even rounds run the mode list in reverse, against a position effect.
+#
+# CLIENT_CPU=1 (#618): the client's run, and oha's under OHA=1, each go in a subshell that ends in
+# `times`, which reads that child's own user + system time exactly. The TSV's cli_cpu and oha_cpu
+# are that time over the run's wall times the client CPUs: 1.0 is every client CPU busy all the
+# window (otherwise -).
+#
 # Usage: bench/socket/fairness.sh [modes] [rounds] [duration]
 #   ROUTE="/aggregate?n=100000&op=groupby" CONNS=500 bench/socket/fairness.sh "nitro bare_spawn go" 3 8s
 #   PROBE=1 bench/socket/fairness.sh "nitro bare_spawn bare_nospawn bare_pool" 3 8s
@@ -92,6 +103,14 @@ done
 listen_ovf()   { awk '/^TcpExt:/ { if (!h) { for (i = 1; i <= NF; i++) if ($i == "ListenOverflows") c = i; h = 1 } else print $c }' /proc/net/netstat; }
 swap_counts()  { awk '$1 == "pswpin" { i = $2 } $1 == "pswpout" { o = $2 } END { print i, o }' /proc/vmstat; }
 rss_mb()       { awk '$1 == "VmRSS:" { printf "%d", $2 / 1024 }' "/proc/$1/status" 2>/dev/null || printf -- '-'; }
+CLIENT_NCPU="$(taskset -c "$CLIENT_CPUS" nproc)"
+# CLIENT_CPU=1: run "$@" with stdout to $1's file, print "<cpu share of the client CPUs>" from
+# `times`' children line (user then system, as 0m1.234s) over the wall.
+timed_run()    { local out="$1"; shift
+  local t0 t1 tl; t0="$(date +%s.%N)"
+  tl="$( { "$@" >"$out"; times; } | tail -1 )"; t1="$(date +%s.%N)"
+  awk -v l="$tl" -v w0="$t0" -v w1="$t1" -v n="$CLIENT_NCPU" 'function sec(x,  a) { split(x, a, "m"); sub("s", "", a[2]); return a[1] * 60 + a[2] }
+    BEGIN { split(l, f, " "); printf "%.3f", (sec(f[1]) + sec(f[2])) / ((w1 - w0) * n) }'; }
 
 PIDS=()
 trap 'for p in ${PIDS[@]+"${PIDS[@]}"}; do kill "$p" 2>/dev/null; done; wait 2>/dev/null' EXIT
@@ -130,9 +149,13 @@ for mode in "${MODE_LIST[@]}"; do
   taskset -c "$CLIENT_CPUS" oha -z 3s -c "$CONNS" --no-tui "http://127.0.0.1:${PORT_OF[$mode]}$ROUTE" >/dev/null 2>&1
 done
 
-printf 'mode\tround\trps\tp50_ms\tp99_ms\tp999_ms\tmax_ms\tshare_over_1s\tconn_min\tconn_p1\tconn_p10\tconn_p50\tconn_max\tjain\tmaxwait_p50_ms\tmaxwait_p90_ms\tp90_ms\tgc_n\tgc_ms\trss_mb\tswap_in\tswap_out\tlisten_ovf\toha_rps\n' > "$RESULT"
+printf 'mode\tround\trps\tp50_ms\tp99_ms\tp999_ms\tmax_ms\tshare_over_1s\tconn_min\tconn_p1\tconn_p10\tconn_p50\tconn_max\tjain\tmaxwait_p50_ms\tmaxwait_p90_ms\tp90_ms\tgc_n\tgc_ms\trss_mb\tswap_in\tswap_out\tlisten_ovf\toha_rps\test0\tcli_cpu\toha_cpu\n' > "$RESULT"
 for round in $(seq 1 "$ROUNDS"); do
-  for mode in "${MODE_LIST[@]}"; do
+  ORDER=("${MODE_LIST[@]}")
+  if [ "${REVERSE_EVEN:-0}" = 1 ] && [ $((round % 2)) = 0 ]; then
+    ORDER=(); for ((k = ${#MODE_LIST[@]} - 1; k >= 0; k--)); do ORDER+=("${MODE_LIST[$k]}"); done
+  fi
+  for mode in "${ORDER[@]}"; do
     stem="$RAW/r$round-$(mode_label "$mode")"
     js="$stem.json"
     probe_args=()
@@ -151,8 +174,15 @@ for round in $(seq 1 "$ROUNDS"); do
     mixing=0
     [ "${MIX:-0}" = 1 ] && case "$(mode_name "$mode")" in bare_*) mixing=1 ;; esac
     [ "$mixing" = 1 ] && curl -fsS -m 60 -o /dev/null "http://127.0.0.1:${PORT_OF[$mode]}/mix?on=1"
-    GOMAXPROCS="$(taskset -c "$CLIENT_CPUS" nproc)" taskset -c "$CLIENT_CPUS" "$CLIENT" \
-      -url "http://127.0.0.1:${PORT_OF[$mode]}$ROUTE" -c "$CONNS" -d "$DUR" ${probe_args[@]+"${probe_args[@]}"} >"$js"
+    est0="$(ss -Htn state established "sport = :${PORT_OF[$mode]}" | wc -l)"
+    cli_cpu=-
+    if [ "${CLIENT_CPU:-0}" = 1 ]; then
+      cli_cpu="$(timed_run "$js" env GOMAXPROCS="$CLIENT_NCPU" taskset -c "$CLIENT_CPUS" "$CLIENT" \
+        -url "http://127.0.0.1:${PORT_OF[$mode]}$ROUTE" -c "$CONNS" -d "$DUR" ${probe_args[@]+"${probe_args[@]}"})"
+    else
+      GOMAXPROCS="$CLIENT_NCPU" taskset -c "$CLIENT_CPUS" "$CLIENT" \
+        -url "http://127.0.0.1:${PORT_OF[$mode]}$ROUTE" -c "$CONNS" -d "$DUR" ${probe_args[@]+"${probe_args[@]}"} >"$js"
+    fi
     [ "$mixing" = 1 ] && curl -fsS -m 600 -o "$stem-mix.json" "http://127.0.0.1:${PORT_OF[$mode]}/mix?on=0"
     # The client has waited for every response, so no request is still in flight.
     [ "$PROBE" = 1 ] && [ "$(mode_name "$mode")" != go ] &&
@@ -169,8 +199,12 @@ for round in $(seq 1 "$ROUNDS"); do
         [ "${VALIDATE:-0}" = 1 ] && curl -fsS -m 60 -o "$stem-mq.json" "http://127.0.0.1:${PORT_OF[$mode]}/mq" ;;
       esac
     fi
-    oha_rps=-
-    if [ "${OHA:-0}" = 1 ]; then
+    oha_rps=-; oha_cpu=-
+    if [ "${OHA:-0}" = 1 ] && [ "${CLIENT_CPU:-0}" = 1 ]; then
+      oha_cpu="$(timed_run "$stem-oha.json" taskset -c "$CLIENT_CPUS" oha -z "$DUR" -c "$CONNS" --no-tui --output-format json \
+        "http://127.0.0.1:${PORT_OF[$mode]}$ROUTE" 2>/dev/null)"
+      oha_rps="$(jq '.summary.requestsPerSec | floor' "$stem-oha.json" 2>/dev/null || printf -- '-')"
+    elif [ "${OHA:-0}" = 1 ]; then
       taskset -c "$CLIENT_CPUS" oha -z "$DUR" -c "$CONNS" --no-tui --output-format json \
         "http://127.0.0.1:${PORT_OF[$mode]}$ROUTE" > "$stem-oha.json" 2>/dev/null
       oha_rps="$(jq '.summary.requestsPerSec | floor' "$stem-oha.json" 2>/dev/null || printf -- '-')"
@@ -179,8 +213,8 @@ for round in $(seq 1 "$ROUNDS"); do
         .latency_ms.max, .share_over_1s, .per_conn_count.min, .per_conn_count.p1, .per_conn_count.p10,
         .per_conn_count.p50, .per_conn_count.max, .jain_index, .per_conn_max_wait_ms.p50,
         .per_conn_max_wait_ms.p90, .latency_ms.p90] | map(if type == "number" then (. * 1000 | round / 1000) else . end) | @tsv' "$js")"
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$row" "$gc_n" "$gc_ms" "$rss" "$((swin1 - swin0))" "$((swout1 - swout0))" \
-      "$((lo1 - lo0))" "$oha_rps" >> "$RESULT"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$row" "$gc_n" "$gc_ms" "$rss" "$((swin1 - swin0))" "$((swout1 - swout0))" \
+      "$((lo1 - lo0))" "$oha_rps" "$est0" "$cli_cpu" "$oha_cpu" >> "$RESULT"
     sleep 2
   done
 done
