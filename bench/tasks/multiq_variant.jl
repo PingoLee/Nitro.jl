@@ -119,7 +119,8 @@
 #         only at a two-sided pop and credits the whole interval since the previous one to the side
 #         of the last pop, which in a server is often a short one-sided L pop that followed a request
 #         task's run. -gc reads the clock at every pop and credits each interval to the side of the
-#         task that ran in it, when that task was popped while both sides had work.
+#         task that ran in it, when that task was popped while both sides had work. M-gc25-r<d> and
+#         M-gc75-r<d> are -gc at -g's other two weights (#618, agent-config #82 Idea 8).
 #     M-a<T>-r<d>: the rings with an age rule instead of a share: the heaps first unless the older
 #       of the d sampled ring heads has waited more than T ms (the sweep cut first).
 #
@@ -164,12 +165,12 @@
 const MULTIQ_VARIANT = get(ENV, "VARIANT", "A")
 const _D_MATCH = match(r"^D([0-9]+|-inf)$", MULTIQ_VARIANT)
 const _E_MATCH = match(r"^E([0-9]+|-inf)$", MULTIQ_VARIANT)
-const _F_MATCH = match(r"^(M|M-h|O)-(f|l|t|t0|p[0-9]+|il|it|g|g0|g25|g75|gc|a[0-9]+)(?:-r([0-9]+)(o?))?$|^M-none$",
+const _F_MATCH = match(r"^(M|M-h|O)-(f|l|t|t0|p[0-9]+|il|it|g|g0|g25|g75|gc|gc25|gc75|a[0-9]+)(?:-r([0-9]+)(o?))?$|^M-none$",
                        MULTIQ_VARIANT)
 MULTIQ_VARIANT in ("A", "A0", "B", "C") || _D_MATCH !== nothing || _E_MATCH !== nothing || _F_MATCH !== nothing ||
     error("VARIANT must be A, A0, B, C, D<K>, D-inf, E<K>, E-inf, M-f, M-l, M-t, M-t0, M-p<K>, M-h-f, M-h-l, ",
           "M-h-t, M-none, M-l-r<d>[o], M-h-l-r<d>, M-t-r<d>, M-t0-r<d>, M-il-r<d>, M-it-r<d>, M-g-r<d>, ",
-          "M-g25-r<d>, M-g75-r<d>, M-g0-r<d>, M-gc-r<d>, M-h-g-r<d>, M-a<T>-r<d>, O-f or O-l, not $(MULTIQ_VARIANT)")
+          "M-g25-r<d>, M-g75-r<d>, M-g0-r<d>, M-gc-r<d>, M-gc25-r<d>, M-gc75-r<d>, M-h-g-r<d>, M-a<T>-r<d>, O-f or O-l, not $(MULTIQ_VARIANT)")
 _F_MATCH === nothing || _F_MATCH[2] === nothing || _F_MATCH[2] in ("f", "l") || _F_MATCH[1] != "O" ||
     error("the shares (-t, -t0, -p<K>) are built for M and M-h, not O")
 # D's slot budget, or nothing for every other variant.
@@ -189,20 +190,21 @@ const FIFO_CLASS = !MULTIQ_FIFO ? :none : startswith(MULTIQ_VARIANT, "O") ? :ori
 const _F_RULE = !MULTIQ_FIFO || MULTIQ_VARIANT == "M-none" ? "" : String(_F_MATCH[2])
 const FIFO_SERVE = !MULTIQ_FIFO ? :none : MULTIQ_VARIANT == "M-none" ? :f :
                    startswith(_F_RULE, "p") ? :p : startswith(_F_RULE, "a") ? :a :
-                   _F_RULE == "il" ? :l : _F_RULE == "it" ? :t : _F_RULE in ("g", "g25", "g75", "gc") ? :g :
+                   _F_RULE == "il" ? :l : _F_RULE == "it" ? :t : _F_RULE in ("g", "g25", "g75", "gc", "gc25", "gc75") ? :g :
                    Symbol(_F_RULE)
 # -gc (#618, the `8,0` diagnostic): -g with the clock read at every pop, each interval credited to
 # the side of the task that ran in it, and only when that task was popped while both sides had work.
 # -g reads the clock only at a two-sided pop and credits the whole interval since the previous one
 # to the side of the LAST pop, so a request task's run followed by a short one-sided L pop is
 # charged to L (measured: the request side credited 0.4% of the time it ran 100% of, at `8,0`).
-const GROUP_CLOCK = _F_RULE == "gc"
+# M-gc25-r<d> and M-gc75-r<d> (#618, agent-config #82 Idea 8): -gc at w = 1/4 and 3/4, -g's weights.
+const GROUP_CLOCK = _F_RULE in ("gc", "gc25", "gc75")
 # The classes (agent-config #82 Idea 5): who a descendant becomes. `:i` F (into the rings), `:g` R
 # (into the R heaps); `:none` no inheritance (every variant before them).
 const FIFO_INHERIT = _F_RULE in ("il", "it") ? :i : FIFO_SERVE in (:g, :g0) ? :g : :none
 const FIFO_GROUP = FIFO_INHERIT === :g
 # -g's weight for the request side, in quarters (w = GROUP_W4 / 4); g0 keeps the balance at 0.
-const GROUP_W4 = _F_RULE == "g25" ? 1 : _F_RULE == "g75" ? 3 : 2
+const GROUP_W4 = _F_RULE in ("g25", "gc25") ? 1 : _F_RULE in ("g75", "gc75") ? 3 : 2
 # M-a<T>: the age, in ms, past which the older sampled ring head goes before the heaps.
 const AGE_MS = FIFO_SERVE === :a ? parse(Int, _F_RULE[2:end]) : 0
 # The shares (run of 2026-11-16): both act only when a pop finds the F queue non-empty, and keep
@@ -234,6 +236,13 @@ const MARK_ALL = FIFO_CLASS === :mark && get(ENV, "MARK_ALL", "0") == "1"
 # C's heaps: C, and D behind its slots.
 const MULTIQ_SEQ_HEAPS = MULTIQ_VARIANT == "C" || SLOT_BUDGET !== nothing
 const MULTIQ_VALIDATE = get(ENV, "VALIDATE", "0") == "1"
+# M_NOCLOCK=1 (VALIDATE, -g only; #618, agent-config #82 Idea 8): the start-up probes of
+# `multiq_check_empty` are skipped, because `_r_probe` sets the pool flag, and `multiq_noclock_check`
+# then asserts that a cell in which nothing is marked left the flag unset and made no -g pop. With the
+# flag unset -g's pop is stock's and reads no clock (the clock is read only in `_GROUP_POP`, reached
+# with the flag set, and in the rings' insert, which takes a marked task): M-none's path.
+const MULTIQ_NOCLOCK = MULTIQ_VALIDATE && get(ENV, "M_NOCLOCK", "0") == "1"
+MULTIQ_NOCLOCK && !FIFO_GROUP && error("M_NOCLOCK=1 checks the -g variants only, not $(MULTIQ_VARIANT)")
 
 # `Base._crc32c` of the `base/partr.jl` C was copied from.
 # 1.13.4's partr.jl is byte-identical to 1.13.2's (and 1.13.3's): the same crc, checked when the
@@ -2690,10 +2699,19 @@ end
 
 # The shares, VALIDATE only: per-thread counts (a copy of every `:default` thread's sstate fields).
 const _S_FIELDS = (:f_cyc, :l_cyc, :both_f, :both_l, :caps, :clips, :acct, :f_choice)
+# -g's run counters (a clock read at every -g pop, VALIDATE only), read beside the credited time so
+# the harness reports credited against run (#618, agent-config #82 Idea 8), as `/mq` does in a server.
+const _GR_FIELDS = (:run_r, :run_l, :run_r2, :run_l2)
+multiq_run_counts() = !(FIFO_GROUP && MULTIQ_VALIDATE) ? nothing :
+    Dict(tid => NamedTuple{_GR_FIELDS}(Tuple(getfield(PARTR.gstates[tid], k) for k in _GR_FIELDS))
+         for tid in Threads.threadpooltids(:default))
 function multiq_share_counts()
     FIFO_ACCOUNTS && MULTIQ_VALIDATE || return nothing
-    return Dict(tid => NamedTuple{_S_FIELDS}(Tuple(getfield(PARTR.sstates[tid], k) for k in _S_FIELDS))
-                for tid in Threads.threadpooltids(:default))
+    s = Dict(tid => NamedTuple{_S_FIELDS}(Tuple(getfield(PARTR.sstates[tid], k) for k in _S_FIELDS))
+             for tid in Threads.threadpooltids(:default))
+    FIFO_GROUP || return s
+    g = multiq_run_counts()
+    return Dict(tid => merge(s[tid], g[tid]) for tid in keys(s))
 end
 
 # The shares, VALIDATE only: print, per `:default` thread, the pops by side, the time credited to
@@ -2710,6 +2728,7 @@ function multiq_share_check(label, before, fbefore; half::Bool = false)
     ms(c) = round(c / SHARE_CYCLES_PER_MS; digits = 1)
     pct(a, b) = a + b == 0 ? NaN : round(100 * a / (a + b); digits = 1)
     bad = String[]
+    sums = zeros(Int, 8)   # -g: credited R, L (while both had work); run R, L; run from two-sided R, L; F pops, L pops
     println(stderr, "validate: share counts, ", label, " (", MULTIQ_VARIANT, ", cap ", ms(SHARE_CAP), " ms):")
     for tid in Threads.threadpooltids(:default)
         d = NamedTuple{_S_FIELDS}(Tuple(getfield(now[tid], k) - getfield(before[tid], k) for k in _S_FIELDS))
@@ -2720,12 +2739,26 @@ function multiq_share_check(label, before, fbefore; half::Bool = false)
                 d.f_choice, "), time F ", ms(d.f_cyc), " ms L ", ms(d.l_cyc), " ms (F ", pct(d.f_cyc, d.l_cyc),
                 "%), while both had work F ", ms(d.both_f), " ms L ", ms(d.both_l), " ms (F ", both, "%), cap ",
                 d.caps, ", clipped intervals ", d.clips)
+        if FIFO_GROUP
+            gr = NamedTuple{_GR_FIELDS}(Tuple(getfield(now[tid], k) - getfield(before[tid], k) for k in _GR_FIELDS))
+            println(stderr, "validate:   tid ", tid, ": run R ", ms(gr.run_r), " ms L ", ms(gr.run_l), " ms (R ",
+                    pct(gr.run_r, gr.run_l), "%), run from two-sided pops R ", ms(gr.run_r2), " ms L ", ms(gr.run_l2),
+                    " ms (R ", pct(gr.run_r2, gr.run_l2), "%)")
+            sums .+= (d.both_f, d.both_l, gr.run_r, gr.run_l, gr.run_r2, gr.run_l2, fp, lp)
+        end
         if half
             (d.both_f + d.both_l) / SHARE_CYCLES_PER_MS >= 50 ||
                 push!(bad, "tid $tid: only $(ms(d.both_f + d.both_l)) ms with both sides busy")
             lo <= both <= hi || push!(bad, "tid $tid: F's share while both had work is $both%")
         end
     end
+    # One machine-readable line per cell for `aggregate_fifo.jl <dir> credit`: ms, and the R parts.
+    FIFO_GROUP && println(stderr, "validate: credit-run, ", label, " (", MULTIQ_VARIANT, "): threads=",
+                          Threads.nthreads(:default), ",", Threads.nthreads(:interactive), " credited_r_ms=",
+                          ms(sums[1]), " credited_l_ms=", ms(sums[2]), " credited_r_pct=", pct(sums[1], sums[2]),
+                          " run_r_ms=", ms(sums[3]), " run_l_ms=", ms(sums[4]), " run_r_pct=", pct(sums[3], sums[4]),
+                          " run2_r_ms=", ms(sums[5]), " run2_l_ms=", ms(sums[6]), " run2_r_pct=", pct(sums[5], sums[6]),
+                          " pops_r=", sums[7], " pops_l=", sums[8])
     isempty(bad) || error("$MULTIQ_VARIANT: $label: the time share is not $lo-$hi% on every :default thread: ",
                           join(bad, "; "))
     return nothing
@@ -2933,10 +2966,32 @@ function _f_unit_asserts()
             "stock heap fill/drain ", lfd,
             FIFO_RINGS ? "; a ring's stamped fill/drain of 600 in order, $(length(P.frings)) rings" : "")
     _M_NEGATIVE == "stall" && _f_stall_control()
-    multiq_watchdog(60)
-    _f_probe()
-    FIFO_GROUP && _r_probe()
-    multiq_watchdog(0)
+    if MULTIQ_NOCLOCK
+        # `_r_probe` sets the pool flag, which is what M_NOCLOCK must see unset.
+        println(stderr, "multiq_variant: M_NOCLOCK=1: the check_empty probes skipped, so the pool flag stays as the program leaves it")
+    else
+        multiq_watchdog(60)
+        _f_probe()
+        FIFO_GROUP && _r_probe()
+        multiq_watchdog(0)
+    end
+    return nothing
+end
+
+# M_NOCLOCK=1, -g only (#618, agent-config #82 Idea 8): a cell in which nothing is marked must leave
+# the pool flag unset and make no -g pop, so no -g clock read happened in it: the pop was stock's.
+function multiq_noclock_check(label)
+    MULTIQ_NOCLOCK || return nothing
+    P = PARTR
+    on = @atomic :acquire P.fl.on
+    pops = sum(g -> g.two + g.one_r + g.one_l + g.none, P.gstates)
+    acct = sum(s -> s.acct, P.sstates)
+    stamps = sum(g -> g.vstamp != 0 ? 1 : 0, P.gstates)
+    (on || pops != 0 || acct != 0 || stamps != 0) &&
+        error("$MULTIQ_VARIANT: $label: with nothing marked the pool flag is $(on ? "set" : "unset"), ",
+              pops, " -g pops, ", acct, " accounted pops, ", stamps, " threads with a -g clock read")
+    println(stderr, "validate: no clock, ", label, " (", MULTIQ_VARIANT, "): pool flag unset, 0 -g pops, ",
+            "0 accounted pops, no thread read the -g clock")
     return nothing
 end
 

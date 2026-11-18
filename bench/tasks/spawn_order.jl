@@ -538,6 +538,7 @@ function measure()
                                           desc = startswith(mode, "pool") ? 0 : expected_desc(shape, sum(r -> length(r.lat), recs))) : nothing
         VALIDATE && multiq_lock_check("$mode/$cl C=$c H=$h $shape", lock0, fd, sum(r -> length(r.lat), recs))
         VALIDATE && multiq_share_check("$mode/$cl C=$c H=$h $shape", share0, sfifo0)
+        VALIDATE && multiq_noclock_check("$mode/$cl C=$c H=$h $shape")
     end
     VALIDATE && validate_threads()
     multiq_variant_check()

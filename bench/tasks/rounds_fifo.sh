@@ -47,6 +47,17 @@
 #   q1        the rings run's first question, one block (BLOCKS=q1 ROUNDS=1): one sweep round, M-l
 #             under VALIDATE per layout for the F-lock counts, and a profile of the 8,0 cell per
 #             variant (A and M-l)
+# PROFILE=gc (the corrected accounts in the harness, agent-config #82 Idea 8: M-gc-r2 beside M-g-r2):
+# BLOCKS=pilot ROUNDS=1 first (8,1: the inner shape, the mixed and the mixed-inner cell for A M-g-r2
+# M-gc-r2: M-g-r2 must land on the classes run); BLOCKS=pool, the Channel worker pool with nothing
+# marked; then the rounds: mixed and mixedinner (A M-g-r2 M-gc-r2 M-gc25-r2 M-gc75-r2, or MIX_V_GC),
+# fairness (A M-g-r2 M-gc-r2, plus M-h-gc-r2 with :default clients), shapes (inner and io for A M-l-r2
+# M-g-r2 M-gc-r2), nesting (fib_fine alone, A M-none M-g-r2 M-gc-r2), markroot (A M-g-r2 M-gc-r2) and
+# cost (A A0 M-none M-g-r2 M-gc-r2). VALIDATE adds the mixed-inner, marked-root and pool cells, the
+# credited-against-run lines (`aggregate_fifo.jl <OUT> credit`), and the no-clock step: under
+# M_NOCLOCK=1 the pool cells and fib_fine alone for M-g-r2 and M-gc-r2 must leave the pool flag unset.
+#   pool      spawn_order.jl MODES=pool at H = 0, C = 50 and 500, :interactive clients at 8,1 and
+#             :default clients at 8,0, the POOL_V variants, nothing marked (PROFILE=gc only)
 #
 #
 # PROFILE=share (the shares of 2026-11-16, M-t and M-p<K>) swaps the lists: cost at C = 500 only,
@@ -151,6 +162,28 @@ elif [ "$PROFILE" = rings ]; then
   VAL_MARKALL_V=""
   VAL_MIX_V="M-l M-l-r2"
   NEG_V="M-l M-l-r2"
+elif [ "$PROFILE" = gc ]; then
+  COST_V="A A0 M-none M-g-r2 M-gc-r2"
+  COST_CELLS="50:0 500:0"
+  FAIR_I81_V="A M-g-r2 M-gc-r2"
+  FAIR_D_V="A M-g-r2 M-gc-r2 M-h-gc-r2"
+  SHAPE_V="A M-l-r2 M-g-r2 M-gc-r2"
+  SHAPE_CELLS="500:2:inner 500:2:io"
+  SHAPE_INNER_V=""
+  NEST_V="A M-none M-g-r2 M-gc-r2"
+  NEST_WORKLOADS="fib_fine"
+  MARKROOT_V="A M-g-r2 M-gc-r2"
+  PILOT_V="A M-g-r2 M-gc-r2"
+  MIX_V="${MIX_V_GC:-A M-g-r2 M-gc-r2 M-gc25-r2 M-gc75-r2}"
+  POOL_V="A A0 M-none M-g-r2 M-gc-r2"
+  VAL_V="A A0 M-none M-l-r2 M-g-r2 M-gc-r2 M-gc25-r2 M-gc75-r2 M-h-gc-r2"
+  VAL_NEST_V="A M-none M-g-r2 M-gc-r2"
+  VAL_MARKALL_V=""
+  VAL_MARKROOT_V="M-g-r2 M-gc-r2"
+  VAL_MIX_V="A M-g-r2 M-gc-r2 M-gc25-r2 M-gc75-r2"
+  NOCLOCK_V="M-g-r2 M-gc-r2"
+  NEG_V="M-g-r2 M-gc-r2"
+  NEG_R_V="M-g-r2 M-gc-r2"
 elif [ "$PROFILE" = inherit ]; then
   I_RULE="${I_RULE:-M-il-r2}"
   COST_V="A A0 M-none M-l-r2 M-g-r2"
@@ -176,7 +209,7 @@ elif [ "$PROFILE" = inherit ]; then
   NEG_R_V="M-g-r2"
 fi
 SWEEP_LAYOUTS="${SWEEP_LAYOUTS:-2,0:0,1 4,0:0,1,2,3 8,0:0,1,2,3,6,7,8,9}"
-case "$PROFILE" in mo|share|rings|inherit) ;; *) echo "rounds_fifo: PROFILE must be mo, share, rings or inherit" >&2; exit 1 ;; esac
+case "$PROFILE" in mo|share|rings|inherit|gc) ;; *) echo "rounds_fifo: PROFILE must be mo, share, rings, inherit or gc" >&2; exit 1 ;; esac
 ordered() {   # round, variants...
   local r="$1"; shift
   if [ $((r % 2)) = 0 ]; then printf '%s\n' "$@" | tac | tr '\n' ' '; else echo "$*"; fi
@@ -248,8 +281,8 @@ nesting_block() {   # round, nested tsv, variants, extra env...
 
 pilot_block() {   # spawn tsv, nested tsv (PROFILE=share: the mixed tsv; inherit: mixed, mixed-inner)
   local tsv="$1" ntsv="$2" v
-  if [ "$PROFILE" = inherit ]; then
-    # The classes' gate, at 8,1: the inner shape, the mixed cell, the mixed-inner cell.
+  if [ "$PROFILE" = inherit ] || [ "$PROFILE" = gc ]; then
+    # The classes' gate (PROFILE=gc: the same cells, M-g-r2 against the classes run), at 8,1: the inner shape, the mixed cell, the mixed-inner cell.
     for v in $PILOT_V; do spawn 0 "$tsv" 8,1 interactive "$v" "500:2:inner" || return 1; done
     MIX_V="$PILOT_V" mixed_block 0 "$ntsv" || return 1
     MIX_V="$PILOT_V" mixed_block 0 "$3" SHAPE=inner
@@ -265,6 +298,19 @@ pilot_block() {   # spawn tsv, nested tsv (PROFILE=share: the mixed tsv; inherit
     for v in $PILOT_V; do spawn 0 "$tsv" 8,1 "$clients" "$v" "500:2" || return 1; done
   done
   NEST_LAYOUTS=8,1 nesting_block 0 "$ntsv" "$PILOT_V" WORKLOADS=fib_fine
+}
+
+# PROFILE=gc: the Channel worker pool, nothing marked, at H = 0 (the stall repro's part 2 cell):
+# :interactive clients at 8,1, :default clients at 8,0. Extra VAR=value arguments reach every process.
+pool_block() {   # round, tsv, variants, extra env...
+  local r="$1" tsv="$2" vs="$3" d=8 cc layout clients v; shift 3
+  [ "$VALIDATE" = 1 ] && d=1
+  for cc in "8,1 interactive" "8,0 default"; do
+    read -r layout clients <<<"$cc"
+    for v in $(ordered "$r" $vs); do
+      ( for kv in "$@"; do export "${kv?}"; done; spawn "$r" "$tsv" "$layout" "$clients" "$v" "50:0 500:0" pool "$d" ) || return 1
+    done
+  done
 }
 
 mixed_block() {   # round, tsv, extra env...
@@ -379,7 +425,13 @@ if [ "$VALIDATE" = 1 ]; then
       { [ "$PROFILE" != inherit ] || {
           MIX_V="$VAL_MIX_V" mixed_block 1 "$OUT/validate-mixedinner.tsv" FIB_FINE=36:12 D=4 SHAPE=inner &&
           markroot_block 1 "$OUT/validate-markroot.tsv" "$VAL_MARKROOT_V" FIB_FINE=36:12 &&
-          sweep_block 1 "$OUT/validate-sweep.tsv"; }; }
+          sweep_block 1 "$OUT/validate-sweep.tsv"; }; } &&
+      { [ "$PROFILE" != gc ] || {
+          MIX_V="$VAL_MIX_V" mixed_block 1 "$OUT/validate-mixedinner.tsv" FIB_FINE=36:12 D=4 SHAPE=inner &&
+          markroot_block 1 "$OUT/validate-markroot.tsv" "$VAL_MARKROOT_V" FIB_FINE=36:12 &&
+          pool_block 1 "$OUT/validate-pool.tsv" "$POOL_V" &&
+          pool_block 1 "$OUT/validate-noclock-pool.tsv" "$NOCLOCK_V" M_NOCLOCK=1 &&
+          nesting_block 1 "$OUT/validate-noclock-nested.tsv" "$NOCLOCK_V" WORKLOADS=fib_fine FIB_FINE=36:12 M_NOCLOCK=1; }; }
     } 2>>"$vlog" || status=1
   fi
   # The negative controls must fail, each with its own message:
@@ -421,6 +473,11 @@ for r in $(seq 1 "$ROUNDS"); do
         if block "cost-r$r" "$a" "$b" -- "${SELF[@]}" cost_block "$r" "$a" "$b"; then
           mv "$a" "$OUT/cost-spawn-r$r.tsv"; mv "$b" "$OUT/micro-r$r.tsv"; log "round $r cost done"
         else log "round $r cost FAILED"; status=1; fi ;;
+      pool)
+        a="$OUT/attempt-pool-r$r-$stamp.tsv"
+        if block "pool-r$r" "$a" -- "${SELF[@]}" pool_block "$r" "$a" "$POOL_V"; then
+          mv "$a" "$OUT/pool-r$r.tsv"; log "round $r pool done"
+        else log "round $r pool FAILED"; status=1; fi ;;
       fairness|shapes)
         a="$OUT/attempt-$kind-spawn-r$r-$stamp.tsv"
         if block "$kind-r$r" "$a" -- "${SELF[@]}" "${kind}_block" "$r" "$a"; then
@@ -433,7 +490,7 @@ for r in $(seq 1 "$ROUNDS"); do
         else log "round $r nesting FAILED"; status=1; fi ;;
       pilot)
         a="$OUT/attempt-pilot-spawn-$stamp.tsv" b="$OUT/attempt-pilot-nested-$stamp.tsv" c="$OUT/attempt-pilot-mixedinner-$stamp.tsv"
-        second=pilot-nested.tsv; [ "$PROFILE" = share ] || [ "$PROFILE" = inherit ] && second=pilot-mixed.tsv
+        second=pilot-nested.tsv; [ "$PROFILE" = share ] || [ "$PROFILE" = inherit ] || [ "$PROFILE" = gc ] && second=pilot-mixed.tsv
         if block "pilot" "$a" "$b" "$c" -- "${SELF[@]}" pilot_block "$a" "$b" "$c"; then
           mv "$a" "$OUT/pilot-spawn.tsv"; mv "$b" "$OUT/$second"
           [ -s "$c" ] && mv "$c" "$OUT/pilot-mixedinner.tsv"; log "pilot done"
