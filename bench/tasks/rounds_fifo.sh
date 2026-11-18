@@ -69,7 +69,9 @@
 #
 # Usage: JL=<julia binary> MICRO_PROJECT=<env with BenchmarkTools> bench/tasks/rounds_fifo.sh [rounds]
 #   OUT           results directory (default bench/results/618-fifo)
-#   ROUNDS        3 (or the argument)
+#   ROUNDS        3 (or the argument): the last round
+#   FIRST_ROUND   1: the first round, to add rounds to a block (FIRST_ROUND=5 ROUNDS=6 adds two,
+#                 numbered and ordered as rounds 5 and 6)
 #   BLOCKS        "cost fairness shapes nesting": which blocks a round runs ("pilot" and "markall"
 #                 are run on their own: BLOCKS=pilot ROUNDS=1)
 #   CPUS          0,1,2,3,6,7,8,9, as spawn_order.sh
@@ -464,7 +466,7 @@ if [ "$VALIDATE" = 1 ]; then
 fi
 
 status=0
-for r in $(seq 1 "$ROUNDS"); do
+for r in $(seq "${FIRST_ROUND:-1}" "$ROUNDS"); do
   for kind in $BLOCKS; do
     stamp="$(date +%Y%m%d-%H%M%S)"
     case "$kind" in
