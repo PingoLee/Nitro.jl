@@ -319,6 +319,19 @@ function pool_rows(rows)
         println("| ", cl, " | ", t, " | ", c, " | ", join((cell(v(s)) for s in names), " | "), " | ", spread, " | ",
                 join((ratios(v(n), a) for n in others), " | "), " |")
     end
+    # Round by round, each value with the position its variant ran in within that round (the rows of a
+    # round's file are in run order; variants are reversed in even rounds), for every cell.
+    for (cl, t, c) in unique((r["clients"], r["threads"], r["c"]) for r in rows)
+        println("\n**Round by round, clients on :", cl, ", --threads=", t, ", C = ", c, "** (req/s, position in the round)\n")
+        println("| round | ", join(names, " | "), " |")
+        println("|--:|", repeat("--:|", length(names)))
+        for rd in sort(unique(r["round"] for r in rows); by = x -> parse(Int, x))
+            rs = filter(r -> (r["round"], r["clients"], r["threads"], r["c"]) == (rd, cl, t, c), rows)
+            pos = Dict(series(r) => i for (i, r) in enumerate(rs))
+            println("| ", rd, " | ", join((haskey(pos, s) ? string(fmt(num(rs[pos[s]], "rps")), " (", pos[s], ")") : "–"
+                                          for s in names), " | "), " |")
+        end
+    end
 end
 
 # The validation pass's credited-against-run lines (`validate: credit-run, <label> (<variant>): k=v ...`
