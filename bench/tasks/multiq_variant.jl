@@ -163,10 +163,24 @@
 # (exit status 142) instead of hanging.
 
 const MULTIQ_VARIANT = get(ENV, "VARIANT", "A")
+# The native mark (#618, agent-config #82 Idea 10): a Julia built from bench/julia/'s patch, whose
+# `Task` has the field `sched_class` and whose scheduler is M-gc-r2 written inside Base.Partr.
+# VARIANT=N marks what M-gc-r2 marks here (handlers and clients; in a server the request task),
+# N-h the handlers only, N-none nothing. No runtime patch is loaded: the build's own
+# `Threads._spawn_set_fair` marks, the one-time init runs at load (below), and VALIDATE reads the
+# build's own counters, which only its validation build (`Base.Partr.SCHED_VALIDATE`) has. Every
+# class-dependent constant below is M-gc-r2's (N, N-none) or M-h-gc-r2's (N-h). The runtime
+# patch refuses to load on such a build: only A and the N variants run there.
+const NATIVE_BUILD = hasfield(Task, :sched_class)
+const MULTIQ_NATIVE = MULTIQ_VARIANT in ("N", "N-h", "N-none")
+MULTIQ_NATIVE && !NATIVE_BUILD && error("VARIANT=$(MULTIQ_VARIANT) needs a Julia built with the native mark (bench/julia/)")
+NATIVE_BUILD && !(MULTIQ_VARIANT == "A" || MULTIQ_NATIVE) &&
+    error("the runtime patch refuses to load on a build with the native mark: VARIANT=$(MULTIQ_VARIANT); use A, N, N-h or N-none")
+const _F_NAME = MULTIQ_VARIANT == "N-h" ? "M-h-gc-r2" : MULTIQ_NATIVE ? "M-gc-r2" : MULTIQ_VARIANT
 const _D_MATCH = match(r"^D([0-9]+|-inf)$", MULTIQ_VARIANT)
 const _E_MATCH = match(r"^E([0-9]+|-inf)$", MULTIQ_VARIANT)
 const _F_MATCH = match(r"^(M|M-h|O)-(f|l|t|t0|p[0-9]+|il|it|g|g0|g25|g75|gc|gc25|gc75|a[0-9]+)(?:-r([0-9]+)(o?))?$|^M-none$",
-                       MULTIQ_VARIANT)
+                       _F_NAME)
 MULTIQ_VARIANT in ("A", "A0", "B", "C") || _D_MATCH !== nothing || _E_MATCH !== nothing || _F_MATCH !== nothing ||
     error("VARIANT must be A, A0, B, C, D<K>, D-inf, E<K>, E-inf, M-f, M-l, M-t, M-t0, M-p<K>, M-h-f, M-h-l, ",
           "M-h-t, M-none, M-l-r<d>[o], M-h-l-r<d>, M-t-r<d>, M-t0-r<d>, M-il-r<d>, M-it-r<d>, M-g-r<d>, ",
@@ -204,7 +218,9 @@ const GROUP_CLOCK = _F_RULE in ("gc", "gc25", "gc75")
 const FIFO_INHERIT = _F_RULE in ("il", "it") ? :i : FIFO_SERVE in (:g, :g0) ? :g : :none
 const FIFO_GROUP = FIFO_INHERIT === :g
 # -g's weight for the request side, in quarters (w = GROUP_W4 / 4); g0 keeps the balance at 0.
-const GROUP_W4 = _F_RULE in ("g25", "gc25") ? 1 : _F_RULE in ("g75", "gc75") ? 3 : 2
+const GROUP_W4 = MULTIQ_NATIVE ? (w = get(ENV, "JULIA_SCHED_FAIR_WEIGHT", "1/2");
+                                  w == "1/4" ? 1 : w == "3/4" ? 3 : w == "1/2" ? 2 : error("JULIA_SCHED_FAIR_WEIGHT=$w")) :
+                 _F_RULE in ("g25", "gc25") ? 1 : _F_RULE in ("g75", "gc75") ? 3 : 2
 # M-a<T>: the age, in ms, past which the older sampled ring head goes before the heaps.
 const AGE_MS = FIFO_SERVE === :a ? parse(Int, _F_RULE[2:end]) : 0
 # The shares (run of 2026-11-16): both act only when a pop finds the F queue non-empty, and keep
@@ -229,8 +245,8 @@ FIFO_RINGS && !(FIFO_SERVE in (:l, :t, :t0, :g, :g0, :a) && _F_MATCH[1] in ("M",
 RING_OWN && !(FIFO_SERVE === :l && FIFO_INHERIT === :none) && error("the own-ring insert is built for M-l-r<d>o only")
 (FIFO_INHERIT !== :none || FIFO_SERVE === :a) && !FIFO_RINGS &&
     error("the classes and the age rule are built on the rings: $(MULTIQ_VARIANT)-r2")
-const MARK_HANDLERS = MULTIQ_FIFO && _F_MATCH[1] in ("M", "M-h")
-const MARK_CLIENTS = MULTIQ_FIFO && _F_MATCH[1] == "M"
+const MARK_HANDLERS = MULTIQ_FIFO && _F_MATCH[1] in ("M", "M-h") && MULTIQ_VARIANT != "N-none"
+const MARK_CLIENTS = MULTIQ_FIFO && _F_MATCH[1] == "M" && MULTIQ_VARIANT != "N-none"
 # Optional, nested.jl only: every spawn marked (the cost of marking fine-grained fork-join).
 const MARK_ALL = FIFO_CLASS === :mark && get(ENV, "MARK_ALL", "0") == "1"
 # C's heaps: C, and D behind its slots.
@@ -259,7 +275,9 @@ const MULTIQ_BACKEND = !isdefined(Base, :Scheduler) ? :partr :
     Base.Scheduler.ChosenScheduler === PARTR ? :partr :
     Symbol(lowercase(String(nameof(Base.Scheduler.ChosenScheduler))))
 const MULTIQ_BUILD = Base.GIT_VERSION_INFO.commit_short *
-    (isdefined(Base, :Scheduler) ? "/" * String(MULTIQ_BACKEND) : "")
+    (isdefined(Base, :Scheduler) ? "/" * String(MULTIQ_BACKEND) : "") *
+    (NATIVE_BUILD ? (PARTR.SCHED_VALIDATE ? "/native-validate" : "/native") :
+     isempty(Base.TAGGED_RELEASE_BANNER) ? "/local" : "")   # a source build: the control shares the official binary's commit
 MULTIQ_VARIANT == "A" || MULTIQ_BACKEND === :partr ||
     error("VARIANT=$(MULTIQ_VARIANT) patches partr, and this build's scheduler is $(MULTIQ_BACKEND)")
 
@@ -1080,7 +1098,22 @@ if PERIODIC_K !== nothing
     end
 end
 
-if MULTIQ_FIFO
+if MULTIQ_NATIVE
+    const _M_NEGATIVE = MULTIQ_VALIDATE ? get(ENV, "M_NEGATIVE", "") : ""
+    _M_NEGATIVE in ("", "blind", "stall", "rblind") || error("M_NEGATIVE must be blind, stall or rblind")
+    MULTIQ_VALIDATE && !PARTR.SCHED_VALIDATE &&
+        error("VALIDATE=1 under VARIANT=$(MULTIQ_VARIANT) needs the native mark's validation build (Base.Partr.SCHED_VALIDATE = true)")
+    # The build reads its negative control once, at its init.
+    _M_NEGATIVE == "" || (ENV["JULIA_SCHED_NEGATIVE"] = _M_NEGATIVE)
+    # The one-time init: the weight and the clock's 10 ms calibration, here at load, so it falls
+    # outside every timed window (a mark would call it on the first marked spawn). It marks nothing:
+    # under N-none the pool flag stays unset.
+    PARTR.fair_init!()
+    (@atomic PARTR.fp.w4) == GROUP_W4 || error("the build's weight is $(@atomic PARTR.fp.w4)/4, the harness's $(GROUP_W4)/4")
+    const SHARE_CAP = @atomic PARTR.fp.cap
+    const SHARE_CYCLES_PER_MS = SHARE_CAP / 10
+end
+if MULTIQ_FIFO && !MULTIQ_NATIVE
     # M and O. Stock's three entry points are the build's own, parsed from its partr.jl the way A0
     # takes `multiq_sift_down`, renamed `stock_multiq_*`; the public names become wrappers that send
     # a class-F task to one FIFO queue for the `:default` pool and everything else down stock's path.
@@ -2000,6 +2033,7 @@ end
 # call is an error: the harness marks only under M.
 function multiq_mark!(t::Task)
     FIFO_CLASS === :mark || error("multiq_mark! under VARIANT=$(MULTIQ_VARIANT)")
+    MULTIQ_NATIVE && (Threads._spawn_set_fair(t, true); return t)
     t.priority |= 0x8000
     return t
 end
@@ -2013,6 +2047,29 @@ function spawn_marked(f, pool::Symbol)
     schedule(t)
     return t
 end
+
+# The per-thread validation counts: the patch's three vectors, or the native build's one (its
+# `vstate` carries every field of the three; grown to every tid here before it is read).
+# The timed native build has no counters at all (they compile in only with SCHED_VALIDATE): every read
+# sees zeros there, as the patch's counters read when VALIDATE is off.
+const _NATIVE_COUNT_KEYS = (:f_first, :f_again, :l_first, :demoted, :f_pops, :l_pops, :skips, :own, :retries, :seen,
+    :acq, :held, :desc, :r_first, :r_again, :r_pops, :r_peak, :foreign, :stock_bit, :stamps, :gpops, :two, :one_r,
+    :one_l, :none, :l_miss, :l_miss_r, :l_miss_none, :vstamp, :vlast, :vtwo, :run_r, :run_l, :run_r2, :run_l2,
+    :f_cyc, :l_cyc, :both_f, :both_l, :caps, :clips, :acct, :f_choice, :k, :nsamp, :dl_sum, :dl_peak, :dq_sum,
+    :dq_peak, :dh_sum, :dh_peak)
+_nvstates() = PARTR.SCHED_VALIDATE ? (PARTR.vs(Int(Threads.maxthreadid())); PARTR.vstates[1]) :
+              fill(NamedTuple{_NATIVE_COUNT_KEYS}(ntuple(_ -> 0, length(_NATIVE_COUNT_KEYS))), Int(Threads.maxthreadid()))
+_fstates() = MULTIQ_NATIVE ? _nvstates() : PARTR.fstates
+_sstates() = MULTIQ_NATIVE ? _nvstates() : PARTR.sstates
+_gstates() = MULTIQ_NATIVE ? _nvstates() : PARTR.gstates
+# The slots the patch sized at load (the native build grows them on demand: no overflow).
+multiq_f_nslots() = MULTIQ_NATIVE ? Int(Threads.maxthreadid()) : PARTR.f_nslots
+# A probe's dummy given a class by hand: the patch's priority bit, or the build's byte.
+_set_class!(t::Task, c::Symbol) = MULTIQ_NATIVE ? PARTR.set_sched_class!(t, c === :F ? PARTR.C_F : PARTR.C_R) :
+                                  (t.priority = c === :F ? PARTR.F_BIT : PARTR.R_BIT; nothing)
+_ring_push!(q, t) = MULTIQ_NATIVE ? PARTR.f_push_stamped!(q, t) : PARTR.f_push!(q, t)
+_new_ring() = MULTIQ_NATIVE ? PARTR.fqueue() : PARTR.fqueue(true)
+_nrings() = MULTIQ_NATIVE ? length(PARTR.rings[PARTR.f_tpid + 1]) : length(PARTR.frings)
 
 # The heap list the variant runs on: what nested.jl counts as "in heaps".
 const MULTIQ_HEAP_LISTS = PERIODIC_K !== nothing ? PARTR.e_heaps :
@@ -2082,7 +2139,7 @@ function _refresh_scheduler_world()
 end
 
 # REFRESH=0 skips it, only to show what goes wrong without it.
-if MULTIQ_VARIANT != "A" && get(ENV, "REFRESH", "1") == "1"
+if MULTIQ_VARIANT != "A" && !MULTIQ_NATIVE && get(ENV, "REFRESH", "1") == "1"
     _refresh_scheduler_world()
 end
 # Compile the (re)defined scheduler before anything is measured.
@@ -2120,7 +2177,7 @@ println(stderr, "multiq_variant: VARIANT=", MULTIQ_VARIANT, MULTIQ_VALIDATE ? " 
         PERIODIC_K === nothing ? "" : ", periodic pop every $(PERIODIC_K == typemax(Int) ? "never" : PERIODIC_K)",
         PERIODIC_K !== nothing && !isempty(_E_NEGATIVE) ? ", NEGATIVE CONTROL $(_E_NEGATIVE)" : "",
         MULTIQ_FIFO ? ", F queue: class $(FIFO_CLASS), serve $(FIFO_SERVE)" *
-                      (FIFO_RINGS ? ", $(length(PARTR.frings)) rings, pop samples $(RINGS_D)" *
+                      (FIFO_RINGS ? ", $(_nrings()) rings, pop samples $(RINGS_D)" *
                                     (RING_OWN ? ", insert into the thread's own rings" : "") : "") *
                       (FIFO_INHERIT === :none ? "" : ", descendants $(FIFO_INHERIT === :i ? "F (into the rings)" : "R (into the R heaps)")") *
                       (FIFO_SERVE === :g ? ", request-side weight $(GROUP_W4)/4" : FIFO_SERVE === :g0 ? ", balance never moved (L first)" : "") *
@@ -2136,7 +2193,10 @@ println(stderr, "multiq_variant: VARIANT=", MULTIQ_VARIANT, MULTIQ_VALIDATE ? " 
 # Calls into the new code, per thread (validation only).
 # Only the threads that existed when this file loaded have a counter (a foreign thread adopted later, such as
 # Reseau's poller in a server, never reaches the counted code: the pops return first on a foreign thread).
-multiq_variant_calls() = [PARTR.variant_calls[64 * (tid - 1) + 1] for tid in 1:(length(PARTR.variant_calls) ÷ 64)]
+_patch_calls() = [PARTR.variant_calls[64 * (tid - 1) + 1] for tid in 1:(length(PARTR.variant_calls) ÷ 64)]
+# The native build counts the pops its new code made per thread: through the group pop (flag set)
+# and stock's pop behind the flag (flag unset).
+multiq_variant_calls() = !MULTIQ_NATIVE ? _patch_calls() : [v.gpops + v.l_pops for v in _nvstates()]
 
 # End of a process: under C and E, nothing ever went into the build's own heaps, and the
 # variant's are empty (under E: every live count 0 and every bucket's ring and shadow empty).
@@ -2627,7 +2687,7 @@ const _F_FIELDS = (:f_first, :f_again, :l_first, :demoted, :f_pops, :l_pops, :sk
                    :desc, :r_first, :r_again, :r_pops, :foreign, :stock_bit)
 function multiq_fifo_counts()
     MULTIQ_FIFO || return nothing
-    fs = PARTR.fstates
+    fs = _fstates()
     return NamedTuple{_F_FIELDS}(Tuple(sum(getfield(s, k) for s in fs) for k in _F_FIELDS))
 end
 
@@ -2644,7 +2704,7 @@ function multiq_fifo_check(label, before; f_first::Union{Int,Nothing}, desc::Uni
     now = multiq_fifo_counts()
     d = NamedTuple{_F_FIELDS}(Tuple(getfield(now, k) - getfield(before, k) for k in _F_FIELDS))
     println(stderr, "validate: F counts, ", label, ": ", join(("$k $(getfield(d, k))" for k in _F_FIELDS), ", "),
-            FIFO_GROUP ? ", R heaps peak $(maximum(s.r_peak for s in PARTR.fstates))" : "")
+            FIFO_GROUP ? ", R heaps peak $(maximum(s.r_peak for s in _fstates()))" : "")
     q = PARTR.f_queued()
     if FIFO_INHERIT === :none
         d.desc == 0 || error("$MULTIQ_VARIANT: $label: $(d.desc) descendants without inheritance")
@@ -2664,7 +2724,7 @@ function multiq_fifo_check(label, before; f_first::Union{Int,Nothing}, desc::Uni
         r == 0 || error("$MULTIQ_VARIANT: $label: $r tasks left in the R heaps")
         d.r_pops == d.r_first + d.r_again ||
             error("$MULTIQ_VARIANT: $label: $(d.r_pops) R pops for $(d.r_first + d.r_again) R inserts")
-        foreach(s -> s.r_peak = 0, PARTR.fstates)
+        foreach(s -> s.r_peak = 0, _fstates())
     end
     d.demoted == 0 || error("$MULTIQ_VARIANT: $label: $(d.demoted) F tasks sent down stock's path")
     d.stock_bit == 0 || error("$MULTIQ_VARIANT: $label: stock's heaps gave out $(d.stock_bit) tasks with a class bit (an insert by the unpatched code)")
@@ -2679,7 +2739,7 @@ end
 # and successful pops, from the `multiq_fifo_check` difference `d`) per request of the cell.
 function multiq_lock_counts()
     MULTIQ_FIFO && MULTIQ_VALIDATE || return nothing
-    return [(s.acq, s.held) for s in PARTR.fstates]
+    return [(s.acq, s.held) for s in _fstates()]
 end
 function multiq_lock_check(label, before, d, requests::Int)
     MULTIQ_FIFO && MULTIQ_VALIDATE || return nothing
@@ -2703,11 +2763,11 @@ const _S_FIELDS = (:f_cyc, :l_cyc, :both_f, :both_l, :caps, :clips, :acct, :f_ch
 # the harness reports credited against run (#618, agent-config #82 Idea 8), as `/mq` does in a server.
 const _GR_FIELDS = (:run_r, :run_l, :run_r2, :run_l2)
 multiq_run_counts() = !(FIFO_GROUP && MULTIQ_VALIDATE) ? nothing :
-    Dict(tid => NamedTuple{_GR_FIELDS}(Tuple(getfield(PARTR.gstates[tid], k) for k in _GR_FIELDS))
+    Dict(tid => NamedTuple{_GR_FIELDS}(Tuple(getfield(_gstates()[tid], k) for k in _GR_FIELDS))
          for tid in Threads.threadpooltids(:default))
 function multiq_share_counts()
     FIFO_ACCOUNTS && MULTIQ_VALIDATE || return nothing
-    s = Dict(tid => NamedTuple{_S_FIELDS}(Tuple(getfield(PARTR.sstates[tid], k) for k in _S_FIELDS))
+    s = Dict(tid => NamedTuple{_S_FIELDS}(Tuple(getfield(_sstates()[tid], k) for k in _S_FIELDS))
              for tid in Threads.threadpooltids(:default))
     FIFO_GROUP || return s
     g = multiq_run_counts()
@@ -2732,7 +2792,7 @@ function multiq_share_check(label, before, fbefore; half::Bool = false)
     println(stderr, "validate: share counts, ", label, " (", MULTIQ_VARIANT, ", cap ", ms(SHARE_CAP), " ms):")
     for tid in Threads.threadpooltids(:default)
         d = NamedTuple{_S_FIELDS}(Tuple(getfield(now[tid], k) - getfield(before[tid], k) for k in _S_FIELDS))
-        fs, f0 = PARTR.fstates[tid], fbefore[tid]
+        fs, f0 = _fstates()[tid], fbefore[tid]
         fp, lp = fs.f_pops + fs.r_pops - f0[1], fs.l_pops - f0[2]
         both = pct(d.both_f, d.both_l)
         println(stderr, "validate:   tid ", tid, ": pops F ", fp, " L ", lp, ", accounted ", d.acct, " (F tried first ",
@@ -2773,16 +2833,16 @@ function multiq_group_counts()
     FIFO_GROUP && MULTIQ_VALIDATE || return nothing
     P = PARTR
     keys = (_G_FIELDS..., _S_FIELDS..., _G_POPS...)
-    return Dict(tid => NamedTuple{keys}((Tuple(getfield(P.gstates[tid], k) for k in _G_FIELDS)...,
-                                         Tuple(getfield(P.sstates[tid], k) for k in _S_FIELDS)...,
-                                         Tuple(getfield(P.fstates[tid], k) for k in _G_POPS)...))
+    return Dict(tid => NamedTuple{keys}((Tuple(getfield(_gstates()[tid], k) for k in _G_FIELDS)...,
+                                         Tuple(getfield(_sstates()[tid], k) for k in _S_FIELDS)...,
+                                         Tuple(getfield(_fstates()[tid], k) for k in _G_POPS)...))
                 for tid in Threads.threadpooltids(:default))
 end
 # The peaks are not differenced (a running maximum); reset them after a read.
 multiq_group_reset_peaks!() = FIFO_GROUP && MULTIQ_VALIDATE &&
-    foreach(g -> (g.dl_peak = 0; g.dq_peak = 0; g.dh_peak = 0), PARTR.gstates)
+    foreach(g -> (g.dl_peak = 0; g.dq_peak = 0; g.dh_peak = 0), _gstates())
 
-share_fifo_pops() = !(FIFO_ACCOUNTS && MULTIQ_VALIDATE) ? nothing : Dict(tid => (PARTR.fstates[tid].f_pops + PARTR.fstates[tid].r_pops, PARTR.fstates[tid].l_pops)
+share_fifo_pops() = !(FIFO_ACCOUNTS && MULTIQ_VALIDATE) ? nothing : Dict(tid => (_fstates()[tid].f_pops + _fstates()[tid].r_pops, _fstates()[tid].l_pops)
                          for tid in Threads.threadpooltids(:default))
 
 # M and O, VALIDATE only, two probes of `multiq_check_empty` (as E's):
@@ -2809,7 +2869,7 @@ function _f_probe(reps::Int = 20)
             end
             dummy = Task(() -> nothing)
             Threads._spawn_set_thrpool(dummy, :default)
-            dummy.priority = P.F_BIT
+            _set_class!(dummy, :F)
             P.multiq_insert(dummy, dummy.priority)
             e = P.multiq_check_empty()
             (e, P.f_take_back!(dummy))
@@ -2840,7 +2900,7 @@ function _r_probe(reps::Int = 20)
             end
             dummy = Task(() -> nothing)
             Threads._spawn_set_thrpool(dummy, :default)
-            dummy.priority = P.R_BIT
+            _set_class!(dummy, :R)
             P.multiq_insert(dummy, dummy.priority)
             e = P.multiq_check_empty()
             (e, P.r_take_back!(dummy))
@@ -2871,7 +2931,7 @@ function _f_stall_control(hold_s::Float64 = 60.0)
     Threads._spawn_set_thrpool(dummy, :default)
     ccall(:jl_set_task_tid, Cint, (Any, Cint), dummy, Threads.threadid() - 1) == 1 ||
         error("F stall control: could not pin the dummy")
-    dummy.priority = P.F_BIT
+    _set_class!(dummy, :F)
     P.multiq_insert(dummy, dummy.priority)
     println(stderr, "multiq_variant: F stall control: a task pinned to tid ", Threads.threadid(),
                     ", which now holds its thread for ", hold_s, " s without popping")
@@ -2897,7 +2957,7 @@ function _f_unit_asserts()
     function push(q, ids, i)
         t = Task(() -> nothing)
         ids[t] = i
-        lock(q.lock); P.f_push!(q, t); unlock(q.lock)
+        lock(q.lock); _ring_push!(q, t); unlock(q.lock)
         return t
     end
     pop(q, ids, tid = me) = (t = P.f_pop!(q, tid, nt); t === nothing ? 0 : ids[t])
@@ -2945,7 +3005,7 @@ function _f_unit_asserts()
     @assert pop(q, ids) == 100 "F: the owner's task behind $(length(others)) pinned entries was not reached"
     if FIFO_RINGS
         # A ring: stamped fill/drain across growth comes out in order, its stamps rising strictly.
-        q, ids = P.fqueue(true), IdDict{Task,Int}()
+        q, ids = _new_ring(), IdDict{Task,Int}()
         for i in 1:600
             t = Task(() -> nothing)
             ids[t] = i
@@ -2955,7 +3015,8 @@ function _f_unit_asserts()
         @assert all(diff(sts) .> 0) "rings: stamps within a ring do not rise"
         rd = [pop(q, ids) for _ in 1:600]
         @assert rd == collect(1:600) "rings: a ring's stamped fill/drain popped out of order"
-        @assert length(P.frings) == 2 * nt "rings: $(length(P.frings)) rings for $nt threads"
+        MULTIQ_NATIVE && PARTR.rings_size(PARTR.f_tpid)   # the native build sizes them at the first marked insert
+        @assert _nrings() == 2 * nt "rings: $(_nrings()) rings for $nt threads"
     end
     # The L heap is the build's: A's fill/drain order.
     lfd = _fill_drain(20)
@@ -2964,7 +3025,10 @@ function _f_unit_asserts()
             ": F queue fill/drain of 600 in order, 2,000 interleaved in order, a pinned head passed over ",
             "and taken by its owner, the owner's task found behind ", length(others), " pinned entries; ",
             "stock heap fill/drain ", lfd,
-            FIFO_RINGS ? "; a ring's stamped fill/drain of 600 in order, $(length(P.frings)) rings" : "")
+            FIFO_RINGS ? "; a ring's stamped fill/drain of 600 in order, $(_nrings()) rings" : "")
+    # The native build counts every clock read of its timed code, the stamps of the standalone rings
+    # above included: the no-clock check counts from here.
+    MULTIQ_NATIVE && (_NOCLOCK_STAMPS0[] = sum(v -> v.stamps, _gstates()))
     _M_NEGATIVE == "stall" && _f_stall_control()
     if MULTIQ_NOCLOCK
         # `_r_probe` sets the pool flag, which is what M_NOCLOCK must see unset.
@@ -2980,16 +3044,17 @@ end
 
 # M_NOCLOCK=1, -g only (#618, agent-config #82 Idea 8): a cell in which nothing is marked must leave
 # the pool flag unset and make no -g pop, so no -g clock read happened in it: the pop was stock's.
+const _NOCLOCK_STAMPS0 = Ref(0)   # native: the clock reads the unit asserts' own rings made
 function multiq_noclock_check(label)
     MULTIQ_NOCLOCK || return nothing
     P = PARTR
     on = @atomic :acquire P.fl.on
-    pops = sum(g -> g.two + g.one_r + g.one_l + g.none, P.gstates)
-    acct = sum(s -> s.acct, P.sstates)
-    stamps = sum(g -> g.vstamp != 0 ? 1 : 0, P.gstates)
+    pops = sum(g -> g.two + g.one_r + g.one_l + g.none, _gstates())
+    acct = sum(s -> s.acct, _sstates())
+    stamps = MULTIQ_NATIVE ? sum(v -> v.stamps, _gstates()) - _NOCLOCK_STAMPS0[] : sum(g -> g.vstamp != 0 ? 1 : 0, _gstates())
     (on || pops != 0 || acct != 0 || stamps != 0) &&
         error("$MULTIQ_VARIANT: $label: with nothing marked the pool flag is $(on ? "set" : "unset"), ",
-              pops, " -g pops, ", acct, " accounted pops, ", stamps, " threads with a -g clock read")
+              pops, " -g pops, ", acct, " accounted pops, ", stamps, MULTIQ_NATIVE ? " clock reads by the timed code" : " threads with a -g clock read")
     println(stderr, "validate: no clock, ", label, " (", MULTIQ_VARIANT, "): pool flag unset, 0 -g pops, ",
             "0 accounted pops, no thread read the -g clock")
     return nothing

@@ -67,6 +67,16 @@
 # mixed cell, A M-l M-t (aggregate_fifo.jl <OUT> sharepilot); VALIDATE adds the mixed cell for
 # every variant (C at FIB_FINE=36:12) and runs the negative controls under M-f and M-t.
 #
+# PROFILE=native (the native mark, agent-config #82 Idea 10: M-gc-r2 written inside a local build of
+# Julia, bench/julia/): a variant token `V%label` runs VARIANT=V on the julia that JLS names `label`
+# (JLS="control=<julia> mark=<julia> official=<julia>"); a bare token runs on JL. BLOCKS=pilot ROUNDS=1
+# is the gate, at 8,1: the starved cell (500:2) and the H = 0 cell (500:0) with :default clients, the
+# mixed cell, and fib_fine alone, for PILOT_V (default: A on the control build, N-none and N on the
+# mark build, A and M-gc-r2 on the official binary). VALIDATE=1 runs on JL, the mark build's
+# validation build: the cost and fairness cells, nested.jl, the mixed and mixed-inner cells, the marked
+# root, the pool cells, the no-clock step (N-none and N, nothing marked in those cells) and the three
+# negative controls under N.
+#
 # Usage: JL=<julia binary> MICRO_PROJECT=<env with BenchmarkTools> bench/tasks/rounds_fifo.sh [rounds]
 #   OUT           results directory (default bench/results/618-fifo)
 #   ROUNDS        3 (or the argument): the last round
@@ -102,6 +112,16 @@ export QUIET_LOAD="${QUIET_LOAD:-0.5}" QUIET_WAIT_S="${QUIET_WAIT_S:-1800}" SAMP
 VER="$("$JL" -e 'print(VERSION)')"
 
 log() { echo "[$(date +%H:%M:%S)] rounds_fifo: $*"; }
+
+# A variant token `V%label` (PROFILE=native) runs VARIANT=V on the julia JLS names `label`.
+declare -A JL_OF
+for kv in ${JLS:-}; do JL_OF["${kv%%=*}"]="${kv#*=}"; done
+jl_of()  { case "$1" in
+             *%*) local b="${1##*%}"; [ -n "${JL_OF[$b]:-}" ] || { echo "rounds_fifo: no JLS entry for $b" >&2; return 1; }
+                  printf '%s' "${JL_OF[$b]}" ;;
+             *) printf '%s' "$JL" ;;
+           esac; }
+var_of() { printf '%s' "${1%%\%*}"; }
 
 # The variants of each cell. ROUND_ORDER reverses them in even rounds. PROFILE=share is the run of
 # 2026-11-16 (the shares, M-t and M-p<K>, against M-l); the default is the M/O run of 2026-11-15.
@@ -186,6 +206,22 @@ elif [ "$PROFILE" = gc ]; then
   NOCLOCK_V="M-g-r2 M-gc-r2"
   NEG_V="M-g-r2 M-gc-r2"
   NEG_R_V="M-g-r2 M-gc-r2"
+elif [ "$PROFILE" = native ]; then
+  PILOT_V="${PILOT_V_NATIVE:-A%control N-none%mark N%mark A%official M-gc-r2%official}"
+  COST_V="A N-none N"
+  COST_CELLS="50:0 500:0"
+  FAIR_I81_V="A N"
+  FAIR_D_V="A N N-h"
+  MIX_V="A N"
+  POOL_V="A N-none N"
+  VAL_V="A N-none N N-h"
+  VAL_NEST_V="A N-none N"
+  VAL_MARKALL_V=""
+  VAL_MARKROOT_V="N"
+  VAL_MIX_V="A N"
+  NOCLOCK_V="N-none N"
+  NEG_V="N"
+  NEG_R_V="N"
 elif [ "$PROFILE" = inherit ]; then
   I_RULE="${I_RULE:-M-il-r2}"
   COST_V="A A0 M-none M-l-r2 M-g-r2"
@@ -211,7 +247,7 @@ elif [ "$PROFILE" = inherit ]; then
   NEG_R_V="M-g-r2"
 fi
 SWEEP_LAYOUTS="${SWEEP_LAYOUTS:-2,0:0,1 4,0:0,1,2,3 8,0:0,1,2,3,6,7,8,9}"
-case "$PROFILE" in mo|share|rings|inherit|gc) ;; *) echo "rounds_fifo: PROFILE must be mo, share, rings, inherit or gc" >&2; exit 1 ;; esac
+case "$PROFILE" in mo|share|rings|inherit|gc|native) ;; *) echo "rounds_fifo: PROFILE must be mo, share, rings, inherit, gc or native" >&2; exit 1 ;; esac
 ordered() {   # round, variants...
   local r="$1"; shift
   if [ $((r % 2)) = 0 ]; then printf '%s\n' "$@" | tac | tr '\n' ' '; else echo "$*"; fi
@@ -221,8 +257,9 @@ ordered() {   # round, variants...
 spawn() {
   local r="$1" tsv="$2" layout="$3" clients="$4" variant="$5" cells="$6" mode="${7:-spawn}" d="${8:-8}"
   local header=0; [ -s "$tsv" ] && header=1
-  env ROUND="$r" NOHEADER="$header" VARIANT="$variant" CELLS="$cells" MODES="$mode" CLIENTS="$clients" D="$d" \
-    timeout -s KILL "${TIMEOUT_S:-900}" taskset -c "$CPUS" "$JL" --threads="$layout" \
+  local jl; jl="$(jl_of "$variant")" || return 1
+  env ROUND="$r" NOHEADER="$header" VARIANT="$(var_of "$variant")" CELLS="$cells" MODES="$mode" CLIENTS="$clients" D="$d" \
+    timeout -s KILL "${TIMEOUT_S:-900}" taskset -c "$CPUS" "$jl" --threads="$layout" \
     "$HERE/spawn_order.jl" >>"$tsv" ||
     { echo "rounds_fifo: spawn_order $layout $clients VARIANT=$variant CELLS=$cells failed or timed out" >&2; return 1; }
 }
@@ -281,8 +318,19 @@ nesting_block() {   # round, nested tsv, variants, extra env...
     CPUS="$CPUS" TIMEOUT_S="${TIMEOUT_S:-600}" "$HERE/nested.sh" "$r" "$tsv"
 }
 
-pilot_block() {   # spawn tsv, nested tsv (PROFILE=share: the mixed tsv; inherit: mixed, mixed-inner)
+pilot_block() {   # spawn tsv, nested tsv (PROFILE=share: the mixed tsv; inherit: mixed, mixed-inner; native: mixed, nested)
   local tsv="$1" ntsv="$2" v
+  if [ "$PROFILE" = native ]; then
+    # The native mark's gate, at 8,1: the starved and the H = 0 cell with :default clients, the mixed
+    # cell, fib_fine alone; one nested.sh call per token, each on its own build.
+    for v in $PILOT_V; do spawn 0 "$tsv" 8,1 default "$v" "500:2 500:0" || return 1; done
+    MIX_V="$PILOT_V" mixed_block 0 "$ntsv" || return 1
+    for v in $PILOT_V; do
+      CHANNELS="$(jl_of "$v")" LAYOUTS=8,1 VARIANTS="$(var_of "$v")" WORKLOADS=fib_fine SKIP= ROUND=0 \
+        CPUS="$CPUS" TIMEOUT_S="${TIMEOUT_S:-600}" "$HERE/nested.sh" 0 "$3" || return 1
+    done
+    return
+  fi
   if [ "$PROFILE" = inherit ] || [ "$PROFILE" = gc ]; then
     # The classes' gate (PROFILE=gc: the same cells, M-g-r2 against the classes run), at 8,1: the inner shape, the mixed cell, the mixed-inner cell.
     for v in $PILOT_V; do spawn 0 "$tsv" 8,1 interactive "$v" "500:2:inner" || return 1; done
@@ -319,8 +367,9 @@ mixed_block() {   # round, tsv, extra env...
   local r="$1" tsv="$2" v header; shift 2
   for v in $(ordered "$r" $MIX_V); do
     header=0; [ -s "$tsv" ] && header=1
-    env "$@" ROUND="$r" NOHEADER="$header" VARIANT="$v" timeout -s KILL "${TIMEOUT_S:-900}" taskset -c "$CPUS" \
-      "$JL" --threads=8,1 "$HERE/mixed_cell.jl" >>"$tsv" ||
+    local jl; jl="$(jl_of "$v")" || return 1
+    env "$@" ROUND="$r" NOHEADER="$header" VARIANT="$(var_of "$v")" timeout -s KILL "${TIMEOUT_S:-900}" taskset -c "$CPUS" \
+      "$jl" --threads=8,1 "$HERE/mixed_cell.jl" >>"$tsv" ||
       { echo "rounds_fifo: mixed_cell VARIANT=$v failed or timed out" >&2; return 1; }
   done
 }
@@ -428,7 +477,7 @@ if [ "$VALIDATE" = 1 ]; then
           MIX_V="$VAL_MIX_V" mixed_block 1 "$OUT/validate-mixedinner.tsv" FIB_FINE=36:12 D=4 SHAPE=inner &&
           markroot_block 1 "$OUT/validate-markroot.tsv" "$VAL_MARKROOT_V" FIB_FINE=36:12 &&
           sweep_block 1 "$OUT/validate-sweep.tsv"; }; } &&
-      { [ "$PROFILE" != gc ] || {
+      { { [ "$PROFILE" != gc ] && [ "$PROFILE" != native ]; } || {
           MIX_V="$VAL_MIX_V" mixed_block 1 "$OUT/validate-mixedinner.tsv" FIB_FINE=36:12 D=4 SHAPE=inner &&
           markroot_block 1 "$OUT/validate-markroot.tsv" "$VAL_MARKROOT_V" FIB_FINE=36:12 &&
           pool_block 1 "$OUT/validate-pool.tsv" "$POOL_V" &&
@@ -492,10 +541,11 @@ for r in $(seq "${FIRST_ROUND:-1}" "$ROUNDS"); do
         else log "round $r nesting FAILED"; status=1; fi ;;
       pilot)
         a="$OUT/attempt-pilot-spawn-$stamp.tsv" b="$OUT/attempt-pilot-nested-$stamp.tsv" c="$OUT/attempt-pilot-mixedinner-$stamp.tsv"
-        second=pilot-nested.tsv; [ "$PROFILE" = share ] || [ "$PROFILE" = inherit ] || [ "$PROFILE" = gc ] && second=pilot-mixed.tsv
+        second=pilot-nested.tsv; [ "$PROFILE" = share ] || [ "$PROFILE" = inherit ] || [ "$PROFILE" = gc ] || [ "$PROFILE" = native ] && second=pilot-mixed.tsv
+        third=pilot-mixedinner.tsv; [ "$PROFILE" = native ] && third=pilot-nested.tsv
         if block "pilot" "$a" "$b" "$c" -- "${SELF[@]}" pilot_block "$a" "$b" "$c"; then
           mv "$a" "$OUT/pilot-spawn.tsv"; mv "$b" "$OUT/$second"
-          [ -s "$c" ] && mv "$c" "$OUT/pilot-mixedinner.tsv"; log "pilot done"
+          [ -s "$c" ] && mv "$c" "$OUT/$third"; log "pilot done"
         else log "pilot FAILED"; status=1; fi ;;
       mixedinner)
         a="$OUT/attempt-mixedinner-r$r-$stamp.tsv"

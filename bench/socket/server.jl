@@ -568,7 +568,7 @@ function mq_body()::String
     d["r_queued"] = P.r_queued()
     d["stock_default_queued"] = sum((h.ntasks for h in P.heaps[P.f_tpid + 1]); init = 0)
     d["foreign_tids"] = [t for t in 1:Int(Threads.maxthreadid()) if Threads.threadpool(t) === :foreign]
-    d["overflow_tids"] = Int(Threads.maxthreadid()) - P.f_nslots
+    d["overflow_tids"] = Int(Threads.maxthreadid()) - multiq_f_nslots()
     d["variant"] = MULTIQ_VARIANT
     d["load_order"] = LOAD_ORDER
     d["mode"] = MODE
