@@ -267,7 +267,7 @@ _response_started(stream::HTTP.Stream)::Bool = (@atomic :acquire stream.response
 # Nothing here runs on the interactive connection task, and nothing runs at all for a handler
 # that never asks: the scarcest thread in the process is untouched (concurrency §2).
 #
-# Reseau internals, pinned by `Reseau = "~1.6"` and canaried in
+# Reseau internals, pinned by `Reseau = "~1.7"` and canaried in
 # test/http_internals_contract_tests.jl: `IOPoll._with_fd_ref`, `IOPoll.NetClosingError`,
 # `SocketOps.recv_from!`, `SocketOps.last_error`, `SocketOps.MSG_PEEK`, `TCP.Conn.fd.pfd`, and
 # HTTP.jl's `Stream.tracked.conn`.

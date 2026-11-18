@@ -675,7 +675,7 @@ end
 
 @testset "disconnect probe surface (src/core/transport.jl `_peer_gone`, #466)" begin
     # `cancel_reason(req)` asks the kernel whether the client left, through Reseau internals that
-    # no HTTP.jl release covers: hence the direct `Reseau = "~1.6"` pin. A rename here would not
+    # no HTTP.jl release covers: hence the direct `Reseau = "~1.7"` pin. A rename here would not
     # fail loudly at every request, only when a handler polls, so each link is pinned by name.
     # test/request_cancellation_tests.jl is the behavioral net (FIN, RST, still connected).
     R = Nitro.Core.Reseau
