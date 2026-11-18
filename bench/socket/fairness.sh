@@ -48,6 +48,10 @@
 #
 # REVERSE_EVEN=1 (#618): even rounds run the mode list in reverse, against a position effect.
 #
+# THROWAWAY=1 (#782): one throwaway slot before round 1, on the first mode of round 1's order,
+# measured the same way and written to the TSV as round 0. The summary table leaves it out; it is
+# there so that no measured mode takes the block's first slot, which reads high.
+#
 # CLIENT_CPU=1 (#618): the client's run, and oha's under OHA=1, each go in a subshell that ends in
 # `times`, which reads that child's own user + system time exactly. The TSV's cli_cpu and oha_cpu
 # are that time over the run's wall times the client CPUs: 1.0 is every client CPU busy all the
@@ -150,9 +154,12 @@ for mode in "${MODE_LIST[@]}"; do
 done
 
 printf 'mode\tround\trps\tp50_ms\tp99_ms\tp999_ms\tmax_ms\tshare_over_1s\tconn_min\tconn_p1\tconn_p10\tconn_p50\tconn_max\tjain\tmaxwait_p50_ms\tmaxwait_p90_ms\tp90_ms\tgc_n\tgc_ms\trss_mb\tswap_in\tswap_out\tlisten_ovf\toha_rps\test0\tcli_cpu\toha_cpu\n' > "$RESULT"
-for round in $(seq 1 "$ROUNDS"); do
+FIRST_ROUND=1; [ "${THROWAWAY:-0}" = 1 ] && FIRST_ROUND=0
+for round in $(seq "$FIRST_ROUND" "$ROUNDS"); do
   ORDER=("${MODE_LIST[@]}")
-  if [ "${REVERSE_EVEN:-0}" = 1 ] && [ $((round % 2)) = 0 ]; then
+  if [ "$round" = 0 ]; then
+    ORDER=("${MODE_LIST[0]}")
+  elif [ "${REVERSE_EVEN:-0}" = 1 ] && [ $((round % 2)) = 0 ]; then
     ORDER=(); for ((k = ${#MODE_LIST[@]} - 1; k >= 0; k--)); do ORDER+=("${MODE_LIST[$k]}"); done
   fi
   for mode in "${ORDER[@]}"; do
@@ -229,7 +236,7 @@ for mode in "${MODE_LIST[@]}"; do
       return (n % 2) ? v[(n + 1) / 2] : (v[n / 2] + v[n / 2 + 1]) / 2 }
     function rng(c,   n, i, lo, hi) { lo = hi = col[1, c] + 0; for (i = 2; i <= rows; i++) { if (col[i, c] + 0 < lo) lo = col[i, c] + 0; if (col[i, c] + 0 > hi) hi = col[i, c] + 0 }
       return sprintf("%g [%g–%g]", med(c), lo, hi) }
-    NR > 1 && $1 == m { rows++; for (c = 3; c <= 24; c++) col[rows, c] = $c; si += $21; so += $22; lo += $23 }
+    NR > 1 && $1 == m && $2 != 0 { rows++; for (c = 3; c <= 24; c++) col[rows, c] = $c; si += $21; so += $22; lo += $23 }
     END { printf "| %s | %s | %s | %s | %s | %s | %s | %s | %g / %g / %g / %g / %g | %s | %g / %g | %s / %s | %s | %d / %d | %d | %s |\n", m, rng(3), rng(4), rng(17), rng(5), rng(6), rng(7), rng(8),
           med(9), med(10), med(11), med(12), med(13), rng(14), med(15), med(16), rng(18), rng(19), rng(20), si, so, lo, rng(24) }' "$RESULT"
 done
