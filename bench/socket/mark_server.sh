@@ -21,6 +21,8 @@
 #             500:2:inner with :interactive clients, and mixed_cell.jl SHAPE=inner, for A, M-l-r2,
 #             M-it-r2 and M-g-r2
 #   cell6     the same with the fork-join inside one of 20 semaphore slots (shape inner20)
+#   both L, both4 L, both2, bothv L   the two fixes of the `8,0` diagnostic together (agent-config #82
+#             Idea 8): bare_marked_listen under M-gc-r2; see the blocks below
 #
 # A defaults to `@A` (bare_spawn under VARIANT=A, the variant file included); A=none runs the
 # no-include process instead, for when the pilot shows the include itself costs something.
@@ -97,6 +99,22 @@ case "$BLOCK" in
   listenv)
     "$HERE/quiet.sh" "618listen-v-${LAYOUT/,/_}" env VALIDATE=1 PROBE=1 ROUTE="$AGG" "$HERE/fairness.sh" \
       "bare_marked@$LAYOUT@M-g-r2 bare_marked_listen@$LAYOUT@M-g-r2 bare_marked@$LAYOUT@M-gc-r2" 1 "$DUR" ;;
+  # The two fixes together (#618, agent-config #82 Idea 8): bare_marked_listen under M-gc-r2, beside A
+  # (no VARIANT), bare_marked under M-gc-r2 and bare_marked_listen under M-g-r2. both: cell 1 at the
+  # layout; both4: cell 4 (MIX=1) at the layout; both2: /plaintext at 8,0 with oha after the client in
+  # every window (OHA=1), bare_spawn under M-none added; bothv: one VALIDATE round at the layout.
+  both)
+    "$HERE/quiet.sh" "618both-cell1-${LAYOUT/,/_}" env PROBE=1 ROUTE="$AGG" "$HERE/fairness.sh" \
+      "bare_spawn@$LAYOUT bare_marked@$LAYOUT@M-gc-r2 bare_marked_listen@$LAYOUT@M-g-r2 bare_marked_listen@$LAYOUT@M-gc-r2" "$ROUNDS" "$DUR" ;;
+  both4)
+    "$HERE/quiet.sh" "618both-cell4-${LAYOUT/,/_}" env MIX=1 PROBE=1 ROUTE="$AGG" "$HERE/fairness.sh" \
+      "bare_spawn@$LAYOUT bare_marked@$LAYOUT@M-gc-r2 bare_marked_listen@$LAYOUT@M-g-r2 bare_marked_listen@$LAYOUT@M-gc-r2" "$ROUNDS" "$DUR" ;;
+  both2)
+    "$HERE/quiet.sh" 618both-cell2-8_0 env OHA=1 PROBE=0 ROUTE="/plaintext" "$HERE/fairness.sh" \
+      "bare_spawn@8,0 bare_spawn@8,0@M-none bare_marked@8,0@M-gc-r2 bare_marked_listen@8,0@M-g-r2 bare_marked_listen@8,0@M-gc-r2" "$ROUNDS" "$DUR" ;;
+  bothv)
+    "$HERE/quiet.sh" "618both-v-${LAYOUT/,/_}" env VALIDATE=1 PROBE=1 ROUTE="$AGG" "$HERE/fairness.sh" \
+      "bare_marked@$LAYOUT@M-gc-r2 bare_marked_listen@$LAYOUT@M-g-r2 bare_marked_listen@$LAYOUT@M-gc-r2" 1 "$DUR" ;;
   cell5|cell6)
     shape=inner; [ "$BLOCK" = cell6 ] && shape=inner20
     export -f harness; export MARK_OUT D CPUS ROOT

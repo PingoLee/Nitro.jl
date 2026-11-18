@@ -16,6 +16,9 @@
 #   julia bench/tasks/aggregate_fifo.jl <dir> markroot   # PROFILE=inherit: fib_fine under one marked root
 #   julia bench/tasks/aggregate_fifo.jl <dir> step0b     # PROFILE=inherit: the own-ring insert's timing
 #   julia bench/tasks/aggregate_fifo.jl <dir> age        # PROFILE=inherit: the age sweep
+#   julia bench/tasks/aggregate_fifo.jl <dir> inheritpilot # PROFILE=gc: the pilot and its gate, as above
+#   julia bench/tasks/aggregate_fifo.jl <dir> pool       # PROFILE=gc: the Channel worker pool, pool-r<N>.tsv
+#   julia bench/tasks/aggregate_fifo.jl <dir> credit     # PROFILE=gc: credited against run, from validate.log
 
 const SPAWN_COLS = ["julia", "commit", "threads", "guard", "variant", "round", "mode", "clients", "c", "h_ms",
                     "rps", "p50_ms", "p90_ms", "p99_ms", "max_ms", "count_min", "count_p1",
@@ -35,12 +38,13 @@ const MIXED_COLS = ["julia", "commit", "threads", "guard", "variant", "round", "
 const MIXED_INNER_COLS = [MIXED_COLS; "shape"; "hw_p50_ms"; "hw_p99_ms"]
 const ORDER = ["pool", "A", "A0", "C", "M-none", "M-f", "M-l", "M-l-r2", "M-l-r2o", "M-l-r4", "M-t", "M-t0", "M-p2", "M-p16",
                "M-p128", "M-p1024", "M-t-r2", "M-t0-r2", "M-il-r2", "M-it-r2", "M-g-r2", "M-g25-r2", "M-g75-r2",
-               "M-g0-r2", "M-a10-r2", "M-a100-r2", "M-a1000-r2", "M-h-f", "M-h-l", "M-h-l-r2", "M-h-l-r4", "M-h-t",
-               "M-h-g-r2", "O-f", "O-l"]
+               "M-g0-r2", "M-gc-r2", "M-gc25-r2", "M-gc75-r2", "M-a10-r2", "M-a100-r2", "M-a1000-r2", "M-h-f",
+               "M-h-l", "M-h-l-r2", "M-h-l-r4", "M-h-t", "M-h-g-r2", "M-h-gc-r2", "O-f", "O-l"]
 # The ratio columns a table shows: the pairs among these whose both series are in it.
 const RATIO_PAIRS = [("M-none", "A0"), ("M-f", "A"), ("M-l", "A"), ("M-l-r2", "A"), ("M-l-r4", "A"),
                      ("M-l-r2", "M-l"), ("M-l-r4", "M-l"), ("M-t", "A"), ("M-t", "M-l"), ("O-f", "A"), ("C", "A"),
-                     ("M-l-r2o", "M-l-r2"), ("M-g-r2", "A"), ("M-g-r2", "M-l-r2"), ("M-il-r2", "A")]
+                     ("M-l-r2o", "M-l-r2"), ("M-g-r2", "A"), ("M-g-r2", "M-l-r2"), ("M-il-r2", "A"),
+                     ("M-gc-r2", "A"), ("M-gc-r2", "M-g-r2")]
 pairs_in(names; base_none = "A0") = [(a == "M-none" ? (a, base_none) : (a, b)) for (a, b) in RATIO_PAIRS
                                      if a in names && (a == "M-none" ? base_none : b) in names]
 pair_heads(ps) = join(("$a/$b" for (a, b) in ps), " | ")
@@ -296,6 +300,65 @@ function inherit_gate(spawn, mixed, mixedinner)
     end
 end
 
+# PROFILE=gc's pool block (agent-config #82 Idea 8): the Channel worker pool at H = 0, nothing marked.
+# Per cell, req/s of every variant, each as a ratio to A, and A's range as a share of its median (the
+# prompt's rule: 5 rounds if that exceeds 10% in the 8,1, C = 500 cell).
+function pool_rows(rows)
+    isempty(rows) && return
+    rows = [merge(r, Dict("mode" => "spawn")) for r in rows]   # a series per variant
+    names = byorder(unique(series(r) for r in rows))
+    println("\n### The Channel worker pool (H = 0, nothing marked), req/s, ", length(unique(r["round"] for r in rows)), " round(s)\n")
+    others = filter(!=("A"), names)
+    println("| clients | layout | C | ", join(names, " | "), " | A's range / median | ", join(("$n/A" for n in others), " | "), " |")
+    println("|---|---|--:|", repeat("--:|", length(names) + 1 + length(others)))
+    for (cl, t, c) in unique((r["clients"], r["threads"], r["c"]) for r in rows)
+        rs = filter(r -> (r["clients"], r["threads"], r["c"]) == (cl, t, c), rows)
+        v(s) = vals(rs, s, "rps")
+        a = v("A")
+        spread = isempty(a) ? "–" : string(round(100 * (maximum(a) - minimum(a)) / med(a); digits = 1), "%")
+        println("| ", cl, " | ", t, " | ", c, " | ", join((cell(v(s)) for s in names), " | "), " | ", spread, " | ",
+                join((ratios(v(n), a) for n in others), " | "), " |")
+    end
+    # Round by round, each value with the position its variant ran in within that round (the rows of a
+    # round's file are in run order; variants are reversed in even rounds), for every cell.
+    for (cl, t, c) in unique((r["clients"], r["threads"], r["c"]) for r in rows)
+        println("\n**Round by round, clients on :", cl, ", --threads=", t, ", C = ", c, "** (req/s, position in the round)\n")
+        println("| round | ", join(names, " | "), " |")
+        println("|--:|", repeat("--:|", length(names)))
+        for rd in sort(unique(r["round"] for r in rows); by = x -> parse(Int, x))
+            rs = filter(r -> (r["round"], r["clients"], r["threads"], r["c"]) == (rd, cl, t, c), rows)
+            pos = Dict(series(r) => i for (i, r) in enumerate(rs))
+            println("| ", rd, " | ", join((haskey(pos, s) ? string(fmt(num(rs[pos[s]], "rps")), " (", pos[s], ")") : "–"
+                                          for s in names), " | "), " |")
+        end
+    end
+end
+
+# The validation pass's credited-against-run lines (`validate: credit-run, <label> (<variant>): k=v ...`
+# from multiq_share_check under -g) in <dir>/validate.log: per cell and variant, the time the share
+# credited each side while both had work against the time each side actually ran (a clock read at
+# every pop), and the part of it that started at a two-sided pop.
+function credit_rows(log)
+    isfile(log) || return println("credit: no ", log)
+    recs = NamedTuple[]
+    for l in eachline(log)
+        m = match(r"^validate: credit-run, (.*) \(([^()]+)\): (.*)$", l)
+        m === nothing && continue
+        kv = Dict(split(x, '=', limit = 2) for x in split(m[3]))
+        push!(recs, (label = String(m[1]), variant = String(m[2]), kv = kv))
+    end
+    isempty(recs) && return println("credit: no credit-run lines in ", log)
+    println("\n### Credited against run, per cell (VALIDATE, -g variants)\n")
+    println("| cell | layout | variant | credited R / L ms (R part) | run R / L ms (R part) | run from two-sided R / L ms (R part) | pops R / L |")
+    println("|---|---|---|---|---|---|---|")
+    for r in sort(recs; by = r -> (r.label, r.kv["threads"], something(findfirst(==(r.variant), ORDER), 99)))
+        k = r.kv
+        println("| ", r.label, " | ", k["threads"], " | ", r.variant, " | ", k["credited_r_ms"], " / ", k["credited_l_ms"],
+                " (", k["credited_r_pct"], "%) | ", k["run_r_ms"], " / ", k["run_l_ms"], " (", k["run_r_pct"], "%) | ",
+                k["run2_r_ms"], " / ", k["run2_l_ms"], " (", k["run2_r_pct"], "%) | ", k["pops_r"], " / ", k["pops_l"], " |")
+    end
+end
+
 function main(dir, what)
     ls = readdir(dir)
     pick(re) = joinpath.(dir, sort(filter(f -> occursin(re, f), ls)))
@@ -337,6 +400,10 @@ function main(dir, what)
         spawn_rows(readtsv(pick(r"^age-spawn\.tsv$"), SPAWN_COLS), "Age sweep: the inner shape")
     elseif what == "markall"
         nested_rows(readtsv(pick(r"^markall-nested\.tsv$"), NESTED_COLS))
+    elseif what == "pool"      # PROFILE=gc: the Channel worker pool rounds
+        pool_rows(readtsv(pick(r"^pool-r\d+\.tsv$"), SPAWN_COLS))
+    elseif what == "credit"    # PROFILE=gc: credited against run, from the validation pass
+        credit_rows(joinpath(dir, "validate.log"))
     elseif what == "validate"
         cost_rows(readtsv(pick(r"^validate-cost-spawn\.tsv$"), SPAWN_COLS))
         spawn_rows(readtsv(pick(r"^validate-fairness-spawn\.tsv$"), SPAWN_COLS), "Validation cells (D = 1 s, not timings)")

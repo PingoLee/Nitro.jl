@@ -349,6 +349,7 @@ function measure()
         slots0 = multiq_slot_counts()
         budget0 = multiq_budget_counts()
         fifo0 = multiq_fifo_counts()
+        share0, sfifo0 = multiq_share_counts(), share_fifo_pops()
         clean, digest = clean_runs(w, runs, min_runs, budget)
         cnt = counted_runs(w, counted, budget, digest)
         w.check(digest)
@@ -364,6 +365,10 @@ function measure()
         # Under E only fine-grain fib keeps every `:default` thread popping for long enough that
         # each makes a periodic pop; the others need one somewhere.
         VALIDATE && multiq_budget_check(w.name, budget0; everywhere = w.name == "fib_fine")
+        # -g: credited against run (#618, agent-config #82 Idea 8); with nothing marked under
+        # M_NOCLOCK=1, the pool flag never set and no -g pop.
+        VALIDATE && multiq_share_check(MARK_ROOT ? "$(w.name) markroot" : w.name, share0, sfifo0)
+        VALIDATE && multiq_noclock_check(w.name)
         v(k) = [getfield(r, k) for r in clean]
         c(k) = [getfield(r, k) for r in cnt]
         r(x) = round(x; sigdigits = 4)
