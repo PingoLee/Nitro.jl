@@ -1042,7 +1042,7 @@ LAG && Threads.@spawn lag_probe()
 
 # Block until killed. A `Timer` keeps an idle task parked so the process stays up and a SIGTERM
 # from `run.sh` ends it cleanly. That `Timer` is also a live libuv handle, which on Julia
-# 1.13.0-rc3..1.13.2 hides JuliaLang/julia#63882 (#586): `PARK=event` parks on a `Base.Event`
+# 1.13.0-rc3..1.13.3 hides JuliaLang/julia#63882 (#586): `PARK=event` parks on a `Base.Event`
 # instead, which is no handle, so `wake.sh` can look for the stall; `GUARD=1` then adds the
 # one-line workaround back explicitly (#598).
 const GUARD_TIMER = get(ENV, "GUARD", "0") == "1" ? Timer(typemax(Int32)) : nothing

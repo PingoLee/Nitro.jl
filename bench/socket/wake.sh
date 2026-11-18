@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Does a parked handler wake while every `:default` thread runs a `yield()`ing handler? (#598)
 #
-# On Julia 1.13.0-rc3 through 1.13.2, a task in `sleep` does not wake while every `:default`
+# On Julia 1.13.0-rc3 through 1.13.3, a task in `sleep` does not wake while every `:default`
 # thread runs a busy loop that calls `yield()`, as long as its own `Timer` is the only live libuv
 # handle in the process (JuliaLang/julia#63882, #586). This asks whether a Nitro server shows it.
 # server.jl's LAG=1 probe is a `:default` task in a `sleep(0.01)` loop. K requests of `/cpu_yield`

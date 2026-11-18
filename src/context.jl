@@ -562,20 +562,22 @@ function _close_eager_revise(service::Service)
     return nothing
 end
 
-# JuliaLang/julia#63882 (#586, #598). On Julia 1.13.0-rc3 through 1.13.x, a task parked on a
+# JuliaLang/julia#63882 (#586, #598). On Julia 1.13.0-rc3 through 1.13.3, a task parked on a
 # `Timer` -- a `sleep`, a `timedwait`, a deadline -- does not wake while every `:default` thread
 # runs a handler that calls `yield()`, as long as its timer is the only live libuv handle in the
-# process. It begins with the scheduler backports in JuliaLang/julia#62665; 1.12 and 1.14-DEV are
-# not affected. A Nitro app with no janitor (no `SessionMiddleware`, no `FixedRateLimiter`, no
-# Workers cleanup scheduler) is exactly that process: `bench/socket/wake.sh` measured a parked
-# handler waking 1.48 s late on 1.13.2, against 3-8 ms on 1.12.7. Any second live `Timer`
-# removes the stall, even one that never fires, so `serve` holds one for as long as it serves:
-# one libuv handle, no callback, no wake-up, nothing on the request path.
+# process. It begins with the scheduler backports in JuliaLang/julia#62665; 1.12 is not affected,
+# and 1.13.4 carries the fix (JuliaLang/julia#63884, backported in #64275). A Nitro app with no
+# janitor (no `SessionMiddleware`, no `FixedRateLimiter`, no Workers cleanup scheduler) is
+# exactly that process: `bench/socket/wake.sh` measured a parked handler waking 1.48 s late on
+# 1.13.2, against 3-8 ms on 1.12.7. Any second live `Timer` removes the stall, even one that
+# never fires, so `serve` holds one for as long as it serves: one libuv handle, no callback, no
+# wake-up, nothing on the request path.
 #
-# The upper bound drops to the first fixed 1.13.x when upstream ships one. Once Nitro's Julia
-# floor passes the last affected release, delete this, its call sites (`_hold_wake_guard!`, and
-# `_consumer_wake_guard` in Workers, #514) and both `wake_guard` fields.
-_needs_wake_guard(v::VersionNumber = VERSION) = v"1.13.0-rc3" <= v < v"1.14.0-"
+# The upper bound is the first fixed release, 1.13.4: `wake.sh` measured it there with this
+# guard disabled, at most 3-8 ms late against 1,483 ms on 1.13.3 in the same block, and 10 ms on
+# 1.14.0-beta1 (#609). Once Nitro's Julia floor passes 1.13.3, delete this, its call sites
+# (`_hold_wake_guard!`, and `_consumer_wake_guard` in Workers, #514) and both `wake_guard` fields.
+_needs_wake_guard(v::VersionNumber = VERSION) = v"1.13.0-rc3" <= v < v"1.13.4"
 
 # Tests only: it drives the serve path wherever the gate is shut (a fixed 1.13.x, a later Julia).
 const _WAKE_GUARD_FORCED = Ref(false)

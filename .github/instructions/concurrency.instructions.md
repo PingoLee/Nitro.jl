@@ -157,8 +157,8 @@ lives in the code comment it names, and that comment is canonical.
 - **Or `yield()` every 1-2 ms** in a loop that has to stay in the handler. It bounds the wait
   (a p99 of 10.5 ms at the knee in #467's run, against 192 ms) but not the throughput loss, so it
   is the fallback, not the rule.
-- **On Julia 1.13.0 through 1.13.2, `yield()` does not wake a parked task when nothing else
-  keeps a libuv timer alive (#586).** In the repro, every default thread runs a loop that yields
+- **On Julia 1.13.0 through 1.13.3, `yield()` does not wake a parked task when nothing else
+  keeps a libuv timer alive (#586). 1.13.4 fixes it.** In the repro, every default thread runs a loop that yields
   every 1 ms, and a task in `sleep(0.001)` does not run again until the loops end (1.5 s), against
   a few ms on 1.12.7 and on 1.14-DEV. It begins at 1.13.0-rc3, with the scheduler backports in
   JuliaLang/julia#62665, and is reported as JuliaLang/julia#63882. **Any second live `Timer`
@@ -173,8 +173,9 @@ lives in the code comment it names, and that comment is canonical.
     consumer never calls `serve`: one never-firing `Timer` in `ConsumerHandle.wake_guard` under the
     same gate. The drain closes it, or the heartbeat does, if it outlives a drain that timed out
     (#607). **Still exposed:** yielding loops while neither a server nor a
-    consumer is up. When a fixed 1.13.x ships, lower the gate's upper bound; once Nitro's floor passes the
-    last affected release, delete the guard and this bullet, and change the documents below
+    consumer is up. The gate's upper bound is 1.13.4, the fixed release: `wake.sh` measured it
+    there with the guard disabled, at most 3-8 ms late against 1,483 ms on 1.13.3 (#609). Once
+    Nitro's floor passes 1.13.3, delete the guard and this bullet, and change the documents below
     with it.
   - **The bench masks it unless told not to:** `bench/socket/server.jl` parks on a `Timer` by
     default, which is itself a guard; `wake.sh` runs it with `PARK=event`.

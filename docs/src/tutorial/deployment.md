@@ -212,7 +212,7 @@ the benchmark's own job counter; its k = 0 baseline was 102k and 2.4 ms.
 - **Or `yield()` every 1–2 ms** in a loop that has to stay in the handler. It does not make the
   work cheaper, so throughput still falls, but it bounds the wait: a p99 of 10.5 ms at k = 8,
   lower than Go's 19.9 ms (Go preempts a goroutine after about 10 ms).
-- **One caveat on Julia 1.13.0 through 1.13.2**
+- **One caveat on Julia 1.13.0 through 1.13.3, fixed in 1.13.4**
   ([#586](https://github.com/PingoLee/Nitro.jl/issues/586), reported upstream as
   [JuliaLang/julia#63882](https://github.com/JuliaLang/julia/issues/63882)).
   - **The stall:** in a repro with every default thread in a yielding loop for 1.5 s, a task
@@ -221,16 +221,19 @@ the benchmark's own job counter; its k = 0 baseline was 102k and 2.4 ms.
   - **When it happens:** only while no other timer is alive in the process. Any second live
     `Timer` removes it, even one that never fires. New requests are not affected: the `yield()`
     column above did not change on 1.13.2.
-  - **Nitro works around it while serving.** On 1.13.0-rc3 and later 1.13 releases, `serve`
+  - **Nitro works around it while serving.** On 1.13.0-rc3 through 1.13.3, `serve`
     holds one `Timer` that never fires, and `terminate` closes it: one handle, nothing per
     request. `bench/socket/wake.sh` measured a Nitro server with no other timer on 1.13.2
     ([#598](https://github.com/PingoLee/Nitro.jl/issues/598)). It kept one handler parked in a
     10 ms `sleep` loop while 8 handlers yielded every 1 ms for 1.5 s. Without the guard the
     parked handler woke 1.48 s late in 3 runs of 3. With `serve`'s guard it woke 10–23 ms
     late, against 2–8 ms on 1.12.7 with no load beside it.
-  - **What is still exposed:** a task that sleeps while no server is up, such as a script that
-    runs yielding loops before or after `serve`. It can hold the same guard itself:
-    `keepalive = Timer(typemax(Int32))`, and `close(keepalive)` when done.
+  - **Julia 1.13.4 fixes it.** The same measurement on 1.13.4, with no guard at all, has the
+    parked handler waking 3–8 ms late, so `serve` holds no guard there
+    ([#609](https://github.com/PingoLee/Nitro.jl/issues/609#issuecomment-6959347406)).
+  - **What is still exposed, on 1.13.0 through 1.13.3:** a task that sleeps while no server is
+    up, such as a script that runs yielding loops before or after `serve`. It can hold the same
+    guard itself: `keepalive = Timer(typemax(Int32))`, and `close(keepalive)` when done.
 
 **With many connections, short computations starve some of them.** The knee above is about
 long handlers. Short ones cause another effect, at saturation with many clients. #618 measured
