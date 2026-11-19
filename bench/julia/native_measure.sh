@@ -6,9 +6,12 @@
 #     logging what it sees every 30 s); still there at the end, the driver STOPS and logs them. It
 #     never stops a process itself;
 #   - after every block: the cache-write check: no file under the builds' own depots' compiled/
-#     newer than a marker made just before the block (a write there means a build compiled during a
-#     timed block; the driver STOPS). New files under ~/.julia/compiled are logged, not fatal: no
-#     build here writes there (every write goes to its first depot), so they are another process's;
+#     created or replaced during the block, against a (path, size, inode) snapshot taken just before
+#     it (a write there means a build compiled during the block; the driver STOPS). Julia 1.13 touches
+#     a cache file in the first depot each time it loads it (`touch_cachefile`), so an mtime alone is
+#     not a write: compilecache writes a new file and renames it into place, a new inode. Changes
+#     under ~/.julia/compiled are logged, not fatal: no build here writes there (every write goes to
+#     its first depot), so they are another process's;
 #   - stops on a block that fails (a VALIDATE pass, a negative control, a server's /mq verdict, a
 #     smoke check, a timed block that gave up after its retries or lost a process).
 # Order (the maintainer's, 2026-11-19): block 0 (validation + smoke, untimed), /plaintext at 8,0 and
@@ -28,7 +31,6 @@ export PATH="$HOME/.local/go/bin:$HOME/.local/bin:$HOME/.juliaup/bin:$PATH"
 export JLS="control=$J/bin/julia-control mark=$J/bin/julia-mark official=$J/bin/julia-official"
 export JULIAS="control=$J/bin/julia-control,$ROOT/bench mark=$J/bin/julia-mark,$ROOT/bench official=$J/bin/julia-official,$ROOT/bench mv=$J/bin/julia-mark-validate,$ROOT/bench"
 export MICRO_PROJECT="${MICRO_PROJECT:-$J/benchenv}"
-export PROFILE=native
 PS_WAIT_S="${PS_WAIT_S:-900}"
 
 log() { echo "[$(date '+%F %T')] $*" | tee -a "$LOG"; }
@@ -46,15 +48,15 @@ ps_check() {   # before a gated block
   done
 }
 
-MARKER="$OUT/.block-marker"
-cache_mark() { touch "$MARKER"; }
+snap() { find "$@" -type f -printf '%p %s %i\n' 2>/dev/null | sort; }
+cache_mark() { snap "$J"/depot-*/compiled >"$OUT/.snap-own"; snap "$HOME/.julia/compiled" >"$OUT/.snap-shared"; }
 cache_check() {   # label
   local own other
-  own="$(find "$J"/depot-*/compiled -newer "$MARKER" -type f 2>/dev/null)"
-  other="$(find "$HOME/.julia/compiled" -newer "$MARKER" -type f 2>/dev/null | head -20)"
-  [ -n "$other" ] && { log "cache check $1: files written under ~/.julia/compiled during the block (not by the builds here):"; echo "$other" | tee -a "$LOG"; }
-  [ -z "$own" ] || { log "cache check $1: CACHE FILES WRITTEN during the block:"; echo "$own" | tee -a "$LOG"; return 1; }
-  log "cache check $1: no cache file written"
+  own="$(comm -13 "$OUT/.snap-own" <(snap "$J"/depot-*/compiled))"
+  other="$(comm -13 "$OUT/.snap-shared" <(snap "$HOME/.julia/compiled") | head -20)"
+  [ -n "$other" ] && { log "cache check $1: files created or replaced under ~/.julia/compiled during the block (not by the builds here):"; echo "$other" | tee -a "$LOG"; }
+  [ -z "$own" ] || { log "cache check $1: CACHE FILES CREATED OR REPLACED during the block (path size inode):"; echo "$own" | tee -a "$LOG"; return 1; }
+  log "cache check $1: no cache file created or replaced"
 }
 
 # The newest fairness raw directory's /mq verdicts must all be ok.
@@ -68,7 +70,8 @@ mq_check() {
   log "mq check: $n /mq files in $(basename "$raw"), every verdict ok"
 }
 
-rf() { "$ROOT/bench/tasks/rounds_fifo.sh" "$@"; }
+# PROFILE goes to rounds_fifo.sh only: server.jl reads PROFILE as its profiling window, in seconds.
+rf() { PROFILE=native "$ROOT/bench/tasks/rounds_fifo.sh" "$@"; }
 ms() { "$ROOT/bench/socket/mark_server.sh" "$@"; }
 
 # A gated mark_server block, retried on a failed gate (3) or a stopped block (4), twice at most.
@@ -84,19 +87,23 @@ ms_gated() {   # block layout
   done
 }
 
-step_validate() {
+step_vharness() {
   log "block 0a: VALIDATE on mark-validate (rounds_fifo PROFILE=native VALIDATE=1)"
-  JL="$J/bin/julia-mark-validate" VALIDATE=1 OUT="$OUT/validate" rf >>"$LOG" 2>&1 || return 1
+  JL="$J/bin/julia-mark-validate" VALIDATE=1 OUT="$OUT/validate" rf >>"$LOG" 2>&1
+}
+step_vserver() {
   log "block 0b: server VALIDATE (nv, mark-validate, /mq)"
   ms nv >>"$LOG" 2>&1 || return 1
-  mq_check || return 1
+  mq_check
+}
+step_smoke() {
   log "block 0c: smoke of the timed block code (D = 1, no gate, not timed)"
   JL="$J/bin/julia-control" NOGATE=1 TD=1 D=1 RUNS=1 FIB_FINE=36:12 ABBA_ROUNDS=1 MICRO_V="N%mark" \
     OUT="$OUT/smoke" BLOCKS="cost cells fibabba" ROUNDS=1 rf >>"$LOG" 2>&1 || return 1
   log "block 0d: smoke of the five server columns at 8,0 and 8,1 (2 s, no gate)"
   ms nsmoke 8,0 >>"$LOG" 2>&1 || return 1
   ms nsmoke 8,1 >>"$LOG" 2>&1 || return 1
-  log "block 0: done"
+  log "block 0c-0d: done"
 }
 step_plain80()  { ms_gated nplain 8,0 >>"$LOG" 2>&1; }
 step_plain81()  { ms_gated nplain 8,1 >>"$LOG" 2>&1; }
@@ -107,7 +114,7 @@ step_cell1_81() { ms_gated ncell1 8,1 >>"$LOG" 2>&1; }
 step_cell4_81() { ms_gated ncell4 8,1 >>"$LOG" 2>&1; }
 step_round()    { JL="$J/bin/julia-control" OUT="$OUT" BLOCKS="cost cells" FIRST_ROUND="$1" ROUNDS="$1" rf >>"$LOG" 2>&1; }
 
-STEPS="${STEPS:-validate plain80 plain81 fibabba cell1_80 cell4_80 round1 round2 round3 round4 round5 round6 cell1_81 cell4_81}"
+STEPS="${STEPS:-vharness vserver smoke plain80 plain81 fibabba cell1_80 cell4_80 round1 round2 round3 round4 round5 round6 cell1_81 cell4_81}"
 if [ -n "${FROM:-}" ]; then
   STEPS="$(echo "$STEPS" | tr ' ' '\n' | sed -n "/^${FROM}\$/,\$p" | tr '\n' ' ')"
   [ -n "$STEPS" ] || stop "FROM=$FROM is not a step"
@@ -116,7 +123,7 @@ fi
 log "driver start: steps [$STEPS], OUT $OUT"
 log "builds: control $("$J/bin/julia-control" -e 'print(Base.GIT_VERSION_INFO.commit_short)'), mark $("$J/bin/julia-mark" -e 'print(Base.GIT_VERSION_INFO.commit_short)') ($(readlink -f "$(sed -n 's/^exec "\([^"]*\)".*/\1/p' "$J/bin/julia-mark")")), official $("$J/bin/julia-official" -e 'print(Base.GIT_VERSION_INFO.commit_short)')"
 for s in $STEPS; do
-  if [ "$s" != validate ]; then ps_check || stop "ps check before $s"; fi
+  if [ "$s" != vharness ]; then ps_check || stop "ps check before $s"; fi
   cache_mark
   log "step $s: start"
   t0=$(date +%s)
