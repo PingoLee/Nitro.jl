@@ -44,7 +44,7 @@ end
 col_of(r::Dict) = col_of(r["commit"], r["variant"])
 num(s) = (x = tryparse(Float64, s); x === nothing ? NaN : x)
 
-fmt(x) = isnan(x) ? "–" : abs(x) >= 1e5 ? string(round(Int, x)) : abs(x) >= 100 ? string(round(x; digits = 1)) :
+fmt(x) = isnan(x) ? "–" : isinf(x) ? string(x) : abs(x) >= 1e5 ? string(round(Int, x)) : abs(x) >= 100 ? string(round(x; digits = 1)) :
          abs(x) >= 1 ? string(round(x; digits = 3)) : string(round(x; sigdigits = 4))
 med(v) = isempty(v) ? NaN : median(v)
 mmr(v) = isempty(v) ? "–" : "$(fmt(median(v))) [$(fmt(minimum(v)))–$(fmt(maximum(v)))]"
@@ -111,9 +111,14 @@ for r in rounds_of("micro"), l in eachline(joinpath(OUT, "micro-r$(r).tsv"))
     f = split(l, '\t'); length(f) >= 8 || continue
     tok = String(f[4]); v, b = occursin('%', tok) ? split(tok, '%') : (tok, "")
     commit = b == "control" ? "x/local" : b == "mark" ? "x/native" : "x"
-    ns = match(r"ns_per_op=([0-9.eE+-]+)", l)
-    push!(micro, Dict("round" => String(f[1]), "threads" => String(f[3]), "variant" => String(v), "commit" => commit,
-                      "kind" => String(f[5]), "name" => String(f[7]), "ns" => ns === nothing ? "NaN" : ns[1]))
+    # micro: ns_per_op (FanOut's second row, ns_per_task, is the same number per task: skipped);
+    # queued: the spawn and the drain time per task, as two rows.
+    for (key, suffix) in (("ns_per_op", ""), ("spawn_ns_per_task", " spawn"), ("drain_ns_per_task", " drain"))
+        m = match(Regex("\\b$(key)=([0-9.eE+-]+)"), l)
+        m === nothing && continue
+        push!(micro, Dict("round" => String(f[1]), "threads" => String(f[3]), "variant" => String(v), "commit" => commit,
+                          "kind" => String(f[5]), "name" => String(f[7]) * suffix, "ns" => m[1]))
+    end
 end
 mnames = unique([(r["threads"], r["kind"], r["name"]) for r in micro])
 mcells = [("$(th) $(k) $(n)", r -> r["threads"] == th && r["kind"] == k && r["name"] == n) for (th, k, n) in mnames]
