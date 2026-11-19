@@ -89,7 +89,10 @@ an AWS ALB both close idle connections at 60 seconds, and a backend that closes 
 the proxy reusing them, which surfaces as sporadic `502`s. Keep it above your proxy's idle
 timeout if you lower it.
 
-**What the two timeouts cost under load.** Nothing measurable, since Reseau 1.7.
+**What the two timeouts cost under load.** On a route that waits on a database, nothing
+measurable since Reseau 1.7. On a route that does no work, about 10% of throughput at the default
+thread layout.
+
 With both timeouts on, HTTP.jl re-arms a keep-alive connection's read deadline about three times
 per request. In Reseau 1.6, HTTP.jl's transport, each re-arm took the one lock of the poller
 thread that every socket in the process waits through, the database driver's included. With
@@ -104,9 +107,21 @@ on both Reseau versions in one block. On a route making 20 queries, with Reseau 
 Reseau 1.6.6 it served 1,467 against 1,686: the timeouts cost 13% there, and 10% for HTTP.jl
 alone without Nitro.
 
+A route that does no work still pays for the re-arms themselves.
+[#782](https://github.com/PingoLee/Nitro.jl/issues/782#issuecomment-6988371464) measured a
+plain-text route with 500 connections on Reseau 1.7.1. At `--threads=8,1` a Nitro server served
+90,177 requests per second with both timeouts at their defaults and 99,747 with both set to 0:
+about 10% less, and HTTP.jl alone without Nitro lost the same share. At `--threads=8,0` the
+difference was about 2%. The likely reason, which is inferred and not measured: with an
+interactive thread, every connection is read on that one thread, it is already the limit of such
+a route, and the three deadline changes per request are spent on it. Once a request does real
+work, that share shrinks to nothing measurable, as the database route shows.
+
 The defaults stay on, because they are what stops a client that never finishes its request head
-or never closes an idle connection. Setting both to 0 gains nothing measurable now, and leaves
-those clients to whatever is in front of Nitro.
+or never closes an idle connection. Setting both to 0 gains nothing measurable on a route that
+spends its time in a database, and about 10% on one that does no work. It leaves those clients to
+whatever is in front of Nitro, so it is a trade to make only when the proxy enforces its own
+header and idle timeouts on every client connection.
 
 The other half of capacity is the process itself: how many threads it starts with, and how much
 memory its garbage collector aims for. Both are covered in
