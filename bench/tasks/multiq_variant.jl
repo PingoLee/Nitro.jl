@@ -172,7 +172,16 @@ const MULTIQ_VARIANT = get(ENV, "VARIANT", "A")
 # class-dependent constant below is M-gc-r2's (N, N-none) or M-h-gc-r2's (N-h). The runtime
 # patch refuses to load on such a build: only A and the N variants run there.
 const NATIVE_BUILD = hasfield(Task, :sched_class)
-const MULTIQ_NATIVE = MULTIQ_VARIANT in ("N", "N-h", "N-none")
+# N25 and N75 (the measurement session of the native mark): N at the request-side weights 1/4 and
+# 3/4, M-gc25-r2's and M-gc75-r2's. The build reads its weight from JULIA_SCHED_FAIR_WEIGHT once, at
+# the init this file runs at load, so the name sets it first; the check after that init confirms it.
+const _N_WEIGHT = MULTIQ_VARIANT == "N25" ? "1/4" : MULTIQ_VARIANT == "N75" ? "3/4" : nothing
+if _N_WEIGHT !== nothing
+    get(ENV, "JULIA_SCHED_FAIR_WEIGHT", _N_WEIGHT) == _N_WEIGHT ||
+        error("VARIANT=$(MULTIQ_VARIANT) sets JULIA_SCHED_FAIR_WEIGHT=$(_N_WEIGHT), and the environment has $(ENV["JULIA_SCHED_FAIR_WEIGHT"])")
+    ENV["JULIA_SCHED_FAIR_WEIGHT"] = _N_WEIGHT
+end
+const MULTIQ_NATIVE = MULTIQ_VARIANT in ("N", "N-h", "N-none", "N25", "N75")
 MULTIQ_NATIVE && !NATIVE_BUILD && error("VARIANT=$(MULTIQ_VARIANT) needs a Julia built with the native mark (bench/julia/)")
 NATIVE_BUILD && !(MULTIQ_VARIANT == "A" || MULTIQ_NATIVE) &&
     error("the runtime patch refuses to load on a build with the native mark: VARIANT=$(MULTIQ_VARIANT); use A, N, N-h or N-none")
