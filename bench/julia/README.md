@@ -57,6 +57,10 @@ Give each build its own first depot, so that no build's precompile cache evicts 
   (handlers only), `N-none` (nothing marked) in `bench/tasks/` and `bench/socket/server.jl`;
   `bench/tasks/rounds_fifo.sh PROFILE=native` with `JLS="control=… mark=… official=…"` interleaves
   the builds in one block. The runtime patch refuses to load on a build that has the mark.
+- `native_measure.sh`: the measurement session as one detached driver: validation and smoke, then
+  every timed block in order, with a `ps` check before each gated block and a check after each
+  block that no build wrote a cache file during it. It stops on any failed check. `N25` and `N75`
+  are N at the weights 1/4 and 3/4.
 - `native_checks.jl`: the port's delicate points (the sysimage's state, the zeroed byte, the option,
   the `:interactive` and sticky rules, one-thread pools, no queue keeping a task alive), at `8,1`,
   `8,2` and `1`.

@@ -76,6 +76,16 @@
 # validation build: the cost and fairness cells, nested.jl, the mixed and mixed-inner cells, the marked
 # root, the pool cells, the no-clock step (N-none and N, nothing marked in those cells) and the three
 # negative controls under N.
+# The measurement (session 2) runs five columns in every timed block, NATIVE_COLS: ctl (A%control),
+# bridgeA (A%official), mark (N%mark), bridge (M-gc-r2%official), mark0 (N-none%mark), with JL the
+# control build; the mixed cells add N25%mark and N75%mark (N at the weights 1/4 and 3/4). Each timed
+# block starts with one throwaway slot (THROWAWAY=0 turns it off). The blocks: cost (as above, the
+# micro rows' variant column carrying the whole token), cells (fairness's three starved cells, the
+# inner shape, mixed, mixed-inner, fib_fine alone and under a marked root, in one quiet block) and
+# fibabba (BLOCKS=fibabba ROUNDS=1: fib_fine alone for ABBA_COLS, ctl and mark0, ABBA_ROUNDS = 12
+# rounds of A B / B A at 8,1 and 8,0). TD=<s> shortens every spawn_order window and NOGATE=1 runs a
+# block without quiet.sh: together, a smoke pass of the block code, never a measurement.
+# bench/julia/native_measure.sh drives the whole session.
 #
 # Usage: JL=<julia binary> MICRO_PROJECT=<env with BenchmarkTools> bench/tasks/rounds_fifo.sh [rounds]
 #   OUT           results directory (default bench/results/618-fifo)
@@ -208,17 +218,33 @@ elif [ "$PROFILE" = gc ]; then
   NEG_R_V="M-g-r2 M-gc-r2"
 elif [ "$PROFILE" = native ]; then
   PILOT_V="${PILOT_V_NATIVE:-A%control N-none%mark N%mark A%official M-gc-r2%official}"
-  COST_V="A N-none N"
+  # The measurement (session 2): five columns in every timed block, one token each. The control build
+  # (ctl), the official binary's own stock (bridgeA), the mark build with the marks M-gc-r2 uses (mark),
+  # the official binary under the runtime patch (bridge), and the mark build with nothing marked (mark0).
+  # Reversed in even rounds, so ctl and mark0 share slots 1 and 5, bridgeA and bridge slots 2 and 4.
+  # The mixed cells add mark at the weights 1/4 and 3/4 in the middle, keeping that symmetry. JL is the
+  # control build: fairness's `pool` reference runs there. VALIDATE keeps the bare lists, on JL.
+  NATIVE_COLS="${NATIVE_COLS:-A%control A%official N%mark M-gc-r2%official N-none%mark}"
+  NATIVE_MIX_COLS="${NATIVE_MIX_COLS:-A%control A%official N%mark N25%mark N75%mark M-gc-r2%official N-none%mark}"
+  COST_V="$NATIVE_COLS"
   COST_CELLS="50:0 500:0"
-  FAIR_I81_V="A N"
-  FAIR_D_V="A N N-h"
-  MIX_V="A N"
+  FAIR_I81_V="$NATIVE_COLS"
+  FAIR_D_V="$NATIVE_COLS"
+  SHAPE_V="$NATIVE_COLS"
+  SHAPE_CELLS="500:2:inner"
+  SHAPE_INNER_V=""
+  NEST_V="$NATIVE_COLS"
+  NEST_WORKLOADS="fib_fine"
+  MARKROOT_V="$NATIVE_COLS"
+  MIX_V="$NATIVE_MIX_COLS"
+  # fibabba: fib_fine alone, ctl and mark0 only, ABBA_ROUNDS rounds of A B / B A at 8,1 and 8,0.
+  ABBA_COLS="${ABBA_COLS:-A%control N-none%mark}"
   POOL_V="A N-none N"
   VAL_V="A N-none N N-h"
   VAL_NEST_V="A N-none N"
   VAL_MARKALL_V=""
   VAL_MARKROOT_V="N"
-  VAL_MIX_V="A N"
+  VAL_MIX_V="A N N25 N75"
   NOCLOCK_V="N-none N"
   NEG_V="N"
   NEG_R_V="N"
@@ -255,7 +281,7 @@ ordered() {   # round, variants...
 
 # One spawn_order.jl process: round, tsv, layout, clients, variant, cells, mode, D.
 spawn() {
-  local r="$1" tsv="$2" layout="$3" clients="$4" variant="$5" cells="$6" mode="${7:-spawn}" d="${8:-8}"
+  local r="$1" tsv="$2" layout="$3" clients="$4" variant="$5" cells="$6" mode="${7:-spawn}" d="${8:-${TD:-8}}"
   local header=0; [ -s "$tsv" ] && header=1
   local jl; jl="$(jl_of "$variant")" || return 1
   env ROUND="$r" NOHEADER="$header" VARIANT="$(var_of "$variant")" CELLS="$cells" MODES="$mode" CLIENTS="$clients" D="$d" \
@@ -265,9 +291,12 @@ spawn() {
 }
 
 # One tasks.jl process: round, tsv, layout, variant.
+# A `V%label` token runs on that build, and its rows carry the whole token in the variant column (two
+# builds of one version would otherwise read alike: the rows' build= label tells them apart too).
 micro() {
-  local r="$1" tsv="$2" layout="$3" variant="$4"
-  VARIANT="$variant" FAN_OUT_NS="1000 10000" timeout -s KILL "${MICRO_TIMEOUT_S:-240}" taskset -c "$CPUS" "$JL" \
+  local r="$1" tsv="$2" layout="$3" variant="$4" jl
+  jl="$(jl_of "$variant")" || return 1
+  VARIANT="$(var_of "$variant")" FAN_OUT_NS="1000 10000" timeout -s KILL "${MICRO_TIMEOUT_S:-240}" taskset -c "$CPUS" "$jl" \
     --project="$MICRO_PROJECT" --threads="$layout" "$HERE/tasks.jl" micro queued |
     sed "s|^|$r\t$VER\t$layout\t$variant\t|" >>"$tsv"
   local rc="${PIPESTATUS[0]}"
@@ -278,19 +307,20 @@ micro() {
 CLIENT_CELLS=("8,1 interactive" "8,1 default" "8,0 default")
 
 cost_block() {   # round, spawn tsv, micro tsv
-  local r="$1" tsv="$2" mtsv="$3" cells="$COST_CELLS" d=8 cc layout clients v vs="$COST_V"
+  local r="$1" tsv="$2" mtsv="$3" cells="$COST_CELLS" d="${TD:-8}" cc layout clients v vs="$COST_V"
   [ "$VALIDATE" = 1 ] && { d=1; [ -n "$VAL_V" ] && vs="$VAL_V"; }
+  native_throwaway "$r" cost || return 1
   for cc in "${CLIENT_CELLS[@]}"; do
     read -r layout clients <<<"$cc"
     for v in $(ordered "$r" $vs); do spawn "$r" "$tsv" "$layout" "$clients" "$v" "$cells" spawn "$d" || return 1; done
   done
   for layout in 8,1 8,0; do
-    for v in $(ordered "$r" $vs); do micro "$r" "$mtsv" "$layout" "$v" || return 1; done
+    for v in $(ordered "$r" ${MICRO_V:-$vs}); do micro "$r" "$mtsv" "$layout" "$v" || return 1; done
   done
 }
 
 fairness_block() {   # round, spawn tsv
-  local r="$1" tsv="$2" cells="500:2" d=8 cc layout clients v vs
+  local r="$1" tsv="$2" cells="500:2" d="${TD:-8}" cc layout clients v vs
   [ "$VALIDATE" = 1 ] && { cells="50:0.2 500:2 500:2:inner 500:2:hetero 500:2:io"; d=1; }
   for cc in "${CLIENT_CELLS[@]}"; do
     read -r layout clients <<<"$cc"
@@ -314,6 +344,17 @@ shapes_block() {   # round, spawn tsv
 
 nesting_block() {   # round, nested tsv, variants, extra env...
   local r="$1" tsv="$2" vs="$3"; shift 3
+  if [ "$PROFILE" = native ] && [ "$VALIDATE" != 1 ]; then
+    # One nested.sh call per token, the tokens innermost (nested.sh's own loop puts the build outermost).
+    local layout v rc=0 s
+    for layout in ${NEST_LAYOUTS:-8,1 8,0}; do
+      for v in $(ordered "$r" $vs); do
+        native_nested "$r" "$tsv" "$layout" "$v" "$@"; s=$?
+        case "$s" in 0) ;; 2) rc=2 ;; *) return "$s" ;; esac
+      done
+    done
+    return "$rc"
+  fi
   env "$@" ROUND="$r" CHANNELS="$JL" LAYOUTS="${NEST_LAYOUTS:-8,1 8,0}" VARIANTS="$(ordered "$r" $vs)" SKIP= \
     CPUS="$CPUS" TIMEOUT_S="${TIMEOUT_S:-600}" "$HERE/nested.sh" "$r" "$tsv"
 }
@@ -424,6 +465,65 @@ age_block() {   # mixed tsv, spawn tsv
   for v in $AGE_V; do spawn 1 "$2" 8,1 interactive "$v" "500:2:inner" || return 1; done
 }
 
+# PROFILE=native: one nested.sh process for one token. Exit 2 is a process killed by its timeout.
+native_nested() {   # round, tsv, layout, token, extra env...
+  local r="$1" tsv="$2" layout="$3" v="$4" jl; shift 4
+  jl="$(jl_of "$v")" || return 1
+  env "$@" ROUND="$r" CHANNELS="$jl" LAYOUTS="$layout" VARIANTS="$(var_of "$v")" SKIP= \
+    CPUS="$CPUS" TIMEOUT_S="${TIMEOUT_S:-600}" "$HERE/nested.sh" "$r" "$tsv"
+}
+
+# PROFILE=native, timed blocks only: one throwaway slot before the block's first measured process, so
+# that none takes the block's first slot (on 2026-11-18 the first process of a block read low in one
+# cell and high in another). It is the first token of the round's order, run once more in the block's
+# first cell, into <OUT>/throwaway-*.tsv (never read). THROWAWAY=0 turns it off.
+native_throwaway() {   # round, kind (cost, cells, fib)
+  [ "$PROFILE" = native ] && [ "$VALIDATE" != 1 ] && [ "${THROWAWAY:-1}" = 1 ] || return 0
+  local r="$1" first
+  case "$2" in
+    cost)  first="$(ordered "$r" $COST_V | cut -d' ' -f1)"
+           spawn "$r" "$OUT/throwaway-spawn.tsv" 8,1 interactive "$first" "$COST_CELLS" spawn "${TD:-8}" ;;
+    cells) first="$(ordered "$r" $FAIR_I81_V | cut -d' ' -f1)"
+           spawn "$r" "$OUT/throwaway-spawn.tsv" 8,1 interactive "$first" "500:2" spawn "${TD:-8}" ;;
+    fib)   first="$(ordered "$r" $ABBA_COLS | cut -d' ' -f1)"
+           native_nested "$r" "$OUT/throwaway-nested.tsv" 8,1 "$first" WORKLOADS=fib_fine ;;
+  esac
+}
+
+# PROFILE=native: the small cells of a round in one quiet block (one gate instead of six), after one
+# throwaway slot: the three starved cells (fairness), the inner shape, the mixed and the mixed-inner
+# cells, fib_fine alone and fib_fine under a marked root, both at 8,1 and 8,0.
+cells_block() {   # round, fairness tsv, shapes tsv, mixed tsv, mixedinner tsv, nested tsv, markroot tsv
+  local r="$1" rc=0 s
+  native_throwaway "$r" cells || return 1
+  fairness_block "$r" "$2" || return 1
+  shapes_block "$r" "$3" || return 1
+  mixed_block "$r" "$4" || return 1
+  mixed_block "$r" "$5" SHAPE=inner || return 1
+  nesting_block "$r" "$6" "$NEST_V" WORKLOADS=fib_fine; s=$?
+  case "$s" in 0) ;; 2) rc=2 ;; *) return "$s" ;; esac
+  markroot_block "$r" "$7" "$MARKROOT_V"; s=$?
+  case "$s" in 0) ;; 2) rc=2 ;; *) return "$s" ;; esac
+  return "$rc"
+}
+
+# PROFILE=native: fib_fine alone for ABBA_COLS (ctl and mark0), ABBA_ROUNDS rounds (12) in one quiet
+# block after one throwaway slot. Round r runs 8,1 then 8,0, the two tokens in order in odd rounds
+# and reversed in even ones (A B / B A), so each token takes each position equally often per layout.
+fibabba_block() {   # nested tsv
+  local tsv="$1" r layout v rc=0 s
+  native_throwaway 1 fib || return 1
+  for r in $(seq 1 "${ABBA_ROUNDS:-12}"); do
+    for layout in 8,1 8,0; do
+      for v in $(ordered "$r" $ABBA_COLS); do
+        native_nested "$r" "$tsv" "$layout" "$v" WORKLOADS=fib_fine; s=$?
+        case "$s" in 0) ;; 2) rc=2 ;; *) return "$s" ;; esac
+      done
+    done
+  done
+  return "$rc"
+}
+
 markroot_block() {   # round, nested tsv, variants, extra env...
   local r="$1" tsv="$2" vs="$3"; shift 3
   NEST_LAYOUTS="${NEST_LAYOUTS:-8,1 8,0}" nesting_block "$r" "$tsv" "$vs" WORKLOADS=fib_fine MARK_ROOT=1 "$@"
@@ -440,6 +540,8 @@ block() {   # label, files..., --, function args...
   local files=()
   while [ "$1" != -- ]; do files+=("$1"); shift; done; shift
   local attempt=1 rc
+  # NOGATE=1: run the block directly, not behind quiet.sh (a smoke pass of the block code, never timed).
+  if [ "${NOGATE:-0}" = 1 ]; then "$@"; rc=$?; [ "$rc" = 2 ] && rc=0; return "$rc"; fi
   while :; do
     "$ROOT/bench/socket/quiet.sh" "$label" "$@"; rc=$?
     [ "$rc" = 2 ] && { log "$label: finished with a process killed by its timeout (recorded in the TSV)"; return 0; }
@@ -552,6 +654,20 @@ for r in $(seq "${FIRST_ROUND:-1}" "$ROUNDS"); do
         if block "mixedinner-r$r" "$a" -- "${SELF[@]}" mixed_block "$r" "$a" SHAPE=inner; then
           mv "$a" "$OUT/mixedinner-r$r.tsv"; log "round $r mixedinner done"
         else log "round $r mixedinner FAILED"; status=1; fi ;;
+      cells)
+        a="$OUT/attempt-cells-fairness-r$r-$stamp.tsv" b="$OUT/attempt-cells-shapes-r$r-$stamp.tsv"
+        c="$OUT/attempt-cells-mixed-r$r-$stamp.tsv" d="$OUT/attempt-cells-mixedinner-r$r-$stamp.tsv"
+        e="$OUT/attempt-cells-nested-r$r-$stamp.tsv" f="$OUT/attempt-cells-markroot-r$r-$stamp.tsv"
+        if block "cells-r$r" "$a" "$b" "$c" "$d" "$e" "$f" -- "${SELF[@]}" cells_block "$r" "$a" "$b" "$c" "$d" "$e" "$f"; then
+          mv "$a" "$OUT/fairness-spawn-r$r.tsv"; mv "$b" "$OUT/shapes-spawn-r$r.tsv"; mv "$c" "$OUT/mixed-r$r.tsv"
+          mv "$d" "$OUT/mixedinner-r$r.tsv"; mv "$e" "$OUT/nested-r$r.tsv"; mv "$f" "$OUT/markroot-r$r.tsv"
+          log "round $r cells done"
+        else log "round $r cells FAILED"; status=1; fi ;;
+      fibabba)
+        a="$OUT/attempt-fibabba-$stamp.tsv"
+        if block "fibabba" "$a" -- "${SELF[@]}" fibabba_block "$a"; then
+          mv "$a" "$OUT/fibabba-nested.tsv"; log "fibabba done"
+        else log "fibabba FAILED"; status=1; fi ;;
       markroot)
         a="$OUT/attempt-markroot-r$r-$stamp.tsv"
         if block "markroot-r$r" "$a" -- "${SELF[@]}" markroot_block "$r" "$a" "$MARKROOT_V"; then

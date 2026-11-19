@@ -147,6 +147,33 @@ case "$BLOCK" in
   burstv)
     "$HERE/quiet.sh" 618burst-v env VALIDATE=1 PROBE=1 ROUTE="$AGG" "$HERE/fairness.sh" \
       "bare_marked@8,0@M-gc-r2 bare_marked_listen@8,0@M-gc-r2 bare_marked@8,1@M-gc-r2 bare_marked_listen@8,1@M-gc-r2" 1 3s ;;
+  # The native mark's measurement (#618, agent-config #82 Idea 10, session 2). JULIAS must name the
+  # builds `control`, `mark` and `official` (and `mv`, the mark's validation build, for nv), each
+  # with the bench project. Five servers, one per column: ctl (the control build, no VARIANT), bridgeA
+  # (the official binary, no VARIANT), mark (the mark build, the request task and the listener marked),
+  # bridge (the official binary under the runtime patch M-gc-r2, the same two marks), mark0 (the mark
+  # build, no VARIANT: nothing loaded, nothing marked). A backlog of 1024 on every server, even rounds
+  # reversed, one throwaway slot, ROUNDS 6. nplain: /plaintext with oha after the client in every
+  # window and both clients' CPU share; ncell1: cell 1; ncell4: cell 4 (MIX=1). nv: one VALIDATE
+  # round of the mark's validation build (/mq). nsmoke: every column once at the layout, 2 s, not
+  # behind the gate (a check of the specs, never timed).
+  nplain|ncell1|ncell4|nsmoke)
+    : "${JULIAS:?JULIAS=\"control=… mark=… official=…\" for the native blocks}"
+    cols="bare_spawn@$LAYOUT%control bare_spawn@$LAYOUT%official bare_marked_listen@$LAYOUT@N%mark bare_marked_listen@$LAYOUT@M-gc-r2%official bare_spawn@$LAYOUT%mark"
+    common=(BACKLOG=1024 REVERSE_EVEN=1 THROWAWAY=1)
+    case "$BLOCK" in
+      nplain) "$HERE/quiet.sh" "618native-plain-${LAYOUT/,/_}" env "${common[@]}" OHA=1 PROBE=0 CLIENT_CPU=1 ROUTE="/plaintext" \
+                "$HERE/fairness.sh" "$cols" "${ROUNDS_GIVEN:-6}" "$DUR" ;;
+      ncell1) "$HERE/quiet.sh" "618native-cell1-${LAYOUT/,/_}" env "${common[@]}" PROBE=1 ROUTE="$AGG" \
+                "$HERE/fairness.sh" "$cols" "${ROUNDS_GIVEN:-6}" "$DUR" ;;
+      ncell4) "$HERE/quiet.sh" "618native-cell4-${LAYOUT/,/_}" env "${common[@]}" MIX=1 PROBE=1 ROUTE="$AGG" \
+                "$HERE/fairness.sh" "$cols" "${ROUNDS_GIVEN:-6}" "$DUR" ;;
+      nsmoke) env BACKLOG=1024 PROBE=1 MIX=1 ROUTE="$AGG" "$HERE/fairness.sh" "$cols" 1 2s ;;
+    esac ;;
+  nv)
+    : "${JULIAS:?JULIAS with an mv entry for nv}"
+    env BACKLOG=1024 VALIDATE=1 PROBE=1 ROUTE="$AGG" "$HERE/fairness.sh" \
+      "bare_marked@8,1@N%mv bare_marked_listen@8,0@N%mv bare_marked_listen@8,1@N%mv" 1 "$DUR" ;;
   cell5|cell6)
     shape=inner; [ "$BLOCK" = cell6 ] && shape=inner20
     export -f harness; export MARK_OUT D CPUS ROOT
