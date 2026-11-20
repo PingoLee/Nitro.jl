@@ -1,0 +1,102 @@
+diff --git a/base/Base.jl b/base/Base.jl
+index 0775305b17..ab6fc3577d 100644
+--- a/base/Base.jl
++++ b/base/Base.jl
+@@ -399,6 +399,7 @@ function __init__()
+     end
+ 
+     CoreLogging.global_logger(CoreLogging.ConsoleLogger())
++    Partr.mark_all_init!()   # the mark-all switch (local experiment, PingoLee/Nitro.jl#618)
+     nothing
+ end
+ 
+diff --git a/base/partr.jl b/base/partr.jl
+index d30ffbe7a9..00e65db3cc 100644
+--- a/base/partr.jl
++++ b/base/partr.jl
+@@ -503,6 +503,58 @@ mutable struct fflag
+ end
+ const fl = fflag(_PAD8, false, _PAD15)
+ 
++# The mark-all switch (a throwaway build for Julia's own tests, never timed; PingoLee/Nitro.jl#618):
++# JULIA_SCHED_MARK_ALL, read once by Base.__init__. Unset, the build behaves as mark-validate.
++#   spawn   Threads._spawn_set_thrpool also marks a :default task: every @spawn (and
++#           Channel(spawn=true)) carries fair=true;
++#   insert  multiq_insert classes F every class-0 task at its first enqueue on :default, which also
++#           takes @threads' tasks and hand-built ones, and overrides the descendant rule.
++# The exit log: with JULIA_SCHED_MARK_ALL_LOG=<dir> (or, when that variable is missing, if
++# ~/app/julia-618/mark-all-log/current is a directory, which catches a process started with a
++# replaced environment), every process writes <dir>/<pid>.tsv at exit: pid, mode, where the
++# directory came from, the thread counts, f_first, l_first, r_first, demoted, r_ins (every insert
++# into the R heaps, first enqueues and wake-ups: r_first + r_again), f_again, its program and args.
++mutable struct fmarkall
++    pad0::NTuple{8,Int}
++    @atomic mode::Int8   # 0 unset, 1 spawn, 2 insert
++    pad1::NTuple{15,Int}
++end
++const fma = fmarkall(_PAD8, Int8(0), _PAD15)
++function mark_all_init!()
++    s = get(ENV, "JULIA_SCHED_MARK_ALL", "")
++    m = s == "" ? Int8(0) : s == "spawn" ? Int8(1) : s == "insert" ? Int8(2) :
++        throw(ArgumentError(LazyString("JULIA_SCHED_MARK_ALL must be spawn or insert, not ", s)))
++    m == Int8(0) || fair_init!()   # the weight and the clock calibration, as a marked spawn does
++    @atomic :release fma.mode = m
++    d = get(ENV, "JULIA_SCHED_MARK_ALL_LOG", "")
++    src = "env"
++    if isempty(d)
++        f = try
++            Base.joinpath(Base.homedir(), "app", "julia-618", "mark-all-log", "current")
++        catch
++            ""
++        end
++        if !isempty(f) && Base.isdir(f)
++            d = f; src = "fallback"
++        end
++    end
++    isempty(d) || Base.atexit(() -> mark_all_log(d, src, s))
++    return nothing
++end
++function mark_all_log(d::String, src::String, s::String)
++    try
++        c = sched_counts()
++        line = string(Base.getpid(), '\t', isempty(s) ? "unset" : s, '\t', src, '\t',
++                      Threads.nthreads(:default), ',', Threads.nthreads(:interactive), '\t',
++                      c.f_first, '\t', c.l_first, '\t', c.r_first, '\t', c.demoted, '\t',
++                      c.r_first + c.r_again, '\t', c.f_again, '\t',
++                      Base.PROGRAM_FILE, '\t', join(Base.ARGS, ' '), '\n')
++        Base.write(Base.joinpath(d, string(Base.getpid(), ".tsv")), line)
++    catch
++    end
++    return nothing
++end
++
+ # Read once, by the first `Threads._spawn_set_fair(t, true)`, in the spawning task: the weight,
+ # the clocksource and, on x86_64, a 10 ms calibration of the cycle counter for the cap. Never
+ # called by the scheduler: a class set by hand runs on the defaults until something calls it.
+@@ -981,6 +1033,12 @@ function multiq_insert(task::Task, priority::UInt16)
+     @sched_validate ccall(:jl_threadpoolid, Int8, (Int16,), Threads.threadid() - 1) == Int8(-1) && (vs().foreign += 1)
+     c = sched_class(task)
+     if c == C_NONE
++        if (@atomic :monotonic fma.mode) == Int8(2) &&
++                ccall(:jl_is_task_started, Cint, (Any,), task) == 0 &&
++                ccall(:jl_get_task_threadpoolid, Int8, (Any,), task) == f_tpid
++            set_sched_class!(task, C_F)
++            return fair_insert(task, priority, C_F)
++        end
+         if !(@atomic :monotonic fl.on) || !fair_descendant(task)
+             @sched_validate ccall(:jl_is_task_started, Cint, (Any,), task) == 0 && (vs().l_first += 1)
+             return stock_multiq_insert(task, priority)
+diff --git a/base/threadingconstructs.jl b/base/threadingconstructs.jl
+index 35b0e0f560..1ce1581423 100644
+--- a/base/threadingconstructs.jl
++++ b/base/threadingconstructs.jl
+@@ -457,6 +457,9 @@ function _spawn_set_thrpool(t::Task, tp::Symbol)
+     end
+     _result = ccall(:jl_set_task_threadpoolid, Cint, (Any, Int8), t, tpid)
+     @assert _result == 1 "_result != 1"
++    if tpid == _sym_to_tpid(:default) && (@atomic :monotonic Base.Partr.fma.mode) == Int8(1)
++        _spawn_set_fair(t, true)
++    end
+     nothing
+ end
+ 

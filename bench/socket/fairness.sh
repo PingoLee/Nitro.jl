@@ -52,6 +52,10 @@
 # measured the same way and written to the TSV as round 0. The summary table leaves it out; it is
 # there so that no measured mode takes the block's first slot, which reads high.
 #
+# FRESH=1 (#618, the battery): every round starts its servers again (the throwaway round only its one
+# mode), on ports of its own, warms them as above, and stops them after its last slot, so a server
+# column's spread is the spread between processes, not one process's rounds. Server logs carry -r<round>.
+#
 # CLIENT_CPU=1 (#618): the client's run, and oha's under OHA=1, each go in a subshell that ends in
 # `times`, which reads that child's own user + system time exactly. The TSV's cli_cpu and oha_cpu
 # are that time over the run's wall times the client CPUs: 1.0 is every client CPU busy all the
@@ -119,40 +123,60 @@ timed_run()    { local out="$1"; shift
 PIDS=()
 trap 'for p in ${PIDS[@]+"${PIDS[@]}"}; do kill "$p" 2>/dev/null; done; wait 2>/dev/null' EXIT
 declare -A PORT_OF PID_OF
-i=0
-for mode in "${MODE_LIST[@]}"; do
-  port=$((BASE_PORT + i)); i=$((i + 1))
-  [ -n "$(ss -Hltn "sport = :$port")" ] && { echo "fairness.sh: port $port in use" >&2; exit 1; }
-  log="$OUT/fairness-$STAMP-$(mode_label "$mode").log"
-  if [ "$(mode_name "$mode")" = go ]; then
-    GOMAXPROCS="$(taskset -c "$SERVER_CPUS" nproc)" PORT="$port" AGG_ROWS="$AGG_ROWS" taskset -c "$SERVER_CPUS" "$GO_BIN" >"$log" 2>&1 &
-  else
-    variant="$(mode_variant "$mode")"
-    build="$(mode_build "$mode")"
-    jcmd=("${JULIA_CMD[@]}"); jproject="$ROOT/bench"
-    if [ -n "$build" ]; then
-      [ -n "${BUILD_BIN[$build]:-}" ] || { echo "fairness.sh: $mode: no JULIAS entry for $build" >&2; exit 1; }
-      jcmd=("${BUILD_BIN[$build]}"); jproject="${BUILD_PROJECT[$build]}"
+# Start the given modes' servers on ports from <first port>, wait for /health, warm each with 3 s of
+# oha. FRESH=1 calls it at the start of every round (new ports, logs suffixed -r<round>), and
+# stop_servers at its end; otherwise once, before round 1.
+start_servers() {   # log tag, first port, modes...
+  local tag="$1" base="$2" i=0 port mode log variant build jcmd jproject t0; shift 2
+  PIDS=(); t0=$(date +%s.%N)
+  for mode in "$@"; do
+    port=$((base + i)); i=$((i + 1))
+    [ -n "$(ss -Hltn "sport = :$port")" ] && { echo "fairness.sh: port $port in use" >&2; exit 1; }
+    log="$OUT/fairness-$STAMP-$(mode_label "$mode")$tag.log"
+    if [ "$(mode_name "$mode")" = go ]; then
+      GOMAXPROCS="$(taskset -c "$SERVER_CPUS" nproc)" PORT="$port" AGG_ROWS="$AGG_ROWS" taskset -c "$SERVER_CPUS" "$GO_BIN" >"$log" 2>&1 &
+    else
+      variant="$(mode_variant "$mode")"
+      build="$(mode_build "$mode")"
+      jcmd=("${JULIA_CMD[@]}"); jproject="$ROOT/bench"
+      if [ -n "$build" ]; then
+        [ -n "${BUILD_BIN[$build]:-}" ] || { echo "fairness.sh: $mode: no JULIAS entry for $build" >&2; exit 1; }
+        jcmd=("${BUILD_BIN[$build]}"); jproject="${BUILD_PROJECT[$build]}"
+      fi
+      env MODE="$(mode_name "$mode")" PORT="$port" AGG_ROWS="$AGG_ROWS" PROBE="$PROBE" VALIDATE="${VALIDATE:-0}" MIX="${MIX:-0}" \
+        ${variant:+VARIANT="$variant"} taskset -c "$SERVER_CPUS" \
+        "${jcmd[@]}" --project="$jproject" --threads="$(mode_threads "$mode")" "$HERE/server.jl" >"$log" 2>&1 &
     fi
-    env MODE="$(mode_name "$mode")" PORT="$port" AGG_ROWS="$AGG_ROWS" PROBE="$PROBE" VALIDATE="${VALIDATE:-0}" MIX="${MIX:-0}" \
-      ${variant:+VARIANT="$variant"} taskset -c "$SERVER_CPUS" \
-      "${jcmd[@]}" --project="$jproject" --threads="$(mode_threads "$mode")" "$HERE/server.jl" >"$log" 2>&1 &
-  fi
-  PIDS+=("$!")
-  PID_OF[$mode]=$!
-  for _ in $(seq 1 240); do curl -fsS -o /dev/null "http://127.0.0.1:$port/health" 2>/dev/null && break; sleep 0.5; done
-  curl -fsS -o /dev/null "http://127.0.0.1:$port/health" || { echo "fairness.sh: $mode did not come up" >&2; tail -20 "$log" >&2; exit 1; }
-  PORT_OF[$mode]=$port
-done
-
+    PIDS+=("$!")
+    PID_OF[$mode]=$!
+    for _ in $(seq 1 240); do curl -fsS -o /dev/null "http://127.0.0.1:$port/health" 2>/dev/null && break; sleep 0.5; done
+    curl -fsS -o /dev/null "http://127.0.0.1:$port/health" || { echo "fairness.sh: $mode did not come up" >&2; tail -20 "$log" >&2; exit 1; }
+    PORT_OF[$mode]=$port
+  done
+  for mode in "$@"; do
+    taskset -c "$CLIENT_CPUS" oha -z 3s -c "$CONNS" --no-tui "http://127.0.0.1:${PORT_OF[$mode]}$ROUTE" >/dev/null 2>&1
+  done
+  echo "servers up and warm in $(awk -v a="$t0" -v b="$(date +%s.%N)" 'BEGIN { printf "%.1f", b - a }') s${tag:+ ($tag)}: $*"
+}
+stop_servers() {   # SIGTERM, then SIGKILL whatever is still there after 20 s (a stop must be bounded)
+  local p k
+  for p in ${PIDS[@]+"${PIDS[@]}"}; do kill "$p" 2>/dev/null; done
+  for k in $(seq 1 40); do
+    for p in ${PIDS[@]+"${PIDS[@]}"}; do kill -0 "$p" 2>/dev/null && break; p=; done
+    [ -z "${p:-}" ] && break
+    sleep 0.5
+  done
+  for p in ${PIDS[@]+"${PIDS[@]}"}; do
+    kill -0 "$p" 2>/dev/null && { echo "fairness.sh: server $p still up 20 s after SIGTERM; SIGKILL" >&2; kill -9 "$p" 2>/dev/null; }
+    wait "$p" 2>/dev/null
+  done
+  PIDS=()
+}
+[ "${FRESH:-0}" = 1 ] || start_servers "" "$BASE_PORT" "${MODE_LIST[@]}"
 echo "fairness bench: modes [$MODES], $ROUTE, c=$CONNS, $ROUNDS x $DUR interleaved$([ "$PROBE" = 1 ] && printf ', PROBE=1')"
 echo "  server CPUs $SERVER_CPUS (--threads=$THREADS unless mode@threads; go GOMAXPROCS=$(taskset -c "$SERVER_CPUS" nproc)), client CPUs $CLIENT_CPUS"
 echo "  concurrency bounds: serve() max_concurrent_requests at its default (nothing: no cap); HTTP.jl listen! defaults (no HTTP/1 connection cap); bare_pool POOL=${POOL:-nthreads(:default)}"
 echo "  julia: $("${JULIA_CMD[@]}" --version); $(go version)"
-for mode in "${MODE_LIST[@]}"; do
-  taskset -c "$CLIENT_CPUS" oha -z 3s -c "$CONNS" --no-tui "http://127.0.0.1:${PORT_OF[$mode]}$ROUTE" >/dev/null 2>&1
-done
-
 printf 'mode\tround\trps\tp50_ms\tp99_ms\tp999_ms\tmax_ms\tshare_over_1s\tconn_min\tconn_p1\tconn_p10\tconn_p50\tconn_max\tjain\tmaxwait_p50_ms\tmaxwait_p90_ms\tp90_ms\tgc_n\tgc_ms\trss_mb\tswap_in\tswap_out\tlisten_ovf\toha_rps\test0\tcli_cpu\toha_cpu\n' > "$RESULT"
 FIRST_ROUND=1; [ "${THROWAWAY:-0}" = 1 ] && FIRST_ROUND=0
 for round in $(seq "$FIRST_ROUND" "$ROUNDS"); do
@@ -162,6 +186,7 @@ for round in $(seq "$FIRST_ROUND" "$ROUNDS"); do
   elif [ "${REVERSE_EVEN:-0}" = 1 ] && [ $((round % 2)) = 0 ]; then
     ORDER=(); for ((k = ${#MODE_LIST[@]} - 1; k >= 0; k--)); do ORDER+=("${MODE_LIST[$k]}"); done
   fi
+  [ "${FRESH:-0}" = 1 ] && start_servers "-r$round" "$((BASE_PORT + (round + 1) * ${#MODE_LIST[@]}))" "${ORDER[@]}"
   for mode in "${ORDER[@]}"; do
     stem="$RAW/r$round-$(mode_label "$mode")"
     js="$stem.json"
@@ -224,6 +249,7 @@ for round in $(seq "$FIRST_ROUND" "$ROUNDS"); do
       "$((lo1 - lo0))" "$oha_rps" "$est0" "$cli_cpu" "$oha_cpu" >> "$RESULT"
     sleep 2
   done
+  [ "${FRESH:-0}" = 1 ] && stop_servers
 done
 
 echo

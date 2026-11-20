@@ -61,6 +61,15 @@ Give each build its own first depot, so that no build's precompile cache evicts 
   every timed block in order, with a `ps` check before each gated block and a check after each
   block that no build wrote a cache file during it. It stops on any failed check. `N25` and `N75`
   are N at the weights 1/4 and 3/4.
+- `native-mark-all-switch.patch` (`git diff nitro-618-native-mark-validate nitro-618-native-mark-all`):
+  a throwaway build for Julia's own tests, never timed. On top of mark-validate, `JULIA_SCHED_MARK_ALL`
+  (read once by `Base.__init__`) makes every `@spawn` carry the mark (`spawn`) or classes every task's
+  first `:default` enqueue as a marked root (`insert`); with `JULIA_SCHED_MARK_ALL_LOG=<dir>` every
+  process writes its validation counters at exit, so a test run shows which processes ran with the
+  switch on. `mark_all_checks.jl` prints, per spawn path, what each mode marks. `battery.sh` is the
+  session that uses it (the maintainer battery of #618), and `battery_report.jl <OUT>` its report: the
+  columns keyed by build (m1 and m2 share a commit), the test counts per column, and the exit logs
+  per test set (a runner worker is attributed by its exit time, so that attribution is inferred).
 - `native_checks.jl`: the port's delicate points (the sysimage's state, the zeroed byte, the option,
   the `:interactive` and sticky rules, one-thread pools, no queue keeping a task alive), at `8,1`,
   `8,2` and `1`.

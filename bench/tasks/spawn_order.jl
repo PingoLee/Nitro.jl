@@ -166,7 +166,8 @@ mutable struct Slot
     io::Bool         # io shape: the handler sleeps its h ms instead of burning them
     sem::Bool        # inner20: the fork-join holds one of SEM's slots
     t_acq::UInt64    # inner20: when the handler got its slot
-    Slot() = new(Base.Event(true), 0.0, 0, 0, 0.0, 0, 0, 0, 0, 0, 0, false, false, 0)   # autoreset: one notify, one wake
+    async::Bool      # async shape: the handler burns its h ms in an `@async` child and waits for it
+    Slot() = new(Base.Event(true), 0.0, 0, 0, 0.0, 0, 0, 0, 0, 0, 0, false, false, 0, false)   # autoreset: one notify, one wake
 end
 
 const SPAWNED = Threads.Atomic{Int}(0)
@@ -177,6 +178,9 @@ const TID_MOVED = Threads.Atomic{Int}(0)     # ended on a tid other than the one
 const PRIO_BAD = Threads.Atomic{Int}(0)      # priority: started with a priority other than the one set
 const INNER_RUN = Threads.Atomic{Int}(0)     # inner: children that ran
 const INNER_BAD = Threads.Atomic{Int}(0)     # inner: children that ran sticky, or off `:default`
+const ASYNC_RUN = Threads.Atomic{Int}(0)     # async: children that ran
+const ASYNC_OFF = Threads.Atomic{Int}(0)     # async: children that ran on a tid other than their parent's
+const ASYNC_PSTICKY = Threads.Atomic{Int}(0) # async: handlers left sticky after their child (Base pins the parent)
 # inner20's slots, and the requests-in-flight counter and its peak (INFLIGHT=1 only).
 const SLOTS = parse(Int, get(ENV, "SLOTS", "20"))
 const SEM = Base.Semaphore(SLOTS)
@@ -225,6 +229,17 @@ function inner_child(q::Float64)
     return burn(q)
 end
 
+# async's child (#618, the battery's item 7a): the handler's h ms, in an `@async` task. An `@async`
+# child is sticky to the spawning thread and goes to that thread's own queue, never the multiqueue;
+# Base also makes the parent sticky, so the handler finishes on the thread it was on.
+function async_child(h::Float64, ptid::Int)
+    if VALIDATE
+        Threads.atomic_add!(ASYNC_RUN, 1)
+        Threads.threadid() != ptid && Threads.atomic_add!(ASYNC_OFF, 1)
+    end
+    return burn(h)
+end
+
 # inner's fork-join: four children of q ms each, fetched in order.
 function fork_join(q::Float64)
     t1 = Threads.@spawn :default inner_child(q)
@@ -256,6 +271,11 @@ function handle!(slot::Slot, inner::Bool)
         slot.sink += fork_join(slot.h / 4)
     elseif slot.io
         sleep(slot.h / 1000)
+    elseif slot.async
+        ptid = Threads.threadid()
+        t = @async async_child(slot.h, ptid)
+        slot.sink += fetch(t)::Float64
+        VALIDATE && current_task().sticky && Threads.atomic_add!(ASYNC_PSTICKY, 1)
     else
         slot.sink += burn(slot.h)
     end
@@ -358,7 +378,7 @@ end
 # (mixed_cell.jl starts its background load there).
 function run_cell(mode::String, clients::Symbol, c::Int, h::Float64, d::Float64, shape::String = "plain";
                   onstart = nothing)
-    shape in ("plain", "hetero", "inner", "io", "inner20") || error("unknown shape $shape")
+    shape in ("plain", "hetero", "inner", "io", "inner20", "async") || error("unknown shape $shape")
     hetero, inner = shape == "hetero", shape in ("inner", "inner20")
     mode == "priority" && MULTIQ_VARIANT != "A" && error("the priority mode runs on the build's own heap only (VARIANT=A)")
     # Under M the pool modes run unmarked (nothing in them is spawned with `spawn_marked`): what the
@@ -366,7 +386,7 @@ function run_cell(mode::String, clients::Symbol, c::Int, h::Float64, d::Float64,
     MULTIQ_FIFO && mode != "spawn" && !(FIFO_CLASS === :mark && startswith(mode, "pool")) &&
         error("VARIANT=$(MULTIQ_VARIANT) runs the spawn mode only (under M, also pool, unmarked)")
     slots = [Slot() for _ in 1:c]
-    foreach(sl -> (sl.io = shape == "io"; sl.sem = shape == "inner20"), slots)
+    foreach(sl -> (sl.io = shape == "io"; sl.sem = shape == "inner20"; sl.async = shape == "async"), slots)
     recs = [Rec() for _ in 1:c]
     jobs = Channel{Slot}(Inf)
     workers = Task[]
@@ -482,15 +502,21 @@ function measure()
     if "priority" in modes && !prio_gate()
         filter!(!=("priority"), modes)
     end
-    # Compile every path before measuring; the warm-up cells are not reported.
-    for mode in modes, cl in clients, shape in ("plain", "hetero", "inner", "io", "inner20")
+    cells = haskey(ENV, "CELLS") ? parse_cells(ENV["CELLS"]) : [(c, h, "plain") for c in cs for h in hs]
+    # Compile every path before measuring; the warm-up cells are not reported. WARM=cell (#618, the
+    # battery) warms only the shapes the cells measure, under the same modes and client pools.
+    # The default list is the one every earlier run warmed; `async` joins it only when a cell measures it.
+    measured = unique!(String[sh for (_, _, sh) in cells])
+    warm = get(ENV, "WARM", "all") == "cell" ? measured :
+           union(["plain", "hetero", "inner", "io", "inner20"], measured)
+    for mode in modes, cl in clients, shape in warm
         run_cell(mode, cl, 8, 0.1, 0.2, shape)
     end
     get(ENV, "NOHEADER", "0") == "1" || println(join(COLUMNS, '\t'))
-    cells = haskey(ENV, "CELLS") ? parse_cells(ENV["CELLS"]) : [(c, h, "plain") for c in cs for h in hs]
     for mode in modes, cl in clients, (c, h, shape) in cells
         if VALIDATE
             HANDLED[] = 0; TID_BAD[] = 0; TID_MOVED[] = 0; PRIO_BAD[] = 0; INNER_RUN[] = 0; INNER_BAD[] = 0
+            ASYNC_RUN[] = 0; ASYNC_OFF[] = 0; ASYNC_PSTICKY[] = 0
         end
         slots0 = multiq_slot_counts()
         budget0 = multiq_budget_counts()
@@ -593,6 +619,12 @@ function validate_cell(recs::Vector{Rec}, mode::String, cl::Symbol, c::Int, h::F
         INNER_RUN[] == 4n || error("validate: inner: $(INNER_RUN[]) children ran for $n requests")
         INNER_BAD[] == 0 || error("validate: inner: $(INNER_BAD[]) children ran sticky or off :default")
         println(stderr, "validate: ", label, ": ", INNER_RUN[], " children ran, all non-sticky on :default")
+    end
+    if shape == "async"
+        ASYNC_RUN[] == n || error("validate: async: $(ASYNC_RUN[]) children ran for $n requests")
+        ASYNC_OFF[] == 0 || error("validate: async: $(ASYNC_OFF[]) children ran off their parent's tid")
+        println(stderr, "validate: ", label, ": ", ASYNC_RUN[], " async children ran, all on their parent's tid; ",
+                ASYNC_PSTICKY[], " of ", n, " handlers sticky after their child")
     end
 end
 

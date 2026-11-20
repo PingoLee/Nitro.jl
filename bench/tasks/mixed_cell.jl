@@ -13,7 +13,8 @@
 #                               in the one-thread `:interactive` pool, so only the handlers reach
 #                               the F queue; M-h-l marks the handlers only)
 #   C, H, D                     500, 2, 8;  FIB_FINE "42:12";  ALONE_RUNS 5;  ROUND 1
-#   SHAPE=plain|inner|inner20   inner: the mixed-inner cell (2026-11-16, agent-config #82 Idea 5): the
+#   SHAPE=plain|inner|inner20|async   (async, #618 the battery: spawn_order.jl's async shape)
+#                               inner: the mixed-inner cell (2026-11-16, agent-config #82 Idea 5): the
 #                               handlers spawn four `:default` children of H/4 and fetch them, the
 #                               inner shape of spawn_order.jl, while fib_fine loops beside them; the
 #                               row gains the shape and the handler wall p50/p99 (ms) at its end
@@ -39,7 +40,7 @@ const MIX_D = parse(Float64, get(ENV, "D", "8"))
 const FIB_N, FIB_CUT = parse.(Int, split(get(ENV, "FIB_FINE", "42:12"), ':'))
 const ALONE_RUNS = parse(Int, get(ENV, "ALONE_RUNS", "5"))
 const MIX_SHAPE = get(ENV, "SHAPE", "plain")
-MIX_SHAPE in ("plain", "inner", "inner20") || error("mixed_cell: SHAPE must be plain, inner or inner20")
+MIX_SHAPE in ("plain", "inner", "inner20", "async") || error("mixed_cell: SHAPE must be plain, inner, inner20 or async")
 
 mix_sfib(n::Int) = n <= 1 ? n : mix_sfib(n - 1) + mix_sfib(n - 2)
 function mix_pfib(n::Int, cut::Int)
@@ -133,7 +134,7 @@ function mixed()
         end)
     end
     if VALIDATE
-        HANDLED[] = 0; TID_MOVED[] = 0; INNER_RUN[] = 0; INNER_BAD[] = 0
+        HANDLED[] = 0; TID_MOVED[] = 0; INNER_RUN[] = 0; INNER_BAD[] = 0; ASYNC_RUN[] = 0; ASYNC_OFF[] = 0; ASYNC_PSTICKY[] = 0
     end
     fifo0 = multiq_fifo_counts()
     share0, sfifo0 = multiq_share_counts(), share_fifo_pops()
