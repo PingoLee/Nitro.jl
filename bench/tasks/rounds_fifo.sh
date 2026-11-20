@@ -86,6 +86,14 @@
 # rounds of A B / B A at 8,1 and 8,0). TD=<s> shortens every spawn_order window and NOGATE=1 runs a
 # block without quiet.sh: together, a smoke pass of the block code, never a measurement.
 # bench/julia/native_measure.sh drives the whole session.
+# The battery (#618, agent-config #82 Idea 12; bench/julia/battery.sh drives it) adds, under
+# PROFILE=native: ROTATE=1 (rotate the token order by round, so three columns take every position
+# equally; reversal leaves the middle one fixed); ABBA_LAYOUTS (fibabba's layouts, default "8,1 8,0");
+# CLIENT_CELLS_SPEC="<layout> <clients>;..." (the cost and fairness cells' layouts, with CPUS set to
+# match); MICRO_LAYOUTS ("none" skips tasks.jl), MICRO_ARGS and MICRO_FAN_OUT (tasks.jl's rows);
+# SHAPE_CELLS_NATIVE (the shapes block's cells); and the blocks costrounds, shaperounds and
+# fairrounds: MULTI_ROUNDS rounds of cost, shapes or fairness in one quiet block after one throwaway
+# slot (run with ROUNDS=1). WARM=cell reaches spawn_order.jl through the environment.
 #
 # Usage: JL=<julia binary> MICRO_PROJECT=<env with BenchmarkTools> bench/tasks/rounds_fifo.sh [rounds]
 #   OUT           results directory (default bench/results/618-fifo)
@@ -231,7 +239,7 @@ elif [ "$PROFILE" = native ]; then
   FAIR_I81_V="$NATIVE_COLS"
   FAIR_D_V="$NATIVE_COLS"
   SHAPE_V="$NATIVE_COLS"
-  SHAPE_CELLS="500:2:inner"
+  SHAPE_CELLS="${SHAPE_CELLS_NATIVE:-500:2:inner}"
   SHAPE_INNER_V=""
   NEST_V="$NATIVE_COLS"
   NEST_WORKLOADS="fib_fine"
@@ -276,6 +284,14 @@ SWEEP_LAYOUTS="${SWEEP_LAYOUTS:-2,0:0,1 4,0:0,1,2,3 8,0:0,1,2,3,6,7,8,9}"
 case "$PROFILE" in mo|share|rings|inherit|gc|native) ;; *) echo "rounds_fifo: PROFILE must be mo, share, rings, inherit, gc or native" >&2; exit 1 ;; esac
 ordered() {   # round, variants...
   local r="$1"; shift
+  # ROTATE=1 (#618, the battery): rotate the list by (r - 1) mod n, so that over n rounds every token
+  # takes every position once (three columns are not balanced by reversal: the middle one never moves).
+  if [ "${ROTATE:-0}" = 1 ] && [ $# -gt 0 ]; then
+    local n=$# k a i out=()
+    k=$(( ((r - 1) % n + n) % n )); a=("$@")
+    for ((i = 0; i < n; i++)); do out+=("${a[$(( (i + k) % n ))]}"); done
+    echo "${out[*]}"; return
+  fi
   if [ $((r % 2)) = 0 ]; then printf '%s\n' "$@" | tac | tr '\n' ' '; else echo "$*"; fi
 }
 
@@ -296,8 +312,10 @@ spawn() {
 micro() {
   local r="$1" tsv="$2" layout="$3" variant="$4" jl
   jl="$(jl_of "$variant")" || return 1
-  VARIANT="$(var_of "$variant")" FAN_OUT_NS="1000 10000" timeout -s KILL "${MICRO_TIMEOUT_S:-240}" taskset -c "$CPUS" "$jl" \
-    --project="$MICRO_PROJECT" --threads="$layout" "$HERE/tasks.jl" micro queued |
+  # MICRO_ARGS and MICRO_FAN_OUT (#618, the battery) narrow the rows: "micro" and "1000" give SpawnWait,
+  # PingPong and FanOut1000 only.
+  VARIANT="$(var_of "$variant")" FAN_OUT_NS="${MICRO_FAN_OUT:-1000 10000}" timeout -s KILL "${MICRO_TIMEOUT_S:-240}" taskset -c "$CPUS" "$jl" \
+    --project="$MICRO_PROJECT" --threads="$layout" "$HERE/tasks.jl" ${MICRO_ARGS:-micro queued} |
     sed "s|^|$r\t$VER\t$layout\t$variant\t|" >>"$tsv"
   local rc="${PIPESTATUS[0]}"
   [ "$rc" = 0 ] || { echo "rounds_fifo: tasks.jl $layout VARIANT=$variant failed ($rc)" >&2; return 1; }
@@ -305,6 +323,9 @@ micro() {
 
 # The three client/layout cells of cost and fairness: "layout clients".
 CLIENT_CELLS=("8,1 interactive" "8,1 default" "8,0 default")
+# CLIENT_CELLS_SPEC="<layout> <clients>;..." replaces them (#618, the battery: other layouts, with CPUS
+# set to match), for the cost and fairness blocks and their throwaway slot.
+[ -n "${CLIENT_CELLS_SPEC:-}" ] && IFS=';' read -r -a CLIENT_CELLS <<<"$CLIENT_CELLS_SPEC"
 
 cost_block() {   # round, spawn tsv, micro tsv
   local r="$1" tsv="$2" mtsv="$3" cells="$COST_CELLS" d="${TD:-8}" cc layout clients v vs="$COST_V"
@@ -314,7 +335,8 @@ cost_block() {   # round, spawn tsv, micro tsv
     read -r layout clients <<<"$cc"
     for v in $(ordered "$r" $vs); do spawn "$r" "$tsv" "$layout" "$clients" "$v" "$cells" spawn "$d" || return 1; done
   done
-  for layout in 8,1 8,0; do
+  for layout in ${MICRO_LAYOUTS:-8,1 8,0}; do
+    [ "$layout" = none ] && continue
     for v in $(ordered "$r" ${MICRO_V:-$vs}); do micro "$r" "$mtsv" "$layout" "$v" || return 1; done
   done
 }
@@ -479,14 +501,17 @@ native_nested() {   # round, tsv, layout, token, extra env...
 # first cell, into <OUT>/throwaway-*.tsv (never read). THROWAWAY=0 turns it off.
 native_throwaway() {   # round, kind (cost, cells, fib)
   [ "$PROFILE" = native ] && [ "$VALIDATE" != 1 ] && [ "${THROWAWAY:-1}" = 1 ] || return 0
-  local r="$1" first
+  local r="$1" first cl cc
+  cc="${CLIENT_CELLS[0]}"   # the block's first client cell (8,1 interactive unless CLIENT_CELLS_SPEC)
   case "$2" in
     cost)  first="$(ordered "$r" $COST_V | cut -d' ' -f1)"
-           spawn "$r" "$OUT/throwaway-spawn.tsv" 8,1 interactive "$first" "$COST_CELLS" spawn "${TD:-8}" ;;
+           spawn "$r" "$OUT/throwaway-spawn.tsv" ${cc% *} ${cc#* } "$first" "$COST_CELLS" spawn "${TD:-8}" ;;
     cells) first="$(ordered "$r" $FAIR_I81_V | cut -d' ' -f1)"
-           spawn "$r" "$OUT/throwaway-spawn.tsv" 8,1 interactive "$first" "500:2" spawn "${TD:-8}" ;;
-    fib)   first="$(ordered "$r" $ABBA_COLS | cut -d' ' -f1)"
-           native_nested "$r" "$OUT/throwaway-nested.tsv" 8,1 "$first" WORKLOADS=fib_fine ;;
+           spawn "$r" "$OUT/throwaway-spawn.tsv" ${cc% *} ${cc#* } "$first" "500:2" spawn "${TD:-8}" ;;
+    shapes) first="$(ordered "$r" $SHAPE_V | cut -d' ' -f1)"
+           spawn "$r" "$OUT/throwaway-spawn.tsv" 8,1 interactive "$first" "$SHAPE_CELLS" spawn "${TD:-8}" ;;
+    fib)   first="$(ordered "$r" $ABBA_COLS | cut -d' ' -f1)"; set -- ${ABBA_LAYOUTS:-8,1 8,0}
+           native_nested "$r" "$OUT/throwaway-nested.tsv" "$1" "$first" WORKLOADS=fib_fine ;;
   esac
 }
 
@@ -514,7 +539,7 @@ fibabba_block() {   # nested tsv
   local tsv="$1" r layout v rc=0 s
   native_throwaway 1 fib || return 1
   for r in $(seq 1 "${ABBA_ROUNDS:-12}"); do
-    for layout in 8,1 8,0; do
+    for layout in ${ABBA_LAYOUTS:-8,1 8,0}; do
       for v in $(ordered "$r" $ABBA_COLS); do
         native_nested "$r" "$tsv" "$layout" "$v" WORKLOADS=fib_fine; s=$?
         case "$s" in 0) ;; 2) rc=2 ;; *) return "$s" ;; esac
@@ -522,6 +547,22 @@ fibabba_block() {   # nested tsv
     done
   done
   return "$rc"
+}
+
+# PROFILE=native, the battery (#618): MULTI_ROUNDS rounds of the cost, shapes or fairness block in ONE
+# quiet block (one gate, not one per round: after a heavy block the gate waits 2-3 min for the load to
+# fall), one throwaway slot first, the rounds numbered 1..MULTI_ROUNDS in the TSVs. Run with ROUNDS=1.
+costrounds_block() {   # spawn tsv, micro tsv
+  local r; native_throwaway 1 cost || return 1
+  for r in $(seq 1 "${MULTI_ROUNDS:-6}"); do THROWAWAY=0 cost_block "$r" "$1" "$2" || return 1; done
+}
+shaperounds_block() {   # spawn tsv
+  local r; native_throwaway 1 shapes || return 1
+  for r in $(seq 1 "${MULTI_ROUNDS:-6}"); do shapes_block "$r" "$1" || return 1; done
+}
+fairrounds_block() {   # spawn tsv
+  local r; native_throwaway 1 cells || return 1
+  for r in $(seq 1 "${MULTI_ROUNDS:-6}"); do fairness_block "$r" "$1" || return 1; done
 }
 
 markroot_block() {   # round, nested tsv, variants, extra env...
@@ -663,6 +704,16 @@ for r in $(seq "${FIRST_ROUND:-1}" "$ROUNDS"); do
           mv "$d" "$OUT/mixedinner-r$r.tsv"; mv "$e" "$OUT/nested-r$r.tsv"; mv "$f" "$OUT/markroot-r$r.tsv"
           log "round $r cells done"
         else log "round $r cells FAILED"; status=1; fi ;;
+      costrounds)
+        a="$OUT/attempt-costrounds-spawn-$stamp.tsv" b="$OUT/attempt-costrounds-micro-$stamp.tsv"
+        if block "costrounds" "$a" "$b" -- "${SELF[@]}" costrounds_block "$a" "$b"; then
+          mv "$a" "$OUT/costrounds-spawn.tsv"; [ -s "$b" ] && mv "$b" "$OUT/costrounds-micro.tsv"; log "costrounds done"
+        else log "costrounds FAILED"; status=1; fi ;;
+      shaperounds|fairrounds)
+        a="$OUT/attempt-$kind-spawn-$stamp.tsv"
+        if block "$kind" "$a" -- "${SELF[@]}" "${kind}_block" "$a"; then
+          mv "$a" "$OUT/$kind-spawn.tsv"; log "$kind done"
+        else log "$kind FAILED"; status=1; fi ;;
       fibabba)
         a="$OUT/attempt-fibabba-$stamp.tsv"
         if block "fibabba" "$a" -- "${SELF[@]}" fibabba_block "$a"; then
