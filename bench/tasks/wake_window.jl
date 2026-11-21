@@ -30,6 +30,11 @@
 # Run with the negative controls on the validation build: JULIA_SCHED_NEGATIVE=blind MODE=ring,
 # JULIA_SCHED_NEGATIVE=rblind MODE=wake. JULIA_THREAD_SLEEP_THRESHOLD=0 makes every idle turn go
 # straight to the sleep sequence (the runtime reads it at start-up; the summary records it).
+# The ring control (#618, agent-config #82 Idea 14; bench/julia/native-mark-nopass.patch, its own
+# throwaway build): JULIA_SCHED_NOPASS=1 makes the ring pop give up after its samples, without the
+# pass over every ring. With JULIA_SCHED_NEGATIVE=blind as well, MODE=ring has neither layer (the
+# check and a pop that cannot miss); NOPASS alone leaves the check. The summary's nopass_env and
+# nopass_armed record it.
 #
 #   julia --threads=2,1 bench/tasks/wake_window.jl
 #   env: MODE ring|wake, MARK 1|0, DUR_S 300, STUCK_MS 100, DELAY_NS "lo:hi" (0:20000), TASKS, LABEL
@@ -252,18 +257,21 @@ end
 rounds, enqueued = MODE == "ring" ? run_ring() : run_wake()
 
 neg = VALIDATE ? string(@atomic P.fp.neg) : "-"
+# The ring control (#618 Idea 14, bench/julia/native-mark-nopass.patch): only its build has the field.
+nopass = VALIDATE && hasfield(typeof(P.fp), :nopass) ? string(getfield(P.fp, :nopass, :sequentially_consistent)) : "-"
 c = VALIDATE ? P.sched_counts() : nothing
 cnt(k) = c === nothing ? "-" : string(getfield(c, k))
 commit = Base.GIT_VERSION_INFO.commit_short
 cols = ["label", "commit", "validate", "mode", "mark", "neg_env", "neg_armed", "threshold", "layout", "tasks", "delay_ns",
         "dur_s", "rounds", "enqueued", "stuck", "late", "unrescued", "lat_p50_us", "lat_p99_us", "lat_p999_us", "lat_max_us",
-        "f_first", "r_first", "r_again", "f_pops", "r_pops", "l_pops", "gpops"]
+        "f_first", "r_first", "r_again", "f_pops", "r_pops", "l_pops", "gpops", "nopass_env", "nopass_armed"]
 vals = [LABEL, commit, string(VALIDATE), MODE, MARK ? "1" : "0", get(ENV, "JULIA_SCHED_NEGATIVE", "-"), neg,
         get(ENV, "JULIA_THREAD_SLEEP_THRESHOLD", "default"),
         string(Threads.nthreads(:default), ",", Threads.nthreads(:interactive)), string(TASKS), string(DELAY_LO, ":", DELAY_HI),
         string(DUR_NS / 1e9), string(rounds), string(enqueued), string(stuck[]), string(late[]), string(unrescued[]),
         string(quantile_us(0.5)), string(quantile_us(0.99)), string(quantile_us(0.999)), string(round(lat_max[] / 1e3; digits = 1)),
-        cnt(:f_first), cnt(:r_first), cnt(:r_again), cnt(:f_pops), cnt(:r_pops), cnt(:l_pops), cnt(:gpops)]
+        cnt(:f_first), cnt(:r_first), cnt(:r_again), cnt(:f_pops), cnt(:r_pops), cnt(:l_pops), cnt(:gpops),
+        get(ENV, "JULIA_SCHED_NOPASS", "-"), nopass]
 get(ENV, "NOHEADER", "0") == "1" || println(join(cols, '\t'))
 println(join(vals, '\t'))
 for e in events

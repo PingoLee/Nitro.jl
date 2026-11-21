@@ -89,3 +89,14 @@ Give each build its own first depot, so that no build's precompile cache evicts 
   driver runs `../tasks/wake_window.jl`, the repro aimed at the lost-wakeup window, read by
   `window_report.jl <dir>`, and question 3 (JuliaLang/julia#62285's two backends against the
   mark, read only within each tree), read by `q3_report.jl <OUT> <fairness tsv>...`.
+- `native-mark-nopass.patch` (`git diff nitro-618-native-mark-validate nitro-618-native-mark-validate-nopass`,
+  sha256 `a2dac6f686b0be494fdd4027a43d3c91e21deea3a90c6aed1be1b0ed14b99cf4`): the ring control of #618 (agent-config #82
+  Idea 14), a throwaway build never timed. On top of mark-validate, `JULIA_SCHED_NOPASS=1` (read by `fair_init!`) makes the
+  ring pop give up after its four samples instead of passing over every ring; with `JULIA_SCHED_NEGATIVE=blind` as well the
+  ring side has neither of its two layers (the empty check and a pop that cannot miss). `slim.sh` is the session that uses
+  it (step `ringA`, `../tasks/wake_window.jl` in ring mode, read by `window_report.jl`), and the same driver times the slim
+  candidates of the unmarked path (six columns: ctl, m2, bp, bp2, s1, s2), read by `slim_report.jl <OUT>`. The candidates
+  are local branches on the mark, never proposed anywhere: s1 (`nitro-618-native-mark-slim1`, 4667d170bd) inlines
+  `multiq_insert` into `enq_work`; s2 (`nitro-618-native-mark-slim2`, b304809bc9) adds the flag tested before the task's
+  class, set by `_spawn_set_fair` at the first mark that will reach the multiqueue, and the empty check's flag-on part out
+  of line. Neither won on 2026-11-21 (#618), so no slim patch file is kept; the measured patch stays the record.

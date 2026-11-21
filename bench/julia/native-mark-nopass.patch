@@ -1,0 +1,48 @@
+diff --git a/base/partr.jl b/base/partr.jl
+index d30ffbe7a9..d9bb41ee12 100644
+--- a/base/partr.jl
++++ b/base/partr.jl
+@@ -488,11 +488,12 @@ mutable struct fparams
+     @atomic cap::Int     # the interval cap, 10 ms in clock units; the balance cap is twice it
+     @atomic w4::Int      # the request side's weight, in quarters
+     @atomic neg::Int     # validation build: the negative control (0 none, 1 blind, 2 stall, 3 rblind)
++    @atomic nopass::Bool # validation build: the ring pop skips its full pass (JULIA_SCHED_NOPASS=1)
+     @atomic tsc::Bool    # x86_64: the TSC is the clocksource (checked, reported, not acted on)
+     @atomic inited::Bool
+     pad1::NTuple{12,Int}
+ end
+-const fp = fparams(_PAD8, DEFAULT_CAP, 2, 0, false, false, _PAD12)
++const fp = fparams(_PAD8, DEFAULT_CAP, 2, 0, false, false, false, _PAD12)
+ const fp_lock = SpinLock()
+ 
+ # The pool flag, on a line nobody writes after it is set.
+@@ -521,6 +522,11 @@ function fair_init!()
+         s == "" ? 0 : s == "blind" ? 1 : s == "stall" ? 2 : s == "rblind" ? 3 :
+             throw(ArgumentError(LazyString("JULIA_SCHED_NEGATIVE must be blind, stall or rblind, not ", s)))
+     end
++    nopass = false
++    @sched_validate nopass = let s = get(ENV, "JULIA_SCHED_NOPASS", "")
++        s == "" || s == "0" ? false : s == "1" ? true :
++            throw(ArgumentError(LazyString("JULIA_SCHED_NOPASS must be 0 or 1, not ", s)))
++    end
+     lock(fp_lock)
+     try
+         if !(@atomic :monotonic fp.inited)
+@@ -537,6 +543,7 @@ function fair_init!()
+             @atomic :monotonic fp.cap = cap
+             @atomic :monotonic fp.w4 = w4
+             @atomic :monotonic fp.neg = neg
++            @atomic :monotonic fp.nopass = nopass
+             @atomic :monotonic fp.tsc = tsc
+             @atomic :release fp.inited = true
+         end
+@@ -867,6 +874,9 @@ function r_pop!(rs::Vector{fqueue}, tid::Int, nt::Int)
+         task = f_pop!(rs[i], tid, nt)
+         task === nothing || return task
+     end
++    # The ring control (validation build, JULIA_SCHED_NOPASS=1): after its samples, the pop gives up
++    # instead of passing over every ring, so a task alone in a ring no sample hit can be missed.
++    @sched_validate (@atomic :monotonic fp.nopass) && return nothing
+     nr = length(rs)
+     nr == 0 && return nothing
+     i0 = Int(cong(UInt32(nr)))

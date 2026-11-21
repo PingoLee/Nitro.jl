@@ -96,6 +96,8 @@
 # slot (run with ROUNDS=1). WARM=cell reaches spawn_order.jl through the environment.
 # The bypass control (#618, agent-config #82 Idea 13; bench/julia/bypass.sh) adds COST_CELLS_NATIVE:
 # the cost block's spawn_order cells under PROFILE=native (default "50:0 500:0").
+# The ring control and the slim path (#618, agent-config #82 Idea 14; bench/julia/slim.sh) add
+# COST_CELLS_NATIVE=none: the cost block runs tasks.jl only, and its throwaway slot is a tasks.jl run.
 #
 # Usage: JL=<julia binary> MICRO_PROJECT=<env with BenchmarkTools> bench/tasks/rounds_fifo.sh [rounds]
 #   OUT           results directory (default bench/results/618-fifo)
@@ -335,6 +337,7 @@ cost_block() {   # round, spawn tsv, micro tsv
   native_throwaway "$r" cost || return 1
   for cc in "${CLIENT_CELLS[@]}"; do
     read -r layout clients <<<"$cc"
+    [ "$cells" = none ] && continue
     for v in $(ordered "$r" $vs); do spawn "$r" "$tsv" "$layout" "$clients" "$v" "$cells" spawn "$d" || return 1; done
   done
   for layout in ${MICRO_LAYOUTS:-8,1 8,0}; do
@@ -507,7 +510,11 @@ native_throwaway() {   # round, kind (cost, cells, fib)
   cc="${CLIENT_CELLS[0]}"   # the block's first client cell (8,1 interactive unless CLIENT_CELLS_SPEC)
   case "$2" in
     cost)  first="$(ordered "$r" $COST_V | cut -d' ' -f1)"
-           spawn "$r" "$OUT/throwaway-spawn.tsv" ${cc% *} ${cc#* } "$first" "$COST_CELLS" spawn "${TD:-8}" ;;
+           if [ "$COST_CELLS" = none ]; then   # tasks.jl only: the throwaway is a tasks.jl run
+             set -- ${MICRO_LAYOUTS:-8,1 8,0}; micro "$r" "$OUT/throwaway-micro.tsv" "$1" "$first"
+           else
+             spawn "$r" "$OUT/throwaway-spawn.tsv" ${cc% *} ${cc#* } "$first" "$COST_CELLS" spawn "${TD:-8}"
+           fi ;;
     cells) first="$(ordered "$r" $FAIR_I81_V | cut -d' ' -f1)"
            spawn "$r" "$OUT/throwaway-spawn.tsv" ${cc% *} ${cc#* } "$first" "500:2" spawn "${TD:-8}" ;;
     shapes) first="$(ordered "$r" $SHAPE_V | cut -d' ' -f1)"
@@ -709,7 +716,7 @@ for r in $(seq "${FIRST_ROUND:-1}" "$ROUNDS"); do
       costrounds)
         a="$OUT/attempt-costrounds-spawn-$stamp.tsv" b="$OUT/attempt-costrounds-micro-$stamp.tsv"
         if block "costrounds" "$a" "$b" -- "${SELF[@]}" costrounds_block "$a" "$b"; then
-          mv "$a" "$OUT/costrounds-spawn.tsv"; [ -s "$b" ] && mv "$b" "$OUT/costrounds-micro.tsv"; log "costrounds done"
+          [ -s "$a" ] && mv "$a" "$OUT/costrounds-spawn.tsv"; [ -s "$b" ] && mv "$b" "$OUT/costrounds-micro.tsv"; log "costrounds done"
         else log "costrounds FAILED"; status=1; fi ;;
       shaperounds|fairrounds)
         a="$OUT/attempt-$kind-spawn-$stamp.tsv"
