@@ -29,11 +29,11 @@ for f in sort(filter(endswith(".events"), readdir(DIR; join = true)))
     end
 end
 
-println("| layout | label | build | neg | rounds | enqueued | stuck | late | unresc. | per 10^6 | p99.9 us | max us | f_first | r_again |")
-println("|---|---|---|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|")
+println("| layout | label | build | neg | nopass | rounds | enqueued | stuck | late | unresc. | per 10^6 | p99.9 us | max us | f_first | r_again |")
+println("|---|---|---|---|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|")
 for r in rows
     n = parse(Int, r["enqueued"]); s = parse(Int, r["stuck"]) + parse(Int, r["late"]) + parse(Int, r["unrescued"])
-    println("| ", join([r["layout"], r["label"], r["commit"], r["neg_env"], r["rounds"], r["enqueued"], r["stuck"], r["late"],
+    println("| ", join([r["layout"], r["label"], r["commit"], r["neg_env"], get(r, "nopass_armed", "-"), r["rounds"], r["enqueued"], r["stuck"], r["late"],
                         r["unrescued"], string(round(1e6 * s / max(n, 1); digits = 2)), r["lat_p999_us"], r["lat_max_us"],
                         r["f_first"], r["r_again"]], " | "), " |")
 end
