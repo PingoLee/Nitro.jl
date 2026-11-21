@@ -94,6 +94,8 @@
 # SHAPE_CELLS_NATIVE (the shapes block's cells); and the blocks costrounds, shaperounds and
 # fairrounds: MULTI_ROUNDS rounds of cost, shapes or fairness in one quiet block after one throwaway
 # slot (run with ROUNDS=1). WARM=cell reaches spawn_order.jl through the environment.
+# The bypass control (#618, agent-config #82 Idea 13; bench/julia/bypass.sh) adds COST_CELLS_NATIVE:
+# the cost block's spawn_order cells under PROFILE=native (default "50:0 500:0").
 #
 # Usage: JL=<julia binary> MICRO_PROJECT=<env with BenchmarkTools> bench/tasks/rounds_fifo.sh [rounds]
 #   OUT           results directory (default bench/results/618-fifo)
@@ -235,7 +237,7 @@ elif [ "$PROFILE" = native ]; then
   NATIVE_COLS="${NATIVE_COLS:-A%control A%official N%mark M-gc-r2%official N-none%mark}"
   NATIVE_MIX_COLS="${NATIVE_MIX_COLS:-A%control A%official N%mark N25%mark N75%mark M-gc-r2%official N-none%mark}"
   COST_V="$NATIVE_COLS"
-  COST_CELLS="50:0 500:0"
+  COST_CELLS="${COST_CELLS_NATIVE:-50:0 500:0}"
   FAIR_I81_V="$NATIVE_COLS"
   FAIR_D_V="$NATIVE_COLS"
   SHAPE_V="$NATIVE_COLS"

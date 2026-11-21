@@ -73,3 +73,19 @@ Give each build its own first depot, so that no build's precompile cache evicts 
 - `native_checks.jl`: the port's delicate points (the sysimage's state, the zeroed byte, the option,
   the `:interactive` and sticky rules, one-thread pools, no queue keeping a task alive), at `8,1`,
   `8,2` and `1`.
+- `native-mark-bypass.patch` (`git diff nitro-618-native-mark nitro-618-native-mark-bypass`, sha256
+  `56304907f6cd518646a151313afba44bd27e951047096d7d5a4c0efda92e6dc0`): the bypass control of #618
+  (agent-config #82 Idea 13), never proposed anywhere. On top of the mark, `multiq_insert`,
+  `multiq_deletemin` and `multiq_check_empty` are stock's own bodies under the tag's names, so the
+  scheduler reaches only them; the mark's wrappers are kept as `mark_multiq_*`, unreachable, and
+  `contrib/generate_precompile.jl` compiles them into the image. Same C runtime as the mark build,
+  the mark's code in the sysimage, and no new path: built like the others (its own tree, the same
+  `Make.user`, its own first depot). `bypass.sh` is the session that uses it, four columns (ctl, m1,
+  m2, bypass) in the cells where the mark builds stood off the control at 2 and 4 threads, with
+  `bypass_report.jl <OUT>` its report. One bypass build is one layout draw, so where a cell reads
+  as the path (the bypass with the control), the driver builds the same commit again in a second
+  tree (bp2; an untracked file marks it dirty, which Julia reads at run time, so the image comes from
+  the same sources) and reruns that cell with ctl, m2, bp and bp2; "the path" needs both. The same
+  driver runs `../tasks/wake_window.jl`, the repro aimed at the lost-wakeup window, read by
+  `window_report.jl <dir>`, and question 3 (JuliaLang/julia#62285's two backends against the
+  mark, read only within each tree), read by `q3_report.jl <OUT> <fairness tsv>...`.

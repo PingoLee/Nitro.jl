@@ -47,6 +47,8 @@
 # just before the client starts, which says so (0) for each run (#618, the accept queue).
 #
 # REVERSE_EVEN=1 (#618): even rounds run the mode list in reverse, against a position effect.
+# ROTATE=1 (#618, Idea 13): round r runs the list rotated by r - 1 instead, so with n modes every mode
+# takes every position once in n rounds (reversal leaves a middle mode fixed); it wins over REVERSE_EVEN.
 #
 # THROWAWAY=1 (#782): one throwaway slot before round 1, on the first mode of round 1's order,
 # measured the same way and written to the TSV as round 0. The summary table leaves it out; it is
@@ -183,6 +185,9 @@ for round in $(seq "$FIRST_ROUND" "$ROUNDS"); do
   ORDER=("${MODE_LIST[@]}")
   if [ "$round" = 0 ]; then
     ORDER=("${MODE_LIST[0]}")
+  elif [ "${ROTATE:-0}" = 1 ]; then
+    ORDER=(); n=${#MODE_LIST[@]}
+    for ((k = 0; k < n; k++)); do ORDER+=("${MODE_LIST[$(( (k + round - 1) % n ))]}"); done
   elif [ "${REVERSE_EVEN:-0}" = 1 ] && [ $((round % 2)) = 0 ]; then
     ORDER=(); for ((k = ${#MODE_LIST[@]} - 1; k >= 0; k--)); do ORDER+=("${MODE_LIST[$k]}"); done
   fi
