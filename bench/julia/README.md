@@ -100,3 +100,12 @@ Give each build its own first depot, so that no build's precompile cache evicts 
   `multiq_insert` into `enq_work`; s2 (`nitro-618-native-mark-slim2`, b304809bc9) adds the flag tested before the task's
   class, set by `_spawn_set_fair` at the first mark that will reach the multiqueue, and the empty check's flag-on part out
   of line. Neither won on 2026-11-21 (#618), so no slim patch file is kept; the measured patch stays the record.
+- `perf_unmarked.sh` (agent-config #82 Idea 15): hardware counters on `../tasks/spawnwait_fixed.jl`, SpawnWait's body as a
+  fixed loop, across the six builds of `slim.sh` (ctl, m2, bp, bp2, s1, s2) at `2,1` and `4,1`; diagnosis, not a timed
+  comparison. `perf stat --per-thread` attached after the warm-up (the loop's `ATTACH` handshake), every counter a
+  difference between a run at N and one at 2N, three event groups of at most five hardware events (the NMI watchdog holds
+  one of Zen 3's six counters); `MODE=who` (which thread runs each child), `perf record` attached for the loop only,
+  `MODE=split` (four stamps an operation: pickup, run, wake, and the median of 70-op block means that tasks.jl's
+  BenchmarkTools row reports) and `MODE=idle` with `JULIA_THREAD_SLEEP_THRESHOLD=infinite` (the poll turn: instructions
+  per turn from a hardware-breakpoint count of the build's own `multiq_deletemin` clone). Needs
+  `kernel.perf_event_paranoid` at 1 or below. `perf_report.jl <OUT>` is its report.
