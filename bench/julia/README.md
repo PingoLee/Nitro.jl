@@ -109,3 +109,15 @@ Give each build its own first depot, so that no build's precompile cache evicts 
   BenchmarkTools row reports) and `MODE=idle` with `JULIA_THREAD_SLEEP_THRESHOLD=infinite` (the poll turn: instructions
   per turn from a hardware-breakpoint count of the build's own `multiq_deletemin` clone). Needs
   `kernel.perf_event_paranoid` at 1 or below. `perf_report.jl <OUT>` is its report.
+- `slim2.sh` (agent-config #82 Idea 16): slim candidate s2 on two builds, and its validation if it stands. A second build
+  of s2's commit (s2b, its tree marked dirty by an untracked file, as bp2's), read by `slim_report.jl` as its `w2` column
+  (`SLIM_DIRS` picks the step directories); the cells with ctl, m2, bp, bp2, s2 and s2b, the split loop and the poll turn
+  (`perf_unmarked.sh` a5 and a6, `PU_BUILDS`), then `slim2_decide.jl`: s2 stands if both its builds stand with the bypass
+  builds wherever m2 is off both and have their pickup within 5 ns, and the result is a draw if the two s2 builds sit
+  further apart than the two bypass builds. Part B (the validate pass, `native_checks.jl` and `slim2_corners.jl`'s three
+  corners, the lost-wakeup windows, Julia's tests, the pass cells, the mark-all build with every spawn marked, the sets
+  of 2026-11-20 that ran in one-thread workers, with `--threads=4,1`) skips itself unless part A says s2 stands.
+  `slim2_corners.jl` checks, on a validation build, a task that gets a class while nothing has armed s2's pool flag (a
+  class set by hand, a mark while sticky, a mark for `:interactive`): whether it is lost, where it sits, and its order.
+  On 2026-11-22 the two s2 builds disagreed (s2b slower than s2 in 12 of 12 rounds at `2,1`): s2's first result was a
+  layout draw, so no slim patch file is kept.

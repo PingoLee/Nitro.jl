@@ -29,6 +29,8 @@
 #                   and a hardware-breakpoint count of the entry of the build's own multiq_deletemin
 #                   clone (the .2 clone this CPU runs; one entry a turn). The breakpoint traps on
 #                   every hit, so (b) gives instructions per turn only, and (u) the rate.
+#   a7              (#618 Idea 16, A5) the plain loop with perf stat attached and with nothing attached,
+#                   PAIRS pairs a build and layout (PU_BUILDS, PU_LAYOUTS: bp and bp2 at 2,1 there).
 # Every step: wait for no julia, oha or go-server process (PS_WAIT_S, default 900 s, then STOP), run
 # behind bench/socket/quiet.sh, and after it compare a (path, size, inode) snapshot of the builds'
 # own depots and the shared depot's compiled/ (no step loads a package; a write STOPS the driver).
@@ -52,8 +54,10 @@ N="${N:-3000000}"; WARM="${WARM:-200000}"; PAIRS="${PAIRS:-5}"; REC_F="${REC_F:-
 SPLIT_N="${SPLIT_N:-1000000}"; IDLE_S="${IDLE_S:-2}"; IDLE_RUNS="${IDLE_RUNS:-3}"
 PS_WAIT_S="${PS_WAIT_S:-900}"
 # label:wrapper:own depot
-BUILDS="ctl:control:depot-control m2:mark:depot-mark-r bp:mark-bypass:depot-mark-bypass bp2:mark-bypass2:depot-mark-bypass2 s1:mark-slim1:depot-mark-slim1 s2:mark-slim2:depot-mark-slim2"
-LAYOUTS="2,1:0,1,2 4,1:0,1,2,3,4"   # one hardware thread a Julia thread, each on its own core
+# PU_BUILDS / PU_LAYOUTS replace these (bench/julia/slim2.sh: s2b, a second build of s2, and the
+# steps of #618 Idea 16 that run on a subset).
+BUILDS="${PU_BUILDS:-ctl:control:depot-control m2:mark:depot-mark-r bp:mark-bypass:depot-mark-bypass bp2:mark-bypass2:depot-mark-bypass2 s1:mark-slim1:depot-mark-slim1 s2:mark-slim2:depot-mark-slim2}"
+LAYOUTS="${PU_LAYOUTS:-2,1:0,1,2 4,1:0,1,2,3,4}"   # one hardware thread a Julia thread, each on its own core
 G1="cycles:u,instructions:u,cycles:k,instructions:k,context-switches,cpu-migrations"
 G2="cycles:u,branches:u,branch-misses:u,L1-dcache-load-misses:u,iTLB-load-misses:u"
 G3="cycles:u,cache-misses:u,ls_dmnd_fills_from_sys.int_cache:u,ls_dmnd_fills_from_sys.lcl_l2:u,ls_dmnd_fills_from_sys.mem_io_local:u"
@@ -63,6 +67,7 @@ stop() { log "STOP: $*"; log "driver stopped; restart with FROM=<step> after fix
 procs() { ps -eo pid=,etime=,comm=,args= | awk '$3 == "julia" || $3 == "oha" || $3 == "go-server"' | cut -c1-220; }
 ps_check() {
   local waited=0 p
+  [ "${NOGATE:-0}" = 1 ] && return 0   # a smoke runs beside builds; never a measurement
   while :; do
     p="$(procs)"
     [ -z "$p" ] && return 0
@@ -77,7 +82,7 @@ snap() {
   find "${d[@]}" "$HOME/.julia/compiled" -type f -printf '%p %s %i\n' 2>/dev/null | sort
 }
 wrapper() { local b; for b in $BUILDS; do [ "${b%%:*}" = "$1" ] && { b="${b#*:}"; echo "$B/julia-${b%%:*}"; return; }; done; }
-tree() { case "$1" in ctl) echo control ;; m2) echo mark-r ;; bp) echo mark-bypass ;; bp2) echo mark-bypass2 ;; s1) echo mark-slim1 ;; s2) echo mark-slim2 ;; esac; }
+tree() { case "$1" in ctl) echo control ;; m2) echo mark-r ;; bp) echo mark-bypass ;; bp2) echo mark-bypass2 ;; s1) echo mark-slim1 ;; s2) echo mark-slim2 ;; s2b) echo mark-slim2b ;; esac; }
 # The run-time address of the build's multiq_deletemin clone in process $2: sys.so's base + the symbol.
 dm_addr() {
   local so="$J/$(tree "$1")/usr/lib/julia/sys.so" sym base
@@ -105,7 +110,9 @@ attached() {
     local a; a="$(dm_addr "$lb" "$pid")" || { kill "$jp"; return 1; }
     ev="${ev//@DM@/$a}"; echo "$a" >"$stem.addr"
   fi
-  if [ "$tool" = record ]; then
+  if [ "$tool" = none ]; then
+    : # the handshake and the loop exactly as with perf, and nothing attached (a7)
+  elif [ "$tool" = record ]; then
     perf record -q -e "$ev" -F "$REC_F" -p "$pid" -o "$stem.data" 2>"$stem.perr" &
   else
     perf stat --per-thread -x';' -e "$ev" -p "$pid" -o "$stem.perf" 2>"$stem.perr" &
@@ -113,9 +120,9 @@ attached() {
   pp=$!
   sleep 0.3
   touch "$stem.go"
-  wait "$jp" || { echo "attached: $lb $layout n=$n exit $?" >&2; wait "$pp"; return 1; }
-  wait "$pp"
-  [ -s "$stem.line" ] && { [ "$tool" = record ] && [ -s "$stem.data" ] || grep -q ';' "$stem.perf" 2>/dev/null; } ||
+  wait "$jp" || { echo "attached: $lb $layout n=$n exit $?" >&2; [ "$tool" = none ] || wait "$pp"; return 1; }
+  [ "$tool" = none ] || wait "$pp"
+  [ -s "$stem.line" ] && { [ "$tool" = none ] || { [ "$tool" = record ] && [ -s "$stem.data" ]; } || grep -q ';' "$stem.perf" 2>/dev/null; } ||
     { echo "attached: $lb $layout n=$n empty output" >&2; return 1; }
 }
 
@@ -184,6 +191,29 @@ block_split() {
   done
 }
 
+# a7 (#618 Idea 16, A5): does attaching perf move the plain fixed loop? PAIRS pairs (N, 2N) a build and
+# layout, each run twice in a row: perf stat (group g1) attached, and nothing attached; the order of the
+# two alternates a pair, the builds rotate.
+block_attach() {
+  local p lc layout cpus lb ns n stem tools t d="$OUT/a7"
+  mkdir -p "$d"
+  for ((p = 1; p <= PAIRS; p++)); do
+    if [ $((p % 2)) = 1 ]; then ns="$N $((2 * N))"; tools="stat none"; else ns="$((2 * N)) $N"; tools="none stat"; fi
+    for lc in $LAYOUTS; do
+      layout="${lc%%:*}" cpus="${lc#*:}"
+      for lb in $(rotated $((p - 1))); do
+        for t in $tools; do
+          for n in $ns; do
+            stem="$d/p$p-${layout/,/_}-$lb-$t-n$n"
+            attached "$lb" "$layout" "$cpus" "$n" "$G1" "$stem" "$t" || return 1
+          done
+          echo "$(date +%T) a7 pair $p $layout $lb $t: $(grep -o 'ns_per_op=[0-9.]*' "$d/p$p-${layout/,/_}-$lb-$t-n$N.line")"
+        done
+      done
+    done
+  done
+}
+
 block_idle() {
   local p lc layout cpus lb d="$OUT/a6"
   mkdir -p "$d"
@@ -216,12 +246,17 @@ for s in $STEPS; do
     a4) cmd=(block_record) ;;
     a5) cmd=(block_split) ;;
     a6) cmd=(block_idle) ;;
+    a7) cmd=(block_attach) ;;
     *) stop "unknown step $s" ;;
   esac
   ps_check || stop "a julia, oha or go-server process stayed before $s"
   snap >"$OUT/snap-before-$s"
   log "step $s start"
-  "$ROOT/bench/socket/quiet.sh" "perf-$s" "$0" --run "${cmd[@]}" >>"$LOG" 2>&1
+  if [ "${NOGATE:-0}" = 1 ]; then   # a smoke of the step's code, never a measurement
+    "$0" --run "${cmd[@]}" >>"$LOG" 2>&1
+  else
+    "$ROOT/bench/socket/quiet.sh" "perf-$s" "$0" --run "${cmd[@]}" >>"$LOG" 2>&1
+  fi
   rc=$?
   snap >"$OUT/snap-after-$s"
   if ! cmp -s "$OUT/snap-before-$s" "$OUT/snap-after-$s"; then
