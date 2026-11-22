@@ -1,0 +1,30 @@
+diff --git a/base/partr.jl b/base/partr.jl
+index 6fdef1b304..0a979d3e06 100644
+--- a/base/partr.jl
++++ b/base/partr.jl
+@@ -1004,11 +1004,23 @@ end
+     return false
+ end
+ 
+-function multiq_insert(task::Task, priority::UInt16)
++# Inlined into `enq_work` (slim candidate s1, #618 Idea 14): with nothing marked, stock's insert is
++# one call deep, as on the tag, and the wrapper adds no frame, safepoint or call of its own.
++@inline function multiq_insert(task::Task, priority::UInt16)
+     @sched_validate ccall(:jl_threadpoolid, Int8, (Int16,), Threads.threadid() - 1) == Int8(-1) && (vs().foreign += 1)
+     c = sched_class(task)
++    if c == C_NONE && !(@atomic :monotonic fl.on)
++        @sched_validate ccall(:jl_is_task_started, Cint, (Any,), task) == 0 && (vs().l_first += 1)
++        return stock_multiq_insert(task, priority)
++    end
++    return fair_insert_entry(task, priority, c)
++end
++
++# The rest of the insert, out of line: a task with no class while the flag is set (a descendant, or
++# stock's), and every classed task.
++@noinline function fair_insert_entry(task::Task, priority::UInt16, c::UInt8)
+     if c == C_NONE
+-        if !(@atomic :monotonic fl.on) || !fair_descendant(task)
++        if !fair_descendant(task)
+             @sched_validate ccall(:jl_is_task_started, Cint, (Any,), task) == 0 && (vs().l_first += 1)
+             return stock_multiq_insert(task, priority)
+         end
