@@ -121,3 +121,47 @@ Give each build its own first depot, so that no build's precompile cache evicts 
   class set by hand, a mark while sticky, a mark for `:interactive`): whether it is lost, where it sits, and its order.
   On 2026-11-22 the two s2 builds disagreed (s2b slower than s2 in 12 of 12 rounds at `2,1`): s2's first result was a
   layout draw, so no slim patch file is kept.
+
+## The port to master (#618, agent-config #82 Idea 17)
+
+`native-mark-master.patch` is the same design written against JuliaLang/julia `master` at
+**`4b0df1484a03216658189c3a94623a5ebe028214`** (2026-11-22, `1.15.0-DEV`): `git diff 4b0df1484a
+nitro-618-native-mark-master` in the local clone. `native-mark-master-inline.patch` is commit 2 on top
+of it (`git diff nitro-618-native-mark-master nitro-618-native-mark-master-inline`): the tag's s1, the
+unmarked insert inlined into `enq_work`, no change of behaviour. Local experiments, not proposed to
+Julia, not stacked on any open PR.
+
+- sha256 `native-mark-master.patch`: `46441f37745139f41edf752a929b20db28adaaf8ed2ed38b40f112f538fc4106` (7 files, +982 −10; the tag's was +961 −10)
+- sha256 `native-mark-master-inline.patch`: `8f6983bbc338370fb7d44cf670387d0e4d04e380c6c8a0dbabc56fe909229eb2`
+
+What master forced, against the tag's patch (everything else moved as it is):
+
+| Where | What and why |
+|---|---|
+| `base/partr.jl`, the R heaps | regenerated from master's four heap functions (`r_heaps.jl gen`) and proved equal to them up to the renaming (`r_heaps.jl check`, token for token): master's pop now loops and yields the OS thread on a task pinned to another thread, and a three-way merge would have kept the tag's pop |
+| `base/partr.jl`, `f_pop!` | when every scanned ring entry is pinned elsewhere, `yield_os_thread()` after waking the owners, as master's pop does |
+| `base/partr.jl` | `Threads.maxthreadid()` (master dropped the import from `Partr`), `Base.unsetindex!` (renamed from `_unsetindex!`) |
+| `base/partr.jl`, validation only | counters `oyields` (ring pops that yielded the OS thread) and `stale` (pops that returned a task no longer runnable: master's `trypoptask` discards it and pops again) |
+| `src/julia_threads.h`, `src/jltypes.c` | the cancellation work took two of the three padding bytes: `sched_class` takes `pad02`, the last one, which leaves `jl_task_t`'s first cache line with no padding; its atomic bit moves to 13 (field 14) |
+| `src/task.c` | zeroed in `jl_new_task` and in `jl_init_root_task` (already zero there by a `memset`; written as master writes `preempt_request`) |
+| `base/boot.jl`, `test/core.jl` | the field comment and the atomic-field table, at master's lines |
+
+Trees, under `~/app/julia-618-master/` (worktrees of the same clone, the same `Make.user` as the tag's,
+`build.sh <tree>`, wrappers `bin/julia-<tree>`, a first depot each): `control` (master untouched),
+`mark`, `mark-validate` (`SCHED_VALIDATE = true`, one line), `mark-inline`. master builds in about 12
+minutes a tree on the bench box.
+
+- `r_heaps.jl gen <base partr.jl>` / `check <base partr.jl> <branch partr.jl>`: rerun at every rebase.
+  On master, run the check with a master build (its parser reads `*%`).
+- `master_checks.jl`: the points master adds (the pinned ring entry, the stale pop, cancellation of a
+  marked root in its ring, of request work in flight and of a `@sync`'s marked children, the class rule
+  under master's scopes, `enq_work`'s early returns), on the validation build at `8,1` and `8,2`; with
+  `abandon N`, forcible abandonments (marked victims on a mark build, unmarked on the control).
+- `pilot_master.sh`: the port's pilot as one quiet block (the starved cell with `:interactive` clients,
+  the mixed cell, `fib_fine` alone and the H = 0 cells with nothing marked, every build against
+  master's control); `STEPS` and `UNMARKED` select the cells and the columns, `PILOT_OUT` the directory.
+- `unmarked_code.jl`: the unmarked insert, pop and empty check as one build compiles them
+  (instructions, calls and their targets, frame, safepoint polls), read on control, mark and mark-inline.
+- `native_checks.jl`'s last check looks in every ring and R-heap slot for the finished tasks: on master a
+  task the main task fetched can stay reachable after GC on the control too, so reachability is asserted
+  only before 1.15.

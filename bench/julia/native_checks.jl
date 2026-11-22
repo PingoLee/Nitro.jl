@@ -132,10 +132,21 @@ if ND >= 2
         foreach(wait, [Threads.@spawn :default sum(1:10) for _ in 1:64])
         GC.gc(true)
     end
-    @assert wr.value === nothing "a finished root is still reachable: a ring keeps it"
-    @assert wk.value === nothing "a finished descendant is still reachable: an R heap keeps it"
+    # On master (1.15-DEV) a task the main task fetched stays reachable after GC on the control too,
+    # through something outside Partr (not identified), so reachability alone cannot convict a
+    # slot: look in every ring slot and R-heap slot, assigned or not past the live count.
+    in_slot(t) = t !== nothing &&
+        (any(q -> any(i -> isassigned(q.tasks, i) && q.tasks[i] === t, eachindex(q.tasks)), P.rings[P.f_tpid + 1]) ||
+         any(h -> any(i -> isassigned(h.tasks, i) && h.tasks[i] === t, eachindex(h.tasks)), P.r_heaps[P.f_tpid + 1]))
+    r, k = wr.value, wk.value
+    @assert !in_slot(r) "a finished root is still held by a ring or R-heap slot"
+    @assert !in_slot(k) "a finished descendant is still held by a ring or R-heap slot"
+    VERSION < v"1.15-" && @assert r === nothing "a finished root is still reachable"
+    VERSION < v"1.15-" && @assert k === nothing "a finished descendant is still reachable"
+    r = k = nothing
     @assert P.f_queued() == 0 && P.r_queued() == 0
-    ok("a finished root (from a ring) and its descendant (from an R heap) are collected: no slot keeps them")
+    ok("a finished root (from a ring) and its descendant (from an R heap): no slot holds them; collected: root " *
+       string(wr.value === nothing) * ", descendant " * string(wk.value === nothing))
 end
 
 V && println(stderr, "native_checks: counts over the process: ",
