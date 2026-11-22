@@ -91,7 +91,8 @@ function read_step(p, pre)
         end
     end
 end
-for d in ("c21", "c41", "f21")
+# SLIM_DIRS: the step directories to read (slim2.sh, #618 Idea 16: "c21 c41 f21 f81 a4cost", and "weak" alone).
+for d in split(get(ENV, "SLIM_DIRS", "c21 c41 f21"))
     isdir(joinpath(OUT, d)) && read_step(joinpath(OUT, d), "")
 end
 for d in ("r21", "r41")

@@ -12,7 +12,7 @@
 using Statistics, Printf
 
 const OUT = ARGS[1]
-const COLS = ["ctl", "m2", "bp", "bp2", "s1", "s2"]
+const COLS = split(get(ENV, "PU_COLS", "ctl m2 bp bp2 s1 s2"))   # slim2.sh: "ctl m2 bp bp2 s2 s2b"
 const LAYOUTS = ["2,1", "4,1"]
 
 kv(line) = Dict(split(f, '=', limit = 2)[1] => split(f, '=', limit = 2)[2] for f in split(chomp(line), '\t') if occursin('=', f))
@@ -292,6 +292,31 @@ function print_a6(v)
     end
 end
 
+# A7 (#618 Idea 16, A5): the plain loop with perf attached and without, wall ns/op as 2N - N.
+function print_a7attach()
+    dir = joinpath(OUT, "a7")
+    isdir(dir) || return
+    println("\n## a7: the plain fixed loop with `perf stat` attached and with nothing attached (2N − N, ns/op)\n")
+    w = Dict{Tuple{String, String, String, String}, Float64}()   # (layout, build, tool, pair) => ns/op
+    for f in readdir(dir)
+        m = match(r"^p(\d+)-(\d)_(\d)-(\w+)-(stat|none)-n(\d+)\.line$", f)
+        m === nothing && continue
+        n = parse(Int, m[6])
+        f2 = joinpath(dir, "p$(m[1])-$(m[2])_$(m[3])-$(m[4])-$(m[5])-n$(2n).line")
+        isfile(f2) || continue
+        w[("$(m[2]),$(m[3])", m[4], m[5], m[1])] = (parse(Int, readline_kv(f2)["loop_ns"]) - parse(Int, readline_kv(joinpath(dir, f))["loop_ns"])) / n
+    end
+    for l in unique(k[1] for k in keys(w)), t in ("stat", "none")
+        bs = sort(unique(k[2] for k in keys(w) if k[1] == l))
+        println("- $l, perf ", t == "stat" ? "attached" : "not attached", ": ",
+                join(["$b $(cell([v for (k, v) in w if k[1] == l && k[2] == b && k[3] == t]))" for b in bs], "; "))
+        if "bp" in bs && "bp2" in bs
+            r = [w[(l, "bp2", t, p)] / w[(l, "bp", t, p)] for p in unique(k[4] for k in keys(w)) if haskey(w, (l, "bp2", t, p)) && haskey(w, (l, "bp", t, p))]
+            println("  bp2/bp per pair: $(cell(r)) ($(count(>(1), r))/$(length(r)) > 1); bp2 − bp median $(fmt(med([w[(l, "bp2", t, p)] - w[(l, "bp", t, p)] for p in unique(k[4] for k in keys(w)) if haskey(w, (l, "bp2", t, p)) && haskey(w, (l, "bp", t, p))]))) ns")
+        end
+    end
+end
+
 println("# perf_unmarked report: $OUT")
 for g in ("a1g1", "a1g2", "a1g3")
     print_a1(g, a1(g))
@@ -302,3 +327,4 @@ print_a4()
 let v = split_runs()
     print_a5(v); print_a6(v); print_a7(v)
 end
+print_a7attach()
