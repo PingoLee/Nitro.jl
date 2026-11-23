@@ -181,7 +181,7 @@ if _N_WEIGHT !== nothing
         error("VARIANT=$(MULTIQ_VARIANT) sets JULIA_SCHED_FAIR_WEIGHT=$(_N_WEIGHT), and the environment has $(ENV["JULIA_SCHED_FAIR_WEIGHT"])")
     ENV["JULIA_SCHED_FAIR_WEIGHT"] = _N_WEIGHT
 end
-const MULTIQ_NATIVE = MULTIQ_VARIANT in ("N", "N-h", "N-none", "N25", "N75")
+const MULTIQ_NATIVE = MULTIQ_VARIANT in ("N", "N-h", "N-none", "N-arm", "N25", "N75")
 MULTIQ_NATIVE && !NATIVE_BUILD && error("VARIANT=$(MULTIQ_VARIANT) needs a Julia built with the native mark (bench/julia/)")
 NATIVE_BUILD && !(MULTIQ_VARIANT == "A" || MULTIQ_NATIVE) &&
     error("the runtime patch refuses to load on a build with the native mark: VARIANT=$(MULTIQ_VARIANT); use A, N, N-h or N-none")
@@ -254,8 +254,8 @@ FIFO_RINGS && !(FIFO_SERVE in (:l, :t, :t0, :g, :g0, :a) && _F_MATCH[1] in ("M",
 RING_OWN && !(FIFO_SERVE === :l && FIFO_INHERIT === :none) && error("the own-ring insert is built for M-l-r<d>o only")
 (FIFO_INHERIT !== :none || FIFO_SERVE === :a) && !FIFO_RINGS &&
     error("the classes and the age rule are built on the rings: $(MULTIQ_VARIANT)-r2")
-const MARK_HANDLERS = MULTIQ_FIFO && _F_MATCH[1] in ("M", "M-h") && MULTIQ_VARIANT != "N-none"
-const MARK_CLIENTS = MULTIQ_FIFO && _F_MATCH[1] == "M" && MULTIQ_VARIANT != "N-none"
+const MARK_HANDLERS = MULTIQ_FIFO && _F_MATCH[1] in ("M", "M-h") && !(MULTIQ_VARIANT in ("N-none", "N-arm"))
+const MARK_CLIENTS = MULTIQ_FIFO && _F_MATCH[1] == "M" && !(MULTIQ_VARIANT in ("N-none", "N-arm"))
 # Optional, nested.jl only: every spawn marked (the cost of marking fine-grained fork-join).
 const MARK_ALL = FIFO_CLASS === :mark && get(ENV, "MARK_ALL", "0") == "1"
 # C's heaps: C, and D behind its slots.
@@ -1121,6 +1121,19 @@ if MULTIQ_NATIVE
     (@atomic PARTR.fp.w4) == GROUP_W4 || error("the build's weight is $(@atomic PARTR.fp.w4)/4, the harness's $(GROUP_W4)/4")
     const SHARE_CAP = @atomic PARTR.fp.cap
     const SHARE_CYCLES_PER_MS = SHARE_CAP / 10
+    # N-arm (#618, agent-config #82 Idea 17 session 2, part E1): nothing marked, as N-none, but one
+    # marked task is spawned on `:default` and finished here, at load, so the pool flag is armed for
+    # the whole run: what a program that marked one task pays for its unmarked work from then on.
+    if MULTIQ_VARIANT == "N-arm"
+        let t = Task(() -> nothing)
+            t.sticky = false
+            Threads._spawn_set_thrpool(t, :default)
+            Threads._spawn_set_fair(t, true)
+            schedule(t)
+            wait(t)
+        end
+        (@atomic :acquire PARTR.fl.on) || error("VARIANT=N-arm: the pool flag is not set after a marked task ran")
+    end
 end
 if MULTIQ_FIFO && !MULTIQ_NATIVE
     # M and O. Stock's three entry points are the build's own, parsed from its partr.jl the way A0

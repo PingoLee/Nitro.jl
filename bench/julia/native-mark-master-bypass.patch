@@ -1,0 +1,88 @@
+diff --git a/base/partr.jl b/base/partr.jl
+index 6fdef1b304..9807fc6a31 100644
+--- a/base/partr.jl
++++ b/base/partr.jl
+@@ -149,7 +149,7 @@ function multiq_size(tpid::Int8)
+     return heap_p
+ end
+ 
+-function stock_multiq_insert(task::Task, priority::UInt16)
++function multiq_insert(task::Task, priority::UInt16)
+     tpid = ccall(:jl_get_task_threadpoolid, Int8, (Any,), task)
+     @assert tpid > -1 "invalid tpid"
+     heap_p = multiq_size(tpid)
+@@ -183,7 +183,7 @@ end
+ 
+ yield_os_thread() = @static Sys.iswindows() ? ccall(:SwitchToThread, stdcall, Cint, ()) : ccall(:sched_yield, Cint, ())
+ 
+-function stock_multiq_deletemin()
++function multiq_deletemin()
+     local rn1::UInt32
+     local heap, task
+ 
+@@ -254,7 +254,7 @@ function stock_multiq_deletemin()
+     return task
+ end
+ 
+-function stock_multiq_check_empty()
++function multiq_check_empty()
+     tid = Threads.threadid()
+     tp = ccall(:jl_threadpoolid, Int8, (Int16,), tid-1) + 1
+     if tp == 0 # Foreign thread
+@@ -268,6 +268,15 @@ function stock_multiq_check_empty()
+     return true
+ end
+ 
++# The bypass control (PingoLee/Nitro.jl#618, agent-config #82 Idea 17, session 2): the three entry
++# points above are stock's own, under master's names, and the scheduler reaches only them. The
++# mark's wrappers below are kept as `mark_multiq_*`, unreachable, and compiled into the image by
++# their precompile statements (contrib/generate_precompile.jl), so the image carries the same code.
++# The mark's code calls stock's bodies by these names.
++const stock_multiq_insert = multiq_insert
++const stock_multiq_deletemin = multiq_deletemin
++const stock_multiq_check_empty = multiq_check_empty
++
+ # The R heaps: a second set of stock heaps, for request work in flight (see below). Stock's own
+ # size, insert, two-choice pop with the sticky retry, and check: the four functions above, copied
+ # with `heaps`, `heaps_lock` and their names renamed. Empty and unsized until a task of class R is
+@@ -1004,7 +1013,7 @@ end
+     return false
+ end
+ 
+-function multiq_insert(task::Task, priority::UInt16)
++function mark_multiq_insert(task::Task, priority::UInt16)
+     @sched_validate ccall(:jl_threadpoolid, Int8, (Int16,), Threads.threadid() - 1) == Int8(-1) && (vs().foreign += 1)
+     c = sched_class(task)
+     if c == C_NONE
+@@ -1051,7 +1060,7 @@ end
+     return true
+ end
+ 
+-function multiq_deletemin()
++function mark_multiq_deletemin()
+     if !(@atomic :acquire fl.on)
+         task = stock_multiq_deletemin()
+         @sched_validate (v_stock_pop(vs(), task); v_stale(vs(), task))
+@@ -1159,7 +1168,7 @@ end
+     return task
+ end
+ 
+-function multiq_check_empty()
++function mark_multiq_check_empty()
+     stock_multiq_check_empty() || return false
+     (@atomic :acquire fl.on) || return true
+     @sched_validate (@atomic :monotonic fp.neg) == 1 && return true   # blind: ignores the rings
+diff --git a/contrib/generate_precompile.jl b/contrib/generate_precompile.jl
+index 1ba264fcd7..b8cef38cb4 100644
+--- a/contrib/generate_precompile.jl
++++ b/contrib/generate_precompile.jl
+@@ -133,6 +133,9 @@ precompile(Base.CoreLogging.current_logger_for_env, (Base.CoreLogging.LogLevel,
+ precompile(Base.CoreLogging.current_logger_for_env, (Base.CoreLogging.LogLevel, Symbol, Module))
+ precompile(Base.CoreLogging.env_override_minlevel, (Symbol, Module))
+ precompile(Base.StackTraces.lookup, (Ptr{Nothing},))
++precompile(Base.Partr.mark_multiq_insert, (Task, UInt16))
++precompile(Base.Partr.mark_multiq_deletemin, ())
++precompile(Base.Partr.mark_multiq_check_empty, ())
+ precompile(Tuple{typeof(Base.run_module_init), Module, Int})
+ precompile(Tuple{Type{Base.VersionNumber}, Int32, Int32, Int32})
+ 
