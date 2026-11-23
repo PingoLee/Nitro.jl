@@ -144,6 +144,12 @@ jl_of()  { case "$1" in
              *) printf '%s' "$JL" ;;
            esac; }
 var_of() { printf '%s' "${1%%\%*}"; }
+# MICRO_PROJECTS="<label>=<env dir> ..." (#618, Idea 17 session 2): a `V%label` token's tasks.jl runs in
+# that environment instead of MICRO_PROJECT, so builds of two Julia versions each load the same
+# package versions from an environment resolved for their own version.
+declare -A MP_OF
+for kv in ${MICRO_PROJECTS:-}; do MP_OF["${kv%%=*}"]="${kv#*=}"; done
+mp_of()  { local b="${1##*%}"; if [[ "$1" == *%* ]] && [ -n "${MP_OF[$b]:-}" ]; then printf '%s' "${MP_OF[$b]}"; else printf '%s' "$MICRO_PROJECT"; fi; }
 
 # The variants of each cell. ROUND_ORDER reverses them in even rounds. PROFILE=share is the run of
 # 2026-11-16 (the shares, M-t and M-p<K>, against M-l); the default is the M/O run of 2026-11-15.
@@ -319,7 +325,7 @@ micro() {
   # MICRO_ARGS and MICRO_FAN_OUT (#618, the battery) narrow the rows: "micro" and "1000" give SpawnWait,
   # PingPong and FanOut1000 only.
   VARIANT="$(var_of "$variant")" FAN_OUT_NS="${MICRO_FAN_OUT:-1000 10000}" timeout -s KILL "${MICRO_TIMEOUT_S:-240}" taskset -c "$CPUS" "$jl" \
-    --project="$MICRO_PROJECT" --threads="$layout" "$HERE/tasks.jl" ${MICRO_ARGS:-micro queued} |
+    --project="$(mp_of "$variant")" --threads="$layout" "$HERE/tasks.jl" ${MICRO_ARGS:-micro queued} |
     sed "s|^|$r\t$VER\t$layout\t$variant\t|" >>"$tsv"
   local rc="${PIPESTATUS[0]}"
   [ "$rc" = 0 ] || { echo "rounds_fifo: tasks.jl $layout VARIANT=$variant failed ($rc)" >&2; return 1; }

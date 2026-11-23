@@ -165,3 +165,52 @@ minutes a tree on the bench box.
 - `native_checks.jl`'s last check looks in every ring and R-heap slot for the finished tasks: on master a
   task the main task fetched can stay reachable after GC on the control too, so reachability is asserted
   only before 1.15.
+
+### Session 2: the measurement on master, with JuliaLang/julia#62285 in the same blocks
+
+Agent-config #82 Idea 17, session 2. Local experiments, not proposed to Julia. Four more trees under
+`~/app/julia-618-master/`, each built like the others:
+- `control2`: the pinned commit again, with an untracked marker file. Julia reports `4b0df1484a*`,
+  and the sources are identical.
+- `mark-bypass`: `native-mark-master-bypass.patch` on the mark (sha256
+  `caf29ef454584155724a70bf6753bbbd3cefe97f9ae962fe523e6be53a496f50`). It is the tag's bypass
+  control ported by hand, since the tag's patch does not apply to master's pop.
+  - Master's three entry points are stock's own bodies again, and the scheduler reaches only them.
+  - The mark's wrappers are kept as `mark_multiq_*`, unreachable, and compiled into the image by
+    three lines in `contrib/generate_precompile.jl`.
+  - `const stock_multiq_* = multiq_*` keeps the mark's code calling stock.
+- `mark-all`: `native-mark-master-all-switch.patch` on mark-validate (sha256
+  `dd07d1e8fb269808b78fdf8ad5bc8914b5de027005591b4d18be6e0a295d2cfe`). It is the tag's
+  `JULIA_SCHED_MARK_ALL=spawn|insert` switch.
+  - The `Base.__init__` hook is placed by hand.
+  - The fallback log directory is `~/app/julia-618-master/mark-all-log/current`.
+  - The exit log gains a `stale` column after `f_again`.
+  - Never timed.
+- `mark-inline-validate`: the local branch `nitro-618-native-mark-master-inline-validate`, which is
+  `native-mark-master-inline.patch` with `SCHED_VALIDATE = true` (one line). Never timed.
+
+**Packages.** The four timed trees (control and mark here; #62285's ws and base,
+`1.14.0-DEV.2682`) load the same registry package versions, from
+`~/app/julia-618-master/envs/{server,micro}-{master,july}`. The pins:
+- server: HTTP 2.15.3, Reseau 1.7.1, JSON 1.13.4, PrecompileTools 1.3.4;
+- micro: BenchmarkTools 1.8.0, JSON 1.13.4, PrecompileTools 1.3.4.
+
+**The scripts.**
+- `master_measure.sh`: the session as one detached driver. Its header lists the steps of parts A–E
+  and the cut order, with the ps check before each step and the cache-write check after each.
+  `SMOKE=1` runs every step once, short and ungated.
+  - The ps check, as the maintainer asked for this run, stops a julia, oha or go-server process that
+    is not the driver's own. "Own" means the driver's pid (`S2_DRIVER_PID`, exported to its `--run`
+    children) is among the process's ancestors. It logs the pid, start time, parent, working
+    directory and command line, sends SIGTERM, waits 10 s, sends SIGKILL, and the step goes on.
+    No other process is ever signalled. A pid whose start time changed (reused) is skipped.
+- `master_measure_report.jl <results dir> [<E2 dir>]`: the report of every part, with part C's
+  table for the maintainer. Stdlib only.
+- `abandon_runs.sh`: part E2. It runs `master_checks.jl abandon N` as many times as fit in a budget,
+  alternating the builds. On a hang, before the kill, it saves the threads' states and wait
+  channels and Julia's own reports (`SIGUSR1` with Profile loaded, then `SIGQUIT`).
+- Two harness additions in `../tasks/`:
+  - `VARIANT=N-arm` (`multiq_variant.jl`): nothing marked, but one marked task runs at load, so the
+    pool flag is set for the whole process.
+  - `MICRO_PROJECTS="<label>=<env>"` (`rounds_fifo.sh`): a column's tasks.jl runs in its own
+    environment.
