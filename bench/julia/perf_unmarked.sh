@@ -53,7 +53,9 @@ LOOP="$ROOT/bench/tasks/spawnwait_fixed.jl"
 N="${N:-3000000}"; WARM="${WARM:-200000}"; PAIRS="${PAIRS:-5}"; REC_F="${REC_F:-999}"
 SPLIT_N="${SPLIT_N:-1000000}"; IDLE_S="${IDLE_S:-2}"; IDLE_RUNS="${IDLE_RUNS:-3}"
 PS_WAIT_S="${PS_WAIT_S:-900}"
-# label:wrapper:own depot
+# label:wrapper:own depot. A wrapper or depot that starts with / is taken as given (#618 Idea 19:
+# master_measure.sh SESSION=3 times builds under two directories); otherwise $B/julia-<wrapper> and
+# $J/<depot>. A label is a word (\w+): perf_report.jl reads it back from the file names.
 # PU_BUILDS / PU_LAYOUTS replace these (bench/julia/slim2.sh: s2b, a second build of s2, and the
 # steps of #618 Idea 16 that run on a subset).
 BUILDS="${PU_BUILDS:-ctl:control:depot-control m2:mark:depot-mark-r bp:mark-bypass:depot-mark-bypass bp2:mark-bypass2:depot-mark-bypass2 s1:mark-slim1:depot-mark-slim1 s2:mark-slim2:depot-mark-slim2}"
@@ -78,10 +80,12 @@ ps_check() {
 }
 snap() {
   local d=() b
-  for b in $BUILDS; do d+=("$J/${b##*:}"); done
+  # compiled/ only: builds from 1.14 on also keep a JIT object cache (cache/v1.1x/objcache*/data.mdb)
+  # in the depot, which grows on every run of every build; it holds no package image.
+  for b in $BUILDS; do case "${b##*:}" in /*) d+=("${b##*:}/compiled") ;; *) d+=("$J/${b##*:}/compiled") ;; esac; done
   find "${d[@]}" "$HOME/.julia/compiled" -type f -printf '%p %s %i\n' 2>/dev/null | sort
 }
-wrapper() { local b; for b in $BUILDS; do [ "${b%%:*}" = "$1" ] && { b="${b#*:}"; echo "$B/julia-${b%%:*}"; return; }; done; }
+wrapper() { local b; for b in $BUILDS; do [ "${b%%:*}" = "$1" ] && { b="${b#*:}"; b="${b%%:*}"; case "$b" in /*) echo "$b" ;; *) echo "$B/julia-$b" ;; esac; return; }; done; }
 tree() { case "$1" in ctl) echo control ;; m2) echo mark-r ;; bp) echo mark-bypass ;; bp2) echo mark-bypass2 ;; s1) echo mark-slim1 ;; s2) echo mark-slim2 ;; s2b) echo mark-slim2b ;; esac; }
 # The run-time address of the build's multiq_deletemin clone in process $2: sys.so's base + the symbol.
 dm_addr() {
