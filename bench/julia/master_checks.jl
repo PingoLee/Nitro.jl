@@ -13,7 +13,12 @@ using Base: cancel!, CancellationRequest, CancellationToken, CancellationTokenSo
 using Base.ScopedValues: with
 const MARK = hasfield(Task, :sched_class)
 const P = Base.Partr
-const V = MARK && P.SCHED_VALIDATE
+const V = MARK && isdefined(P, :SCHED_VALIDATE) && P.SCHED_VALIDATE
+# The PR candidate has no validation code: neither the switch nor the queue-depth probes. These read
+# the same state from the structures themselves.
+fair_on() = @atomic :acquire P.fl.on
+f_queued() = isdefined(P, :f_queued) ? P.f_queued() : sum((@atomic :monotonic q.n for q in P.rings[P.f_tpid + 1]); init = 0)
+r_queued() = isdefined(P, :r_queued) ? P.r_queued() : sum((@atomic :monotonic h.ntasks for h in P.r_heaps[P.f_tpid + 1]); init = 0)
 const ND = Threads.nthreads(:default)
 ok(msg) = println(stderr, "master_checks: ok: ", msg)
 println(stderr, "master_checks: ", VERSION, " ", Base.GIT_VERSION_INFO.commit_short,
@@ -23,7 +28,7 @@ ND >= 2 || error("master_checks: needs a :default pool of 2 or more threads")
 
 counts() = P.sched_counts()
 delta(a, b, k) = getfield(b, k) - getfield(a, k)
-empty_queues() = P.f_queued() == 0 && P.r_queued() == 0
+empty_queues() = f_queued() == 0 && r_queued() == 0
 function until(f, what; timeout = 30.0)
     t0 = time()
     while !f()
@@ -74,9 +79,9 @@ parked(t::Task) = istaskstarted(t) && (@atomic :monotonic t.waiting_on) !== noth
 
 # ------------------------------------------------------------------------------------------------
 function main_mode()
-    V || error("master_checks: the main mode needs the validation build (Base.Partr.SCHED_VALIDATE)")
+    V || println(stderr, "master_checks: no validation build: the checks that read the counters are skipped")
     # Set the flag first: one marked spawn.
-    @assert fetch(mspawn(() -> 1)) == 1 && P.fair_on()
+    @assert fetch(mspawn(() -> 1)) == 1 && fair_on()
 
     # d. The class rule at a task's first enqueue, under master's scopes. A marked root's children
     # are R whether spawned directly, inside @sync, inside `with(CANCEL_TOKEN => …)` or as
@@ -119,16 +124,16 @@ function main_mode()
     Threads._spawn_set_thrpool(t, :default)
     Threads._spawn_set_fair(t, true)
     @atomic t._state = 0x03   # task_state_abandoned
-    c0 = counts()
+    c0 = V ? counts() : nothing
     @assert Base.enq_work(t) === t
-    @assert ins(counts()) == ins(c0) && empty_queues() "enq_work of an abandoned task reached the insert"
+    @assert (!V || ins(counts()) == ins(c0)) && empty_queues() "enq_work of an abandoned task reached the insert"
     ev = Base.Event()
     w = mspawn(() -> wait(ev))
     until(() -> parked(w), "the marked task to park on the event")
-    c0 = counts()
+    c0 = V ? counts() : nothing
     err = try; Base.enq_work(w); nothing; catch e; e; end
     @assert err isa ConcurrencyViolationError "enq_work of a parked task did not throw: $err"
-    @assert ins(counts()) == ins(c0) && empty_queues() "a parked task reached the insert"
+    @assert (!V || ins(counts()) == ins(c0)) && empty_queues() "a parked task reached the insert"
     notify(ev); wait(w)
     @assert empty_queues()
     ok("e: an abandoned task and a task registered on a wait queue never reach the mark's insert")
@@ -144,60 +149,65 @@ function main_mode()
     Threads._spawn_set_thrpool(t, :default)
     Threads._spawn_set_fair(t, true)
     @assert ccall(:jl_set_task_tid, Cint, (Any, Cint), t, k - 1) != 0
-    c0 = counts()
+    c0 = V ? counts() : nothing
     schedule(t)
     sleep(0.2)
-    c1 = counts()
+    c1 = V ? counts() : nothing
     @assert ran[] == 0 "the pinned task ran while its owner was busy"
-    @assert P.f_queued() == 1 "the pinned task is not in a ring ($(P.f_queued()) queued)"
-    @assert delta(c0, c1, :skips) > 0 && delta(c0, c1, :oyields) > 0 "skips $(delta(c0, c1, :skips)), oyields $(delta(c0, c1, :oyields))"
+    @assert f_queued() == 1 "the pinned task is not in a ring ($(f_queued()) queued)"
+    V && @assert delta(c0, c1, :skips) > 0 && delta(c0, c1, :oyields) > 0 "skips $(delta(c0, c1, :skips)), oyields $(delta(c0, c1, :oyields))"
     release(go, ts)
     wait(t)
     @assert ran[] == 1 && on[] == k "ran $(ran[]) times, on thread $(on[]), owner $k"
     @assert empty_queues()
-    ok("a: a pinned ring entry: skipped $(delta(c0, c1, :skips)) times, $(delta(c0, c1, :oyields)) OS-thread yields in 200 ms, then run once by its owner (thread $k)")
+    ok(V ? "a: a pinned ring entry: skipped $(delta(c0, c1, :skips)) times, $(delta(c0, c1, :oyields)) OS-thread yields in 200 ms, then run once by its owner (thread $k)" :
+           "a: a pinned ring entry stayed queued while its owner was busy, then ran once on its owner (thread $k)")
 
     # b. The stale task, injected: an abandoned task in a ring, one in an R heap and one in a stock
     # heap (inserted directly, as enq_work would refuse them). The pops return them, trypoptask
     # discards them, nothing runs, nothing aborts, the queues end empty.
-    function stale_task(c)
-        t = Task(() -> error("a stale task ran"))
-        t.sticky = false
-        Threads._spawn_set_thrpool(t, :default)
-        c == 0x00 || P.set_sched_class!(t, c)
-        @atomic t._state = 0x03
-        return t
+    if V
+        function stale_task(c)
+            t = Task(() -> error("a stale task ran"))
+            t.sticky = false
+            Threads._spawn_set_thrpool(t, :default)
+            c == 0x00 || P.set_sched_class!(t, c)
+            @atomic t._state = 0x03
+            return t
+        end
+        c0 = counts()
+        for c in (P.C_F, P.C_R, 0x00)
+            P.multiq_insert(stale_task(c), UInt16(0))
+        end
+        # Where each went, from the insert counters (an idle thread may pop them at once).
+        ci = counts()
+        @assert (delta(c0, ci, :f_first), delta(c0, ci, :r_first), delta(c0, ci, :l_first)) == (1, 1, 1) "the injected tasks went to rings/R/stock: $((delta(c0, ci, :f_first), delta(c0, ci, :r_first), delta(c0, ci, :l_first)))"
+        until(() -> (foreach(wait, [Threads.@spawn :default nothing for _ in 1:ND]);
+                     delta(c0, counts(), :stale) >= 3), "three stale pops")
+        c1 = counts()
+        @assert delta(c0, c1, :stale) == 3 "stale pops: $(delta(c0, c1, :stale))"
+        @assert empty_queues()
+        ok("b: an abandoned task in a ring, an R heap and a stock heap: 3 stale pops, discarded, nothing ran")
+    else
+        println(stderr, "master_checks: skipped: b (needs the counters: placement and stale pops)")
     end
-    c0 = counts()
-    for c in (P.C_F, P.C_R, 0x00)
-        P.multiq_insert(stale_task(c), UInt16(0))
-    end
-    # Where each went, from the insert counters (an idle thread may pop them at once).
-    ci = counts()
-    @assert (delta(c0, ci, :f_first), delta(c0, ci, :r_first), delta(c0, ci, :l_first)) == (1, 1, 1) "the injected tasks went to rings/R/stock: $((delta(c0, ci, :f_first), delta(c0, ci, :r_first), delta(c0, ci, :l_first)))"
-    until(() -> (foreach(wait, [Threads.@spawn :default nothing for _ in 1:ND]);
-                 delta(c0, counts(), :stale) >= 3), "three stale pops")
-    c1 = counts()
-    @assert delta(c0, c1, :stale) == 3 "stale pops: $(delta(c0, c1, :stale))"
-    @assert empty_queues()
-    ok("b: an abandoned task in a ring, an R heap and a stock heap: 3 stale pops, discarded, nothing ran")
 
     # c1. A marked root cancelled while it waits in a ring (every :default thread held): it stays
     # there, starts once the threads free up, and fails at its first cancellation point.
     go, _, ts = hold(ND)
     ran = Threads.Atomic{Int}(0)
-    c0 = counts()
+    c0 = V ? counts() : nothing
     t, src = marked_cancellable(() -> (Threads.atomic_add!(ran, 1); Base.@cancel_check; :not_cancelled))
     sleep(0.05)
-    @assert ran[] == 0 && P.f_queued() == 1 "the root is not waiting in a ring"
+    @assert ran[] == 0 && f_queued() == 1 "the root is not waiting in a ring"
     cancel!(src)
     sleep(0.05)
-    @assert ran[] == 0 && P.f_queued() == 1 "cancel! moved or ran the queued root"
+    @assert ran[] == 0 && f_queued() == 1 "cancel! moved or ran the queued root"
     release(go, ts)
     until(() -> istaskdone(t), "the cancelled root to finish")
-    c1 = counts()
+    c1 = V ? counts() : nothing
     @assert ran[] == 1 && istaskfailed(t) && t.result isa CancellationRequest "ran $(ran[]), result $(t.result)"
-    @assert delta(c0, c1, :f_first) == 1 && delta(c0, c1, :f_pops) == 1 && empty_queues()
+    @assert (!V || (delta(c0, c1, :f_first) == 1 && delta(c0, c1, :f_pops) == 1)) && empty_queues()
     ok("c1: a marked root cancelled in its ring: stayed queued, ran once, failed with $(t.result)")
 
     # c2. Request work cancelled in flight: a marked root and its descendant, both parked in sleep();
@@ -205,7 +215,7 @@ function main_mode()
     ran_kid = Threads.Atomic{Int}(0)
     kid_class = Ref{UInt8}(0xff)
     kidref = Ref{Task}()
-    c0 = counts()
+    c0 = V ? counts() : nothing
     t, src = marked_cancellable() do
         kidref[] = Threads.@spawn :default begin
             kid_class[] = P.sched_class(current_task())
@@ -217,12 +227,12 @@ function main_mode()
     until(() -> parked(t) && isassigned(kidref) && parked(kidref[]), "root and kid to park")
     cancel!(src)
     until(() -> istaskdone(t) && istaskdone(kidref[]), "root and kid to finish")
-    c1 = counts()
+    c1 = V ? counts() : nothing
     @assert istaskfailed(t) && t.result isa CancellationRequest "root: $(t.result)"
     @assert istaskfailed(kidref[]) && kidref[].result isa CancellationRequest && ran_kid[] == 1 && kid_class[] == P.C_R
-    @assert delta(c0, c1, :r_again) >= 2 "R re-inserts on wake: $(delta(c0, c1, :r_again))"
+    V && @assert delta(c0, c1, :r_again) >= 2 "R re-inserts on wake: $(delta(c0, c1, :r_again))"
     @assert empty_queues()
-    ok("c2: a marked root and its R child parked in sleep, cancelled: woken, re-inserted as R ($(delta(c0, c1, :r_again)) re-inserts), failed, each body once")
+    ok("c2: a marked root and its R child parked in sleep, cancelled: woken" * (V ? ", re-inserted as R ($(delta(c0, c1, :r_again)) re-inserts)" : "") * ", failed, each body once")
 
     # c3. A @sync whose marked children are cancelled, (i) parked and (ii) still in their rings.
     nk = 2ND
@@ -253,7 +263,7 @@ function main_mode()
     end
     until(() -> length(kids) == nk, "the root to spawn $nk children")
     sleep(0.05)
-    @assert ran[] == 0 && P.f_queued() == nk "(ii) $(P.f_queued()) of $nk children in rings, $(ran[]) ran"
+    @assert ran[] == 0 && f_queued() == nk "(ii) $(f_queued()) of $nk children in rings, $(ran[]) ran"
     cancel!(src)
     spin[] = false
     release(go, ts)
@@ -261,13 +271,15 @@ function main_mode()
     @assert istaskfailed(t) && ran[] == nk && all(istaskfailed, kids) && empty_queues() "(ii) ran $(ran[]) of $nk"
     ok("c3: @sync with $nk marked children cancelled: (i) parked, (ii) still in rings; every child ran once and failed, queues empty")
 
-    # The process's accounts: every ring insert popped, every R insert popped.
-    c = counts()
-    println(stderr, "master_checks: counts over the process: ", join(("$k $(getfield(c, k))" for k in
-            (:f_first, :f_pops, :r_first, :r_again, :r_pops, :desc, :skips, :oyields, :stale, :demoted)), ", "))
-    @assert c.f_first == c.f_pops "ring inserts $(c.f_first), ring pops $(c.f_pops)"
-    @assert c.r_first + c.r_again == c.r_pops "R inserts $(c.r_first + c.r_again), R pops $(c.r_pops)"
-    ok("process accounts: ring inserts = ring pops ($(c.f_first)), R inserts = R pops ($(c.r_pops))")
+    if V
+        # The process's accounts: every ring insert popped, every R insert popped.
+        c = counts()
+        println(stderr, "master_checks: counts over the process: ", join(("$k $(getfield(c, k))" for k in
+                (:f_first, :f_pops, :r_first, :r_again, :r_pops, :desc, :skips, :oyields, :stale, :demoted)), ", "))
+        @assert c.f_first == c.f_pops "ring inserts $(c.f_first), ring pops $(c.f_pops)"
+        @assert c.r_first + c.r_again == c.r_pops "R inserts $(c.r_first + c.r_again), R pops $(c.r_pops)"
+        ok("process accounts: ring inserts = ring pops ($(c.f_first)), R inserts = R pops ($(c.r_pops))")
+    end
     println(stderr, "master_checks: all passed at threads ", ND, ",", Threads.nthreads(:interactive))
 end
 
@@ -284,7 +296,7 @@ function watchdog(secs)
         sh = [sum(h -> Int(@atomic :monotonic h.ntasks), P.heaps[i]; init = 0) for i in 1:length(P.heaps)]
         undone = [t for t in PENDING if !istaskdone(t)]
         println(stderr, "master_checks: WATCHDOG after $(secs) s in phase ", PHASE[], ": stock heaps per pool ", sh,
-                MARK ? ", rings $(P.f_queued()), R heaps $(P.r_queued())" : "",
+                MARK ? ", rings $(f_queued()), R heaps $(r_queued())" : "",
                 ", churn tasks not done ", length(undone), " (started ", count(istaskstarted, undone), ")",
                 isempty(undone) ? "" : ", first: tid $(Threads.threadid(undone[1])), sticky $(undone[1].sticky)" *
                     (MARK ? ", class $(P.sched_class(undone[1]))" : ""),
@@ -318,7 +330,7 @@ function abandon_mode(n)
     end
     PHASE[] = "after churn"
     if MARK
-        @assert empty_queues() "queues not empty after the abandonments: $(P.f_queued()), $(P.r_queued())"
+        @assert empty_queues() "queues not empty after the abandonments: $(f_queued()), $(r_queued())"
     end
     stale = V ? delta(c0, counts(), :stale) : -1
     close(wd)

@@ -280,12 +280,19 @@ end
 
 # The build's partr module, the scheduler backend it runs and the label its TSV rows carry.
 const PARTR = isdefined(Base, :Partr) ? Base.Partr : Base.Scheduler.Partr
+# A native build without its validation (the PR candidate) has neither the switch nor the queue-depth
+# probes: read them through these, which fall back to the rings' and the R heaps' own counts.
+const PARTR_VALIDATE = isdefined(PARTR, :SCHED_VALIDATE) && PARTR.SCHED_VALIDATE
+partr_f_queued() = isdefined(PARTR, :f_queued) ? PARTR.f_queued() :
+    sum((@atomic :monotonic q.n for q in PARTR.rings[PARTR.f_tpid + 1]); init = 0)
+partr_r_queued() = isdefined(PARTR, :r_queued) ? PARTR.r_queued() :
+    sum((@atomic :monotonic h.ntasks for h in PARTR.r_heaps[PARTR.f_tpid + 1]); init = 0)
 const MULTIQ_BACKEND = !isdefined(Base, :Scheduler) ? :partr :
     Base.Scheduler.ChosenScheduler === PARTR ? :partr :
     Symbol(lowercase(String(nameof(Base.Scheduler.ChosenScheduler))))
 const MULTIQ_BUILD = Base.GIT_VERSION_INFO.commit_short *
     (isdefined(Base, :Scheduler) ? "/" * String(MULTIQ_BACKEND) : "") *
-    (NATIVE_BUILD ? (PARTR.SCHED_VALIDATE ? "/native-validate" : "/native") :
+    (NATIVE_BUILD ? (PARTR_VALIDATE ? "/native-validate" : "/native") :
      isempty(Base.TAGGED_RELEASE_BANNER) ? "/local" : "")   # a source build: the control shares the official binary's commit
 MULTIQ_VARIANT == "A" || MULTIQ_BACKEND === :partr ||
     error("VARIANT=$(MULTIQ_VARIANT) patches partr, and this build's scheduler is $(MULTIQ_BACKEND)")
@@ -1110,7 +1117,7 @@ end
 if MULTIQ_NATIVE
     const _M_NEGATIVE = MULTIQ_VALIDATE ? get(ENV, "M_NEGATIVE", "") : ""
     _M_NEGATIVE in ("", "blind", "stall", "rblind") || error("M_NEGATIVE must be blind, stall or rblind")
-    MULTIQ_VALIDATE && !PARTR.SCHED_VALIDATE &&
+    MULTIQ_VALIDATE && !PARTR_VALIDATE &&
         error("VALIDATE=1 under VARIANT=$(MULTIQ_VARIANT) needs the native mark's validation build (Base.Partr.SCHED_VALIDATE = true)")
     # The build reads its negative control once, at its init.
     _M_NEGATIVE == "" || (ENV["JULIA_SCHED_NEGATIVE"] = _M_NEGATIVE)
@@ -2079,7 +2086,7 @@ const _NATIVE_COUNT_KEYS = (:f_first, :f_again, :l_first, :demoted, :f_pops, :l_
     :one_l, :none, :l_miss, :l_miss_r, :l_miss_none, :vstamp, :vlast, :vtwo, :run_r, :run_l, :run_r2, :run_l2,
     :f_cyc, :l_cyc, :both_f, :both_l, :caps, :clips, :acct, :f_choice, :k, :nsamp, :dl_sum, :dl_peak, :dq_sum,
     :dq_peak, :dh_sum, :dh_peak)
-_nvstates() = PARTR.SCHED_VALIDATE ? (PARTR.vs(Int(Threads.maxthreadid())); PARTR.vstates[1]) :
+_nvstates() = PARTR_VALIDATE ? (PARTR.vs(Int(Threads.maxthreadid())); PARTR.vstates[1]) :
               fill(NamedTuple{_NATIVE_COUNT_KEYS}(ntuple(_ -> 0, length(_NATIVE_COUNT_KEYS))), Int(Threads.maxthreadid()))
 _fstates() = MULTIQ_NATIVE ? _nvstates() : PARTR.fstates
 _sstates() = MULTIQ_NATIVE ? _nvstates() : PARTR.sstates
@@ -2107,7 +2114,7 @@ function multiq_queued(tp::Int)
         for h in MULTIQ_HEAP_LISTS[tp]
             n += @atomic :monotonic h.ntasks
         end
-        MULTIQ_FIFO && tp == PARTR.f_tpid + 1 && (n += PARTR.f_queued() + PARTR.r_queued())   # M, O: the F queue (or rings), and -g's R heaps, too
+        MULTIQ_FIFO && tp == PARTR.f_tpid + 1 && (n += partr_f_queued() + partr_r_queued())   # M, O: the F queue (or rings), and -g's R heaps, too
     else
         WS = Base.Scheduler.ChosenScheduler
         for r in WS.Rings[tp]
@@ -2229,9 +2236,9 @@ function multiq_variant_check()
             n = sum((h.ntasks for h in PARTR.heaps[tp]); init = 0)
             n == 0 || error("$MULTIQ_VARIANT: $n tasks left in the heaps of pool $tp")
         end
-        q = PARTR.f_queued()
+        q = partr_f_queued()
         q == 0 || error("$MULTIQ_VARIANT: $q tasks left in the F queue")
-        r = PARTR.r_queued()
+        r = partr_r_queued()
         r == 0 || error("$MULTIQ_VARIANT: $r tasks left in the R heaps")
         if MULTIQ_VALIDATE
             c = multiq_fifo_counts()
@@ -2727,7 +2734,7 @@ function multiq_fifo_check(label, before; f_first::Union{Int,Nothing}, desc::Uni
     d = NamedTuple{_F_FIELDS}(Tuple(getfield(now, k) - getfield(before, k) for k in _F_FIELDS))
     println(stderr, "validate: F counts, ", label, ": ", join(("$k $(getfield(d, k))" for k in _F_FIELDS), ", "),
             FIFO_GROUP ? ", R heaps peak $(maximum(s.r_peak for s in _fstates()))" : "")
-    q = PARTR.f_queued()
+    q = partr_f_queued()
     if FIFO_INHERIT === :none
         d.desc == 0 || error("$MULTIQ_VARIANT: $label: $(d.desc) descendants without inheritance")
     else
@@ -2742,7 +2749,7 @@ function multiq_fifo_check(label, before; f_first::Union{Int,Nothing}, desc::Uni
     if FIFO_GROUP
         d.f_again == 0 || error("$MULTIQ_VARIANT: $label: $(d.f_again) started tasks went into a ring")
         d.r_first == d.desc || error("$MULTIQ_VARIANT: $label: $(d.r_first) R first inserts for $(d.desc) descendants")
-        r = PARTR.r_queued()
+        r = partr_r_queued()
         r == 0 || error("$MULTIQ_VARIANT: $label: $r tasks left in the R heaps")
         d.r_pops == d.r_first + d.r_again ||
             error("$MULTIQ_VARIANT: $label: $(d.r_pops) R pops for $(d.r_first + d.r_again) R inserts")

@@ -564,8 +564,8 @@ function mq_body()::String
     d = Dict{String, Any}(string(k) => getfield(now, k) - getfield(before, k) for k in _F_FIELDS)
     d["marked_spawns"] = marked - last.marked
     d["marked_stamped"] = stamped - last.stamped
-    d["f_queued"] = P.f_queued()
-    d["r_queued"] = P.r_queued()
+    d["f_queued"] = partr_f_queued()
+    d["r_queued"] = partr_r_queued()
     d["stock_default_queued"] = sum((h.ntasks for h in P.heaps[P.f_tpid + 1]); init = 0)
     d["foreign_tids"] = [t for t in 1:Int(Threads.maxthreadid()) if Threads.threadpool(t) === :foreign]
     d["overflow_tids"] = Int(Threads.maxthreadid()) - multiq_f_nslots()

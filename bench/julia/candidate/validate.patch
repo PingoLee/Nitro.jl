@@ -1,0 +1,496 @@
+diff --git a/base/partr.jl b/base/partr.jl
+index ac57546e5f..a743adcf90 100644
+--- a/base/partr.jl
++++ b/base/partr.jl
+@@ -459,6 +459,14 @@ end
+ # request side. Only `:default` tasks are classed: a marked task of another pool that reaches the
+ # multiqueue takes stock's path with its class cleared.
+ 
++# The validation switch. The validation build differs from the timed build by this line only:
++# every counter, assert and negative control below is inside `@sched_validate`, which expands to
++# nothing when it is false.
++const SCHED_VALIDATE = true
++macro sched_validate(ex)
++    return SCHED_VALIDATE ? esc(ex) : nothing
++end
++
+ # The classes, in `Task.sched_class` (an atomic UInt8 in the task's first cache line).
+ const C_NONE = 0x00   # stock (L), or not classified yet
+ const C_F = 0x01      # a marked root that has not run: the rings
+@@ -499,6 +507,16 @@ end
+ const fp = fparams(_PAD8, DEFAULT_CAP, 2, false, _PAD12)
+ const fp_lock = SpinLock()
+ 
++# Validation build only: the negative control (0 none, 1 blind, 2 stall, 3 rblind) and, on x86_64,
++# whether the TSC is the clocksource (checked, reported, not acted on).
++@sched_validate begin
++    mutable struct vparams
++        @atomic neg::Int
++        @atomic tsc::Bool
++    end
++    const vp = vparams(0, false)
++end
++
+ # The pool flag, on a line nobody writes after it is set.
+ mutable struct fflag
+     pad0::NTuple{8,Int}
+@@ -515,6 +533,17 @@ function fair_init!()
+     w = get(ENV, "JULIA_SCHED_FAIR_WEIGHT", "1/2")
+     w4 = w == "1/4" ? 1 : w == "1/2" ? 2 : w == "3/4" ? 3 :
+          throw(ArgumentError(LazyString("JULIA_SCHED_FAIR_WEIGHT must be 1/4, 1/2 or 3/4, not ", w)))
++    @sched_validate begin
++        tsc = false
++        @static if Sys.ARCH === :x86_64
++            cs = "/sys/devices/system/clocksource/clocksource0/current_clocksource"
++            tsc = isfile(cs) && strip(read(cs, String)) == "tsc"
++        end
++        neg = let s = get(ENV, "JULIA_SCHED_NEGATIVE", "")
++            s == "" ? 0 : s == "blind" ? 1 : s == "stall" ? 2 : s == "rblind" ? 3 :
++                throw(ArgumentError(LazyString("JULIA_SCHED_NEGATIVE must be blind, stall or rblind, not ", s)))
++        end
++    end
+     lock(fp_lock)
+     try
+         if !(@atomic :monotonic fp.inited)
+@@ -530,6 +559,7 @@ function fair_init!()
+             end
+             @atomic :monotonic fp.cap = cap
+             @atomic :monotonic fp.w4 = w4
++            @sched_validate (@atomic :monotonic vp.neg = neg; @atomic :monotonic vp.tsc = tsc)
+             @atomic :release fp.inited = true
+         end
+     finally
+@@ -628,8 +658,66 @@ end
+     return sstates[1][tid]
+ end
+ 
++# Validation build only: per-thread counts, grown on demand (a foreign thread adopted later, such
++# as an I/O poller that wakes socket waiters, gets a slot of its own).
++@sched_validate begin
++    mutable struct vstate
++        f_first::Int; f_again::Int; l_first::Int; demoted::Int; f_pops::Int; l_pops::Int
++        skips::Int; own::Int; retries::Int; seen::Int; acq::Int; held::Int; desc::Int
++        r_first::Int; r_again::Int; r_pops::Int; r_peak::Int; foreign::Int; stock_bit::Int
++        stamps::Int     # clock reads by the timed code: ring stamps and group pops
++        gpops::Int      # pops made with the flag set
++        oyields::Int    # ring pops that found only pinned entries and yielded the OS thread
++        stale::Int      # pops that returned a task no longer runnable (the caller discards it)
++        two::Int; one_r::Int; one_l::Int; none::Int; l_miss::Int; l_miss_r::Int; l_miss_none::Int
++        vstamp::Int; vlast::Int; vtwo::Int
++        run_r::Int; run_l::Int; run_r2::Int; run_l2::Int
++        f_cyc::Int; l_cyc::Int; both_f::Int; both_l::Int; caps::Int; clips::Int; acct::Int; f_choice::Int
++        k::Int; nsamp::Int; dl_sum::Int; dl_peak::Int; dq_sum::Int; dq_peak::Int; dh_sum::Int; dh_peak::Int
++        vstate() = (v = new(); for i in 1:fieldcount(vstate); setfield!(v, i, 0); end; v)
++    end
++    const vstates = [Vector{vstate}(undef, 0)]
++    const vstates_lock = SpinLock()
++    function vs(tid::Int = Int(Threads.threadid()))
++        a = vstates[1]
++        tid <= length(a) && return @inbounds a[tid]
++        @lock vstates_lock begin
++            a = vstates[1]
++            if tid > length(a)
++                n = max(tid, Int(Threads.maxthreadid()))
++                b = Vector{vstate}(undef, n)
++                copyto!(b, a)
++                for i = (length(a) + 1):n
++                    b[i] = vstate()
++                end
++                vstates[1] = b
++                a = b
++            end
++        end
++        return a[tid]
++    end
++    # The counts summed over every thread (peaks too: read them per thread), and one thread's.
++    sched_counts() = NamedTuple{fieldnames(vstate)}(Tuple(sum((getfield(v, k) for v in vstates[1]); init = 0)
++                                                           for k in fieldnames(vstate)))
++    sched_counts(tid::Int) = (v = vs(tid); NamedTuple{fieldnames(vstate)}(Tuple(getfield(v, k) for k in fieldnames(vstate))))
++    sched_reset_peaks!() = foreach(v -> (v.r_peak = 0; v.dl_peak = 0; v.dq_peak = 0; v.dh_peak = 0), vstates[1])
++    @noinline function f_fail(msg::String)
++        ccall(:jl_safe_printf, Cvoid, (Cstring, Cstring), "%s\n", msg)
++        ccall(:abort, Cvoid, ())
++    end
++end
++
+ # Every ring lock goes through here.
++# The validation build counts acquisitions and, with a trylock first, how many found the lock held.
+ @inline function f_lock!(q::fqueue)
++    @sched_validate begin
++        v = vs()
++        v.acq += 1
++        if trylock(q.lock)
++            return nothing
++        end
++        v.held += 1
++    end
+     lock(q.lock)
+     return nothing
+ end
+@@ -659,6 +747,7 @@ end
+     i = f_idx(q, n + 1)
+     q.tasks[i] = task
+     st = s_stamp()
++    @sched_validate vs().stamps += 1
+     st > q.next || (st = q.next + UInt64(1))
+     q.seqs[i] = st
+     q.next = st
+@@ -709,6 +798,21 @@ end
+     return false
+ end
+ 
++@sched_validate begin
++    # After a pop under the lock: the popped entry was older than the new head when it was the
++    # head, and the first entries are still in stamp order.
++    @inline function f_check_order(q::fqueue, popped_seq::UInt64, k::Int)
++        n = Int(q.n)
++        k == 1 && n > 0 && q.seqs[q.head] <= popped_seq &&
++            f_fail(string("F: popped stamp ", popped_seq, " from the head, but the new head has ", q.seqs[q.head]))
++        for j in 2:min(n, 32)
++            q.seqs[f_idx(q, j)] > q.seqs[f_idx(q, j - 1)] ||
++                f_fail(string("F: entries ", j - 1, " and ", j, " are out of stamp order"))
++        end
++        return nothing
++    end
++end
++
+ # The ring pop, with the sticky-retry protocol: a task re-enqueued by `notify` before its own
+ # thread switched out of it keeps that thread's tid until the switch, and `jl_set_task_tid` fails
+ # for every other thread. So scan from the head over at most as many entries as the pool has
+@@ -733,9 +837,13 @@ function f_pop!(q::fqueue, tid::Int, nt::Int)
+         if 0 <= owner < 64
+             wake |= UInt64(1) << owner
+         end
++        @sched_validate vs(tid).skips += 1
+     end
++    @sched_validate hd = k == 0 && n > 0 ? q.tasks[q.head] : nothing
+     if k > 0
++        @sched_validate popped_seq = q.seqs[f_idx(q, k)]
+         f_remove!(q, k)
++        @sched_validate f_check_order(q, popped_seq, k)
+     end
+     unlock(q.lock)
+     while wake != 0
+@@ -748,9 +856,36 @@ function f_pop!(q::fqueue, tid::Int, nt::Int)
+             # Every scanned entry is pinned elsewhere: as stock's pop does for such a task, give up
+             # the CPU in case its owner needs it. The caller keeps polling.
+             yield_os_thread()
++            @sched_validate vs(tid).oyields += 1
++        end
++        @sched_validate begin
++            # A stall: every scanned entry pinned to a thread that never takes it. Count only while
++            # the head's owner makes no pop at all: 10^6 failed pops with no pop by the owner.
++            hd === nothing && return nothing
++            s = vs(tid)
++            o = Int(ccall(:jl_get_task_tid, Int16, (Any,), hd)) + 1
++            progress = o >= 1 ? vs(o).f_pops + vs(o).l_pops + vs(o).r_pops : -1
++            if s.retries == 0 || progress != s.seen
++                s.retries = 1
++                s.seen = progress
++            else
++                s.retries += 1
++            end
++            if s.retries == 1_000_000
++                f_fail(string("F: 10^6 pops in a row on tid ", tid, " found only entries pinned to other ",
++                    "threads, and the head's owner made no pop meanwhile; ", n, " queued; the head: owner tid ", o,
++                    ", task pool ", ccall(:jl_get_task_threadpoolid, Int8, (Any,), hd), ", sticky ", hd.sticky,
++                    ", class ", sched_class(hd), ", started ", ccall(:jl_is_task_started, Cint, (Any,), hd)))
++            end
+         end
+         return nothing
+     end
++    @sched_validate begin
++        s = vs(tid)
++        s.retries = 0
++        s.f_pops += 1
++        k > 1 && ccall(:jl_get_task_tid, Int16, (Any,), task) == tid - 1 && (s.own += 1)
++    end
+     return task
+ end
+ 
+@@ -775,11 +910,29 @@ function r_pop!(rs::Vector{fqueue}, tid::Int, nt::Int)
+     return nothing
+ end
+ 
++# The queues' depth, read racily (as stock's `ntasks`): the rings and the R heaps of `:default`.
++function f_queued()
++    n = 0
++    for q in rings[f_tpid + 1]
++        n += @atomic :monotonic q.n
++    end
++    return n
++end
++function r_queued()
++    n = 0
++    for h in r_heaps[f_tpid + 1]
++        n += @atomic :monotonic h.ntasks
++    end
++    return n
++end
++fair_on() = @atomic :acquire fl.on
++
+ # The request side's pop: the R heaps when `rr` says they have work, then the rings when `rf` does.
+ @inline function g_req_pop(rs::Vector{fqueue}, rr::Bool, rf::Bool, tid::Int, nt::Int)
+     if rr
+         t = r_multiq_deletemin()
+         if t !== nothing
++            @sched_validate vs(tid).r_pops += 1
+             return t
+         end
+     end
+@@ -787,6 +940,65 @@ end
+     return nothing
+ end
+ 
++@sched_validate begin
++    # The shape of a group pop, the misses of stock's two-choice sample, the time each side ran (a
++    # clock read of its own, never counted in `stamps`), and the queues' depth every 64th pop.
++    function v_gcount(v::vstate, lw::Bool, rr::Bool, rf::Bool, task, side::Int, lmiss::Bool)
++        two = lw && (rr || rf)
++        if two
++            v.two += 1
++        elseif rr || rf
++            v.one_r += 1
++        elseif lw
++            v.one_l += 1
++        else
++            v.none += 1
++        end
++        if lmiss
++            v.l_miss += 1
++            if task === nothing
++                v.l_miss_none += 1
++            elseif side == 1
++                v.l_miss_r += 1
++            end
++        end
++        vnow = s_stamp() % Int
++        if v.vlast != 0
++            dd = vnow > v.vstamp ? vnow - v.vstamp : 0
++            if v.vlast == 1
++                v.run_r += dd
++                v.vtwo != 0 && (v.run_r2 += dd)
++            else
++                v.run_l += dd
++                v.vtwo != 0 && (v.run_l2 += dd)
++            end
++        end
++        v.vstamp = vnow
++        v.vlast = task === nothing ? 0 : side
++        v.vtwo = two ? 1 : 0
++        v.k += 1
++        if v.k & 63 == 0
++            v.nsamp += 1
++            dl = 0
++            for h in heaps[f_tpid + 1]
++                dl += Int(@atomic :monotonic h.ntasks)
++            end
++            dq = f_queued()
++            dh = r_queued()
++            v.dl_sum += dl; dl > v.dl_peak && (v.dl_peak = dl)
++            v.dq_sum += dq; dq > v.dq_peak && (v.dq_peak = dq)
++            v.dh_sum += dh; dh > v.dh_peak && (v.dh_peak = dh)
++        end
++        return nothing
++    end
++    @inline v_stock_pop(v::vstate, task) =
++        task === nothing || (v.l_pops += 1; sched_class(task) == C_NONE || (v.stock_bit += 1))
++    # A popped task that is no longer runnable: `trypoptask` discards it and pops again (an
++    # abandoned task left in a queue). The pop is counted as made; this says it ran nothing.
++    @inline v_stale(v::vstate, task) =
++        task === nothing || (@atomic :monotonic task._state) == 0x00 || (v.stale += 1)
++end
++
+ # A task with no class, at its first enqueue, made runnable by a task of class F or R, in the
+ # pool: a descendant, R from here on. Reached only with the flag set.
+ @inline function fair_descendant(task::Task)
+@@ -794,6 +1006,7 @@ end
+             sched_class(current_task()) != C_NONE &&
+             ccall(:jl_get_task_threadpoolid, Int8, (Any,), task) == f_tpid
+         set_sched_class!(task, C_R)
++        @sched_validate vs().desc += 1
+         return true
+     end
+     return false
+@@ -802,8 +1015,10 @@ end
+ # Inlined into `enq_work`: with nothing marked, stock's insert is one call deep, and this wrapper
+ # adds no frame, safepoint or call of its own.
+ @inline function multiq_insert(task::Task, priority::UInt16)
++    @sched_validate ccall(:jl_threadpoolid, Int8, (Int16,), Threads.threadid() - 1) == Int8(-1) && (vs().foreign += 1)
+     c = sched_class(task)
+     if c == C_NONE && !(@atomic :monotonic fl.on)
++        @sched_validate ccall(:jl_is_task_started, Cint, (Any,), task) == 0 && (vs().l_first += 1)
+         return stock_multiq_insert(task, priority)
+     end
+     return fair_insert_entry(task, priority, c)
+@@ -814,6 +1029,7 @@ end
+ @noinline function fair_insert_entry(task::Task, priority::UInt16, c::UInt8)
+     if c == C_NONE
+         if !fair_descendant(task)
++            @sched_validate ccall(:jl_is_task_started, Cint, (Any,), task) == 0 && (vs().l_first += 1)
+             return stock_multiq_insert(task, priority)
+         end
+         c = C_R
+@@ -830,13 +1046,19 @@ end
+     if ccall(:jl_get_task_threadpoolid, Int8, (Any,), task) != f_tpid
+         # Only `:default` tasks are classed: stock's path, with the class cleared.
+         set_sched_class!(task, C_NONE)
++        @sched_validate vs().demoted += 1
+         return stock_multiq_insert(task, priority)
+     end
+     if c == C_R
++        @sched_validate started ? (vs().r_again += 1) : (vs().r_first += 1)
+         r_multiq_insert(task, priority)
++        @sched_validate let v = vs(), n = r_queued()
++            n > v.r_peak && (v.r_peak = n)
++        end
+         return true
+     end
+     # A root that has not run: a ring. The rings and the accounts are sized before the flag is set.
++    @sched_validate vs().f_first += 1
+     ring_p = rings_size(f_tpid)
+     if !(@atomic :monotonic fl.on)
+         sstates_size(Int(Threads.maxthreadid()))
+@@ -852,6 +1074,7 @@ end
+ function multiq_deletemin()
+     if !(@atomic :acquire fl.on)
+         task = stock_multiq_deletemin()
++        @sched_validate (v_stock_pop(vs(), task); v_stale(vs(), task))
+         return task
+     end
+     return fair_deletemin()
+@@ -862,6 +1085,7 @@ end
+     tpid = ccall(:jl_threadpoolid, Int8, (Int16,), tid - 1)
+     if tpid != f_tpid   # another pool, or a foreign thread (which stock gives nothing)
+         task = stock_multiq_deletemin()
++        @sched_validate (v_stock_pop(vs(tid), task); v_stale(vs(tid), task))
+         return task
+     end
+     local task::Union{Nothing,Task}
+@@ -871,23 +1095,39 @@ end
+     lw = !stock_multiq_check_empty()
+     rr = !r_multiq_check_empty()
+     rf = r_any(rs)
++    @sched_validate begin
++        v = vs(tid)
++        v.gpops += 1
++        lmiss = false
++    end
+     # The clock at every pop: the interval since this thread's previous pop is the run of the task
+     # that pop returned (`s.last`'s side), credited only when that pop found both sides with work.
+     now = s_stamp()
++    @sched_validate v.stamps += 1
+     if s.last != 0 && s.k != 0
+         d = now > s.stamp ? Int(now - s.stamp) : 0
+         cap = @atomic :monotonic fp.cap
+         if d > cap
+             d = cap
++            @sched_validate v.clips += 1
+         end
+         w4 = @atomic :monotonic fp.w4
+         b = s.last == 1 ? s.bal + d * (4 - w4) : s.bal - d * w4
+         if b > 2 * cap
+             b = 2 * cap
++            @sched_validate v.caps += 1
+         elseif b < -2 * cap
+             b = -2 * cap
++            @sched_validate v.caps += 1
+         end
+         s.bal = b
++        @sched_validate if s.last == 1
++            v.f_cyc += d
++            v.both_f += d
++        else
++            v.l_cyc += d
++            v.both_l += d
++        end
+     end
+     s.stamp = now
+     s.k = lw && (rr || rf) ? 1 : 0
+@@ -900,28 +1140,41 @@ end
+             if task === nothing
+                 task = stock_multiq_deletemin()
+                 side = 2
++                @sched_validate task === nothing && !stock_multiq_check_empty() && (lmiss = true)
+             end
+         else
+             task = stock_multiq_deletemin()
+             side = 2
++            @sched_validate task === nothing && !stock_multiq_check_empty() && (lmiss = true)
+             if task === nothing
+                 task = g_req_pop(rs, true, true, tid, nt)
+                 side = 1
+             end
+         end
++        @sched_validate begin
++            v.acct += 1
++            rfirst && (v.f_choice += 1)
++        end
+     elseif rr || rf
+         task = g_req_pop(rs, rr, rf, tid, nt)
+         side = 1
+         if task === nothing
+             task = stock_multiq_deletemin()
+             side = 2
++            @sched_validate task === nothing && !stock_multiq_check_empty() && (lmiss = true)
+         end
+     elseif lw
+         task = stock_multiq_deletemin()
+         side = 2
++        @sched_validate task === nothing && !stock_multiq_check_empty() && (lmiss = true)
+     else
+         task = nothing
+     end
++    @sched_validate begin
++        side == 2 && v_stock_pop(v, task)
++        v_gcount(v, lw, rr, rf, task, side, lmiss)
++        v_stale(v, task)
++    end
+     s.last = task === nothing ? 0 : side
+     return task
+ end
+@@ -929,11 +1182,44 @@ end
+ function multiq_check_empty()
+     stock_multiq_check_empty() || return false
+     (@atomic :acquire fl.on) || return true
++    @sched_validate (@atomic :monotonic vp.neg) == 1 && return true   # blind: ignores the rings
+     ccall(:jl_threadpoolid, Int8, (Int16,), Threads.threadid() - 1) == f_tpid || return true
+     for q in rings[f_tpid + 1]
+         (@atomic :monotonic q.n) == 0 || return false
+     end
++    @sched_validate (@atomic :monotonic vp.neg) == 3 && return true   # rblind: ignores the R heaps
+     return r_multiq_check_empty()
+ end
+ 
++@sched_validate begin
++    # For the probes: remove `t` from whichever ring holds it, or from the R heap that holds it,
++    # under that structure's lock; whether it was found.
++    function f_take_back!(t::Task)
++        for q in rings[f_tpid + 1]
++            lock(q.lock)
++            k = findfirst(j -> q.tasks[f_idx(q, j)] === t, 1:Int(q.n))
++            k === nothing || f_remove!(q, k)
++            unlock(q.lock)
++            k === nothing || return true
++        end
++        return false
++    end
++    function r_take_back!(t::Task)
++        for h in r_heaps[f_tpid + 1]
++            lock(h.lock)
++            n = Int(h.ntasks)
++            k = findfirst(j -> h.tasks[j] === t, 1:n)
++            if k !== nothing
++                h.tasks[k] = h.tasks[n]
++                Base.unsetindex!(h.tasks, n)
++                @atomic :monotonic h.ntasks = Int32(n - 1)
++                n == 1 && (@atomic :monotonic h.priority = typemax(UInt16))
++            end
++            unlock(h.lock)
++            k === nothing || return true
++        end
++        return false
++    end
++end
++
+ end
