@@ -1,0 +1,37 @@
+round	build	file	args	layout	exit	line
+1	control	spawn_path.jl	plain 50	8,0	0	spawn_path 1.15.0-DEV.974 419aba7972: threads=8,0 mode=plain clients=50 rps=3838963
+1	candidate	spawn_path.jl	plain 50	8,0	0	spawn_path 1.15.0-DEV.976 2e8094f8ea: threads=8,0 mode=plain clients=50 rps=3804397
+1	control	spawn_path.jl	fair 50	8,0	0	spawn_path 1.15.0-DEV.974 419aba7972: fair= not supported by this build
+1	candidate	spawn_path.jl	fair 50	8,0	0	spawn_path 1.15.0-DEV.976 2e8094f8ea: threads=8,0 mode=fair clients=50 rps=3083321
+1	control	spawn_path.jl	plain 500	8,0	0	spawn_path 1.15.0-DEV.974 419aba7972: threads=8,0 mode=plain clients=500 rps=3869007
+1	candidate	spawn_path.jl	plain 500	8,0	0	spawn_path 1.15.0-DEV.976 2e8094f8ea: threads=8,0 mode=plain clients=500 rps=3802086
+1	control	spawn_path.jl	fair 500	8,0	0	spawn_path 1.15.0-DEV.974 419aba7972: fair= not supported by this build
+1	candidate	spawn_path.jl	fair 500	8,0	0	spawn_path 1.15.0-DEV.976 2e8094f8ea: threads=8,0 mode=fair clients=500 rps=3104588
+1	control	armed.jl	unarmed	8,1	0	armed 1.15.0-DEV.974 419aba7972: threads=8,1 mode=unarmed median_s=0.7911 min_s=0.7745
+1	candidate	armed.jl	unarmed	8,1	0	armed 1.15.0-DEV.976 2e8094f8ea: threads=8,1 mode=unarmed median_s=0.7933 min_s=0.7748
+1	control	armed.jl	armed	8,1	0	armed 1.15.0-DEV.974 419aba7972: fair= not supported by this build
+1	candidate	armed.jl	armed	8,1	0	armed 1.15.0-DEV.976 2e8094f8ea: threads=8,1 mode=armed median_s=0.8396 min_s=0.8075
+2	candidate	spawn_path.jl	plain 50	8,0	0	spawn_path 1.15.0-DEV.976 2e8094f8ea: threads=8,0 mode=plain clients=50 rps=3818025
+2	control	spawn_path.jl	plain 50	8,0	0	spawn_path 1.15.0-DEV.974 419aba7972: threads=8,0 mode=plain clients=50 rps=3879271
+2	candidate	spawn_path.jl	fair 50	8,0	0	spawn_path 1.15.0-DEV.976 2e8094f8ea: threads=8,0 mode=fair clients=50 rps=3071715
+2	control	spawn_path.jl	fair 50	8,0	0	spawn_path 1.15.0-DEV.974 419aba7972: fair= not supported by this build
+2	candidate	spawn_path.jl	plain 500	8,0	0	spawn_path 1.15.0-DEV.976 2e8094f8ea: threads=8,0 mode=plain clients=500 rps=3792353
+2	control	spawn_path.jl	plain 500	8,0	0	spawn_path 1.15.0-DEV.974 419aba7972: threads=8,0 mode=plain clients=500 rps=3863496
+2	candidate	spawn_path.jl	fair 500	8,0	0	spawn_path 1.15.0-DEV.976 2e8094f8ea: threads=8,0 mode=fair clients=500 rps=3132196
+2	control	spawn_path.jl	fair 500	8,0	0	spawn_path 1.15.0-DEV.974 419aba7972: fair= not supported by this build
+2	candidate	armed.jl	unarmed	8,1	0	armed 1.15.0-DEV.976 2e8094f8ea: threads=8,1 mode=unarmed median_s=0.7863 min_s=0.775
+2	control	armed.jl	unarmed	8,1	0	armed 1.15.0-DEV.974 419aba7972: threads=8,1 mode=unarmed median_s=0.7823 min_s=0.7672
+2	candidate	armed.jl	armed	8,1	0	armed 1.15.0-DEV.976 2e8094f8ea: threads=8,1 mode=armed median_s=0.8328 min_s=0.8056
+2	control	armed.jl	armed	8,1	0	armed 1.15.0-DEV.974 419aba7972: fair= not supported by this build
+3	control	spawn_path.jl	plain 50	8,0	0	spawn_path 1.15.0-DEV.974 419aba7972: threads=8,0 mode=plain clients=50 rps=3848684
+3	candidate	spawn_path.jl	plain 50	8,0	0	spawn_path 1.15.0-DEV.976 2e8094f8ea: threads=8,0 mode=plain clients=50 rps=3805426
+3	control	spawn_path.jl	fair 50	8,0	0	spawn_path 1.15.0-DEV.974 419aba7972: fair= not supported by this build
+3	candidate	spawn_path.jl	fair 50	8,0	0	spawn_path 1.15.0-DEV.976 2e8094f8ea: threads=8,0 mode=fair clients=50 rps=3065159
+3	control	spawn_path.jl	plain 500	8,0	0	spawn_path 1.15.0-DEV.974 419aba7972: threads=8,0 mode=plain clients=500 rps=3886469
+3	candidate	spawn_path.jl	plain 500	8,0	0	spawn_path 1.15.0-DEV.976 2e8094f8ea: threads=8,0 mode=plain clients=500 rps=3833861
+3	control	spawn_path.jl	fair 500	8,0	0	spawn_path 1.15.0-DEV.974 419aba7972: fair= not supported by this build
+3	candidate	spawn_path.jl	fair 500	8,0	0	spawn_path 1.15.0-DEV.976 2e8094f8ea: threads=8,0 mode=fair clients=500 rps=3129205
+3	control	armed.jl	unarmed	8,1	0	armed 1.15.0-DEV.974 419aba7972: threads=8,1 mode=unarmed median_s=0.7885 min_s=0.77
+3	candidate	armed.jl	unarmed	8,1	0	armed 1.15.0-DEV.976 2e8094f8ea: threads=8,1 mode=unarmed median_s=0.7931 min_s=0.7753
+3	control	armed.jl	armed	8,1	0	armed 1.15.0-DEV.974 419aba7972: fair= not supported by this build
+3	candidate	armed.jl	armed	8,1	0	armed 1.15.0-DEV.976 2e8094f8ea: threads=8,1 mode=armed median_s=0.8338 min_s=0.8017

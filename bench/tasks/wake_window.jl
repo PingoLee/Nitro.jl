@@ -256,7 +256,7 @@ end
 
 rounds, enqueued = MODE == "ring" ? run_ring() : run_wake()
 
-neg = VALIDATE ? string(@atomic P.fp.neg) : "-"
+neg = VALIDATE ? string(isdefined(P, :vp) ? (@atomic P.vp.neg) : (@atomic P.fp.neg)) : "-"
 # The ring control (#618 Idea 14, bench/julia/native-mark-nopass.patch): only its build has the field.
 nopass = VALIDATE && hasfield(typeof(P.fp), :nopass) ? string(getfield(P.fp, :nopass, :sequentially_consistent)) : "-"
 c = VALIDATE ? P.sched_counts() : nothing

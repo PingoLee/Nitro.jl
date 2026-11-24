@@ -224,3 +224,66 @@ Agent-config #82 Idea 17, session 2. Local experiments, not proposed to Julia. F
   section S3 gives every ratio as a speed. The driver logs, per `gated` block and around `jperf`, which
   JIT object caches (`objcache*/data.mdb`, Julia 1.14 and later) changed; blocks `rounds_fifo.sh` gates
   itself are not covered.
+
+## The PR candidate (#618, session 4)
+
+The measured design in the form a reviewer of Julia would receive it: the port's two commits rebased on
+JuliaLang/julia `master` at **`419aba7972bfcb5f18bf8514fe7c86babdb1fa29`** (2026-11-24), with every line
+of validation code taken out, tests in Julia's own `test/`, the experimental marking and the
+environment variable's manual entry. Local only: nothing here was pushed to, or proposed on, JuliaLang.
+
+| Patch | sha256 | What |
+|---|---|---|
+| `candidate/0001-*.patch` | `56da7f51c27df7c42dc2541104701defd79dc44a3c489ef68df6bdc777c2e7bc` | commit 1, the measured design, tests, NEWS, manual |
+| `candidate/0002-*.patch` | `e075ff604c476aab24b8e59cd15536d0aed9c9e7f98988bd0f834ec6c56a77a9` | commit 2, the unmarked insert inlined into `enq_work` |
+| `candidate/validate.patch` | `70dca07e2c7caa1a7d1fec924f556103cc4f7925b5e504644de5af402518e19e` | the validation, put back on top (additions only, switch on) |
+
+`git am` the two `000*` files on `419aba7972` to get the candidate; add `validate.patch` with `git apply`
+for the validation build. The commit messages are kept in the series.
+
+**What differs from `native-mark-master.patch` and why.**
+- Nothing under the patch moved between `4b0df1484a` and the pin: `git diff 4b0df1484a 419aba7972` is
+  empty over `base/partr.jl`, `base/task.jl`, `base/threadingconstructs.jl`, `base/boot.jl`,
+  `src/julia_threads.h`, `src/jltypes.c`, `src/task.c` and `src/scheduler.c`. The cherry-pick applied
+  without a conflict (`test/core.jl` merged at an offset), and `jl_task_t`'s last padding byte in the
+  first cache line (offset 63) was still free.
+- The R heaps regenerated from the pin's four functions are text-identical to the port's;
+  `r_heaps.jl check` passes on the candidate and fails, as it must, on the tag's branch (both pops).
+- The validation is gone: the `SCHED_VALIDATE` switch and its macro, the counters, the order assert,
+  the stall detector, the three planted errors, the probe helpers, the queue-depth probes
+  (`f_queued`, `r_queued`, `fair_on`) and the unread `fp.tsc`. `fparams` loses `neg` and `tsc`.
+- Comments that named this repository or the experiment are rewritten. The `fair` keyword's docstring
+  and the manual entry carry Julia's experimental warning ("This interface is experimental and
+  subject to change or removal without notice.", as `@opaque` and `Base.Experimental` mark theirs) and
+  a `!!! compat "Julia 1.15"`. NEWS.md has an entry under *Multi-threading changes*.
+- Tests: a testset at the end of `test/threads_exec.jl` (the keyword, the class each task gets, every
+  marked task run once, cancellation of marked work in four forms), run by `threads.jl` at five thread
+  layouts, and the atomic-field line of `test/core.jl`.
+
+**Branches and trees** (local clone `~/app/julia-62285/src`, push URL `DISABLED`; trees under
+`~/app/julia-618-master/`, the master trees' `Make.user`, `build.sh <tree>`, a wrapper and a first depot
+each): `nitro-618-fair-candidate` (tree `candidate`), `nitro-618-fair-candidate-validate` (tree
+`candidate-validate`), `validate-off` (the validation branch with the switch set back to false,
+uncommitted: it compiles the three entry points to the candidate's code), and the pin untouched, built
+twice (`pin-control`, `pin-control2` with an untracked marker; it reports `419aba7972*`).
+
+**Which checks run where.** On `candidate-validate`: `rounds_fifo.sh PROFILE=native VALIDATE=1` with
+its three negative controls, `native_checks.jl` (8,1, 8,2, 1), `master_checks.jl` (8,1, 8,2),
+`wake_window.jl` ring and wake at 2,1 with the rblind positive control. On `candidate`: the checks
+that need no counter (`native_checks.jl` and `master_checks.jl` now run on a build without the
+validation and skip what reads the counters), Julia's tests, and the new testset alone 20 times at
+each layout. The bench scripts read `SCHED_VALIDATE` and the depth probes behind `isdefined` now.
+
+### The evidence, regenerable
+
+`candidate_evidence.sh <master> <master, second build> <this PR>` regenerates every number the PR
+description quotes, from any three builds: the claims table's rows a–i (in its header), the standalone
+reproducers in `candidate/` and the description's reproducer, behind `quiet.sh`, with the ps check
+and the cache-write check around every step. It writes `raw/` (the per-round TSVs), `environment.md`
+and `results.md`; `results.md` is written by `candidate_evidence_report.jl`, never by hand, and gives
+each row as a claim, the command, a table of speeds (above 1 is faster) and the criterion with PASS or
+FAIL. The reproducers in `candidate/` need only the standard library and run on any build (a build
+without the keyword says so): `julia --threads=8,1 candidate/starved.jl [fair]`, `fib_fine.jl`,
+`armed.jl [armed]`, `julia --threads=2 candidate/pfib.jl [none|root|all]`,
+`julia --threads=8,0 candidate/spawn_path.jl [plain|fair] [clients]`. This session's run is in
+`evidence/candidate-20261124/` (run with `OUT=` there; the default output under `bench/results/` is ignored by git). In the committed copy, absolute home paths read `~` and the test logs' host name reads `<host>`; nothing else was edited.

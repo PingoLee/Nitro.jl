@@ -10,7 +10,12 @@
 # left, before anything is marked.
 const P = Base.Partr
 hasfield(Task, :sched_class) || error("native_checks: this julia has no native mark (Task.sched_class)")
-const V = P.SCHED_VALIDATE
+const V = isdefined(P, :SCHED_VALIDATE) && P.SCHED_VALIDATE
+# The PR candidate has no validation code: neither the switch nor the queue-depth probes. These read
+# the same state from the structures themselves.
+fair_on() = @atomic :acquire P.fl.on
+f_queued() = isdefined(P, :f_queued) ? P.f_queued() : sum((@atomic :monotonic q.n for q in P.rings[P.f_tpid + 1]); init = 0)
+r_queued() = isdefined(P, :r_queued) ? P.r_queued() : sum((@atomic :monotonic h.ntasks for h in P.r_heaps[P.f_tpid + 1]); init = 0)
 ok(msg) = println(stderr, "native_checks: ok: ", msg)
 const ND, NI = Threads.nthreads(:default), Threads.nthreads(:interactive)
 println(stderr, "native_checks: ", VERSION, " ", Base.GIT_VERSION_INFO.commit_short, V ? " (validation build)" : "",
@@ -18,7 +23,7 @@ println(stderr, "native_checks: ", VERSION, " ", Base.GIT_VERSION_INFO.commit_sh
 
 # The sysimage: Partr's new structures are saved with it, so they must be empty and unsized there, as
 # stock's heaps are, the flag unset, the init not run and the cap at its default.
-@assert !P.fair_on() "the pool flag is set before anything is marked"
+@assert !fair_on() "the pool flag is set before anything is marked"
 @assert all(isempty, P.rings) "rings sized in the image: $(length.(P.rings))"
 @assert all(isempty, P.r_heaps) "R heaps sized in the image: $(length.(P.r_heaps))"
 @assert isempty(P.sstates[1]) "accounts sized in the image: $(length(P.sstates[1]))"
@@ -45,7 +50,7 @@ ok("a new task's class is 0, also on memory freed from 10,000 marked tasks")
 
 # Unmarked work never sets the flag.
 @assert sum(fetch.([Threads.@spawn :default sum(1:10) for _ in 1:2000])) == 2000 * 55
-@assert !P.fair_on() "the flag was set by unmarked spawns"
+@assert !fair_on() "the flag was set by unmarked spawns"
 ok("2,000 unmarked spawns leave the flag unset")
 
 # The option. A started task cannot be marked.
@@ -53,15 +58,15 @@ t = Threads.@spawn 1 + 1
 wait(t)
 err = try; Threads._spawn_set_fair(t, true); nothing; catch e; e; end
 @assert err isa ArgumentError "marking a started task did not throw"
-@assert fetch(Threads.@spawn :default fair=false 2) == 2 && !P.fair_on()
+@assert fetch(Threads.@spawn :default fair=false 2) == 2 && !fair_on()
 c0 = V ? P.sched_counts() : nothing
 x = 40
 @assert fetch(Threads.@spawn :default fair=(x > 0) $x + 2) == 42
 @assert (@atomic P.fp.inited) "the first fair=true spawn did not run the init"
 println(stderr, "native_checks: cap ", @atomic(P.fp.cap), " clock units = 10 ms (", @atomic(P.fp.cap) / 10, " per ms), ",
-        "TSC clocksource ", @atomic(P.fp.tsc), ", weight ", @atomic(P.fp.w4), "/4")
+        "TSC clocksource ", isdefined(P, :vp) ? @atomic(P.vp.tsc) : hasfield(typeof(P.fp), :tsc) ? @atomic(P.fp.tsc) : "-", ", weight ", @atomic(P.fp.w4), "/4")
 if ND >= 2
-    @assert P.fair_on() "a marked :default spawn on a pool of $ND threads did not set the flag"
+    @assert fair_on() "a marked :default spawn on a pool of $ND threads did not set the flag"
     @assert length(P.rings[2]) == 2 * ND "$(length(P.rings[2])) rings for $ND threads"
     @assert length(P.sstates[1]) >= Threads.maxthreadid() "accounts not sized before the flag"
     V && (d = P.sched_counts(); @assert d.f_first - c0.f_first == 1 && d.f_pops - c0.f_pops == 1 "F counts $(d.f_first - c0.f_first), $(d.f_pops - c0.f_pops)")
@@ -69,7 +74,7 @@ if ND >= 2
 else
     # A pool of one thread: enq_work sends every task to the thread's own queue, never to the
     # multiqueue, so nothing is sized and the flag stays unset.
-    @assert !P.fair_on() && isempty(P.rings[2]) "a one-thread :default pool reached the rings"
+    @assert !fair_on() && isempty(P.rings[2]) "a one-thread :default pool reached the rings"
     ok("one-thread :default pool: the marked task ran from the thread's own queue; flag unset, nothing sized")
 end
 
@@ -95,7 +100,7 @@ if NI >= 1
     mine, child = interactive_parent()
     if NI == 1
         @assert mine == P.C_F "a marked task of a one-thread :interactive pool ran with class $mine"
-        want = P.fair_on() ? P.C_R : P.C_NONE
+        want = fair_on() ? P.C_R : P.C_NONE
         @assert child == want "its :default child ran with class $child, expected $want"
         ok("marked :interactive task (1 thread): ran with F, its :default child with $(child == P.C_R ? "R" : "no class")")
     else
@@ -144,7 +149,7 @@ if ND >= 2
     VERSION < v"1.15-" && @assert r === nothing "a finished root is still reachable"
     VERSION < v"1.15-" && @assert k === nothing "a finished descendant is still reachable"
     r = k = nothing
-    @assert P.f_queued() == 0 && P.r_queued() == 0
+    @assert f_queued() == 0 && r_queued() == 0
     ok("a finished root (from a ring) and its descendant (from an R heap): no slot holds them; collected: root " *
        string(wr.value === nothing) * ", descendant " * string(wk.value === nothing))
 end
