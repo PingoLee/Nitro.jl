@@ -13,7 +13,7 @@ using Statistics, Printf
 
 const OUT = ARGS[1]
 const COLS = split(get(ENV, "PU_COLS", "ctl m2 bp bp2 s1 s2"))   # slim2.sh: "ctl m2 bp bp2 s2 s2b"
-const LAYOUTS = ["2,1", "4,1"]
+const LAYOUTS = split(get(ENV, "PU_REPORT_LAYOUTS", "2,1 4,1"))   # master_measure.sh SESSION=3: "8,1"
 
 kv(line) = Dict(split(f, '=', limit = 2)[1] => split(f, '=', limit = 2)[2] for f in split(chomp(line), '\t') if occursin('=', f))
 readline_kv(path) = kv(readline(path))
@@ -98,6 +98,7 @@ function print_a1(g, res)
                 println("| IPC (u) | $role | ", join(fmt.(ipc), " | "), " |")
             end
         end
+        haskey(res, (l, "m2")) || (println(); continue)   # the separation is the 2026-11-21 builds' question
         println("\nSeparation (medians, all threads): m2 − bp, m2 − bp2, |bp − bp2|; ✔ = m2 off both by more than bp off bp2\n")
         println("| counter | role | m2 − bp | m2 − bp2 | \\|bp − bp2\\| | sep | s1 − bp | s2 − bp |")
         println("|---|---|--:|--:|--:|:-:|--:|--:|")

@@ -5,7 +5,9 @@
 # Builds are named by the commit label each row carries (multiq_variant.jl's MULTIQ_BUILD, which ends
 # in `*` for a tree marked dirty): ctl (master 4b0df1484a), ctl2 (the same commit again), mark
 # (a570d2c9d9; split by variant: mark = nothing marked, markN = N, markArm = N-arm), inline (ca2a5c7f0b),
-# bypass (ffa1184f7b*), ws and base (#62285's head 84961e79ff, work-stealing and partr).
+# bypass (ffa1184f7b*), ws and base (#62285's head 84961e79ff, work-stealing and partr); session 3
+# (SESSION=3, section S3): july (6ac8c4f030, the merge-base, the master trees' Make.user) and july-n
+# (6ac8c4f030*, the same commit with base's Make.user: a native sysimage).
 # A ratio is "slower" as its metric says: times (fib_fine, tasks.jl ns, pfib) above 1 are slower,
 # throughputs (rps) below 1 are slower. Each tree is read only against its own base.
 using Dates, Printf
@@ -36,6 +38,8 @@ function col_of(commit::AbstractString, variant::AbstractString = "A")
     c == "ffa1184f7b*" && return "bypass"
     c == "84961e79ff/workstealing" && return "ws"
     c == "84961e79ff/partr" && return "base"
+    c == "6ac8c4f030" && return "july"
+    c == "6ac8c4f030*" && return "july-n"
     if c == "a570d2c9d9"
         variant == "N-none" && return "mark"
         variant == "N-arm" && return "markArm"
@@ -70,7 +74,7 @@ function ratio_line(cell::Cell, a, b, lower)
 end
 
 # ------------------------------------------------------------------------------------------ header
-println(io, "# #618 session 2 report: ", OUT, "\n")
+println(io, "# #618 report of master_measure.sh: ", OUT, "\n")
 log = joinpath(OUT, "driver.log")
 if isfile(log)
     for l in eachline(log)
@@ -490,4 +494,94 @@ if isfile(tsv)
         isfile(e) && println(io, "--- stderr (last 60 lines)\n", join(last(readlines(e), 60), "\n"))
         println(io, "```")
     end
+end
+
+# ------------------------------------------------------------------------------------------ session 3
+# Master at #62285's merge-base, built twice (SESSION=3). Every ratio here is a SPEED against its
+# reference: above 1 is faster (a throughput ratio, or the reference's time over this one's).
+const S3_COLS = ["july", "july-n", "base", "ctl", "ctl2"]
+const S3_PAIRS = [("base", "july-n", "base/july-n: the branch, one configuration"),
+                  ("ctl", "july", "control/july: master's four months, one configuration"),
+                  ("july-n", "july", "july-n/july: the build configuration, one source"),
+                  ("ctl2", "ctl", "control2/control: the floor"),
+                  ("ctl", "base", "control/base: session 2's gap")]
+speed(cell::Cell, a, b, lower) = lower ? perround(cell, b, a) : perround(cell, a, b)
+function s3_reading(cell::Cell, lower)
+    m(a, b) = med(speed(cell, a, b, lower))
+    fl = abs(m("ctl2", "ctl") - 1)
+    bar = max(0.05, 3fl)
+    beyond(x) = !isnan(x) && abs(x - 1) > bar
+    b, ms, t = m("base", "july-n"), m("ctl", "july"), m("july-n", "july")
+    v = beyond(b) && !beyond(ms) ? "**THE BRANCH**" : beyond(ms) && !beyond(b) ? "**MASTER**" :
+        beyond(b) && beyond(ms) ? "**BOTH** (branch $(f3(b)), master $(f3(ms)))" : "**NEITHER READABLE**"
+    beyond(t) && (v *= "; **CONFIGURATION** (july-n/july $(f3(t)))")
+    return bar, v
+end
+function s3_cell(name, cell::Cell, lower, unit, summary)
+    isempty(cell) && return
+    println(io, "\n### $name ($unit)\n")
+    columns_table(cell, S3_COLS, unit)
+    println(io, "\n| speed per round (above 1 is faster) | median [min–max] | faster in |\n|---|--:|--:|")
+    for (a, b, what) in S3_PAIRS
+        r = speed(cell, a, b, lower)
+        isempty(r) && continue
+        println(io, "| $what | $(fmt(r; f = f3)) | $(count(>(1), r)) of $(length(r)) |")
+    end
+    bar, v = s3_reading(cell, lower)
+    println(io, "\nBar: beyond 5% and beyond 3 × |control2/control − 1| = $(f3(bar)). Reading: $v")
+    push!(summary, "| $name ($unit) | " * join([fg(med(values_of(cell, c))) for c in S3_COLS], " · ") * " | " *
+          join([f3(med(speed(cell, a, b, lower))) for (a, b, _) in S3_PAIRS[1:4]], " | ") * " | $(f3(bar)) | $v |")
+end
+const S3_SERVER_COL = Dict("july" => "july", "july-n" => "july-n", "base" => "base", "control" => "ctl", "control2" => "ctl2")
+if any(isdir(joinpath(OUT, s)) for s in ("jtasks", "jspawn", "jpool", "jperf", "jplain81", "jplain80"))
+    println(io, "\n## S3. Master at #62285's merge-base: is base/control the branch or master?\n")
+    println(io, "Columns: july (6ac8c4f030, the master trees' multi-target Make.user), july-n (the same commit, base's native Make.user), base (#62285's head, partr), ctl and ctl2 (master 4b0df1484a, twice). Every ratio is a SPEED: above 1 is faster.")
+    summary = String[]
+    mp = joinpath(OUT, "jtasks", "costrounds-micro.tsv")
+    if isfile(mp)
+        for row in ("SpawnWait", "FanOut1000")
+            local c = Cell()
+            for l in eachline(mp)
+                v = split(l, '\t')
+                length(v) >= 11 && v[7] == row && startswith(v[8], "ns_per_op=") || continue
+                add!(c, parse(Int, v[1]), col_of(replace(v[end], "build=" => ""), split(v[4], '%')[1]), num(replace(v[8], "ns_per_op=" => "")))
+            end
+            s3_cell("tasks.jl $row, 8,1", c, true, "ns/op", summary)
+        end
+    end
+    rows = readtsv(joinpath(OUT, "jspawn", "costrounds-spawn.tsv"))
+    for (lay, cl) in (("8,1", "interactive"), ("8,0", "default")), C in ("50", "500")
+        local c = Cell()
+        for r in rows
+            (r["threads"] == lay && r["clients"] == cl && r["c"] == C) || continue
+            add!(c, parse(Int, r["round"]), col_of(r["commit"], r["variant"]), num(r["rps"]))
+        end
+        s3_cell("spawn path H = 0, C = $C, :$cl, $lay", c, false, "req/s", summary)
+    end
+    rows = readtsv(joinpath(OUT, "jpool", "pool.tsv"))
+    for (lay, cl) in (("8,1", "interactive"), ("8,0", "default"))
+        local c = Cell()
+        for r in rows
+            r["threads"] == lay && r["clients"] == cl || continue
+            add!(c, parse(Int, r["round"]), col_of(r["commit"], r["variant"]), num(r["rps"]))
+        end
+        s3_cell("Channel worker pool, C = 500, :$cl, $lay", c, false, "req/s", summary)
+    end
+    for (step, lay) in (("jplain81", "8,1"), ("jplain80", "8,0"))
+        local c = Cell()
+        for r in fairness_rows(step)
+            flayout(r["mode"]) == lay || continue
+            local m = match(r"%(\w[\w-]*)$", r["mode"]); m === nothing && continue
+            haskey(S3_SERVER_COL, m[1]) || continue
+            add!(c, parse(Int, r["round"]), S3_SERVER_COL[m[1]], num(r["oha_rps"]))
+        end
+        s3_cell("/plaintext, oha, c = 500, $lay", c, false, "oha rps", summary)
+    end
+    if !isempty(summary)
+        println(io, "\n### The table (medians; speeds above 1 are faster)\n")
+        println(io, "| cell | july · july-n · base · control · control2 | base/july-n | control/july | july-n/july | control2/control | bar | reading |")
+        println(io, "|---|---|--:|--:|--:|--:|--:|---|")
+        foreach(l -> println(io, l), summary)
+    end
+    isdir(joinpath(OUT, "jperf")) && println(io, "\nPart B: `PU_COLS=\"july julyn base ctl\" PU_REPORT_LAYOUTS=8,1 julia bench/julia/perf_report.jl $(joinpath(OUT, "jperf"))`.")
 end

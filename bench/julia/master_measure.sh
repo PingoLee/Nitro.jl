@@ -49,6 +49,19 @@
 # Usage: bench/julia/master_measure.sh   (detached: setsid nohup … > driver.out 2>&1 < /dev/null &)
 #   SMOKE=1: every step once, short (TD=1 for the harness windows, one round, NOGATE=1, D steps on one
 #   small set), into results/s2-smoke; never a measurement.
+#
+# SESSION=3 (agent-config #82 Idea 19): master at #62285's merge-base, 6ac8c4f030, untouched, built
+# twice: july (the master trees' Make.user, the multi-target sysimage) and july-n (base's Make.user
+# without JULIA_SCHEDULER: with JULIA_CPU_TARGET empty, Make.inc sets MARCH=native, so a native sysimage
+# AND a C runtime built with -march=native, as ws and base have; an untracked marker makes it report
+# 6ac8c4f030*). Five columns, nothing marked: july, july-n, base, control, control2, J_ROUNDS (10)
+# rotated rounds, one throwaway slot first, a fresh process a round. base/july-n is the branch at one
+# configuration, control/july four months of master at one configuration, july-n/july the build
+# configuration at one source, control2/control the floor. Steps, uncuttable first: jtasks (tasks.jl SpawnWait and
+# FanOut1000 at 8,1), jspawn (H = 0, C = 50 and 500, :interactive 8,1 and :default 8,0), jpool (the
+# Channel worker pool, C = 500, 8,1 and 8,0), jperf (part B: perf_unmarked.sh a1g1 on july, july-n,
+# base and control at 8,1, labels july julyn base ctl), jplain81; cuttable jplain80 (/plaintext, oha,
+# c = 500). Results in results/s3 (s3-smoke). Report: master_measure_report.jl <OUT>, section S3.
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
@@ -56,16 +69,18 @@ J="$HOME/app/julia-618-master"
 B="$J/bin"
 T="$HOME/app/julia-618/bin"
 export SMOKE="${SMOKE:-0}"
+export SESSION="${SESSION:-2}"
 # A block reached through `--run` (behind quiet.sh, which reassigns an exported OUT) takes the
 # parent's results directory from S2_OUT.
 [ "${1:-}" = --run ] && [ -n "${S2_OUT:-}" ] && OUT="$S2_OUT"
 if [ "$SMOKE" = 1 ]; then
   export TD="${TD:-1}" NOGATE=1
-  OUT="${OUT:-$J/results/s2-smoke}"
-  A_ROUNDS=1 B_ROUNDS=1 C_ROUNDS=1 CM_ROUNDS=1 E1_ROUNDS=1
+  OUT="${OUT:-$J/results/s$SESSION-smoke}"
+  A_ROUNDS=1 B_ROUNDS=1 C_ROUNDS=1 CM_ROUNDS=1 E1_ROUNDS=1 J_ROUNDS=1
 else
-  OUT="${OUT:-$J/results/s2}"
+  OUT="${OUT:-$J/results/s$SESSION}"
   A_ROUNDS="${A_ROUNDS:-15}" B_ROUNDS="${B_ROUNDS:-5}" C_ROUNDS="${C_ROUNDS:-6}" CM_ROUNDS="${CM_ROUNDS:-5}" E1_ROUNDS="${E1_ROUNDS:-6}"
+  J_ROUNDS="${J_ROUNDS:-10}"
 fi
 mkdir -p "$OUT"
 export S2_OUT="$OUT"
@@ -74,13 +89,17 @@ export S2_OUT="$OUT"
 export S2_DRIVER_PID="${S2_DRIVER_PID:-$$}"
 LOG="$OUT/driver.log"
 export PATH="$HOME/.local/go/bin:$HOME/.local/bin:$HOME/.juliaup/bin:$PATH"
-export JLS="control=$B/julia-control control2=$B/julia-control2 mark=$B/julia-mark mark-inline=$B/julia-mark-inline mark-bypass=$B/julia-mark-bypass mark-validate=$B/julia-mark-validate mark-all=$B/julia-mark-all mark-inline-validate=$B/julia-mark-inline-validate ws=$T/julia-ws base=$T/julia-base"
+export JLS="control=$B/julia-control control2=$B/julia-control2 mark=$B/julia-mark mark-inline=$B/julia-mark-inline mark-bypass=$B/julia-mark-bypass mark-validate=$B/julia-mark-validate mark-all=$B/julia-mark-all mark-inline-validate=$B/julia-mark-inline-validate ws=$T/julia-ws base=$T/julia-base july=$B/julia-july july-n=$B/julia-july-n"
 EM="$J/envs/micro-master" EJ="$J/envs/micro-july" SM="$J/envs/server-master" SJ="$J/envs/server-july"
-export MICRO_PROJECT="$EM" MICRO_PROJECTS="ws=$EJ base=$EJ"
+export MICRO_PROJECT="$EM" MICRO_PROJECTS="ws=$EJ base=$EJ july=$EJ july-n=$EJ"
 JULIAS4="control=$B/julia-control,$SM mark=$B/julia-mark,$SM ws=$T/julia-ws,$SJ base=$T/julia-base,$SJ"
+# Session 3's server columns: the merge-base builds and base load the July environments, the two
+# controls master's.
+JULIAS5="july=$B/julia-july,$SJ july-n=$B/julia-july-n,$SJ base=$T/julia-base,$SJ control=$B/julia-control,$SM control2=$B/julia-control2,$SM"
 CPUS8="0,1,2,3,6,7,8,9"
 AGG="/aggregate?n=100000&op=groupby"
 FIVE="A%control A%control2 N-none%mark N-none%mark-inline N-none%mark-bypass"
+JULY5="A%july A%july-n A%base A%control A%control2"
 WIN_DUR_S="${WIN_DUR_S:-300}"
 
 log() { echo "[$(date '+%F %T')] $*" | tee -a "$LOG"; }
@@ -159,11 +178,22 @@ rf() { PROFILE=native JL="$B/julia-control" "$ROOT/bench/tasks/rounds_fifo.sh" "
 
 # A gated command (quiet.sh), retried on a failed gate (3) or a stopped block (4), twice at most.
 # NOGATE=1 runs it directly (the smoke).
+# Julia >= 1.14 keeps a JIT object cache (LMDB, `cache/v1.1x/objcache*/data.mdb`) in the first depot,
+# written by every process. It is not a package image, so cache_check ignores it; this logs, per
+# gated block and outside the timed command, which data.mdb files changed (size bytes, mtime).
+objsnap() { find "${DEPOTS[@]}" "$HOME/.julia/cache" -path '*objcache*' -name data.mdb -printf '%p %s %T@\n' 2>/dev/null | sort; }
+objcache_log() {   # label, snapshot before
+  local after; after="$(objsnap)"
+  if [ "$after" = "$2" ]; then log "objcache $1: no data.mdb written"
+  else log "objcache $1: data.mdb written (path size mtime, after):"; comm -13 <(echo "$2") <(echo "$after") | tee -a "$LOG"; fi
+}
 gated() {   # label, command...
-  local attempt=1 rc
+  local attempt=1 rc o0
   [ "${NOGATE:-0}" = 1 ] && { shift; "$@"; return $?; }
   while :; do
+    o0="$(objsnap)"
     "$ROOT/bench/socket/quiet.sh" "$@"; rc=$?
+    objcache_log "$1" "$o0" >/dev/null   # its caller sends stdout to $LOG too: write it once
     { [ "$rc" = 3 ] || [ "$rc" = 4 ]; } || return "$rc"
     [ "$attempt" -le 2 ] || return "$rc"
     log "gated $1: attempt $attempt ended with status $rc; retrying"
@@ -233,7 +263,7 @@ FAIR_ROUNDS_OF() { [ "$SMOKE" = 1 ] && echo 1 || echo "$1"; }
 FAIR_DUR() { [ "$SMOKE" = 1 ] && echo 2s || echo 8s; }
 step_server() {  # label, route, modes, rounds, extra env...
   local label="$1" route="$2" modes="$3" n; n="$(FAIR_ROUNDS_OF "$4")"; shift 4
-  gated "618s2-$label" env "$@" FRESH=1 BACKLOG=1024 ROTATE=1 THROWAWAY=1 PROBE=0 ROUTE="$route" JULIAS="$JULIAS4" \
+  gated "618s2-$label" env "$@" FRESH=1 BACKLOG=1024 ROTATE=1 THROWAWAY=1 PROBE=0 ROUTE="$route" JULIAS="${SERVER_JULIAS:-$JULIAS4}" \
     "$ROOT/bench/socket/fairness.sh" "$modes" "$n" "$(FAIR_DUR)" >>"$LOG" 2>&1
 }
 
@@ -278,6 +308,21 @@ pool_rounds() {  # tsv, rounds, columns...
       done
     done
   done
+}
+
+# ---------------------------------------------------------------- session 3, part B (perf_unmarked.sh)
+# perf stat on spawnwait_fixed.jl at N and 2N, attached after the warm-up: step a1g1 (cycles and
+# instructions, user and kernel, context switches, migrations), the builds rotated a pair, at 8,1 on
+# CPUS8. perf_unmarked.sh runs its block behind quiet.sh itself and checks its builds' depots; its own
+# ps check waits for julia, oha and go-server processes (there are none of the driver's here).
+step_jperf() {
+  local n="${PERF_N:-3000000}" pairs="${PERF_PAIRS:-5}"
+  [ "$SMOKE" = 1 ] && { n=100000; pairs=1; }
+  local o0 rc; o0="$(objsnap)"   # perf_unmarked.sh gates its own blocks; log the step as a whole
+  FROM= PERF_UNMARKED_OUT="$OUT/jperf" N="$n" PAIRS="$pairs" STEPS=a1g1 PU_LAYOUTS="8,1:$CPUS8" \
+    PU_BUILDS="july:$B/julia-july:$J/depot-july julyn:$B/julia-july-n:$J/depot-july-n base:$T/julia-base:$HOME/app/julia-618/depot-base ctl:$B/julia-control:$J/depot-control" \
+    "$HERE/perf_unmarked.sh" >>"$LOG" 2>&1
+  rc=$?; objcache_log jperf "$o0"; return "$rc"
 }
 
 # ---------------------------------------------------------------- part D
@@ -358,14 +403,19 @@ if [ "${1:-}" = --run ]; then shift; "$@"; exit $?; fi
 
 UNTIMED=" bshare dtests donethread dinline "
 CUTTABLE=" a21f a21s a41s ctasks dinline bpfib "
-STEPS="${STEPS:-a81f a80h bstarved bmixed bshare bcell1 cspawn cserver cmixed cplain81 cplain80 cfj dtests donethread e1 a21f a21s a41s ctasks dinline bpfib}"
+DEFAULT_STEPS="a81f a80h bstarved bmixed bshare bcell1 cspawn cserver cmixed cplain81 cplain80 cfj dtests donethread e1 a21f a21s a41s ctasks dinline bpfib"
+if [ "$SESSION" = 3 ]; then
+  CUTTABLE=" jplain80 "
+  DEFAULT_STEPS="jtasks jspawn jpool jperf jplain81 jplain80"
+fi
+STEPS="${STEPS:-$DEFAULT_STEPS}"
 if [ -n "${FROM:-}" ]; then
   STEPS="$(echo "$STEPS" | tr ' ' '\n' | sed -n "/^${FROM}\$/,\$p" | tr '\n' ' ')"
   [ -n "$STEPS" ] || stop "FROM=$FROM is not a step"
 fi
 
-log "driver start: steps [$STEPS], OUT $OUT, SMOKE=$SMOKE, rounds A $A_ROUNDS B $B_ROUNDS C $C_ROUNDS mixed-C $CM_ROUNDS E1 $E1_ROUNDS${DEADLINE:+, deadline $(date -d @"$DEADLINE" '+%F %T') for [$CUTTABLE]}"
-for w in control control2 mark mark-inline mark-bypass mark-validate mark-all mark-inline-validate; do
+log "driver start: session $SESSION, steps [$STEPS], OUT $OUT, SMOKE=$SMOKE, rounds A $A_ROUNDS B $B_ROUNDS C $C_ROUNDS mixed-C $CM_ROUNDS E1 $E1_ROUNDS S3 $J_ROUNDS${DEADLINE:+, deadline $(date -d @"$DEADLINE" '+%F %T') for [$CUTTABLE]}"
+for w in control control2 mark mark-inline mark-bypass mark-validate mark-all mark-inline-validate july july-n; do
   log "build $w: $("$B/julia-$w" --startup-file=no -e 'print(VERSION, " ", Base.GIT_VERSION_INFO.commit_short)' 2>&1 | head -1)"
 done
 for w in ws base; do log "build $w: $("$T/julia-$w" --startup-file=no -e 'print(VERSION, " ", Base.GIT_VERSION_INFO.commit_short)' 2>&1 | head -1)"; done
@@ -403,6 +453,13 @@ for s in $STEPS; do
     donethread) step_donethread ;;
     dinline) step_dinline ;;
     e1) step_fib e1 8,1 "$CPUS8" "A%control N-none%mark N-arm%mark" "$E1_ROUNDS" ;;
+    jtasks) step_micro jtasks 8,1 "$CPUS8" "$JULY5" "$J_ROUNDS" ;;
+    jspawn) step_h0 jspawn "8,1 interactive;8,0 default" "$JULY5" "$J_ROUNDS" ;;
+    jpool) mkdir -p "$OUT/jpool"; rm -f "$OUT/jpool/pool.tsv"
+           gated 618s3-jpool "$0" --run pool_rounds "$OUT/jpool/pool.tsv" "$J_ROUNDS" $JULY5 >>"$LOG" 2>&1 ;;
+    jperf) step_jperf ;;
+    jplain81) SERVER_JULIAS="$JULIAS5" step_server jplain81 /plaintext "bare_spawn@8,1%july bare_spawn@8,1%july-n bare_spawn@8,1%base bare_spawn@8,1%control bare_spawn@8,1%control2" "$J_ROUNDS" OHA=1 CLIENT_CPU=1 ;;
+    jplain80) SERVER_JULIAS="$JULIAS5" step_server jplain80 /plaintext "bare_spawn@8,0%july bare_spawn@8,0%july-n bare_spawn@8,0%base bare_spawn@8,0%control bare_spawn@8,0%control2" "$J_ROUNDS" OHA=1 CLIENT_CPU=1 ;;
     *) stop "unknown step $s" ;;
   esac
   rc=$?

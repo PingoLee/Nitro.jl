@@ -214,3 +214,13 @@ Agent-config #82 Idea 17, session 2. Local experiments, not proposed to Julia. F
     pool flag is set for the whole process.
   - `MICRO_PROJECTS="<label>=<env>"` (`rounds_fifo.sh`): a column's tasks.jl runs in its own
     environment.
+- `SESSION=3` (agent-config #82 Idea 19): master at #62285's merge-base `6ac8c4f030`, built twice under
+  `~/app/julia-618-master/` (`july` with the master trees' multi-target `Make.user`, `july-n` with
+  `base`'s native one), timed beside `base`, `control` and `control2` so that base/july-n reads the
+  branch, control/july reads master and july-n/july reads the build configuration (an empty
+  `JULIA_CPU_TARGET` sets `MARCH=native`, so the C runtime differs as well as the sysimage). Part B is
+  `perf_unmarked.sh` `a1g1` at `8,1`, which now takes absolute wrapper and depot paths in `PU_BUILDS`
+  (`perf_report.jl`: `PU_REPORT_LAYOUTS`), and whose cache check reads `compiled/` only. The report's
+  section S3 gives every ratio as a speed. The driver logs, per `gated` block and around `jperf`, which
+  JIT object caches (`objcache*/data.mdb`, Julia 1.14 and later) changed; blocks `rounds_fifo.sh` gates
+  itself are not covered.
