@@ -1,0 +1,234 @@
+--- a/base/partr.jl	2026-11-24 21:07:38.939167907 -0300
++++ b/base/partr.jl	2026-11-24 21:07:38.957168331 -0300
+@@ -107,7 +107,10 @@
+     end
+ end
+ 
+-function multiq_size(tpid::Int8)
++# The four heap functions take the heap vector (with its lock, or its size function) so that the
++# R heaps below share their bodies; stock's and the R side's are thin callers, so each still
++# compiles to code of its own.
++@inline function _multiq_size(heaps::Vector{Vector{taskheap}}, heaps_lock::Vector{SpinLock}, tpid::Int8)
+     nt = UInt32(Threads._nthreads_in_pool(tpid))
+     if nt == 0
+         # A pool with no threads can still receive tasks (e.g. during
+@@ -148,11 +151,13 @@
+ 
+     return heap_p
+ end
++multiq_size(tpid::Int8) = _multiq_size(heaps, heaps_lock, tpid)
+ 
+-function stock_multiq_insert(task::Task, priority::UInt16)
++@inline function _multiq_insert(heaps::Vector{Vector{taskheap}}, heap_size::F, task::Task,
++                                priority::UInt16) where {F}
+     tpid = ccall(:jl_get_task_threadpoolid, Int8, (Any,), task)
+     @assert tpid > -1 "invalid tpid"
+-    heap_p = multiq_size(tpid)
++    heap_p = heap_size(tpid)
+     tp = tpid + 1
+ 
+     task.priority = priority
+@@ -180,10 +185,11 @@
+ 
+     return true
+ end
++stock_multiq_insert(task::Task, priority::UInt16) = _multiq_insert(heaps, multiq_size, task, priority)
+ 
+ yield_os_thread() = @static Sys.iswindows() ? ccall(:SwitchToThread, stdcall, Cint, ()) : ccall(:sched_yield, Cint, ())
+ 
+-function stock_multiq_deletemin()
++@inline function _multiq_deletemin(heaps::Vector{Vector{taskheap}})
+     local rn1::UInt32
+     local heap, task
+ 
+@@ -253,8 +259,9 @@
+ 
+     return task
+ end
++stock_multiq_deletemin() = _multiq_deletemin(heaps)
+ 
+-function stock_multiq_check_empty()
++@inline function _multiq_check_empty(heaps::Vector{Vector{taskheap}})
+     tid = Threads.threadid()
+     tp = ccall(:jl_threadpoolid, Int8, (Int16,), tid-1) + 1
+     if tp == 0 # Foreign thread
+@@ -267,172 +274,16 @@
+     end
+     return true
+ end
++stock_multiq_check_empty() = _multiq_check_empty(heaps)
+ 
+-# The R heaps: a second set of stock heaps, for request work in flight (see below). Stock's own
+-# size, insert, two-choice pop with the sticky retry, and check: the four functions above, copied
+-# with `heaps`, `heaps_lock` and their names renamed. Empty and unsized until a task of class R is
+-# inserted.
++# The R heaps: a second set of stock heaps, for request work in flight (see below), through stock's
++# four bodies above. Empty and unsized until a task of class R is inserted.
+ const r_heaps = [Vector{taskheap}(undef, 0), Vector{taskheap}(undef, 0)]
+ const r_heaps_lock = [SpinLock(), SpinLock()]
+-
+-function r_multiq_size(tpid::Int8)
+-    nt = UInt32(Threads._nthreads_in_pool(tpid))
+-    if nt == 0
+-        # A pool with no threads can still receive tasks (e.g. during
+-        # sysimage bootstrap); size the r_heaps so insertion can park them
+-        # instead of indexing an empty heap vector.
+-        nt = UInt32(1)
+-    end
+-    tp = tpid + 1
+-    tpheaps = r_heaps[tp]
+-    heap_c = UInt32(2)
+-    heap_p = UInt32(length(tpheaps))
+-
+-    if heap_c * nt <= heap_p
+-        return heap_p
+-    end
+-
+-    @lock r_heaps_lock[tp] begin
+-        # Re-read under the lock; growing from a stale copy would replace the
+-        # current r_heaps and orphan tasks concurrently inserted into them (#62144).
+-        tpheaps = r_heaps[tp]
+-        heap_p = UInt32(length(tpheaps))
+-        nt = UInt32(Threads._nthreads_in_pool(tpid))
+-        if nt == 0
+-            nt = UInt32(1)
+-        end
+-        if heap_c * nt <= heap_p
+-            return heap_p
+-        end
+-
+-        heap_p += heap_c * nt
+-        newheaps = Vector{taskheap}(undef, heap_p)
+-        copyto!(newheaps, tpheaps)
+-        for i = (1 + length(tpheaps)):heap_p
+-            newheaps[i] = taskheap()
+-        end
+-        r_heaps[tp] = newheaps
+-    end
+-
+-    return heap_p
+-end
+-
+-function r_multiq_insert(task::Task, priority::UInt16)
+-    tpid = ccall(:jl_get_task_threadpoolid, Int8, (Any,), task)
+-    @assert tpid > -1 "invalid tpid"
+-    heap_p = r_multiq_size(tpid)
+-    tp = tpid + 1
+-
+-    task.priority = priority
+-
+-    rn = cong(heap_p)
+-    tpheaps = r_heaps[tp]
+-    while !trylock(tpheaps[rn].lock)
+-        rn = cong(heap_p)
+-    end
+-
+-    heap = tpheaps[rn]
+-    if heap.ntasks >= length(heap.tasks)
+-        resize!(heap.tasks, length(heap.tasks) * 2)
+-    end
+-
+-    ntasks = heap.ntasks + Int32(1)
+-    @atomic :monotonic heap.ntasks = ntasks
+-    heap.tasks[ntasks] = task
+-    multiq_sift_up(heap, ntasks)
+-    priority = heap.priority
+-    if task.priority < priority
+-        @atomic :monotonic heap.priority = task.priority
+-    end
+-    unlock(heap.lock)
+-
+-    return true
+-end
+-
+-function r_multiq_deletemin()
+-    local rn1::UInt32
+-    local heap, task
+-
+-    tid = Threads.threadid()
+-    tp = ccall(:jl_threadpoolid, Int8, (Int16,), tid-1) + 1
+-    if tp == 0 # Foreign thread
+-        return nothing
+-    end
+-    tpheaps = r_heaps[tp]
+-
+-    while true
+-        GC.safepoint()
+-        heap_p = UInt32(length(tpheaps))
+-        for i = UInt32(0):heap_p
+-            if i == heap_p
+-                return nothing
+-            end
+-            rn1 = cong(heap_p)
+-            rn2 = cong(heap_p)
+-            prio1 = tpheaps[rn1].priority
+-            prio2 = tpheaps[rn2].priority
+-            if prio1 > prio2
+-                prio1 = prio2
+-                rn1 = rn2
+-            elseif prio1 == prio2 && prio1 == typemax(UInt16)
+-                continue
+-            end
+-            if trylock(tpheaps[rn1].lock)
+-                if prio1 == tpheaps[rn1].priority
+-                    break
+-                end
+-                unlock(tpheaps[rn1].lock)
+-            end
+-        end
+-
+-        @assert @isdefined(rn1) "Assertion to tell the compiler about the definedness of this variable"
+-
+-        heap = tpheaps[rn1]
+-        task = heap.tasks[1]
+-        if ccall(:jl_set_task_tid, Cint, (Any, Cint), task, tid-1) == 0
+-            # This task is sticky to a different thread, so we can't run it.
+-            # Wake that thread so it can come pick up its own work, then keep
+-            # looking for something we are allowed to run.
+-            task_tid = ccall(:jl_get_task_tid, Int16, (Any,), task)
+-            unlock(heap.lock)
+-            if task_tid != Int16(-1)
+-                ccall(:jl_wakeup_thread, Cint, (Int16,), task_tid)
+-            end
+-            # Keep polling (the owner may release the task without waking
+-            # anyone), but give up the CPU in case that thread needs it.
+-            yield_os_thread()
+-            continue
+-        end
+-        break
+-    end
+-    ntasks = heap.ntasks
+-    @atomic :monotonic heap.ntasks = ntasks - Int32(1)
+-    heap.tasks[1] = heap.tasks[ntasks]
+-    Base.unsetindex!(heap.tasks, Int(ntasks))
+-    prio1 = typemax(UInt16)
+-    if ntasks > 1
+-        multiq_sift_down(heap, Int32(1))
+-        prio1 = heap.tasks[1].priority
+-    end
+-    @atomic :monotonic heap.priority = prio1
+-    unlock(heap.lock)
+-
+-    return task
+-end
+-
+-function r_multiq_check_empty()
+-    tid = Threads.threadid()
+-    tp = ccall(:jl_threadpoolid, Int8, (Int16,), tid-1) + 1
+-    if tp == 0 # Foreign thread
+-        return true
+-    end
+-    for i = UInt32(1):length(r_heaps[tp])
+-        if r_heaps[tp][i].ntasks != 0
+-            return false
+-        end
+-    end
+-    return true
+-end
++r_multiq_size(tpid::Int8) = _multiq_size(r_heaps, r_heaps_lock, tpid)
++r_multiq_insert(task::Task, priority::UInt16) = _multiq_insert(r_heaps, r_multiq_size, task, priority)
++r_multiq_deletemin() = _multiq_deletemin(r_heaps)
++r_multiq_check_empty() = _multiq_check_empty(r_heaps)
+ 
+ # ---------------------------------------------------------------------------------------------
+ # Opt-in arrival order for marked tasks (experimental).

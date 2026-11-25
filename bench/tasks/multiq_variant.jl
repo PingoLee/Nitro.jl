@@ -2989,7 +2989,9 @@ function _f_unit_asserts()
         lock(q.lock); _ring_push!(q, t); unlock(q.lock)
         return t
     end
-    pop(q, ids, tid = me) = (t = P.f_pop!(q, tid, nt); t === nothing ? 0 : ids[t])
+    # The candidate's second version gives the ring pop the thread's accounts (its wake mask).
+    ringpop(q, tid) = applicable(P.f_pop!, q, tid, nt) ? P.f_pop!(q, tid, nt) : P.f_pop!(q, tid, nt, P.acct(tid))
+    pop(q, ids, tid = me) = (t = ringpop(q, tid); t === nothing ? 0 : ids[t])
     # Fill and drain, across ring growth (capacity 256).
     q, ids = newq(), IdDict{Task,Int}()
     foreach(i -> push(q, ids, i), 1:600)

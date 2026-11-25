@@ -1,0 +1,1146 @@
+From 69d2a83696e293322d2abab5e6308b0a0ae50560 Mon Sep 17 00:00:00 2001
+From: PingoLee <eurafael@msn.com>
+Date: Tue, 24 Nov 2026 14:50:15 -0300
+Subject: [PATCH 1/2] scheduler: add an experimental fair class for spawned
+ tasks
+
+`Threads.@spawn fair=true` marks a root task. Until it first runs, a marked
+root waits in FIFO rings, stamped at insert, instead of the priority heaps;
+a pop samples two rings and takes the older head. Once it has started, it
+and every task it first makes runnable are queued in a second set of the
+stock heaps. When both that work and other tasks are waiting, a thread
+shares its time between the two by a weight (`JULIA_SCHED_FAIR_WEIGHT`,
+default 1/2), so closed-loop clients that spawn work and wait on it are
+served in about the order they arrived instead of being starved by newer
+work. Only `:default` tasks are classed. The class is one byte, the last
+padding byte of the first cache line of `jl_task_t`. Until something is
+marked, the scheduler's entry points take the stock path after one load
+of a flag.
+
+The keyword and the variable are experimental and may change.
+
+Assisted-by: Claude Code (Opus 5.5)
+---
+ NEWS.md                                 |   5 +
+ base/boot.jl                            |   2 +-
+ base/partr.jl                           | 692 +++++++++++++++++++++++-
+ base/threadingconstructs.jl             |  42 +-
+ doc/src/manual/environment-variables.md |  14 +
+ src/jltypes.c                           |   6 +-
+ src/julia_threads.h                     |   4 +-
+ src/task.c                              |   2 +
+ test/core.jl                            |   2 +-
+ test/threads_exec.jl                    | 168 ++++++
+ 10 files changed, 927 insertions(+), 10 deletions(-)
+
+diff --git a/NEWS.md b/NEWS.md
+index 7272888d6d..c7fc7c3b44 100644
+--- a/NEWS.md
++++ b/NEWS.md
+@@ -41,6 +41,11 @@ Multi-threading changes
+   the default control state, so for example unmasking floating-point exceptions with
+   `feenableexcept` no longer makes compilation fail. The sticky exception status flags are not
+   preserved across task switches, nor across any of those runtime entries ([#51277], [#63570]).
++* `Threads.@spawn fair=true` marks a task as a root of request work (experimental). While
++  anything is marked, marked `:default` tasks start in approximately the order they were spawned,
++  the tasks they make runnable are served with them, and a thread shares its time between that
++  work and the rest by a weight set with `JULIA_SCHED_FAIR_WEIGHT`. A program that marks nothing
++  is scheduled as before.
+ 
+ Build system changes
+ --------------------
+diff --git a/base/boot.jl b/base/boot.jl
+index f7cd429802..bf01036d92 100644
+--- a/base/boot.jl
++++ b/base/boot.jl
+@@ -198,7 +198,7 @@
+ #    @atomic _isexception::UInt8
+ #    @atomic preempt_request::UInt8
+ #    bound_cancel_default::UInt8
+-#    pad02::UInt8
++#    @atomic sched_class::UInt8
+ #    rngState0::UInt64
+ #    rngState1::UInt64
+ #    rngState2::UInt64
+diff --git a/base/partr.jl b/base/partr.jl
+index 30d6c92808..c9364e0eb9 100644
+--- a/base/partr.jl
++++ b/base/partr.jl
+@@ -149,7 +149,7 @@ function multiq_size(tpid::Int8)
+     return heap_p
+ end
+ 
+-function multiq_insert(task::Task, priority::UInt16)
++function stock_multiq_insert(task::Task, priority::UInt16)
+     tpid = ccall(:jl_get_task_threadpoolid, Int8, (Any,), task)
+     @assert tpid > -1 "invalid tpid"
+     heap_p = multiq_size(tpid)
+@@ -183,7 +183,7 @@ end
+ 
+ yield_os_thread() = @static Sys.iswindows() ? ccall(:SwitchToThread, stdcall, Cint, ()) : ccall(:sched_yield, Cint, ())
+ 
+-function multiq_deletemin()
++function stock_multiq_deletemin()
+     local rn1::UInt32
+     local heap, task
+ 
+@@ -254,7 +254,7 @@ function multiq_deletemin()
+     return task
+ end
+ 
+-function multiq_check_empty()
++function stock_multiq_check_empty()
+     tid = Threads.threadid()
+     tp = ccall(:jl_threadpoolid, Int8, (Int16,), tid-1) + 1
+     if tp == 0 # Foreign thread
+@@ -268,4 +268,690 @@ function multiq_check_empty()
+     return true
+ end
+ 
++# The R heaps: a second set of stock heaps, for request work in flight (see below). Stock's own
++# size, insert, two-choice pop with the sticky retry, and check: the four functions above, copied
++# with `heaps`, `heaps_lock` and their names renamed. Empty and unsized until a task of class R is
++# inserted.
++const r_heaps = [Vector{taskheap}(undef, 0), Vector{taskheap}(undef, 0)]
++const r_heaps_lock = [SpinLock(), SpinLock()]
++
++function r_multiq_size(tpid::Int8)
++    nt = UInt32(Threads._nthreads_in_pool(tpid))
++    if nt == 0
++        # A pool with no threads can still receive tasks (e.g. during
++        # sysimage bootstrap); size the r_heaps so insertion can park them
++        # instead of indexing an empty heap vector.
++        nt = UInt32(1)
++    end
++    tp = tpid + 1
++    tpheaps = r_heaps[tp]
++    heap_c = UInt32(2)
++    heap_p = UInt32(length(tpheaps))
++
++    if heap_c * nt <= heap_p
++        return heap_p
++    end
++
++    @lock r_heaps_lock[tp] begin
++        # Re-read under the lock; growing from a stale copy would replace the
++        # current r_heaps and orphan tasks concurrently inserted into them (#62144).
++        tpheaps = r_heaps[tp]
++        heap_p = UInt32(length(tpheaps))
++        nt = UInt32(Threads._nthreads_in_pool(tpid))
++        if nt == 0
++            nt = UInt32(1)
++        end
++        if heap_c * nt <= heap_p
++            return heap_p
++        end
++
++        heap_p += heap_c * nt
++        newheaps = Vector{taskheap}(undef, heap_p)
++        copyto!(newheaps, tpheaps)
++        for i = (1 + length(tpheaps)):heap_p
++            newheaps[i] = taskheap()
++        end
++        r_heaps[tp] = newheaps
++    end
++
++    return heap_p
++end
++
++function r_multiq_insert(task::Task, priority::UInt16)
++    tpid = ccall(:jl_get_task_threadpoolid, Int8, (Any,), task)
++    @assert tpid > -1 "invalid tpid"
++    heap_p = r_multiq_size(tpid)
++    tp = tpid + 1
++
++    task.priority = priority
++
++    rn = cong(heap_p)
++    tpheaps = r_heaps[tp]
++    while !trylock(tpheaps[rn].lock)
++        rn = cong(heap_p)
++    end
++
++    heap = tpheaps[rn]
++    if heap.ntasks >= length(heap.tasks)
++        resize!(heap.tasks, length(heap.tasks) * 2)
++    end
++
++    ntasks = heap.ntasks + Int32(1)
++    @atomic :monotonic heap.ntasks = ntasks
++    heap.tasks[ntasks] = task
++    multiq_sift_up(heap, ntasks)
++    priority = heap.priority
++    if task.priority < priority
++        @atomic :monotonic heap.priority = task.priority
++    end
++    unlock(heap.lock)
++
++    return true
++end
++
++function r_multiq_deletemin()
++    local rn1::UInt32
++    local heap, task
++
++    tid = Threads.threadid()
++    tp = ccall(:jl_threadpoolid, Int8, (Int16,), tid-1) + 1
++    if tp == 0 # Foreign thread
++        return nothing
++    end
++    tpheaps = r_heaps[tp]
++
++    while true
++        GC.safepoint()
++        heap_p = UInt32(length(tpheaps))
++        for i = UInt32(0):heap_p
++            if i == heap_p
++                return nothing
++            end
++            rn1 = cong(heap_p)
++            rn2 = cong(heap_p)
++            prio1 = tpheaps[rn1].priority
++            prio2 = tpheaps[rn2].priority
++            if prio1 > prio2
++                prio1 = prio2
++                rn1 = rn2
++            elseif prio1 == prio2 && prio1 == typemax(UInt16)
++                continue
++            end
++            if trylock(tpheaps[rn1].lock)
++                if prio1 == tpheaps[rn1].priority
++                    break
++                end
++                unlock(tpheaps[rn1].lock)
++            end
++        end
++
++        @assert @isdefined(rn1) "Assertion to tell the compiler about the definedness of this variable"
++
++        heap = tpheaps[rn1]
++        task = heap.tasks[1]
++        if ccall(:jl_set_task_tid, Cint, (Any, Cint), task, tid-1) == 0
++            # This task is sticky to a different thread, so we can't run it.
++            # Wake that thread so it can come pick up its own work, then keep
++            # looking for something we are allowed to run.
++            task_tid = ccall(:jl_get_task_tid, Int16, (Any,), task)
++            unlock(heap.lock)
++            if task_tid != Int16(-1)
++                ccall(:jl_wakeup_thread, Cint, (Int16,), task_tid)
++            end
++            # Keep polling (the owner may release the task without waking
++            # anyone), but give up the CPU in case that thread needs it.
++            yield_os_thread()
++            continue
++        end
++        break
++    end
++    ntasks = heap.ntasks
++    @atomic :monotonic heap.ntasks = ntasks - Int32(1)
++    heap.tasks[1] = heap.tasks[ntasks]
++    Base.unsetindex!(heap.tasks, Int(ntasks))
++    prio1 = typemax(UInt16)
++    if ntasks > 1
++        multiq_sift_down(heap, Int32(1))
++        prio1 = heap.tasks[1].priority
++    end
++    @atomic :monotonic heap.priority = prio1
++    unlock(heap.lock)
++
++    return task
++end
++
++function r_multiq_check_empty()
++    tid = Threads.threadid()
++    tp = ccall(:jl_threadpoolid, Int8, (Int16,), tid-1) + 1
++    if tp == 0 # Foreign thread
++        return true
++    end
++    for i = UInt32(1):length(r_heaps[tp])
++        if r_heaps[tp][i].ntasks != 0
++            return false
++        end
++    end
++    return true
++end
++
++# ---------------------------------------------------------------------------------------------
++# Opt-in arrival order for marked tasks (experimental).
++#
++# `Threads.@spawn fair=true expr` marks a task as a root (`Task.sched_class = C_F`). With nothing
++# marked in the process the three entry points below are stock's after one load of the pool flag
++# (`fl.on`, set once at the first marked insert and never cleared) and, on insert, of the task's
++# class byte. Once something is marked, the `:default` pool has three structures:
++#
++# - the rings: one FIFO ring beside each stock heap (2 per thread), each under its own lock, an
++#   insert into a random ring stamped with the clock inside the lock, a pop that samples 2 rings
++#   and takes the older head. They hold roots that have never run (class F).
++# - the R heaps: a second set of stock heaps, for request work in flight (class R): a root once it
++#   has started, and every task first made runnable by an F or R task (a descendant).
++# - stock's heaps, for everything else (L).
++#
++# A pop that finds both the request side (R heaps, then rings) and L with work splits the
++# thread's time: the clock is read at every pop, the interval since a thread's previous pop is
++# credited to the side of the task that ran in it when that pop found both sides with work, with
++# weight w (JULIA_SCHED_FAIR_WEIGHT, 1/4, 1/2 or 3/4; default 1/2) for the request side, capped at
++# 10 ms an interval, and the request side goes first while its balance is negative.
++#
++# A class is decided at a task's first enqueue; a wake-up never moves a task between L and the
++# request side. Only `:default` tasks are classed: a marked task of another pool that reaches the
++# multiqueue takes stock's path with its class cleared.
++
++# The classes, in `Task.sched_class` (an atomic UInt8 in the task's first cache line).
++const C_NONE = 0x00   # stock (L), or not classified yet
++const C_F = 0x01      # a marked root that has not run: the rings
++const C_R = 0x02      # request work in flight: the R heaps
++
++const f_tpid = Int8(1)   # `:default` (`Threads._sym_to_tpid(:default)`)
++
++@inline sched_class(t::Task) = @atomic :monotonic t.sched_class
++@inline function set_sched_class!(t::Task, c::UInt8)
++    @atomic :monotonic t.sched_class = c
++    return nothing
++end
++
++# The clock: the cycle counter on x86_64 (the TSC, Linux's usual clocksource there),
++# the monotonic clock elsewhere. Only ever differenced on one thread pop to pop, and compared
++# between two ring heads.
++@static if Sys.ARCH === :x86_64
++    @inline s_stamp() = ccall("llvm.readcyclecounter", llvmcall, UInt64, ())
++    const DEFAULT_CAP = 30_000_000   # 10 ms at 3 GHz, until `fair_init!` calibrates it
++else
++    @inline s_stamp() = time_ns()
++    const DEFAULT_CAP = 10_000_000   # 10 ms in ns
++end
++
++const _PAD8 = (0, 0, 0, 0, 0, 0, 0, 0)
++const _PAD12 = (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
++const _PAD15 = (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
++
++# The parameters, on lines of their own. Their defaults are safe for a class set by hand without
++# `fair_init!`: the cap is 10 ms at 3 GHz, the weight 1/2.
++mutable struct fparams
++    pad0::NTuple{8,Int}
++    @atomic cap::Int     # the interval cap, 10 ms in clock units; the balance cap is twice it
++    @atomic w4::Int      # the request side's weight, in quarters
++    @atomic inited::Bool
++    pad1::NTuple{12,Int}
++end
++const fp = fparams(_PAD8, DEFAULT_CAP, 2, false, _PAD12)
++const fp_lock = SpinLock()
++
++# The pool flag, on a line nobody writes after it is set.
++mutable struct fflag
++    pad0::NTuple{8,Int}
++    @atomic on::Bool
++    pad1::NTuple{15,Int}
++end
++const fl = fflag(_PAD8, false, _PAD15)
++
++# Read once, by the first `Threads._spawn_set_fair(t, true)`, in the spawning task: the weight and,
++# on x86_64, a 10 ms calibration of the cycle counter for the cap. Never called by the scheduler: a
++# class set by hand runs on the defaults until something calls it.
++function fair_init!()
++    (@atomic :acquire fp.inited) && return nothing
++    w = get(ENV, "JULIA_SCHED_FAIR_WEIGHT", "1/2")
++    w4 = w == "1/4" ? 1 : w == "1/2" ? 2 : w == "3/4" ? 3 :
++         throw(ArgumentError(LazyString("JULIA_SCHED_FAIR_WEIGHT must be 1/4, 1/2 or 3/4, not ", w)))
++    # The calibration runs before the lock is taken, with a safepoint in its loop: a second task
++    # that marks at the same moment calibrates too and finds the parameters set, and a GC does not
++    # wait for it.
++    cap = DEFAULT_CAP
++    @static if Sys.ARCH === :x86_64
++        t0 = time_ns()
++        c0 = s_stamp()
++        while time_ns() - t0 < 10_000_000
++            GC.safepoint()
++        end
++        c1 = s_stamp()
++        t1 = time_ns()
++        cap = round(Int, 10 * Float64(c1 - c0) / (Float64(t1 - t0) / 1e6))
++    end
++    lock(fp_lock)
++    try
++        if !(@atomic :monotonic fp.inited)
++            @atomic :monotonic fp.cap = cap
++            @atomic :monotonic fp.w4 = w4
++            @atomic :release fp.inited = true
++        end
++    finally
++        unlock(fp_lock)
++    end
++    return nothing
++end
++
++# A ring: power-of-two capacity, oldest at `head`, under its own spin lock. `n` and `hstamp` (the
++# head's stamp, `typemax(UInt64)` when the ring is empty) are atomic, written under the lock and
++# read without it by the pops' samples and by `multiq_check_empty`. `seqs` holds each entry's
++# stamp, `next` the last stamp given, so stamps rise strictly within a ring.
++mutable struct fqueue
++    const lock::SpinLock
++    tasks::Vector{Task}
++    seqs::Vector{UInt64}
++    head::Int
++    @atomic n::Int32
++    @atomic hstamp::UInt64
++    next::UInt64
++    pad::NTuple{12,Int}
++    fqueue() = new(SpinLock(), Vector{Task}(undef, 256), Vector{UInt64}(undef, 256), 1, zero(Int32),
++                   typemax(UInt64), zero(UInt64), _PAD12)
++end
++
++# The rings of each pool (only `:default`'s are ever sized), grown as `multiq_size` grows the
++# heaps: 2 per thread of the task's pool, under the pool's lock, never shrunk, the old rings kept.
++const rings = [Vector{fqueue}(undef, 0), Vector{fqueue}(undef, 0)]
++const rings_lock = [SpinLock(), SpinLock()]
++
++function rings_size(tpid::Int8)
++    nt = UInt32(Threads._nthreads_in_pool(tpid))
++    if nt == 0
++        nt = UInt32(1)
++    end
++    tp = tpid + 1
++    tprings = rings[tp]
++    ring_c = UInt32(2)
++    ring_p = UInt32(length(tprings))
++    if ring_c * nt <= ring_p
++        return ring_p
++    end
++    @lock rings_lock[tp] begin
++        tprings = rings[tp]
++        ring_p = UInt32(length(tprings))
++        nt = UInt32(Threads._nthreads_in_pool(tpid))
++        if nt == 0
++            nt = UInt32(1)
++        end
++        if ring_c * nt <= ring_p
++            return ring_p
++        end
++        ring_p += ring_c * nt
++        newrings = Vector{fqueue}(undef, ring_p)
++        copyto!(newrings, tprings)
++        for i = (1 + length(tprings)):ring_p
++            newrings[i] = fqueue()
++        end
++        rings[tp] = newrings
++    end
++    return ring_p
++end
++
++# The per-thread accounts, each padded to lines of its own, touched only by their own thread's pops
++# made with the flag set. Sized to `maxthreadid()` by the first marked insert, before the flag is
++# set; a pop by a thread past the end (none: only pool threads get here, and they exist at
++# start-up) grows them.
++mutable struct sstate
++    bal::Int        # request-side time minus L time, weighted, kept within twice the cap
++    stamp::UInt64   # the clock at this thread's previous pop
++    last::Int       # the side of the task that pop returned: 0 none, 1 request, 2 L
++    k::Int          # 1 when that pop found both sides with work
++    wake::Vector{UInt64}   # the ring pop's owners to wake, one bit a thread id (see `f_pop!`)
++    pad::NTuple{12,Int}
++    sstate() = new(0, zero(UInt64), 0, 0, zeros(UInt64, wake_words()), _PAD12)
++end
++# Words of a wake mask covering every thread id the process has.
++wake_words() = cld(Int(Threads.maxthreadid()), 64)
++const sstates = [Vector{sstate}(undef, 0)]
++const sstates_lock = SpinLock()
++
++function sstates_size(n::Int)
++    length(sstates[1]) >= n && return nothing
++    @lock sstates_lock begin
++        a = sstates[1]
++        if length(a) < n
++            b = Vector{sstate}(undef, n)
++            copyto!(b, a)
++            for i = (length(a) + 1):n
++                b[i] = sstate()
++            end
++            sstates[1] = b
++        end
++    end
++    return nothing
++end
++
++@inline function acct(tid::Int)
++    a = sstates[1]
++    tid <= length(a) && return @inbounds a[tid]
++    sstates_size(max(tid, Int(Threads.maxthreadid())))
++    return sstates[1][tid]
++end
++
++@inline f_idx(q::fqueue, k::Int) = ((q.head - 1 + k - 1) & (length(q.tasks) - 1)) + 1
++
++function f_grow!(q::fqueue)
++    cap = length(q.tasks)
++    n = Int(q.n)
++    tasks = Vector{Task}(undef, 2 * cap)
++    seqs = Vector{UInt64}(undef, 2 * cap)
++    for k in 1:n
++        i = f_idx(q, k)
++        tasks[k] = q.tasks[i]
++        seqs[k] = q.seqs[i]
++    end
++    q.tasks = tasks
++    q.seqs = seqs
++    q.head = 1
++    @atomic :monotonic q.hstamp = n == 0 ? typemax(UInt64) : seqs[1]
++    return nothing
++end
++
++# At the tail, under the lock: the stamp is read inside the lock and kept above the ring's last.
++@inline function f_push_stamped!(q::fqueue, task::Task)
++    n = Int(q.n)
++    n == length(q.tasks) && f_grow!(q)
++    i = f_idx(q, n + 1)
++    q.tasks[i] = task
++    st = s_stamp()
++    st > q.next || (st = q.next + UInt64(1))
++    q.seqs[i] = st
++    q.next = st
++    n == 0 && (@atomic :monotonic q.hstamp = st)
++    @atomic :monotonic q.n = Int32(n + 1)
++    return nothing
++end
++
++# Remove entry k (1 = the head), under the lock: the k - 1 entries ahead of it move one step
++# toward the tail, so the others keep their order. The freed slot is unset, so no ring keeps a
++# task alive.
++@inline function f_remove!(q::fqueue, k::Int)
++    for j in k:-1:2
++        q.tasks[f_idx(q, j)] = q.tasks[f_idx(q, j - 1)]
++        q.seqs[f_idx(q, j)] = q.seqs[f_idx(q, j - 1)]
++    end
++    Base.unsetindex!(q.tasks, q.head)
++    q.head = (q.head & (length(q.tasks) - 1)) + 1
++    n = q.n - Int32(1)
++    @atomic :monotonic q.hstamp = n == 0 ? typemax(UInt64) : q.seqs[q.head]
++    @atomic :monotonic q.n = n
++    return nothing
++end
++
++# The stamp of a ring's head, read without the lock from its atomic field (a hint, as stock reads
++# a heap's `priority`); `typemax(UInt64)` when the ring is empty.
++@inline ring_head(q::fqueue) = @atomic :monotonic q.hstamp
++
++# The index of the ring with the older head of 2 sampled, 0 when both looked empty.
++@inline function ring_pick(rs::Vector{fqueue})
++    nr = UInt32(length(rs))
++    best, bst = 0, typemax(UInt64)
++    for _ in 1:2
++        i = Int(cong(nr))
++        i == 0 && continue
++        st = ring_head(rs[i])
++        if st < bst
++            best, bst = i, st
++        end
++    end
++    return best
++end
++
++@inline function ring_any(rs::Vector{fqueue})
++    for q in rs
++        (@atomic :monotonic q.n) == 0 || return true
++    end
++    return false
++end
++
++# The ring pop, with the sticky-retry protocol: a task re-enqueued by `notify` before its own
++# thread switched out of it keeps that thread's tid until the switch, and `jl_set_task_tid` fails
++# for every other thread. So scan from the head over at most as many entries as the pool has
++# threads, take the first one this thread may run, wake the owner of each one passed over and
++# leave those in place. `nothing` when every scanned entry is pinned elsewhere, after yielding the
++# OS thread as stock's pop does.
++function f_pop!(q::fqueue, tid::Int, nt::Int, acc::sstate)
++    # Owners to wake go into this thread's own mask, under the lock; they are woken after it, and
++    # an owner past the mask (a thread added since it was sized) wakes every thread past it.
++    wake = acc.wake
++    nw = length(wake)
++    lo, hi = nw + 1, 0
++    past = false
++    lock(q.lock)
++    n = Int(q.n)
++    lim = min(n, nt)
++    k = 0
++    local task::Task
++    for j in 1:lim
++        t = q.tasks[f_idx(q, j)]
++        if ccall(:jl_set_task_tid, Cint, (Any, Cint), t, tid - 1) != 0
++            k = j
++            task = t
++            break
++        end
++        owner = Int(ccall(:jl_get_task_tid, Int16, (Any,), t))
++        if owner >= 0
++            w = (owner >> 6) + 1
++            if w <= nw
++                @inbounds wake[w] |= UInt64(1) << (owner & 63)
++                lo = min(lo, w)
++                hi = max(hi, w)
++            else
++                past = true
++            end
++        end
++    end
++    if k > 0
++        f_remove!(q, k)
++    end
++    unlock(q.lock)
++    for w in lo:hi
++        m = @inbounds wake[w]
++        @inbounds wake[w] = UInt64(0)
++        while m != 0
++            ccall(:jl_wakeup_thread, Cint, (Int16,), Int16(((w - 1) << 6) + trailing_zeros(m)))
++            m &= m - UInt64(1)
++        end
++    end
++    past && wake_past(nw << 6)
++    if k == 0
++        if n > 0
++            # Every scanned entry is pinned elsewhere: as stock's pop does for such a task, give up
++            # the CPU in case its owner needs it. The caller keeps polling.
++            yield_os_thread()
++        end
++        return nothing
++    end
++    return task
++end
++
++@noinline function wake_past(t0::Int)
++    for t in t0:(Int(Threads.maxthreadid()) - 1)
++        ccall(:jl_wakeup_thread, Cint, (Int16,), Int16(t))
++    end
++    return nothing
++end
++
++# Up to four samples, each followed by the ring pop on the ring it picked; then one pass over
++# every ring from a random one, so a task alone in a ring no sample hit is still reached.
++function ring_pop!(rs::Vector{fqueue}, tid::Int, nt::Int, acc::sstate)
++    length(acc.wake) < wake_words() && (acc.wake = zeros(UInt64, wake_words()))   # threads were added
++    for _ in 1:4
++        i = ring_pick(rs)
++        i == 0 && continue
++        task = f_pop!(rs[i], tid, nt, acc)
++        task === nothing || return task
++    end
++    nr = length(rs)
++    nr == 0 && return nothing
++    i0 = Int(cong(UInt32(nr)))
++    for j in 0:nr-1
++        q = rs[(i0 - 1 + j) % nr + 1]
++        (@atomic :monotonic q.n) == 0 && continue
++        task = f_pop!(q, tid, nt, acc)
++        task === nothing || return task
++    end
++    return nothing
++end
++
++# The request side's pop: the R heaps when `rr` says they have work, then the rings when `rf` does.
++@inline function g_req_pop(rs::Vector{fqueue}, rr::Bool, rf::Bool, tid::Int, nt::Int, acc::sstate)
++    if rr
++        t = r_multiq_deletemin()
++        if t !== nothing
++            return t
++        end
++    end
++    rf && return ring_pop!(rs, tid, nt, acc)
++    return nothing
++end
++
++# A task with no class, at its first enqueue, made runnable by a task of class F or R, in the
++# pool: a descendant, R from here on. Reached only with the flag set.
++@inline function fair_descendant(task::Task)
++    if ccall(:jl_is_task_started, Cint, (Any,), task) == 0 &&
++            sched_class(current_task()) != C_NONE &&
++            ccall(:jl_get_task_threadpoolid, Int8, (Any,), task) == f_tpid
++        set_sched_class!(task, C_R)
++        return true
++    end
++    return false
++end
++
++function multiq_insert(task::Task, priority::UInt16)
++    c = sched_class(task)
++    if c == C_NONE
++        if !(@atomic :monotonic fl.on) || !fair_descendant(task)
++            return stock_multiq_insert(task, priority)
++        end
++        c = C_R
++    end
++    return fair_insert(task, priority, c)
++end
++
++@noinline function fair_insert(task::Task, priority::UInt16, c::UInt8)
++    started = ccall(:jl_is_task_started, Cint, (Any,), task) != 0
++    if c == C_F && started
++        c = C_R   # a root that has started is request work from here on
++        set_sched_class!(task, C_R)
++    end
++    if ccall(:jl_get_task_threadpoolid, Int8, (Any,), task) != f_tpid
++        # Only `:default` tasks are classed: stock's path, with the class cleared.
++        set_sched_class!(task, C_NONE)
++        return stock_multiq_insert(task, priority)
++    end
++    if c == C_R
++        r_multiq_insert(task, priority)
++        return true
++    end
++    # A root that has not run: a ring. The rings and the accounts are sized before the flag is set.
++    ring_p = rings_size(f_tpid)
++    if !(@atomic :monotonic fl.on)
++        sstates_size(Int(Threads.maxthreadid()))
++        @atomic :release fl.on = true
++    end
++    q = rings[f_tpid + 1][cong(ring_p)]
++    lock(q.lock)
++    f_push_stamped!(q, task)
++    unlock(q.lock)
++    return true
++end
++
++function multiq_deletemin()
++    if !(@atomic :acquire fl.on)
++        task = stock_multiq_deletemin()
++        return task
++    end
++    return fair_deletemin()
++end
++
++@noinline function fair_deletemin()
++    tid = Int(Threads.threadid())
++    tpid = ccall(:jl_threadpoolid, Int8, (Int16,), tid - 1)
++    if tpid != f_tpid   # another pool, or a foreign thread (which stock gives nothing)
++        task = stock_multiq_deletemin()
++        return task
++    end
++    local task::Union{Nothing,Task}
++    s = acct(tid)
++    nt = Int(Threads._nthreads_in_pool(tpid))
++    rs = rings[f_tpid + 1]
++    lw = !stock_multiq_check_empty()
++    rr = !r_multiq_check_empty()
++    rf = ring_any(rs)
++    # The clock at every pop: the interval since this thread's previous pop is the run of the task
++    # that pop returned (`s.last`'s side), credited only when that pop found both sides with work.
++    now = s_stamp()
++    if s.last != 0 && s.k != 0
++        d = now > s.stamp ? Int(now - s.stamp) : 0
++        cap = @atomic :monotonic fp.cap
++        if d > cap
++            d = cap
++        end
++        w4 = @atomic :monotonic fp.w4
++        b = s.last == 1 ? s.bal + d * (4 - w4) : s.bal - d * w4
++        if b > 2 * cap
++            b = 2 * cap
++        elseif b < -2 * cap
++            b = -2 * cap
++        end
++        s.bal = b
++    end
++    s.stamp = now
++    s.k = lw && (rr || rf) ? 1 : 0
++    side = 0
++    if lw && (rr || rf)
++        rfirst = s.bal < 0
++        if rfirst
++            task = g_req_pop(rs, rr, rf, tid, nt, s)
++            side = 1
++            if task === nothing
++                task = stock_multiq_deletemin()
++                side = 2
++            end
++        else
++            task = stock_multiq_deletemin()
++            side = 2
++            if task === nothing
++                task = g_req_pop(rs, true, true, tid, nt, s)
++                side = 1
++            end
++        end
++    elseif rr || rf
++        task = g_req_pop(rs, rr, rf, tid, nt, s)
++        side = 1
++        if task === nothing
++            task = stock_multiq_deletemin()
++            side = 2
++        end
++    elseif lw
++        task = stock_multiq_deletemin()
++        side = 2
++    else
++        task = nothing
++    end
++    s.last = task === nothing ? 0 : side
++    return task
++end
++
++function multiq_check_empty()
++    stock_multiq_check_empty() || return false
++    (@atomic :acquire fl.on) || return true
++    ccall(:jl_threadpoolid, Int8, (Int16,), Threads.threadid() - 1) == f_tpid || return true
++    for q in rings[f_tpid + 1]
++        (@atomic :monotonic q.n) == 0 || return false
++    end
++    return r_multiq_check_empty()
++end
++
+ end
+diff --git a/base/threadingconstructs.jl b/base/threadingconstructs.jl
+index c6ce23b775..b80eb88d56 100644
+--- a/base/threadingconstructs.jl
++++ b/base/threadingconstructs.jl
+@@ -834,7 +834,24 @@ function _spawn_set_thrpool(t::Task, tp::Symbol)
+ end
+ 
+ """
+-    Threads.@spawn [:default|:interactive|:samepool] expr
++    Threads._spawn_set_fair(t::Task, fair::Bool)
++
++Mark `t`, a task that has not started, as a root of request work (`fair = true`), as
++`Threads.@spawn fair=true` does; `fair = false` does nothing. The class is set whatever the
++task's pool: the scheduler decides at the task's first enqueue what it means (only `:default`
++tasks are classed). The first call in a process reads `JULIA_SCHED_FAIR_WEIGHT` and calibrates
++the scheduler's clock (about 10 ms, once).
++"""
++function _spawn_set_fair(t::Task, fair::Bool)
++    fair || return nothing
++    Base.istaskstarted(t) && throw(ArgumentError("cannot mark a task that has started"))
++    Base.Partr.fair_init!()
++    Base.Partr.set_sched_class!(t, Base.Partr.C_F)
++    return nothing
++end
++
++"""
++    Threads.@spawn [:default|:interactive|:samepool] [fair=false] expr
+ 
+ Create a [`Task`](@ref) and [`schedule`](@ref) it to run on any available
+ thread in the specified threadpool: `:default`, `:interactive`, or `:samepool`
+@@ -848,6 +865,16 @@ directly into the constructed underlying closure. This allows you to insert
+ the _value_ of a variable, isolating the asynchronous code from changes to
+ the variable's value in the current task.
+ 
++`fair=true` (any expression that evaluates to a `Bool`) marks the task as a root of request
++work. While anything in the process is marked, marked `:default` tasks start in approximately
++the order they were spawned, the tasks they make runnable are served as theirs, and a thread
++splits its time between that work and the rest (`JULIA_SCHED_FAIR_WEIGHT`: `1/4`, `1/2` or
++`3/4`; default `1/2`). With nothing marked the scheduler's order is unchanged.
++
++!!! warning
++    This interface is experimental and subject to change or removal without notice. The name of
++    the `fair` keyword and its form may change in a later version.
++
+ !!! note
+     The thread that the task runs on may change if the task yields, therefore `threadid()` should not
+     be treated as constant for a task. See [`Task Migration`](@ref man-task-migration), and the broader
+@@ -866,6 +893,9 @@ the variable's value in the current task.
+ !!! compat "Julia 1.12"
+     The same threadpool may be specified as of Julia 1.12.
+ 
++!!! compat "Julia 1.15"
++    The `fair` keyword is available as of Julia 1.15.
++
+ # Examples
+ ```julia-repl
+ julia> t() = println("Hello from ", Threads.threadid());
+@@ -879,7 +909,16 @@ Hello from 4
+ """
+ macro spawn(args...)
+     tp = QuoteNode(:default)
++    fair = false
+     na = length(args)
++    if na >= 2 && args[na - 1] isa Expr && args[na - 1].head === :(=)
++        kw = args[na - 1]
++        kw.args[1] === :fair ||
++            throw(ArgumentError(LazyString("unsupported keyword in @spawn: ", kw.args[1])))
++        fair = kw.args[2]
++        args = (args[1:na - 2]..., args[na])
++        na -= 1
++    end
+     if na == 2
+         ttype, ex = args
+         if ttype isa QuoteNode
+@@ -910,6 +949,7 @@ macro spawn(args...)
+                 tp = Threads.threadpool()
+             end
+             _spawn_set_thrpool(task, tp)
++            $(fair === false ? nothing : :(_spawn_set_fair(task, $(esc(fair)))))
+             if $(Expr(:islocal, var))
+                 put!($var, task)
+             end
+diff --git a/doc/src/manual/environment-variables.md b/doc/src/manual/environment-variables.md
+index b6103d0069..7c2abb1d58 100644
+--- a/doc/src/manual/environment-variables.md
++++ b/doc/src/manual/environment-variables.md
+@@ -409,6 +409,20 @@ then spinning threads never sleep. Otherwise, `$JULIA_THREAD_SLEEP_THRESHOLD` is
+ interpreted as an unsigned 64-bit integer (`uint64_t`) and gives, in
+ nanoseconds, the amount of time after which spinning threads should sleep.
+ 
++### [`JULIA_SCHED_FAIR_WEIGHT`](@id JULIA_SCHED_FAIR_WEIGHT)
++
++The share of a thread's time given to marked work (tasks spawned with
++`Threads.@spawn fair=true` and the tasks they make runnable) while both marked and unmarked
++`:default` tasks are waiting: `1/4`, `1/2` or `3/4`. Defaults to `1/2`. It is read once, by the
++first task marked in the process; any other value is an error at that point.
++
++!!! warning
++    This interface is experimental and subject to change or removal without notice. The name of
++    the variable and its form may change in a later version.
++
++!!! compat "Julia 1.15"
++    The environment variable was added in 1.15.
++
+ ### [`JULIA_NUM_GC_THREADS`](@id JULIA_NUM_GC_THREADS)
+ 
+ Sets the number of threads used by Garbage Collection. If unspecified is set to the number of worker threads.
+diff --git a/src/jltypes.c b/src/jltypes.c
+index 0dfb54cb43..a99acc4d71 100644
+--- a/src/jltypes.c
++++ b/src/jltypes.c
+@@ -5058,7 +5058,7 @@ void jl_init_types(void) JL_GC_DISABLED
+                                         "_isexception",
+                                         "preempt_request",
+                                         "bound_cancel_default",
+-                                        "pad02",
++                                        "sched_class",
+                                         "rngState0",
+                                         "rngState1",
+                                         "rngState2",
+@@ -5122,10 +5122,10 @@ void jl_init_types(void) JL_GC_DISABLED
+     jl_value_t *boundt = jl_new_struct(jl_uniontype_type, (jl_value_t*)jl_cancel_source_type, jl_nothing_type);
+     jl_svecset(jl_task_type->types, 31, boundt);
+     // Set field 20 (metrics_enabled) as const
+-    // Set fields 8 (_state), 12 (preempt_request), 24-27 (metric counters),
++    // Set fields 8 (_state), 12 (preempt_request), 14 (sched_class), 24-27 (metric counters),
+     // 28 (waiting_on) and 32 (bound_cancel_token) as atomic
+     const static uint32_t task_constfields[1]  = { 0b00000000000010000000000000000000 };
+-    const static uint32_t task_atomicfields[1] = { 0b10001111100000000000100010000000 };
++    const static uint32_t task_atomicfields[1] = { 0b10001111100000000010100010000000 };
+     jl_task_type->name->constfields = task_constfields;
+     jl_task_type->name->atomicfields = task_atomicfields;
+ 
+diff --git a/src/julia_threads.h b/src/julia_threads.h
+index 878c32b24a..458f626058 100644
+--- a/src/julia_threads.h
++++ b/src/julia_threads.h
+@@ -499,7 +499,9 @@ typedef struct JL_GC_TRACKED_TYPE _jl_task_t {
+     // source; saved and restored alongside `bound_cancel_token` by exception
+     // handlers and the finalizer bracket.
+     uint8_t bound_cancel_default;
+-    uint8_t pad0[1];
++    // scheduler class (base/partr.jl): 0 stock, 1 a marked root not yet run, 2 request work in flight
++    // (the last padding byte of this cache line: the line has no padding left)
++    _Atomic(uint8_t) sched_class;
+     // === 64 bytes (cache line)
+     uint64_t rngState[JL_RNG_SIZE];
+     // flag indicating whether or not to record timing metrics for this task
+diff --git a/src/task.c b/src/task.c
+index f22ad08546..80934d5a51 100644
+--- a/src/task.c
++++ b/src/task.c
+@@ -1148,6 +1148,7 @@ JL_DLLEXPORT jl_task_t *jl_new_task(jl_value_t *start, jl_value_t *completion_fu
+     jl_atomic_store_relaxed(&t->running_time_ns, 0);
+     jl_atomic_store_relaxed(&t->finished_at, 0);
+     jl_atomic_store_relaxed(&t->preempt_request, 0);
++    jl_atomic_store_relaxed(&t->sched_class, 0); // the allocation is not zeroed
+     jl_atomic_store_relaxed(&t->bound_cancel_token, jl_nothing);
+     t->bound_cancel_default = 0;
+     jl_atomic_store_relaxed(&t->reset_ctx, NULL);
+@@ -1562,6 +1563,7 @@ jl_task_t *jl_init_root_task(jl_ptls_t ptls, void *stack_lo, void *stack_hi)
+         jl_atomic_store_relaxed(&ct->last_started_running_at, 0);
+     }
+     jl_atomic_store_relaxed(&ct->preempt_request, 0);
++    jl_atomic_store_relaxed(&ct->sched_class, 0); // already zero (memset above), stored as preempt_request is
+     jl_atomic_store_relaxed(&ct->bound_cancel_token, jl_nothing);
+     ct->bound_cancel_default = 0;
+     jl_atomic_store_relaxed(&ct->reset_ctx, NULL);
+diff --git a/test/core.jl b/test/core.jl
+index fa9426826b..2eaa096950 100644
+--- a/test/core.jl
++++ b/test/core.jl
+@@ -54,7 +54,7 @@ for (T, c) in (
+         (DataType, [:super, :types, :layout]),
+         (Core.Memory, []),
+         (Core.GenericMemoryRef, []),
+-        (Task, [:_state, :preempt_request, :running_time_ns, :finished_at, :first_enqueued_at, :last_started_running_at, :waiting_on, :bound_cancel_token]),
++        (Task, [:_state, :preempt_request, :sched_class, :running_time_ns, :finished_at, :first_enqueued_at, :last_started_running_at, :waiting_on, :bound_cancel_token]),
+         (Core.BindingPartition, [:min_world, :max_world, :next]),
+     )
+     @test Set((fieldname(T, i) for i in 1:fieldcount(T) if Base.isfieldatomic(T, i))) == Set(c)
+diff --git a/test/threads_exec.jl b/test/threads_exec.jl
+index f7493acc49..1252ec22a5 100644
+--- a/test/threads_exec.jl
++++ b/test/threads_exec.jl
+@@ -1997,3 +1997,171 @@ if threadpoolsize() >= 2
+         @test fetch(t) == 2 * (sizeof(Int) + 1) + 1
+     end
+ end
++
++# `Threads.@spawn fair=true` (experimental): the keyword, the class each task gets at its first
++# enqueue, and that marked work is neither lost nor run twice, cancelled or not. A pool of one
++# thread never reaches the multiqueue, so there a mark is kept as set and nothing else is classed.
++@testset "@spawn fair=" begin
++    P = Base.Partr
++    cls(t::Task = current_task()) = @atomic :monotonic t.sched_class
++    nd = threadpoolsize(:default)
++    multi = nd >= 2
++    # every thread in `tids` held by a spinner pinned to it; `release` ends them
++    function hold(tids)
++        go = Threads.Atomic{Bool}(true)
++        up = Threads.Atomic{Int}(0)
++        ts = [spawn_pinned(tid) do
++                  Threads.atomic_add!(up, 1)
++                  while go[]
++                      GC.safepoint()
++                      ccall(:jl_cpu_pause, Cvoid, ())
++                  end
++              end for tid in tids]
++        while up[] < length(tids)
++            yield()
++        end
++        return go, ts
++    end
++    release(go, ts) = (go[] = false; foreach(wait, ts))
++    parked(t::Task) = istaskstarted(t) && (@atomic :monotonic t.waiting_on) !== nothing
++    cancellable(f) = (src = Base.CancellationTokenSource();
++                      (Base.ScopedValues.with(f, Base.CANCEL_TOKEN => Base.CancellationToken(src)), src))
++    # the :default threads other than this task's own
++    free = [tid for tid in Threads.threadpooltids(:default) if tid != Threads.threadid()]
++
++    @testset "keyword" begin
++        x = 40
++        @test fetch(Threads.@spawn fair=(x > 0) $x + 2) == 42
++        @test fetch(Threads.@spawn :default fair=true cls()) == P.C_F
++        @test fetch(Threads.@spawn fair=false cls()) == P.C_NONE
++        @test fetch(Threads.@spawn :default fair=false cls()) == P.C_NONE
++        @test_throws ArgumentError @macroexpand Threads.@spawn unfair=true 1
++        t = Threads.@spawn nothing
++        wait(t)
++        @test_throws ArgumentError Threads._spawn_set_fair(t, true)
++        @test cls(Base.roottask) == P.C_NONE
++    end
++
++    @testset "classes" begin
++        function classes()
++            r = Dict{Symbol,Any}()
++            r[:self] = cls()
++            r[:spawn] = fetch(Threads.@spawn cls())
++            local t
++            @sync t = Threads.@spawn cls()
++            r[:sync] = fetch(t)
++            ws = fill(0xff, 2nd)
++            Threads.@threads :dynamic for i in 1:2nd
++                ws[i] = cls()
++            end
++            r[:threads] = unique(ws)
++            yield()
++            r[:after] = cls()
++            return r
++        end
++        m = fetch(Threads.@spawn fair=true classes())
++        kid = multi ? P.C_R : P.C_NONE
++        @test m[:self] == P.C_F                      # a marked root before it has waited
++        @test m[:after] == (multi ? P.C_R : P.C_F)   # once it has started and waited
++        @test m[:spawn] == m[:sync] == kid
++        @test m[:threads] == [kid]
++        u = fetch(Threads.@spawn classes())
++        @test u[:self] == u[:spawn] == u[:sync] == u[:after] == P.C_NONE
++        @test u[:threads] == [P.C_NONE]
++        # a marked task of another pool keeps its mark only where it never reaches the multiqueue
++        tp, c = fetch(Threads.@spawn :interactive fair=true (Threads.threadpool(), cls()))
++        @test c == (tp === :default || threadpoolsize(tp) == 1 ? P.C_F : P.C_NONE)
++    end
++
++    @testset "every marked task runs once" begin
++        nr, nk = 8nd, 4
++        hits = [Threads.Atomic{Int}(0) for _ in 1:nr*(nk + 1)]
++        @sync for i in 1:nr
++            Threads.@spawn fair=true begin
++                Threads.atomic_add!(hits[(i - 1)*(nk + 1) + 1], 1)
++                @sync for j in 1:nk
++                    Threads.@spawn Threads.atomic_add!(hits[(i - 1)*(nk + 1) + 1 + j], 1)
++                end
++            end
++        end
++        @test all(h -> h[] == 1, hits)
++    end
++
++    @testset "cancelled marked work runs at most once" begin
++        # a marked root cancelled while still queued: every other :default thread is held, and
++        # this task does not yield until the root is cancelled
++        go, ts = hold(free)
++        ran = Threads.Atomic{Int}(0)
++        t, src = cancellable() do
++            Threads.@spawn fair=true (Threads.atomic_add!(ran, 1); Base.@cancel_check; :not_cancelled)
++        end
++        @test ran[] == 0
++        Base.cancel!(src)
++        release(go, ts)
++        @test_throws TaskFailedException wait(t)
++        @test ran[] <= 1 && t.result isa Base.CancellationRequest
++
++        # request work in flight: a marked root and its child, both parked
++        kid = Ref{Task}()
++        ran = Threads.Atomic{Int}(0)
++        t, src = cancellable() do
++            Threads.@spawn fair=true begin
++                kid[] = Threads.@spawn (Threads.atomic_add!(ran, 1); sleep(1000))
++                sleep(1000)
++            end
++        end
++        while !(parked(t) && isassigned(kid) && parked(kid[]))
++            sleep(0.001)
++        end
++        Base.cancel!(src)
++        @test_throws TaskFailedException wait(t)
++        @test_throws TaskFailedException wait(kid[])
++        @test ran[] == 1 && kid[].result isa Base.CancellationRequest
++
++        # the marked children of a @sync, parked
++        nk = 2nd
++        hits = [Threads.Atomic{Int}(0) for _ in 1:nk]
++        t, src = cancellable() do
++            Threads.@spawn fair=true @sync for i in 1:nk
++                Threads.@spawn fair=true (Threads.atomic_add!(hits[i], 1); sleep(1000))
++            end
++        end
++        while !(all(h -> h[] == 1, hits) && parked(t))
++            sleep(0.001)
++        end
++        Base.cancel!(src)
++        @test_throws TaskFailedException wait(t)
++        @test all(h -> h[] == 1, hits)
++
++        # the marked children of a @sync, still queued: the root runs on one free thread, the
++        # others are held, and this task does not yield until they are cancelled
++        if !isempty(free)
++            go, ts = hold(free[2:end])
++            hits = [Threads.Atomic{Int}(0) for _ in 1:nk]
++            spawned = Threads.Atomic{Int}(0)
++            spin = Threads.Atomic{Bool}(true)
++            kids = Vector{Task}(undef, nk)
++            t, src = cancellable() do
++                Threads.@spawn fair=true @sync begin
++                    for i in 1:nk
++                        kids[i] = Threads.@spawn fair=true (Threads.atomic_add!(hits[i], 1); sleep(1000))
++                        Threads.atomic_add!(spawned, 1)
++                    end
++                    while spin[]
++                        GC.safepoint()
++                    end
++                end
++            end
++            while spawned[] < nk
++                GC.safepoint()
++            end
++            @test all(h -> h[] == 0, hits)
++            Base.cancel!(src)
++            spin[] = false
++            release(go, ts)
++            @test_throws TaskFailedException wait(t)
++            @test all(h -> h[] <= 1, hits)
++            @test all(istaskfailed, kids)
++        end
++    end
++end
+-- 
+2.43.0
+

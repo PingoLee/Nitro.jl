@@ -287,3 +287,62 @@ without the keyword says so): `julia --threads=8,1 candidate/starved.jl [fair]`,
 `armed.jl [armed]`, `julia --threads=2 candidate/pfib.jl [none|root|all]`,
 `julia --threads=8,0 candidate/spawn_path.jl [plain|fair] [clients]`. This session's run is in
 `evidence/candidate-20261124/` (run with `OUT=` there; the default output under `bench/results/` is ignored by git). In the committed copy, absolute home paths read `~` and the test logs' host name reads `<host>`; nothing else was edited.
+
+## The PR candidate, second version (#618, session 5)
+
+The candidate of 2026-11-24 with what a first read of the scheduler code would reject fixed where the fix is small and can be checked. Same base, `419aba7972`, and same controls (`pin-control`, `pin-control2`). Local only: nothing was pushed to, or proposed on, JuliaLang.
+
+| File in `candidate-v2/` | sha256 | What |
+|---|---|---|
+| `0001-*.patch` | `bce0647eb49d5602e8c99f813a4939e62cf5b1790e260a5555c1c7de0c23c1a3` | commit 1: the design with changes 1–4 and 6, its tests, NEWS, the manual |
+| `0002-*.patch` | `74c5931ac931f871da5b9f768c1f4cd40f121d363df453972c9ef3a9f2390ee5` | commit 2: the unmarked insert inlined into `enq_work` (unchanged) |
+| `validate.patch` | `96525fec25359a05f7581a0f6a60732b06e274fd7bb409dc2b0b5841b1f67ad5` | the validation, additions only, switch on |
+| `bypass.patch` | `1b56e5e05d56b94c32e0ec394d5d9a0e6756d377becaaba6752fd9b7d271a609` | the bypass control on v2 (stock's entry points under master's names; the mark's compiled in, unreachable) |
+| `timens.patch` | `1ebe38ee94ec6ffd155e71a7e9628b9dcd776af00205ab0b3c0c1f16f936e943` | variant, not adopted: `time_ns()` as the clock everywhere |
+| `attempt-r-heaps-inline-bodies.patch` | `04eb755b905a9dbe6bb46a8720def6b532e5496df33d80864b65e22dc4711870` | change 5 as specified (shared `@inline` bodies): fails the gate, not applied |
+| `attempt-r-heaps-eval-loop.patch` | `869e08d9a302d7c1b4c33d7fc81b76c600c660743a4ff0477eeef8c882490849` | change 5 another way (one source, an `@eval` loop over both heap sets): passes the gate, not applied |
+
+`git am 0001-*.patch 0002-*.patch` on `419aba7972` gives v2; `git apply` any of the others on top of it.
+
+**What changed from the candidate of 2026-11-24, change by change, with its check:**
+
+1. **`f_pop!` woke only owners with a thread id under 64.**
+   - Now each passed-over owner sets a bit in a per-thread mask. The mask is a `Vector{UInt64}` in the thread's accounts, sized from `maxthreadid()` when the accounts are, and regrown in `ring_pop!`, outside every lock, if threads were added.
+   - The pop ORs bits under the ring's lock and wakes the owners after unlocking. It allocates nothing, and it never calls the runtime's wake under the lock. An owner past the mask makes it wake every thread past it.
+   - Check: `v2_checks.jl wake64 ring` at `--threads=72` (correctness, never timed), with a marked root pinned to thread 73, asleep. The task is put in a ring with `Partr.multiq_insert` (as `enq_work` does, but without its direct wake of a pinned task's owner, #58689), and one other `:default` thread is woken.
+     - The candidate's validation build aborts in its stall detector, three runs of three: thread 2 passed the task over 10⁶ times while owner 73 made no pop.
+     - v2 runs it once, on its owner, in 2–5 ms.
+     - The forms `busy` and `sleep` pass on both builds. `enq_work` wakes the owner itself in both, so they cannot test this fix.
+2. **The ring's head stamp is atomic.**
+   - `fqueue.hstamp` is `@atomic`, `typemax(UInt64)` when the ring is empty, and written under the lock by every push, remove and grow. `ring_head` reads only it.
+   - Fields read outside their lock now:
+     - `fqueue.n` and `fqueue.hstamp`, which are atomic;
+     - `rings[tp]` and `sstates[1]`, the same unlocked read of a vector element replaced whole under its lock that stock makes of `heaps[tp]`.
+   - Nothing else is read unlocked. The ring pick went from 133 to 71 instructions.
+3. **`fair_init!` holds no lock across its 10 ms calibration,** and the calibration loop has a safepoint. Check: `v2_checks.jl init2`, two tasks marking at once in a fresh process: both return, with the parameters set.
+4. **The words.** NEWS.md and the `fair` docstring say "start in approximately the order they were spawned".
+5. **The R heaps without the copy: not applied.**
+   - The prompt's form failed its gate: one `@inline` body for each of the four heap functions, with thin callers for stock and the R side. Stock's and the R side's insert, check and size compile to the candidate's native code. Both pops do not: their GC root slots are assigned in another order, and three pairs of 8-byte zero stores become 16-byte vector stores. The frame size and the instruction count are unchanged.
+   - So the copy stays, `r_heaps.jl` still applies to this branch (its check passes on v2), and the attempt is `attempt-r-heaps-inline-bodies.patch`.
+   - A second form passes the gate on all twelve functions and is offered as `attempt-r-heaps-eval-loop.patch`: stock's four functions written once in an `@eval` loop over both heap sets.
+6. **`f_lock!` is gone** (`lock(q.lock)` at both sites; the validation counts ring locks with a hook before each). The ring helpers are `ring_*`, so `r_` now means the R heaps only.
+
+On the final builds, v2 compiles all twelve compared functions (`enq_work`, `trypoptask`, `multiq_insert`, `multiq_check_empty`, `multiq_size`, stock's insert, pop and check, and the R side's four) to the candidate's native code, and `v2-validate-off` compiles them to v2's. `native_code_gate.sh <julia A> <julia B>` is the gate: it runs `unmarked_code.jl --full --heaps` on both builds, cuts the output into one block per function, normalises addresses and symbol suffixes, and says IDENTICAL or DIFFERS for each. `v2_checks.jl` holds the probes of changes 1 and 3.
+
+**Builds and trees** under `~/app/julia-618-master/`:
+- `v2` and `v2-validate`: the local branches `nitro-618-fair-candidate-v2` and `…-v2-validate`;
+- `v2-validate-off`: the validation branch with the switch false;
+- `v2-bypass` and `v2-timens`: the local branches `…-v2-bypass` and `…-v2-timens`.
+
+**Unchanged, and still on the reviewer's list:** the paddings, the constants, the environment variable read in Base, the pool flag that is never cleared, the class names, the inconsistency of a one-thread `:interactive` pool, and the untested paths.
+
+**The evidence of v2** is in `evidence/candidate-v2-20261124/`. It ran `candidate_evidence.sh pin-control pin-control2 v2 v2-bypass` with `TIMENS=v2-timens`.
+- The bypass is a fourth column in row e and in row f's unmarked line.
+- Row e reads, per cell:
+  - **LAYOUT** if v2 is within the floor of master's second build, or if the bypass stands with v2;
+  - **THE PATH** if the bypass stands with both master builds while v2 is slower than all three in 10 of 12 rounds, with its size in ns an operation;
+  - **NOT SEPARABLE** otherwise.
+- Row d's bar is p99 ≤ 150 ms in every round and a median throughput ≥ 0.98, beside master's own spread between rounds. The bar of 2026-11-24 asked 0.98 in every round, tighter than two runs of master agree.
+- Each row with a standalone reproducer sets the reproducer's number beside the harness's.
+- The time_ns variant has its own steps (`t*`, cut first under `DEADLINE`) and its own section.
+- In the committed copy, home paths read `~` and the test logs' host name reads `<host>`.

@@ -1,0 +1,64 @@
+diff --git a/base/partr.jl b/base/partr.jl
+index fa3559e01b..7f8f07d8fc 100644
+--- a/base/partr.jl
++++ b/base/partr.jl
+@@ -472,23 +472,17 @@ const f_tpid = Int8(1)   # `:default` (`Threads._sym_to_tpid(:default)`)
+     return nothing
+ end
+ 
+-# The clock: the cycle counter on x86_64 (the TSC, Linux's usual clocksource there),
+-# the monotonic clock elsewhere. Only ever differenced on one thread pop to pop, and compared
+-# between two ring heads.
+-@static if Sys.ARCH === :x86_64
+-    @inline s_stamp() = ccall("llvm.readcyclecounter", llvmcall, UInt64, ())
+-    const DEFAULT_CAP = 30_000_000   # 10 ms at 3 GHz, until `fair_init!` calibrates it
+-else
+-    @inline s_stamp() = time_ns()
+-    const DEFAULT_CAP = 10_000_000   # 10 ms in ns
+-end
++# The clock: the monotonic clock, in ns, on every platform. Only ever differenced on one thread
++# pop to pop, and compared between two ring heads.
++@inline s_stamp() = time_ns()
++const DEFAULT_CAP = 10_000_000   # 10 ms in ns
+ 
+ const _PAD8 = (0, 0, 0, 0, 0, 0, 0, 0)
+ const _PAD12 = (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+ const _PAD15 = (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+ 
+ # The parameters, on lines of their own. Their defaults are safe for a class set by hand without
+-# `fair_init!`: the cap is 10 ms at 3 GHz, the weight 1/2.
++# `fair_init!`: the cap is 10 ms, the weight 1/2.
+ mutable struct fparams
+     pad0::NTuple{8,Int}
+     @atomic cap::Int     # the interval cap, 10 ms in clock units; the balance cap is twice it
+@@ -507,28 +501,14 @@ mutable struct fflag
+ end
+ const fl = fflag(_PAD8, false, _PAD15)
+ 
+-# Read once, by the first `Threads._spawn_set_fair(t, true)`, in the spawning task: the weight and,
+-# on x86_64, a 10 ms calibration of the cycle counter for the cap. Never called by the scheduler: a
+-# class set by hand runs on the defaults until something calls it.
++# Read once, by the first `Threads._spawn_set_fair(t, true)`, in the spawning task: the weight.
++# Never called by the scheduler: a class set by hand runs on the defaults until something calls it.
+ function fair_init!()
+     (@atomic :acquire fp.inited) && return nothing
+     w = get(ENV, "JULIA_SCHED_FAIR_WEIGHT", "1/2")
+     w4 = w == "1/4" ? 1 : w == "1/2" ? 2 : w == "3/4" ? 3 :
+          throw(ArgumentError(LazyString("JULIA_SCHED_FAIR_WEIGHT must be 1/4, 1/2 or 3/4, not ", w)))
+-    # The calibration runs before the lock is taken, with a safepoint in its loop: a second task
+-    # that marks at the same moment calibrates too and finds the parameters set, and a GC does not
+-    # wait for it.
+     cap = DEFAULT_CAP
+-    @static if Sys.ARCH === :x86_64
+-        t0 = time_ns()
+-        c0 = s_stamp()
+-        while time_ns() - t0 < 10_000_000
+-            GC.safepoint()
+-        end
+-        c1 = s_stamp()
+-        t1 = time_ns()
+-        cap = round(Int, 10 * Float64(c1 - c0) / (Float64(t1 - t0) / 1e6))
+-    end
+     lock(fp_lock)
+     try
+         if !(@atomic :monotonic fp.inited)
