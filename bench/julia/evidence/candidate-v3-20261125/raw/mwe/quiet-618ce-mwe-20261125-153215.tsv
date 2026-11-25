@@ -1,0 +1,4 @@
+time	load1	load5	foreign	busy_outside
+15:35:05	0.43	2.71		tmux:=6.5 
+15:35:11	1.75	2.91		node=9.7 tmux:=6.5 
+15:35:16	2.33	3.02		

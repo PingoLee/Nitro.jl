@@ -1,0 +1,245 @@
+diff --git a/base/partr.jl b/base/partr.jl
+index 80c8607237..a87f31ebf7 100644
+--- a/base/partr.jl
++++ b/base/partr.jl
+@@ -151,7 +151,6 @@ end
+ 
+     return heap_p
+ end
+-multiq_size(tpid::Int8) = _multiq_size(heaps, heaps_lock, tpid)
+ 
+ @inline function _multiq_insert(heaps::Vector{Vector{taskheap}}, heap_size::F, task::Task,
+                                 priority::UInt16) where {F}
+@@ -185,7 +184,6 @@ multiq_size(tpid::Int8) = _multiq_size(heaps, heaps_lock, tpid)
+ 
+     return true
+ end
+-stock_multiq_insert(task::Task, priority::UInt16) = _multiq_insert(heaps, multiq_size, task, priority)
+ 
+ yield_os_thread() = @static Sys.iswindows() ? ccall(:SwitchToThread, stdcall, Cint, ()) : ccall(:sched_yield, Cint, ())
+ 
+@@ -259,7 +257,6 @@ yield_os_thread() = @static Sys.iswindows() ? ccall(:SwitchToThread, stdcall, Ci
+ 
+     return task
+ end
+-stock_multiq_deletemin() = _multiq_deletemin(heaps)
+ 
+ @inline function _multiq_check_empty(heaps::Vector{Vector{taskheap}})
+     tid = Threads.threadid()
+@@ -274,7 +271,174 @@ stock_multiq_deletemin() = _multiq_deletemin(heaps)
+     end
+     return true
+ end
+-stock_multiq_check_empty() = _multiq_check_empty(heaps)
++
++# The bypass control: stock's four heap functions, master's text under master's names, and the
++# scheduler reaches only them. The mark's entry points are kept below as `mark_multiq_*`,
++# unreachable, and compiled into the image by their precompile statements
++# (contrib/generate_precompile.jl), so the image carries the same code; the shared bodies above
++# serve only the R heaps here. The mark's code calls stock's functions by these names.
++function multiq_size(tpid::Int8)
++    nt = UInt32(Threads._nthreads_in_pool(tpid))
++    if nt == 0
++        # A pool with no threads can still receive tasks (e.g. during
++        # sysimage bootstrap); size the heaps so insertion can park them
++        # instead of indexing an empty heap vector.
++        nt = UInt32(1)
++    end
++    tp = tpid + 1
++    tpheaps = heaps[tp]
++    heap_c = UInt32(2)
++    heap_p = UInt32(length(tpheaps))
++
++    if heap_c * nt <= heap_p
++        return heap_p
++    end
++
++    @lock heaps_lock[tp] begin
++        # Re-read under the lock; growing from a stale copy would replace the
++        # current heaps and orphan tasks concurrently inserted into them (#62144).
++        tpheaps = heaps[tp]
++        heap_p = UInt32(length(tpheaps))
++        nt = UInt32(Threads._nthreads_in_pool(tpid))
++        if nt == 0
++            nt = UInt32(1)
++        end
++        if heap_c * nt <= heap_p
++            return heap_p
++        end
++
++        heap_p += heap_c * nt
++        newheaps = Vector{taskheap}(undef, heap_p)
++        copyto!(newheaps, tpheaps)
++        for i = (1 + length(tpheaps)):heap_p
++            newheaps[i] = taskheap()
++        end
++        heaps[tp] = newheaps
++    end
++
++    return heap_p
++end
++
++function multiq_insert(task::Task, priority::UInt16)
++    tpid = ccall(:jl_get_task_threadpoolid, Int8, (Any,), task)
++    @assert tpid > -1 "invalid tpid"
++    heap_p = multiq_size(tpid)
++    tp = tpid + 1
++
++    task.priority = priority
++
++    rn = cong(heap_p)
++    tpheaps = heaps[tp]
++    while !trylock(tpheaps[rn].lock)
++        rn = cong(heap_p)
++    end
++
++    heap = tpheaps[rn]
++    if heap.ntasks >= length(heap.tasks)
++        resize!(heap.tasks, length(heap.tasks) * 2)
++    end
++
++    ntasks = heap.ntasks + Int32(1)
++    @atomic :monotonic heap.ntasks = ntasks
++    heap.tasks[ntasks] = task
++    multiq_sift_up(heap, ntasks)
++    priority = heap.priority
++    if task.priority < priority
++        @atomic :monotonic heap.priority = task.priority
++    end
++    unlock(heap.lock)
++
++    return true
++end
++
++function multiq_deletemin()
++    local rn1::UInt32
++    local heap, task
++
++    tid = Threads.threadid()
++    tp = ccall(:jl_threadpoolid, Int8, (Int16,), tid-1) + 1
++    if tp == 0 # Foreign thread
++        return nothing
++    end
++    tpheaps = heaps[tp]
++
++    while true
++        GC.safepoint()
++        heap_p = UInt32(length(tpheaps))
++        for i = UInt32(0):heap_p
++            if i == heap_p
++                return nothing
++            end
++            rn1 = cong(heap_p)
++            rn2 = cong(heap_p)
++            prio1 = tpheaps[rn1].priority
++            prio2 = tpheaps[rn2].priority
++            if prio1 > prio2
++                prio1 = prio2
++                rn1 = rn2
++            elseif prio1 == prio2 && prio1 == typemax(UInt16)
++                continue
++            end
++            if trylock(tpheaps[rn1].lock)
++                if prio1 == tpheaps[rn1].priority
++                    break
++                end
++                unlock(tpheaps[rn1].lock)
++            end
++        end
++
++        @assert @isdefined(rn1) "Assertion to tell the compiler about the definedness of this variable"
++
++        heap = tpheaps[rn1]
++        task = heap.tasks[1]
++        if ccall(:jl_set_task_tid, Cint, (Any, Cint), task, tid-1) == 0
++            # This task is sticky to a different thread, so we can't run it.
++            # Wake that thread so it can come pick up its own work, then keep
++            # looking for something we are allowed to run.
++            task_tid = ccall(:jl_get_task_tid, Int16, (Any,), task)
++            unlock(heap.lock)
++            if task_tid != Int16(-1)
++                ccall(:jl_wakeup_thread, Cint, (Int16,), task_tid)
++            end
++            # Keep polling (the owner may release the task without waking
++            # anyone), but give up the CPU in case that thread needs it.
++            yield_os_thread()
++            continue
++        end
++        break
++    end
++    ntasks = heap.ntasks
++    @atomic :monotonic heap.ntasks = ntasks - Int32(1)
++    heap.tasks[1] = heap.tasks[ntasks]
++    Base.unsetindex!(heap.tasks, Int(ntasks))
++    prio1 = typemax(UInt16)
++    if ntasks > 1
++        multiq_sift_down(heap, Int32(1))
++        prio1 = heap.tasks[1].priority
++    end
++    @atomic :monotonic heap.priority = prio1
++    unlock(heap.lock)
++
++    return task
++end
++
++function multiq_check_empty()
++    tid = Threads.threadid()
++    tp = ccall(:jl_threadpoolid, Int8, (Int16,), tid-1) + 1
++    if tp == 0 # Foreign thread
++        return true
++    end
++    for i = UInt32(1):length(heaps[tp])
++        if heaps[tp][i].ntasks != 0
++            return false
++        end
++    end
++    return true
++end
++
++const stock_multiq_insert = multiq_insert
++const stock_multiq_deletemin = multiq_deletemin
++const stock_multiq_check_empty = multiq_check_empty
+ 
+ # The R heaps: a second set of stock heaps, for request work in flight (see below), through stock's
+ # four bodies above. Empty and unsized until a task of class R is inserted.
+@@ -661,7 +825,7 @@ end
+ 
+ # Inlined into `enq_work`: with nothing marked, stock's insert is one call deep, and this wrapper
+ # adds no frame, safepoint or call of its own.
+-@inline function multiq_insert(task::Task, priority::UInt16)
++@inline function mark_multiq_insert(task::Task, priority::UInt16)
+     c = sched_class(task)
+     if c == C_NONE && !(@atomic :monotonic fl.on)
+         return stock_multiq_insert(task, priority)
+@@ -709,7 +873,7 @@ end
+     return true
+ end
+ 
+-function multiq_deletemin()
++function mark_multiq_deletemin()
+     if !(@atomic :acquire fl.on)
+         task = stock_multiq_deletemin()
+         return task
+@@ -786,7 +950,7 @@ end
+     return task
+ end
+ 
+-function multiq_check_empty()
++function mark_multiq_check_empty()
+     stock_multiq_check_empty() || return false
+     (@atomic :acquire fl.on) || return true
+     ccall(:jl_threadpoolid, Int8, (Int16,), Threads.threadid() - 1) == f_tpid || return true
+diff --git a/contrib/generate_precompile.jl b/contrib/generate_precompile.jl
+index 1ba264fcd7..b8cef38cb4 100644
+--- a/contrib/generate_precompile.jl
++++ b/contrib/generate_precompile.jl
+@@ -133,6 +133,9 @@ precompile(Base.CoreLogging.current_logger_for_env, (Base.CoreLogging.LogLevel,
+ precompile(Base.CoreLogging.current_logger_for_env, (Base.CoreLogging.LogLevel, Symbol, Module))
+ precompile(Base.CoreLogging.env_override_minlevel, (Symbol, Module))
+ precompile(Base.StackTraces.lookup, (Ptr{Nothing},))
++precompile(Base.Partr.mark_multiq_insert, (Task, UInt16))
++precompile(Base.Partr.mark_multiq_deletemin, ())
++precompile(Base.Partr.mark_multiq_check_empty, ())
+ precompile(Tuple{typeof(Base.run_module_init), Module, Int})
+ precompile(Tuple{Type{Base.VersionNumber}, Int32, Int32, Int32})
+ 

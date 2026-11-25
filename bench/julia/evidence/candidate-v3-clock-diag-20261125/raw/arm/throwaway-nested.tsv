@@ -1,0 +1,2 @@
+julia	commit	threads	guard	variant	round	bench	n	cut	depth	spawns	runs	wall_min_s	wall_median_s	alloc_mib_median	gc_ms_median	gc_pct_median	gc_pauses_median	gc_full_median	hwm_mib_max	peak_queued_median	peak_live_median	peak_heaps_median	peak_queued_max	counted_wall_median_s	digest
+1.15.0-DEV.974	419aba7972/local	8,1	1	A	1	fib_fine	42	12	30	2178308	7	0.7864	0.7923	919.8	80.55	9.717	9	0	228.0	6485	12569	8618	7821	0.8276	ff80c38

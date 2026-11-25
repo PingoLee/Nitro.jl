@@ -1,0 +1,99 @@
+Precompiling project...
+   0.3 s  ✓ UUIDs
+   0.3 s  ✓ PCRE2_jll
+   0.3 s  ✓ dSFMT_jll
+   0.3 s  ✓ p7zip_jll
+   0.3 s  ✓ Statistics
+   0.3 s  ✓ Base64
+   0.3 s  ✓ Zlib_jll
+   0.3 s  ✓ Unicode
+   0.2 s  ✓ nghttp2_jll
+   0.3 s  ✓ Zstd_jll
+   0.3 s  ✓ OpenSSL_jll
+   0.4 s  ✓ NetworkOptions
+   0.2 s  ✓ MozillaCACerts_jll
+   0.3 s  ✓ LibSSH2_jll
+   0.4 s  ✓ Printf
+   0.4 s  ✓ ArgTools
+   0.2 s  ✓ libpicosat_jll
+   0.4 s  ✓ SuiteSparse_jll
+   0.5 s  ✓ Serialization
+   0.2 s  ✓ Logging
+   0.3 s  ✓ LibGit2_jll
+   0.3 s  ✓ LibCURL_jll
+   0.2 s  ✓ Mmap
+   0.3 s  ✓ libLLVM_jll
+   0.3 s  ✓ Tar
+   0.3 s  ✓ LibCURL
+   0.3 s  ✓ DelimitedFiles
+   0.3 s  ✓ LLD_jll
+   1.0 s  ✓ LibGit2
+   0.3 s  ✓ GMP_jll
+   0.2 s  ✓ CRC32c
+   0.2 s  ✓ Future
+   0.2 s  ✓ MPFR_jll
+   0.3 s  ✓ OpenLibm_jll
+   0.2 s  ✓ LibUnwind_jll
+   2.0 s  ✓ Dates
+   0.2 s  ✓ LibUV_jll
+   0.3 s  ✓ LLVMLibUnwind_jll
+   2.4 s  ✓ Downloads
+   1.5 s  ✓ TOML
+   3.8 s  ✓ Distributed
+   0.4 s  ✓ SharedArrays
+   6.3 s  ✓ StyledStrings
+   0.9 s  ✓ JuliaSyntaxHighlighting
+   2.4 s  ✓ Profile
+   2.8 s  ✓ Markdown
+   0.7 s  ✓ InteractiveUtils
+   3.1 s  ✓ Test
+  27.7 s  ✓ SparseArrays
+   0.2 s  ✓ SuiteSparse
+   0.3 s  ✓ Statistics → SparseArraysExt
+  26.5 s  ✓ REPL
+  50.3 s  ✓ Pkg
+   0.5 s  ✓ LazyArtifacts
+   1.9 s  ✓ Pkg → REPLExt
+  55 dependencies successfully precompiled in 62 seconds
+Running parallel tests with:
+  gethostname() = <host>
+  BUILDKITE_AGENT_NAME = (not set)
+  getpid() = 2204184
+  nworkers() = 6
+  nthreads(:interactive) = 1
+  nthreads(:default) = 1
+  Sys.CPU_THREADS = 6
+  Sys.total_memory() = 15.487 GiB
+  Sys.free_memory() = 12.284 GiB
+  diskstat().total = 786.880 GiB
+  diskstat().available = 442.088 GiB
+  diskstat(tempdir()).total = 786.880 GiB
+  diskstat(tempdir()).available = 442.088 GiB
+  Sys.uptime() = 326866.45 (90.8 hours)
+
+Test           (Worker) | Time (s) | GC (s) | GC % | Alloc (MB) | RSS (MB)
+cancellation        (4) |        started at 2026-11-25T15:13:39.839
+core                (3) |        started at 2026-11-25T15:13:39.920
+channel_threadpool  (6) |        started at 2026-11-25T15:13:39.939
+threadpool_use      (7) |        started at 2026-11-25T15:13:39.939
+threads             (2) |        started at 2026-11-25T15:13:39.940
+channels            (5) |        started at 2026-11-25T15:13:39.940
+threadpool_use      (7) |     0.24 |   0.00 |  0.0 |      16.09 |   419.58
+channel_threadpool  (6) |     0.21 |   0.00 |  0.0 |      24.39 |   419.58
+threadpool_latency  (7) |        started at 2026-11-25T15:13:40.553
+threadpool_latency  (7) |     1.56 |   0.00 |  0.0 |       4.38 |   419.58
+channels            (5) |    17.19 |   0.70 |  4.1 |     535.95 |   586.82
+ threads         (2): threads_exec.jl with JULIA_NUM_THREADS == 1,0 passed
+ cancellation    (4): ┌ Warning: BLAS cancellation tests need a second default-pool thread; skipping
+ cancellation    (4): └ @ Main.Test32Main_cancellation ~/app/julia-618-master/pin-control/usr/share/julia/test/cancellation.jl:2178
+ threads         (2): threads_exec.jl with JULIA_NUM_THREADS == 1,1 passed
+cancellation        (4) |    54.79 |   1.03 |  1.9 |    1160.98 |   666.12
+core                (3) |    58.60 |   6.18 | 10.5 |   13473.36 |  2340.73
+ threads         (2): threads_exec.jl with JULIA_NUM_THREADS == 2,0 passed
+ threads         (2): threads_exec.jl with JULIA_NUM_THREADS == 2,1 passed
+ threads         (2): threads_exec.jl with JULIA_NUM_THREADS == 4,0 passed
+threads             (2) |   120.06 |   0.19 |  0.2 |     540.34 |   459.00
+
+Test Summary: |    Pass  Broken    Total     Time
+  Overall     | 7357256      12  7357268  2m04.5s
+    SUCCESS

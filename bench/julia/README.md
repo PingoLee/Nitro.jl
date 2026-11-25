@@ -346,3 +346,47 @@ On the final builds, v2 compiles all twelve compared functions (`enq_work`, `try
 - Each row with a standalone reproducer sets the reproducer's number beside the harness's.
 - The time_ns variant has its own steps (`t*`, cut first under `DEADLINE`) and its own section.
 - In the committed copy, home paths read `~` and the test logs' host name reads `<host>`.
+
+## The PR candidate, third version (#618, session 6)
+
+v2 with the maintainer's two decisions of 2026-11-25 applied, checked and measured whole again. Same base, `419aba7972`, and same controls (`pin-control`, `pin-control2`). Local only: nothing was pushed to, or proposed on, JuliaLang.
+
+| File in `candidate-v3/` | sha256 | What |
+|---|---|---|
+| `0001-*.patch` | `e175b765f59c63e531db88083ef00a6376d8d41c89383f801dfad71bf089af56` | commit 1: the design with both changes, its tests, NEWS, the manual |
+| `0002-*.patch` | `5c9a6b740df370858a8c83f64c0e7ebd9b5ac503690d62445aeb701cb7870868` | commit 2: the unmarked insert inlined into `enq_work` (unchanged) |
+| `validate.patch` | `ee4d8a912f611535e13de40869a9410927925c05caf7f61a8f6251de49fa446f` | the validation, additions only (286 lines), switch on |
+| `bypass.patch` | `3f278e0c27192db89dff0e58abe18fe621a23826b1ff2d2c165c3c20c3136435` | the bypass control on v3: stock's four heap functions in master's text under master's names; the mark's entry points compiled in, unreachable |
+
+`git am 0001-*.patch 0002-*.patch` on `419aba7972` gives v3; `git apply` either of the others on top of it.
+
+**What changed from v2, and why:**
+
+1. **`time_ns()` is the clock, on every platform** (the maintainer's decision; v2's `timens.patch` measured it at 1.4–1.6 points on the marked spawn path and nothing else). The cycle counter, the 10 ms calibration, the architecture branch and the second `DEFAULT_CAP` are gone: one cap, `10_000_000` ns. `fair_init!` now only reads `JULIA_SCHED_FAIR_WEIGHT` and publishes it, under its lock, so that the weight is published once; `fp.cap` is written only by its constructor. The first marked spawn returns in under 0.01 ms (v2: about 10 ms). The `fparams` comment and `_spawn_set_fair`'s docstring no longer mention a calibration; NEWS and the manual entry never named the clock.
+2. **The R heaps share stock's heap functions** (the maintainer's decision; v2's `attempt-r-heaps-inline-bodies.patch`). Each of stock's four heap functions is one `@inline` body taking the heap vector (and its lock, or its size function); stock's and the R side's are thin callers. The copy is gone (+19 −168 on v2), so **`r_heaps.jl` is not needed for this branch** (kept for the earlier ones).
+   - `native_code_gate.sh` is now a report, not the gate: ten of the twelve compared functions compile to v2's native code. Both pops differ, in the same way: the GC root slots (`[rbp-48/56/64]`) are assigned in another order, three pairs of 8-byte zero stores become one `vxorps` and one 16-byte `vmovaps`, and the last alignment `nop` differs. The frame and the instruction count (464) are unchanged.
+   - The question "what does code that marks nothing pay for this" is asked by measurement instead: row e, with a bypass that carries **master's text** for stock's four functions, so that the bypass standing with v3 cannot hide a cost of the shared bodies.
+   - The image does not shrink. The `_multiq_*` bodies are also compiled standalone into it, while their callers inline them: `sys.so` is 46 KB larger than v2's (`.text` +19 KB).
+
+v3's diff against `419aba7972` is +770 −12 lines (v2: +938 −10).
+
+**Checks** (as for v2; on `v3-validate` unless said):
+- the diff from v3 to v3-validate only adds lines (286), and `v3-validate-off` compiles all twelve compared functions to v3's code;
+- `rounds_fifo.sh PROFILE=native VALIDATE=1` is clean, and its six negative controls fail;
+- `native_checks.jl` and `master_checks.jl` pass;
+- `v2_checks.jl wake64 ring` at `--threads=72` and `init2` pass;
+- `wake_window.jl` ring and wake at 2,1 report 0 stuck in 19.4 M and 18.6 M rounds, and the R-side positive control 34 stuck;
+- the new testset passes 20 of 20 runs at five layouts, and `make check-whitespace` is clean.
+
+The credited share reads 50.0% at w = 1/2 on the new clock. No assert of the validation assumed cycle units: its clock sums are named `f_cyc`/`l_cyc` but are only summed, and the harness converts them through `fp.cap / 10`. The bypass's four heap entry points compile to master's own code.
+
+**The evidence of v3** is in `evidence/candidate-v3-20261125/`. It ran `candidate_evidence.sh pin-control pin-control2 v3 v3-bypass` with `CE_PREV` pointing at v2's run, so `results.md` ends with a "v2 against v3" table of the two runs' medians.
+- Row f's unmarked floor is now one-sided: only slower than master by more than the floor fails. Row h is a stated cost with no bar, printed beside the earlier readings.
+- Every cell of row e reads LAYOUT, and row f's unmarked line is within its floor, so the `@eval` fallback was not needed.
+- **Row f's root-marked line fails its 0.90 bar** (0.886 at 2 threads, 0.889 at 8,1). Row h reads 6.1%, and the marked spawn path 0.82.
+
+**Which change moved the marked rows:** `evidence/candidate-v3-clock-diag-20261125/` (its README; `clock_diag_report.jl`). It is not in the prompt, and not in the evidence directory. It measured rows f and h on v2, v2-timens and v3 in one block, with existing builds, `PFIB_COLS` and `ARM_COLS` (column overrides added to `candidate_evidence.sh`; the defaults are unchanged).
+- **The clock moved them.** `time_ns()` costs the root-marked pfib(25) 4.5 points at 2 threads and 2.4 at 8,1, and work after one marked task 2.6 points.
+- The shared bodies add at most about a point, within the spread.
+
+**Builds and trees** under `~/app/julia-618-master/`: `v3`, `v3-validate` (the local branches `nitro-618-fair-candidate-v3` and `…-v3-validate`), `v3-validate-off` (switch false) and `v3-bypass` (`…-v3-bypass`). Notes are in `notes-s6.md`, the checks in `results/s6-checks/`.
