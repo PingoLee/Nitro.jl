@@ -1,0 +1,37 @@
+round	build	file	args	layout	exit	line
+1	control	starved.jl	plain	8,1	0	starved 1.15.0-DEV.974 419aba7972: threads=8,1 mode=plain tasks_per_s=3834 p50_ms=15.0 p99_ms=2952.0 max_ms=8128.5 client_min=1 client_median=55
+1	candidate	starved.jl	plain	8,1	0	starved 1.15.0-DEV.976 2caefffc63: threads=8,1 mode=plain tasks_per_s=3834 p50_ms=15.0 p99_ms=2778.0 max_ms=8110.3 client_min=1 client_median=59
+1	control	starved.jl	fair	8,1	0	starved 1.15.0-DEV.974 419aba7972: fair= not supported by this build
+1	candidate	starved.jl	fair	8,1	0	starved 1.15.0-DEV.976 2caefffc63: threads=8,1 mode=fair tasks_per_s=3836 p50_ms=132.0 p99_ms=153.0 max_ms=176.5 client_min=60 client_median=61
+1	control	fib_fine.jl		8,1	0	fib_fine 1.15.0-DEV.974 419aba7972: threads=8,1 runs=7 median_s=0.808 min_s=0.7742
+1	candidate	fib_fine.jl		8,1	0	fib_fine 1.15.0-DEV.976 2caefffc63: threads=8,1 runs=7 median_s=0.8002 min_s=0.7689
+1	control	pfib.jl	none	2	0	pfib 1.15.0-DEV.974 419aba7972: threads=2,1 mode=none min_s=0.05578 median_s=0.0573 runs=70
+1	candidate	pfib.jl	none	2	0	pfib 1.15.0-DEV.976 2caefffc63: threads=2,1 mode=none min_s=0.05481 median_s=0.05653 runs=70
+1	control	pfib.jl	root	2	0	pfib 1.15.0-DEV.974 419aba7972: fair= not supported by this build
+1	candidate	pfib.jl	root	2	0	pfib 1.15.0-DEV.976 2caefffc63: threads=2,1 mode=root min_s=0.05888 median_s=0.06068 runs=66
+1	control	pfib.jl	all	2	0	pfib 1.15.0-DEV.974 419aba7972: fair= not supported by this build
+1	candidate	pfib.jl	all	2	0	pfib 1.15.0-DEV.976 2caefffc63: threads=2,1 mode=all min_s=0.1124 median_s=0.1315 runs=31
+2	candidate	starved.jl	plain	8,1	0	starved 1.15.0-DEV.976 2caefffc63: threads=8,1 mode=plain tasks_per_s=3832 p50_ms=15.0 p99_ms=2879.0 max_ms=8129.0 client_min=1 client_median=59
+2	control	starved.jl	plain	8,1	0	starved 1.15.0-DEV.974 419aba7972: threads=8,1 mode=plain tasks_per_s=3834 p50_ms=15.0 p99_ms=2782.0 max_ms=8126.6 client_min=1 client_median=59
+2	candidate	starved.jl	fair	8,1	0	starved 1.15.0-DEV.976 2caefffc63: threads=8,1 mode=fair tasks_per_s=3833 p50_ms=132.0 p99_ms=159.0 max_ms=210.0 client_min=59 client_median=61
+2	control	starved.jl	fair	8,1	0	starved 1.15.0-DEV.974 419aba7972: fair= not supported by this build
+2	candidate	fib_fine.jl		8,1	0	fib_fine 1.15.0-DEV.976 2caefffc63: threads=8,1 runs=7 median_s=0.7996 min_s=0.7713
+2	control	fib_fine.jl		8,1	0	fib_fine 1.15.0-DEV.974 419aba7972: threads=8,1 runs=7 median_s=0.7995 min_s=0.7737
+2	candidate	pfib.jl	none	2	0	pfib 1.15.0-DEV.976 2caefffc63: threads=2,1 mode=none min_s=0.05556 median_s=0.05693 runs=70
+2	control	pfib.jl	none	2	0	pfib 1.15.0-DEV.974 419aba7972: threads=2,1 mode=none min_s=0.05622 median_s=0.05764 runs=70
+2	candidate	pfib.jl	root	2	0	pfib 1.15.0-DEV.976 2caefffc63: threads=2,1 mode=root min_s=0.05917 median_s=0.06101 runs=66
+2	control	pfib.jl	root	2	0	pfib 1.15.0-DEV.974 419aba7972: fair= not supported by this build
+2	candidate	pfib.jl	all	2	0	pfib 1.15.0-DEV.976 2caefffc63: threads=2,1 mode=all min_s=0.1136 median_s=0.1317 runs=31
+2	control	pfib.jl	all	2	0	pfib 1.15.0-DEV.974 419aba7972: fair= not supported by this build
+3	control	starved.jl	plain	8,1	0	starved 1.15.0-DEV.974 419aba7972: threads=8,1 mode=plain tasks_per_s=3833 p50_ms=15.0 p99_ms=2877.6 max_ms=8130.2 client_min=1 client_median=60
+3	candidate	starved.jl	plain	8,1	0	starved 1.15.0-DEV.976 2caefffc63: threads=8,1 mode=plain tasks_per_s=3833 p50_ms=15.0 p99_ms=2893.6 max_ms=8120.8 client_min=1 client_median=54
+3	control	starved.jl	fair	8,1	0	starved 1.15.0-DEV.974 419aba7972: fair= not supported by this build
+3	candidate	starved.jl	fair	8,1	0	starved 1.15.0-DEV.976 2caefffc63: threads=8,1 mode=fair tasks_per_s=3835 p50_ms=132.0 p99_ms=162.0 max_ms=221.0 client_min=60 client_median=61
+3	control	fib_fine.jl		8,1	0	fib_fine 1.15.0-DEV.974 419aba7972: threads=8,1 runs=7 median_s=0.7942 min_s=0.7788
+3	candidate	fib_fine.jl		8,1	0	fib_fine 1.15.0-DEV.976 2caefffc63: threads=8,1 runs=7 median_s=0.7842 min_s=0.7733
+3	control	pfib.jl	none	2	0	pfib 1.15.0-DEV.974 419aba7972: threads=2,1 mode=none min_s=0.05654 median_s=0.05768 runs=69
+3	candidate	pfib.jl	none	2	0	pfib 1.15.0-DEV.976 2caefffc63: threads=2,1 mode=none min_s=0.05562 median_s=0.0574 runs=70
+3	control	pfib.jl	root	2	0	pfib 1.15.0-DEV.974 419aba7972: fair= not supported by this build
+3	candidate	pfib.jl	root	2	0	pfib 1.15.0-DEV.976 2caefffc63: threads=2,1 mode=root min_s=0.06 median_s=0.06153 runs=65
+3	control	pfib.jl	all	2	0	pfib 1.15.0-DEV.974 419aba7972: fair= not supported by this build
+3	candidate	pfib.jl	all	2	0	pfib 1.15.0-DEV.976 2caefffc63: threads=2,1 mode=all min_s=0.1119 median_s=0.131 runs=32

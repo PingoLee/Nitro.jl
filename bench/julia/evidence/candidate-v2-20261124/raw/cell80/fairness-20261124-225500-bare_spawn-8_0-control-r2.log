@@ -1,0 +1,150 @@
+
+[1846855] signal 15: Terminated
+in expression starting at ~/app/Nitro.jl/bench/socket/server.jl:1054
+epoll_wait at /lib/x86_64-linux-gnu/libc.so.6 (unknown line)
+macro expansion at ~/.julia/packages/Reseau/0wu47/src/iopoll/epoll.jl:272:0 (pc: 10) [inlined]
+_backend_poll_once! at ~/.julia/packages/Reseau/0wu47/src/iopoll/epoll.jl:253:1 (pc: 62)
+_poller_thread_main! at ~/.julia/packages/Reseau/0wu47/src/iopoll/runtime.jl:490:9 (pc: 7)
+_poller_thread_entry at ~/.julia/packages/Reseau/0wu47/src/iopoll/runtime.jl:512:9 (pc: 10)
+jlcapi__poller_thread_entry_0 at ~/app/julia-618-master/depot-pin-control/compiled/v1.15/Reseau/vKBJ8_HPPav_92aa7dce3195f273.so (unknown line)
+unknown function (ip: 0x734e9aa9cb63) at /lib/x86_64-linux-gnu/libc.so.6
+unknown function (ip: 0x734e9ab29e8b) at /lib/x86_64-linux-gnu/libc.so.6
+unknown function (ip: (nil)) at (unknown file)
+unknown function (ip: 0x734e9aa98e2f) at /lib/x86_64-linux-gnu/libc.so.6
+pthread_cond_wait at /lib/x86_64-linux-gnu/libc.so.6 (unknown line)
+uv_cond_wait at /workspace/srcdir/libuv/src/unix/thread.c:822:0
+jl_parallel_gc_threadfun at ~/app/julia-618-master/pin-control/src/gc-stock.c:4370:13
+unknown function (ip: 0x734e9aa9cb63) at /lib/x86_64-linux-gnu/libc.so.6
+unknown function (ip: 0x734e9ab29e8b) at /lib/x86_64-linux-gnu/libc.so.6
+unknown function (ip: (nil)) at (unknown file)
+unknown function (ip: 0x734e9aa98e2f) at /lib/x86_64-linux-gnu/libc.so.6
+pthread_cond_wait at /lib/x86_64-linux-gnu/libc.so.6 (unknown line)
+uv_cond_wait at /workspace/srcdir/libuv/src/unix/thread.c:822:0
+jl_parallel_gc_threadfun at ~/app/julia-618-master/pin-control/src/gc-stock.c:4370:13
+unknown function (ip: 0x734e9aa9cb63) at /lib/x86_64-linux-gnu/libc.so.6
+unknown function (ip: 0x734e9ab29e8b) at /lib/x86_64-linux-gnu/libc.so.6
+unknown function (ip: (nil)) at (unknown file)
+unknown function (ip: 0x734e9aa98e2f) at /lib/x86_64-linux-gnu/libc.so.6
+pthread_cond_wait at /lib/x86_64-linux-gnu/libc.so.6 (unknown line)
+uv_cond_wait at /workspace/srcdir/libuv/src/unix/thread.c:822:0
+jl_parallel_gc_threadfun at ~/app/julia-618-master/pin-control/src/gc-stock.c:4370:13
+unknown function (ip: 0x734e9aa9cb63) at /lib/x86_64-linux-gnu/libc.so.6
+unknown function (ip: 0x734e9ab29e8b) at /lib/x86_64-linux-gnu/libc.so.6
+unknown function (ip: (nil)) at (unknown file)
+unknown function (ip: 0x734e9aa98e2f) at /lib/x86_64-linux-gnu/libc.so.6
+pthread_cond_wait at /lib/x86_64-linux-gnu/libc.so.6 (unknown line)
+uv_cond_wait at /workspace/srcdir/libuv/src/unix/thread.c:822:0
+jl_parallel_gc_threadfun at ~/app/julia-618-master/pin-control/src/gc-stock.c:4370:13
+unknown function (ip: 0x734e9aa9cb63) at /lib/x86_64-linux-gnu/libc.so.6
+unknown function (ip: 0x734e9ab29e8b) at /lib/x86_64-linux-gnu/libc.so.6
+unknown function (ip: (nil)) at (unknown file)
+unknown function (ip: 0x734e9aa98e2f) at /lib/x86_64-linux-gnu/libc.so.6
+pthread_cond_wait at /lib/x86_64-linux-gnu/libc.so.6 (unknown line)
+uv_cond_wait at /workspace/srcdir/libuv/src/unix/thread.c:822:0
+jl_parallel_gc_threadfun at ~/app/julia-618-master/pin-control/src/gc-stock.c:4370:13
+unknown function (ip: 0x734e9aa9cb63) at /lib/x86_64-linux-gnu/libc.so.6
+unknown function (ip: 0x734e9ab29e8b) at /lib/x86_64-linux-gnu/libc.so.6
+unknown function (ip: (nil)) at (unknown file)
+unknown function (ip: 0x734e9aa98e2f) at /lib/x86_64-linux-gnu/libc.so.6
+pthread_cond_wait at /lib/x86_64-linux-gnu/libc.so.6 (unknown line)
+uv_cond_wait at /workspace/srcdir/libuv/src/unix/thread.c:822:0
+jl_parallel_gc_threadfun at ~/app/julia-618-master/pin-control/src/gc-stock.c:4370:13
+unknown function (ip: 0x734e9aa9cb63) at /lib/x86_64-linux-gnu/libc.so.6
+unknown function (ip: 0x734e9ab29e8b) at /lib/x86_64-linux-gnu/libc.so.6
+unknown function (ip: (nil)) at (unknown file)
+unknown function (ip: 0x734e9aa98e2f) at /lib/x86_64-linux-gnu/libc.so.6
+pthread_cond_wait at /lib/x86_64-linux-gnu/libc.so.6 (unknown line)
+uv_cond_wait at /workspace/srcdir/libuv/src/unix/thread.c:822:0
+jl_parallel_gc_threadfun at ~/app/julia-618-master/pin-control/src/gc-stock.c:4370:13
+unknown function (ip: 0x734e9aa9cb63) at /lib/x86_64-linux-gnu/libc.so.6
+unknown function (ip: 0x734e9ab29e8b) at /lib/x86_64-linux-gnu/libc.so.6
+unknown function (ip: (nil)) at (unknown file)
+unknown function (ip: 0x734e9aa98e2f) at /lib/x86_64-linux-gnu/libc.so.6
+pthread_cond_wait at /lib/x86_64-linux-gnu/libc.so.6 (unknown line)
+uv_cond_wait at /workspace/srcdir/libuv/src/unix/thread.c:822:0
+ijl_task_get_next at ~/app/julia-618-master/pin-control/src/scheduler.c:668:21
+wait at task.jl (unknown line)
+wait_forever at task.jl:1559:0 (pc: 5)
+jfptr_wait_forever_0.1 at ~/app/julia-618-master/pin-control/usr/lib/julia/sys.so (unknown line)
+jl_apply at ~/app/julia-618-master/pin-control/src/julia.h:2612:12 [inlined]
+start_task at ~/app/julia-618-master/pin-control/src/task.c:1291:23
+unknown function (ip: (nil)) at (unknown file)
+unknown function (ip: 0x734e9aa98e2f) at /lib/x86_64-linux-gnu/libc.so.6
+pthread_cond_wait at /lib/x86_64-linux-gnu/libc.so.6 (unknown line)
+uv_cond_wait at /workspace/srcdir/libuv/src/unix/thread.c:822:0
+ijl_task_get_next at ~/app/julia-618-master/pin-control/src/scheduler.c:668:21
+wait at task.jl (unknown line)
+wait_forever at task.jl:1559:0 (pc: 5)
+jfptr_wait_forever_0.1 at ~/app/julia-618-master/pin-control/usr/lib/julia/sys.so (unknown line)
+jl_apply at ~/app/julia-618-master/pin-control/src/julia.h:2612:12 [inlined]
+start_task at ~/app/julia-618-master/pin-control/src/task.c:1291:23
+unknown function (ip: (nil)) at (unknown file)
+unknown function (ip: 0x734e9aa98e2f) at /lib/x86_64-linux-gnu/libc.so.6
+pthread_cond_wait at /lib/x86_64-linux-gnu/libc.so.6 (unknown line)
+uv_cond_wait at /workspace/srcdir/libuv/src/unix/thread.c:822:0
+ijl_task_get_next at ~/app/julia-618-master/pin-control/src/scheduler.c:668:21
+wait at task.jl (unknown line)
+wait_forever at task.jl:1559:0 (pc: 5)
+jfptr_wait_forever_0.1 at ~/app/julia-618-master/pin-control/usr/lib/julia/sys.so (unknown line)
+jl_apply at ~/app/julia-618-master/pin-control/src/julia.h:2612:12 [inlined]
+start_task at ~/app/julia-618-master/pin-control/src/task.c:1291:23
+unknown function (ip: (nil)) at (unknown file)
+unknown function (ip: 0x734e9aa98e2f) at /lib/x86_64-linux-gnu/libc.so.6
+pthread_cond_wait at /lib/x86_64-linux-gnu/libc.so.6 (unknown line)
+uv_cond_wait at /workspace/srcdir/libuv/src/unix/thread.c:822:0
+ijl_task_get_next at ~/app/julia-618-master/pin-control/src/scheduler.c:668:21
+wait at task.jl (unknown line)
+wait_forever at task.jl:1559:0 (pc: 5)
+jfptr_wait_forever_0.1 at ~/app/julia-618-master/pin-control/usr/lib/julia/sys.so (unknown line)
+jl_apply at ~/app/julia-618-master/pin-control/src/julia.h:2612:12 [inlined]
+start_task at ~/app/julia-618-master/pin-control/src/task.c:1291:23
+unknown function (ip: (nil)) at (unknown file)
+unknown function (ip: 0x734e9aa98e2f) at /lib/x86_64-linux-gnu/libc.so.6
+pthread_cond_wait at /lib/x86_64-linux-gnu/libc.so.6 (unknown line)
+uv_cond_wait at /workspace/srcdir/libuv/src/unix/thread.c:822:0
+ijl_task_get_next at ~/app/julia-618-master/pin-control/src/scheduler.c:668:21
+wait at task.jl (unknown line)
+wait_forever at task.jl:1559:0 (pc: 5)
+jfptr_wait_forever_0.1 at ~/app/julia-618-master/pin-control/usr/lib/julia/sys.so (unknown line)
+jl_apply at ~/app/julia-618-master/pin-control/src/julia.h:2612:12 [inlined]
+start_task at ~/app/julia-618-master/pin-control/src/task.c:1291:23
+unknown function (ip: (nil)) at (unknown file)
+unknown function (ip: 0x734e9aa98e2f) at /lib/x86_64-linux-gnu/libc.so.6
+pthread_cond_wait at /lib/x86_64-linux-gnu/libc.so.6 (unknown line)
+uv_cond_wait at /workspace/srcdir/libuv/src/unix/thread.c:822:0
+ijl_task_get_next at ~/app/julia-618-master/pin-control/src/scheduler.c:668:21
+wait at task.jl (unknown line)
+wait_forever at task.jl:1559:0 (pc: 5)
+jfptr_wait_forever_0.1 at ~/app/julia-618-master/pin-control/usr/lib/julia/sys.so (unknown line)
+jl_apply at ~/app/julia-618-master/pin-control/src/julia.h:2612:12 [inlined]
+start_task at ~/app/julia-618-master/pin-control/src/task.c:1291:23
+unknown function (ip: (nil)) at (unknown file)
+unknown function (ip: 0x734e9aa98e2f) at /lib/x86_64-linux-gnu/libc.so.6
+pthread_cond_wait at /lib/x86_64-linux-gnu/libc.so.6 (unknown line)
+uv_cond_wait at /workspace/srcdir/libuv/src/unix/thread.c:822:0
+ijl_task_get_next at ~/app/julia-618-master/pin-control/src/scheduler.c:668:21
+wait at task.jl (unknown line)
+wait_forever at task.jl:1559:0 (pc: 5)
+jfptr_wait_forever_0.1 at ~/app/julia-618-master/pin-control/usr/lib/julia/sys.so (unknown line)
+jl_apply at ~/app/julia-618-master/pin-control/src/julia.h:2612:12 [inlined]
+start_task at ~/app/julia-618-master/pin-control/src/task.c:1291:23
+unknown function (ip: (nil)) at (unknown file)
+epoll_pwait at /lib/x86_64-linux-gnu/libc.so.6 (unknown line)
+uv__io_poll at /workspace/srcdir/libuv/src/unix/linux.c:1404:0
+uv_run at /workspace/srcdir/libuv/src/unix/core.c:430:0
+ijl_task_get_next at ~/app/julia-618-master/pin-control/src/scheduler.c:587:34
+wait at task.jl:1701:0 (pc: 49)
+wait_forever at task.jl:1559:0 (pc: 5)
+jfptr_wait_forever_0 at ~/app/julia-618-master/depot-pin-control/compiled/v1.15/Reseau/vKBJ8_HPPav_92aa7dce3195f273.so (unknown line)
+jl_apply at ~/app/julia-618-master/pin-control/src/julia.h:2612:12 [inlined]
+start_task at ~/app/julia-618-master/pin-control/src/task.c:1291:23
+unknown function (ip: (nil)) at (unknown file)
+Allocations: 28582257 (Pool: 28412591; Big: 169666); GC: 112
+┌ Info: bench: serving
+│   MODE = "bare_spawn"
+│   PORT = 8887
+│   threads = 8
+│   interactive = 0
+│   variant = ""
+│   marked = false
+└   load_order = "variant_first"

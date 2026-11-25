@@ -1,0 +1,11 @@
+julia	commit	threads	guard	variant	round	c	h_ms	d_s	rps	p50_ms	p99_ms	max_ms	count_min	count_median	jain	slow1_spawn_to_start_pct	slow1_end_to_wake_pct	fib_alone_median_s	fib_alone_min_s	fib_alone_max_s	fib_runs	fib_median_s	fib_min_s	fib_max_s	fib_walls_s	shape	hw_p50_ms	hw_p99_ms	inflight_mean	inflight_peak	slot_wait_p50_ms	slot_wait_p99_ms
+1.15.0-DEV.974	419aba7972/local	8,1	1	A	1	500	2.0	8.0	3425	11.97	5656.0	8896.0	1	35	0.447	99.9	0.0	0.8192	0.8053	0.9555	0	NaN	NaN	NaN		plain	2.0	2.034	6.87	-1	NaN	NaN
+1.15.0-DEV.976	2caefffc63/native	8,1	1	N	1	500	2.0	8.0	1759	283.2	326.0	371.1	28	29	1.0	98.2	1.1	0.8489	0.8322	0.9784	5	1.517	1.504	1.589	1.589,1.506,1.517,1.504,1.546	plain	2.0	2.001	3.652	-1	NaN	NaN
+1.15.0-DEV.976	2caefffc63/native	8,1	1	N	2	500	2.0	8.0	1763	282.4	328.0	354.8	28	29	1.0	97.9	1.5	0.8503	0.8327	0.9875	5	1.514	1.5	1.525	1.514,1.521,1.525,1.5,1.513	plain	2.0	2.001	3.658	-1	NaN	NaN
+1.15.0-DEV.974	419aba7972/local	8,1	1	A	2	500	2.0	8.0	3404	9.009	8091.0	8820.0	1	1	0.281	99.9	0.0	0.833	0.8124	0.927	0	NaN	NaN	NaN		plain	2.0	2.032	6.832	-1	NaN	NaN
+1.15.0-DEV.974	419aba7972/local	8,1	1	A	3	500	2.0	8.0	3401	9.022	6881.0	8905.0	1	4	0.323	99.9	0.0	0.8236	0.8115	0.983	0	NaN	NaN	NaN		plain	2.0	2.034	6.812	-1	NaN	NaN
+1.15.0-DEV.976	2caefffc63/native	8,1	1	N	3	500	2.0	8.0	1746	285.5	326.7	355.9	28	29	1.0	98.2	1.2	0.8515	0.842	0.9739	5	1.524	1.483	1.564	1.564,1.488,1.483,1.545,1.524	plain	2.0	2.001	3.678	-1	NaN	NaN
+1.15.0-DEV.976	2caefffc63/native	8,1	1	N	4	500	2.0	8.0	1749	284.0	329.0	377.6	28	29	1.0	98.3	1.1	0.844	0.8271	0.9672	5	1.512	1.473	1.544	1.544,1.511,1.512,1.473,1.512	plain	2.0	2.008	3.674	-1	NaN	NaN
+1.15.0-DEV.974	419aba7972/local	8,1	1	A	4	500	2.0	8.0	3412	9.012	6740.0	8870.0	1	13	0.335	99.9	0.0	0.8228	0.7974	0.9515	0	NaN	NaN	NaN		plain	2.0	2.033	6.84	-1	NaN	NaN
+1.15.0-DEV.974	419aba7972/local	8,1	1	A	5	500	2.0	8.0	3453	8.988	7827.0	8624.0	1	4	0.274	99.9	0.0	0.825	0.804	0.9265	0	NaN	NaN	NaN		plain	2.0	2.032	6.954	-1	NaN	NaN
+1.15.0-DEV.976	2caefffc63/native	8,1	1	N	5	500	2.0	8.0	1734	287.0	335.5	367.0	28	29	1.0	98.4	1.0	0.8762	0.8305	0.9691	5	1.519	1.49	1.532	1.49,1.507,1.527,1.532,1.519	plain	2.0	2.003	3.663	-1	NaN	NaN

@@ -3,10 +3,13 @@
 # regenerated from three builds by one command. The claims are fixed in advance (README, "The PR
 # candidate"): one row a claim, one cell and one criterion a row.
 #
-#   bench/julia/candidate_evidence.sh <control> <control2> <candidate>
+#   bench/julia/candidate_evidence.sh <control> <control2> <candidate> [<bypass>]
 #
 # Each argument is a julia executable or wrapper: <control> and <control2> the same commit built
-# twice (the floor), <candidate> that commit with the patch. Run it detached:
+# twice (the floor), <candidate> that commit with the patch, and optionally <bypass>, the patch with
+# stock's entry points under master's names (the mark's code compiled in, unreachable): a fourth
+# column in row e and in row f's unmarked line. TIMENS=<julia> adds a variant of the candidate,
+# measured in its own steps (t*) beside the candidate, after every row. Run it detached:
 #   setsid nohup bench/julia/candidate_evidence.sh C C2 P > driver.out 2>&1 < /dev/null &
 # Results go to OUT (default bench/results/candidate-evidence-<date>): raw/<step>/ (the TSVs),
 # environment.md, results.md (written by candidate_evidence_report.jl, never by hand), driver.log.
@@ -28,9 +31,12 @@
 #         repro, repro_gh   the standalone reproducers in bench/julia/candidate/ on control and
 #                   candidate [REPRO_ROUNDS 3]; repro_gh holds g's and h's
 #         mwe       the PR description's reproducer, once on control and once marked on candidate
+#   (TIMENS=) tstarved tmixed tspawnpath tarm tfloorfib tfloorh0   rows b, c, g, h and e with the
+#                   variant beside the candidate [TIMENS_ROUNDS 6]
 #         report    results.md
-# STEPS="<names>" runs a subset, FROM=<name> starts at a step. SMOKE=1: every step once and short,
-# never a measurement.
+# STEPS="<names>" runs a subset, FROM=<name> starts at a step. DEADLINE=<epoch s>: the variant's
+# steps and pfib81, if not started by then, are skipped and logged as CUT. SMOKE=1: every step once
+# and short, never a measurement.
 #
 # Around every step, as master_measure.sh: before it the ps check (a julia, oha or go-server
 # process that is not the driver's own is logged with its pid, start time, parent, working
@@ -43,32 +49,34 @@ set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
 if [ "${1:-}" != --run ]; then
-  [ $# -eq 3 ] || { echo "usage: $0 <control> <control2> <candidate>" >&2; exit 2; }
+  { [ $# -eq 3 ] || [ $# -eq 4 ]; } || { echo "usage: $0 <control> <control2> <candidate> [<bypass>]" >&2; exit 2; }
   export CE_CONTROL="$(readlink -f "$1")" CE_CONTROL2="$(readlink -f "$2")" CE_CANDIDATE="$(readlink -f "$3")"
+  export CE_BYPASS=""; [ $# -eq 4 ] && CE_BYPASS="$(readlink -f "$4")"
+  export CE_TIMENS=""; [ -n "${TIMENS:-}" ] && CE_TIMENS="$(readlink -f "$TIMENS")"
 fi
 [ -n "${CE_OUT:-}" ] && OUT="$CE_OUT"
 export SMOKE="${SMOKE:-0}"
 if [ "$SMOKE" = 1 ]; then
   export TD="${TD:-1}" NOGATE=1
   OUT="${OUT:-$ROOT/bench/results/candidate-evidence-smoke}"
-  STARVED_ROUNDS=1 MIXED_ROUNDS=1 CELL_ROUNDS=1 FLOOR_ROUNDS=1 PFIB_ROUNDS=1 SPAWN_ROUNDS=1 ARM_ROUNDS=1 REPRO_ROUNDS=1
+  STARVED_ROUNDS=1 MIXED_ROUNDS=1 CELL_ROUNDS=1 FLOOR_ROUNDS=1 PFIB_ROUNDS=1 SPAWN_ROUNDS=1 ARM_ROUNDS=1 REPRO_ROUNDS=1 TIMENS_ROUNDS=1
 else
   OUT="${OUT:-$ROOT/bench/results/candidate-evidence-$(date +%Y%m%d)}"
   STARVED_ROUNDS="${STARVED_ROUNDS:-5}" MIXED_ROUNDS="${MIXED_ROUNDS:-5}" CELL_ROUNDS="${CELL_ROUNDS:-5}"
   FLOOR_ROUNDS="${FLOOR_ROUNDS:-12}" PFIB_ROUNDS="${PFIB_ROUNDS:-6}" SPAWN_ROUNDS="${SPAWN_ROUNDS:-6}"
-  ARM_ROUNDS="${ARM_ROUNDS:-6}" REPRO_ROUNDS="${REPRO_ROUNDS:-3}"
+  ARM_ROUNDS="${ARM_ROUNDS:-6}" REPRO_ROUNDS="${REPRO_ROUNDS:-3}" TIMENS_ROUNDS="${TIMENS_ROUNDS:-6}"
 fi
 mkdir -p "$OUT/raw"
 export CE_OUT="$OUT"
 export CE_DRIVER_PID="${CE_DRIVER_PID:-$$}"
 LOG="$OUT/driver.log"
 export PATH="$HOME/.local/go/bin:$HOME/.local/bin:$HOME/.juliaup/bin:$PATH"
-C="$CE_CONTROL" C2="$CE_CONTROL2" P="$CE_CANDIDATE"
+C="$CE_CONTROL" C2="$CE_CONTROL2" P="$CE_CANDIDATE" BP="${CE_BYPASS:-}" TN="${CE_TIMENS:-}"
 ENVS="${CE_ENVS:-$HOME/app/julia-618-master/envs}"
 EM="$ENVS/micro-master" SM="$ENVS/server-master"
-export JLS="control=$C control2=$C2 candidate=$P"
+export JLS="control=$C control2=$C2 candidate=$P${BP:+ bypass=$BP}${TN:+ timens=$TN}"
 export MICRO_PROJECT="$EM"
-JULIAS3="control=$C,$SM candidate=$P,$SM"
+JULIAS3="control=$C,$SM candidate=$P,$SM${TN:+ timens=$TN,$SM}"
 CPUS8="0,1,2,3,6,7,8,9"
 AGG="/aggregate?n=100000&op=groupby"
 
@@ -121,7 +129,7 @@ ps_check() {
 }
 DEPOTS=()
 if [ "${1:-}" != --run ]; then
-  for w in "$C" "$C2" "$P"; do d="$(first_depot "$w")"; [ -n "$d" ] && DEPOTS+=("$d"); done
+  for w in "$C" "$C2" "$P" $BP $TN; do d="$(first_depot "$w")"; [ -n "$d" ] && DEPOTS+=("$d"); done
 fi
 snap() { local d; for d in "$@"; do [ -d "$d/compiled" ] && find "$d/compiled" -type f -printf '%p %s %i\n' 2>/dev/null; done | sort; }
 cache_mark() { snap "${DEPOTS[@]}" >"$OUT/.snap-own"; }
@@ -158,12 +166,13 @@ rotated() {
   for ((i = 0; i < n; i++)); do out+=("${a[$(( (i + k) % n ))]}"); done
   echo "${out[*]}"
 }
-jl_of() { case "$1" in control) echo "$C" ;; control2) echo "$C2" ;; candidate) echo "$P" ;; *) return 1 ;; esac; }
+jl_of() { case "$1" in control) echo "$C" ;; control2) echo "$C2" ;; candidate) echo "$P" ;; bypass) echo "$BP" ;; timens) echo "$TN" ;; *) return 1 ;; esac; }
+LABELS="control control2 candidate${BP:+ bypass}${TN:+ timens}"
 
 # ---------------------------------------------------------------- untimed: environments, environment.md
 step_prep() {    # each build's first depot gets the micro and server environments precompiled
   local w e
-  for w in "$C" "$C2" "$P"; do
+  for w in "$C" "$C2" "$P" $BP $TN; do
     for e in "$EM" "$SM"; do
       JULIA_PKG_OFFLINE=true "$w" --startup-file=no --project="$e" -e 'using Pkg; Pkg.instantiate(); Pkg.precompile()' >>"$LOG" 2>&1 ||
         { log "prep: precompiling $e for $w failed"; return 1; }
@@ -182,10 +191,13 @@ step_env() {
     echo "- Kernel: $(uname -srvm)"
     echo "- Governor: $(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || echo '?'); boost: $(cat /sys/devices/system/cpu/cpufreq/boost 2>/dev/null || echo '?')"
     echo "- Clocksource: $(cat /sys/devices/system/clocksource/clocksource0/current_clocksource 2>/dev/null)"
+    echo "- Uptime: $(uptime -p) (up since $(uptime -s)); load before the first block (/proc/loadavg): $(cat /proc/loadavg)"
+    echo "- Memory: $(free -m | awk '/^Mem:/ { printf "%s MiB total, %s MiB free, %s MiB available", $2, $4, $7 }'); swap used $(free -m | awk '/^Swap:/ { print $3 }') MiB"
+    echo "- Transparent huge pages: enabled $(cat /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null), defrag $(cat /sys/kernel/mm/transparent_hugepage/defrag 2>/dev/null)"
     echo "- Pinning: the cells and the server on CPUs $CPUS8 (taskset; 0,1,2 for --threads=2); fairness.sh's load generator on 4,5,10,11. Each column is a fresh process every round."
     echo "- Gate: every timed block behind bench/socket/quiet.sh (no other julia, oha or go-server process, load1 < 0.5)."
     echo
-    for label in control control2 candidate; do
+    for label in $LABELS; do
       w="$(jl_of "$label")"
       echo "## $label: \`$w\`"
       echo
@@ -258,7 +270,7 @@ pfib_block() {   # tsv, rounds, layout, cpus, columns...
     for c in $(rotated "$r" "$@"); do pfib_one "$tsv" "$r" "$layout" "$cpus" "$c"; done
   done
 }
-PFIB_COLS="ctl:control:none ctl2:control2:none cand:candidate:none root:candidate:root all:candidate:all"
+PFIB_COLS="ctl:control:none ctl2:control2:none cand:candidate:none root:candidate:root all:candidate:all${BP:+ byp:bypass:none}"
 step_pfib() {    # step, layout, cpus
   local a="$OUT/raw/$1/pfib.tsv"; mkdir -p "$OUT/raw/$1"; rm -f "$a"
   printf 'round\tlabel\tmode\tlayout\tn\tmin_s\tmedian_s\tallocs\tmemory_bytes\tsamples\tmaxrss_mb\n' >"$a"
@@ -322,23 +334,28 @@ mwe_block() {    # dir
 if [ "${1:-}" = --run ]; then shift; "$@"; exit $?; fi
 
 UNTIMED=" prep env tests report "
-DEFAULT_STEPS="prep env starved mixed cell81 cell80 floorfib floorh0 pfib2 pfib81 spawnpath arm tests repro repro_gh mwe report"
+DEFAULT_STEPS="prep env starved mixed cell81 cell80 floorfib floorh0 pfib2 pfib81 spawnpath arm tests repro repro_gh mwe${TN:+ tstarved tmixed tspawnpath tarm tfloorfib tfloorh0} report"
+FLOOR_COLS="A%control A%control2 N-none%candidate${BP:+ N-none%bypass}"
 STEPS="${STEPS:-$DEFAULT_STEPS}"
 if [ -n "${FROM:-}" ]; then
   STEPS="$(echo "$STEPS" | tr ' ' '\n' | sed -n "/^${FROM}\$/,\$p" | tr '\n' ' ')"
   [ -n "$STEPS" ] || stop "FROM=$FROM is not a step"
 fi
 log "driver start: steps [$STEPS], OUT $OUT, SMOKE=$SMOKE"
-for label in control control2 candidate; do
+for label in $LABELS; do
   w="$(jl_of "$label")"
   log "build $label: $w: $("$w" --startup-file=no -e 'print(VERSION, " ", Base.GIT_VERSION_INFO.commit_short)' 2>&1 | head -1)"
 done
 { printf 'label\tpath\tcommit_short\n'
-  for label in control control2 candidate; do
+  for label in $LABELS; do
     w="$(jl_of "$label")"
     printf '%s\t%s\t%s\n' "$label" "$w" "$("$w" --startup-file=no -e 'print(Base.GIT_VERSION_INFO.commit_short)' 2>/dev/null)"
   done; } >"$OUT/builds.tsv"
+CUTTABLE=" tstarved tmixed tspawnpath tarm tfloorfib tfloorh0 pfib81 "   # the prompt's cut order: the variant, then row f at 8,1
 for s in $STEPS; do
+  if [ -n "${DEADLINE:-}" ] && [ "$(date +%s)" -ge "$DEADLINE" ] && [[ "$CUTTABLE" == *" $s "* ]]; then
+    log "step $s: CUT (not started by the deadline)"; continue
+  fi
   ps_check || stop "ps check before $s"
   cache_mark; results_mark
   log "step $s: start"
@@ -350,8 +367,8 @@ for s in $STEPS; do
     mixed) step_mixed mixed "A%control N%candidate" "$MIXED_ROUNDS" ;;
     cell81) step_server cell81 "$AGG" "bare_spawn@8,1%control bare_marked_listen@8,1@N%candidate" "$CELL_ROUNDS" ;;
     cell80) step_server cell80 "$AGG" "bare_spawn@8,0%control bare_marked_listen@8,0@N%candidate" "$CELL_ROUNDS" ;;
-    floorfib) step_fib floorfib 8,1 "$CPUS8" "A%control A%control2 N-none%candidate" "$FLOOR_ROUNDS" ;;
-    floorh0) step_h0 floorh0 "8,0 default" "A%control A%control2 N-none%candidate" "$FLOOR_ROUNDS" ;;
+    floorfib) step_fib floorfib 8,1 "$CPUS8" "$FLOOR_COLS" "$FLOOR_ROUNDS" ;;
+    floorh0) step_h0 floorh0 "8,0 default" "$FLOOR_COLS" "$FLOOR_ROUNDS" ;;
     pfib2) step_pfib pfib2 2 0,1,2 ;;
     pfib81) step_pfib pfib81 8,1 "$CPUS8" ;;
     spawnpath) step_h0 spawnpath "8,0 default" "A%control N%candidate" "$SPAWN_ROUNDS" ;;
@@ -360,6 +377,12 @@ for s in $STEPS; do
     repro) step_repro repro "${REPRO_CORE[@]}" ;;
     repro_gh) step_repro repro_gh "${REPRO_GH[@]}" ;;
     mwe) mkdir -p "$OUT/raw/mwe"; gated 618ce-mwe "$0" --run mwe_block "$OUT/raw/mwe" >>"$LOG" 2>&1 ;;
+    tstarved) step_starved tstarved "A%control N%candidate N%timens" "$TIMENS_ROUNDS" ;;
+    tmixed) step_mixed tmixed "A%control N%candidate N%timens" "$TIMENS_ROUNDS" ;;
+    tspawnpath) step_h0 tspawnpath "8,0 default" "A%control N%candidate N%timens" "$TIMENS_ROUNDS" ;;
+    tarm) step_fib tarm 8,1 "$CPUS8" "A%control N-none%timens N-arm%timens N-none%candidate N-arm%candidate" "$TIMENS_ROUNDS" ;;
+    tfloorfib) step_fib tfloorfib 8,1 "$CPUS8" "A%control A%control2 N-none%candidate N-none%timens" "$TIMENS_ROUNDS" ;;
+    tfloorh0) step_h0 tfloorh0 "8,0 default" "A%control A%control2 N-none%candidate N-none%timens" "$TIMENS_ROUNDS" ;;
     report) "$C" --startup-file=no "$HERE/candidate_evidence_report.jl" "$OUT" >"$OUT/results.md" 2>>"$LOG" ;;
     *) stop "unknown step $s" ;;
   esac
