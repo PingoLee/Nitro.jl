@@ -1,0 +1,595 @@
+[2026-11-26 13:20:28] driver start: steps [prep env starved mixed cell81 cell80 floorfib floorh0 pfib2 pfib81 spawnpath arm tests repro repro_gh mwe report], OUT ~/app/Nitro.jl/.claude/worktrees/bench-618-v4-evidence/bench/julia/evidence/candidate-v4-20261126, SMOKE=0
+[2026-11-26 13:20:28] build control: ~/app/julia-618-master/bin/julia-pin-control: 1.15.0-DEV.974 419aba7972
+[2026-11-26 13:20:28] build control2: ~/app/julia-618-master/bin/julia-pin-control2: 1.15.0-DEV.974 419aba7972*
+[2026-11-26 13:20:28] build candidate: ~/app/julia-618-master/bin/julia-v4: 1.15.0-DEV.976 1bffccdc2f
+[2026-11-26 13:20:28] build bypass: ~/app/julia-618-master/bin/julia-v4-bypass: 1.15.0-DEV.977 1c676fcdb3
+[2026-11-26 13:20:29] step prep: start
+[2026-11-26 13:20:34] step prep: exit 0 after 0 min
+[2026-11-26 13:20:34] cache check prep: no cache file created or replaced
+[2026-11-26 13:20:34] step env: start
+[2026-11-26 13:20:37] environment.md written
+[2026-11-26 13:20:37] step env: exit 0 after 0 min
+[2026-11-26 13:20:37] cache check env: no cache file created or replaced
+[2026-11-26 13:20:37] step starved: start
+[13:20:37] quiet gate for fairrounds: load1 < 0.5 and no julia/oha/go-server (at most 1800s)
+[13:22:17] gate passed after 100s (load1 0.42); running: ~/app/Nitro.jl/.claude/worktrees/bench-618-v4-evidence/bench/tasks/rounds_fifo.sh --run fairrounds_block ~/app/Nitro.jl/.claude/worktrees/bench-618-v4-evidence/bench/julia/evidence/candidate-v4-20261126/raw/starved/attempt-fairrounds-spawn-20261126-132037.tsv
+multiq_variant: VARIANT=A
+spawn_order: julia 1.15.0-DEV.974 (419aba7972 2026-11-24 17:01 UTC), threads 8,1, guard 1, a plain @spawn from :interactive lands on :default, :default tids [2, 3, 4, 5, 6, 7, 8, 9], D = 8.0 s, variant A
+multiq_variant: VARIANT=A
+spawn_order: julia 1.15.0-DEV.974 (419aba7972 2026-11-24 17:01 UTC), threads 8,1, guard 1, a plain @spawn from :interactive lands on :default, :default tids [2, 3, 4, 5, 6, 7, 8, 9], D = 8.0 s, variant A
+multiq_variant: VARIANT=A
+spawn_order: julia 1.15.0-DEV.974 (419aba7972 2026-11-24 17:01 UTC), threads 8,1, guard 1, a plain @spawn from :interactive lands on :default, :default tids [2, 3, 4, 5, 6, 7, 8, 9], D = 8.0 s, variant A
+multiq_variant: VARIANT=N, F queue: class mark, serve g, 0 rings, pop samples 2, descendants R (into the R heaps), request-side weight 2/4, marks handlers+clients
+spawn_order: julia 1.15.0-DEV.976 (1bffccdc2f 2026-11-26 03:26 UTC), threads 8,1, guard 1, a plain @spawn from :interactive lands on :default, :default tids [2, 3, 4, 5, 6, 7, 8, 9], D = 8.0 s, variant N
+multiq_variant: VARIANT=A
+spawn_order: julia 1.15.0-DEV.974 (419aba7972 2026-11-24 17:01 UTC), threads 8,1, guard 1, a plain @spawn from :interactive lands on :default, :default tids [2, 3, 4, 5, 6, 7, 8, 9], D = 8.0 s, variant A
+multiq_variant: VARIANT=N, F queue: class mark, serve g, 0 rings, pop samples 2, descendants R (into the R heaps), request-side weight 2/4, marks handlers+clients
+spawn_order: julia 1.15.0-DEV.976 (1bffccdc2f 2026-11-26 03:26 UTC), threads 8,1, guard 1, a plain @spawn from :interactive lands on :default, :default tids [2, 3, 4, 5, 6, 7, 8, 9], D = 8.0 s, variant N
+multiq_variant: VARIANT=A
+spawn_order: julia 1.15.0-DEV.974 (419aba7972 2026-11-24 17:01 UTC), threads 8,1, guard 1, a plain @spawn from :interactive lands on :default, :default tids [2, 3, 4, 5, 6, 7, 8, 9], D = 8.0 s, variant A
+multiq_variant: VARIANT=A
+spawn_order: julia 1.15.0-DEV.974 (419aba7972 2026-11-24 17:01 UTC), threads 8,1, guard 1, a plain @spawn from :interactive lands on :default, :default tids [2, 3, 4, 5, 6, 7, 8, 9], D = 8.0 s, variant A
+multiq_variant: VARIANT=A
+spawn_order: julia 1.15.0-DEV.974 (419aba7972 2026-11-24 17:01 UTC), threads 8,1, guard 1, a plain @spawn from :interactive lands on :default, :default tids [2, 3, 4, 5, 6, 7, 8, 9], D = 8.0 s, variant A
+multiq_variant: VARIANT=N, F queue: class mark, serve g, 0 rings, pop samples 2, descendants R (into the R heaps), request-side weight 2/4, marks handlers+clients
+spawn_order: julia 1.15.0-DEV.976 (1bffccdc2f 2026-11-26 03:26 UTC), threads 8,1, guard 1, a plain @spawn from :interactive lands on :default, :default tids [2, 3, 4, 5, 6, 7, 8, 9], D = 8.0 s, variant N
+multiq_variant: VARIANT=A
+spawn_order: julia 1.15.0-DEV.974 (419aba7972 2026-11-24 17:01 UTC), threads 8,1, guard 1, a plain @spawn from :interactive lands on :default, :default tids [2, 3, 4, 5, 6, 7, 8, 9], D = 8.0 s, variant A
+multiq_variant: VARIANT=N, F queue: class mark, serve g, 0 rings, pop samples 2, descendants R (into the R heaps), request-side weight 2/4, marks handlers+clients
+spawn_order: julia 1.15.0-DEV.976 (1bffccdc2f 2026-11-26 03:26 UTC), threads 8,1, guard 1, a plain @spawn from :interactive lands on :default, :default tids [2, 3, 4, 5, 6, 7, 8, 9], D = 8.0 s, variant N
+multiq_variant: VARIANT=A
+spawn_order: julia 1.15.0-DEV.974 (419aba7972 2026-11-24 17:01 UTC), threads 8,1, guard 1, a plain @spawn from :interactive lands on :default, :default tids [2, 3, 4, 5, 6, 7, 8, 9], D = 8.0 s, variant A
+multiq_variant: VARIANT=A
+spawn_order: julia 1.15.0-DEV.974 (419aba7972 2026-11-24 17:01 UTC), threads 8,1, guard 1, a plain @spawn from :interactive lands on :default, :default tids [2, 3, 4, 5, 6, 7, 8, 9], D = 8.0 s, variant A
+multiq_variant: VARIANT=A
+spawn_order: julia 1.15.0-DEV.974 (419aba7972 2026-11-24 17:01 UTC), threads 8,1, guard 1, a plain @spawn from :interactive lands on :default, :default tids [2, 3, 4, 5, 6, 7, 8, 9], D = 8.0 s, variant A
+multiq_variant: VARIANT=N, F queue: class mark, serve g, 0 rings, pop samples 2, descendants R (into the R heaps), request-side weight 2/4, marks handlers+clients
+spawn_order: julia 1.15.0-DEV.976 (1bffccdc2f 2026-11-26 03:26 UTC), threads 8,1, guard 1, a plain @spawn from :interactive lands on :default, :default tids [2, 3, 4, 5, 6, 7, 8, 9], D = 8.0 s, variant N
+[13:24:58] sampler summary for fairrounds (~/app/Nitro.jl/.claude/worktrees/bench-618-v4-evidence/bench/results/quiet-fairrounds-20261126-132037.tsv):
+  samples 29 every 5s; load1 min 0.42 median 6.47 max 8.36
+  samples with a foreign julia/oha/go-server: 0
+  samples with an outside process above 5% CPU: 7  [node peak 29.0%]  [tmux: peak 6.5%]
+  block exit status 0
+[13:24:58] rounds_fifo: fairrounds done
+[13:24:58] rounds_fifo: done (status 0); next: julia ~/app/Nitro.jl/.claude/worktrees/bench-618-v4-evidence/bench/tasks/aggregate_fifo.jl ~/app/Nitro.jl/.claude/worktrees/bench-618-v4-evidence/bench/julia/evidence/candidate-v4-20261126/raw/starved
+[2026-11-26 13:24:58] step starved: exit 0 after 4 min
+[2026-11-26 13:24:58] cache check starved: no cache file created or replaced
+[2026-11-26 13:24:58] step mixed: start
+[13:24:58] quiet gate for 618ce-mixed: load1 < 0.5 and no julia/oha/go-server (at most 1800s)
+[13:27:49] gate passed after 170s (load1 0.49); running: bench/julia/candidate_evidence.sh --run mixed_rounds ~/app/Nitro.jl/.claude/worktrees/bench-618-v4-evidence/bench/julia/evidence/candidate-v4-20261126/raw/mixed A%control N%candidate 5
+multiq_variant: VARIANT=A
+mixed_cell: julia 1.15.0-DEV.974 (419aba7972), threads 8,1, variant A, C = 500, H = 2.0 ms, D = 8.0 s, fib_fine 42:12 looping on :default, shape plain
+multiq_variant: VARIANT=A
+mixed_cell: julia 1.15.0-DEV.974 (419aba7972), threads 8,1, variant A, C = 500, H = 2.0 ms, D = 8.0 s, fib_fine 42:12 looping on :default, shape plain
+multiq_variant: VARIANT=N, F queue: class mark, serve g, 0 rings, pop samples 2, descendants R (into the R heaps), request-side weight 2/4, marks handlers+clients
+mixed_cell: julia 1.15.0-DEV.976 (1bffccdc2f), threads 8,1, variant N, C = 500, H = 2.0 ms, D = 8.0 s, fib_fine 42:12 looping on :default, shape plain
+multiq_variant: VARIANT=A
+mixed_cell: julia 1.15.0-DEV.974 (419aba7972), threads 8,1, variant A, C = 500, H = 2.0 ms, D = 8.0 s, fib_fine 42:12 looping on :default, shape inner
+multiq_variant: VARIANT=N, F queue: class mark, serve g, 0 rings, pop samples 2, descendants R (into the R heaps), request-side weight 2/4, marks handlers+clients
+mixed_cell: julia 1.15.0-DEV.976 (1bffccdc2f), threads 8,1, variant N, C = 500, H = 2.0 ms, D = 8.0 s, fib_fine 42:12 looping on :default, shape inner
+multiq_variant: VARIANT=N, F queue: class mark, serve g, 0 rings, pop samples 2, descendants R (into the R heaps), request-side weight 2/4, marks handlers+clients
+mixed_cell: julia 1.15.0-DEV.976 (1bffccdc2f), threads 8,1, variant N, C = 500, H = 2.0 ms, D = 8.0 s, fib_fine 42:12 looping on :default, shape plain
+multiq_variant: VARIANT=A
+mixed_cell: julia 1.15.0-DEV.974 (419aba7972), threads 8,1, variant A, C = 500, H = 2.0 ms, D = 8.0 s, fib_fine 42:12 looping on :default, shape plain
+multiq_variant: VARIANT=N, F queue: class mark, serve g, 0 rings, pop samples 2, descendants R (into the R heaps), request-side weight 2/4, marks handlers+clients
+mixed_cell: julia 1.15.0-DEV.976 (1bffccdc2f), threads 8,1, variant N, C = 500, H = 2.0 ms, D = 8.0 s, fib_fine 42:12 looping on :default, shape inner
+multiq_variant: VARIANT=A
+mixed_cell: julia 1.15.0-DEV.974 (419aba7972), threads 8,1, variant A, C = 500, H = 2.0 ms, D = 8.0 s, fib_fine 42:12 looping on :default, shape inner
+multiq_variant: VARIANT=A
+mixed_cell: julia 1.15.0-DEV.974 (419aba7972), threads 8,1, variant A, C = 500, H = 2.0 ms, D = 8.0 s, fib_fine 42:12 looping on :default, shape plain
+multiq_variant: VARIANT=N, F queue: class mark, serve g, 0 rings, pop samples 2, descendants R (into the R heaps), request-side weight 2/4, marks handlers+clients
+mixed_cell: julia 1.15.0-DEV.976 (1bffccdc2f), threads 8,1, variant N, C = 500, H = 2.0 ms, D = 8.0 s, fib_fine 42:12 looping on :default, shape plain
+multiq_variant: VARIANT=A
+mixed_cell: julia 1.15.0-DEV.974 (419aba7972), threads 8,1, variant A, C = 500, H = 2.0 ms, D = 8.0 s, fib_fine 42:12 looping on :default, shape inner
+multiq_variant: VARIANT=N, F queue: class mark, serve g, 0 rings, pop samples 2, descendants R (into the R heaps), request-side weight 2/4, marks handlers+clients
+mixed_cell: julia 1.15.0-DEV.976 (1bffccdc2f), threads 8,1, variant N, C = 500, H = 2.0 ms, D = 8.0 s, fib_fine 42:12 looping on :default, shape inner
+multiq_variant: VARIANT=N, F queue: class mark, serve g, 0 rings, pop samples 2, descendants R (into the R heaps), request-side weight 2/4, marks handlers+clients
+mixed_cell: julia 1.15.0-DEV.976 (1bffccdc2f), threads 8,1, variant N, C = 500, H = 2.0 ms, D = 8.0 s, fib_fine 42:12 looping on :default, shape plain
+multiq_variant: VARIANT=A
+mixed_cell: julia 1.15.0-DEV.974 (419aba7972), threads 8,1, variant A, C = 500, H = 2.0 ms, D = 8.0 s, fib_fine 42:12 looping on :default, shape plain
+multiq_variant: VARIANT=N, F queue: class mark, serve g, 0 rings, pop samples 2, descendants R (into the R heaps), request-side weight 2/4, marks handlers+clients
+mixed_cell: julia 1.15.0-DEV.976 (1bffccdc2f), threads 8,1, variant N, C = 500, H = 2.0 ms, D = 8.0 s, fib_fine 42:12 looping on :default, shape inner
+multiq_variant: VARIANT=A
+mixed_cell: julia 1.15.0-DEV.974 (419aba7972), threads 8,1, variant A, C = 500, H = 2.0 ms, D = 8.0 s, fib_fine 42:12 looping on :default, shape inner
+multiq_variant: VARIANT=A
+mixed_cell: julia 1.15.0-DEV.974 (419aba7972), threads 8,1, variant A, C = 500, H = 2.0 ms, D = 8.0 s, fib_fine 42:12 looping on :default, shape plain
+multiq_variant: VARIANT=N, F queue: class mark, serve g, 0 rings, pop samples 2, descendants R (into the R heaps), request-side weight 2/4, marks handlers+clients
+mixed_cell: julia 1.15.0-DEV.976 (1bffccdc2f), threads 8,1, variant N, C = 500, H = 2.0 ms, D = 8.0 s, fib_fine 42:12 looping on :default, shape plain
+multiq_variant: VARIANT=A
+mixed_cell: julia 1.15.0-DEV.974 (419aba7972), threads 8,1, variant A, C = 500, H = 2.0 ms, D = 8.0 s, fib_fine 42:12 looping on :default, shape inner
+multiq_variant: VARIANT=N, F queue: class mark, serve g, 0 rings, pop samples 2, descendants R (into the R heaps), request-side weight 2/4, marks handlers+clients
+mixed_cell: julia 1.15.0-DEV.976 (1bffccdc2f), threads 8,1, variant N, C = 500, H = 2.0 ms, D = 8.0 s, fib_fine 42:12 looping on :default, shape inner
+[13:33:21] sampler summary for 618ce-mixed (~/app/Nitro.jl/.claude/worktrees/bench-618-v4-evidence/bench/results/quiet-618ce-mixed-20261126-132458.tsv):
+  samples 60 every 5s; load1 min 0.49 median 6.54 max 7.92
+  samples with a foreign julia/oha/go-server: 0
+  samples with an outside process above 5% CPU: 15  [node peak 16.1%]  [tmux: peak 6.5%]  [top peak 6.7%]
+  block exit status 0
+[2026-11-26 13:33:21] step mixed: exit 0 after 8 min
+[2026-11-26 13:33:21] cache check mixed: no cache file created or replaced
+[2026-11-26 13:33:21] step cell81: start
+[13:33:21] quiet gate for 618ce-cell81: load1 < 0.5 and no julia/oha/go-server (at most 1800s)
+[13:36:11] gate passed after 170s (load1 0.48); running: env FRESH=1 BACKLOG=1024 ROTATE=1 THROWAWAY=1 PROBE=0 ROUTE=/aggregate?n=100000&op=groupby JULIAS=control=~/app/julia-618-master/bin/julia-pin-control,~/app/julia-618-master/envs/server-master candidate=~/app/julia-618-master/bin/julia-v4,~/app/julia-618-master/envs/server-master ~/app/Nitro.jl/.claude/worktrees/bench-618-v4-evidence/bench/socket/fairness.sh bare_spawn@8,1%control bare_marked_listen@8,1@N%candidate 5 8s
+fairness bench: modes [bare_spawn@8,1%control bare_marked_listen@8,1@N%candidate], /aggregate?n=100000&op=groupby, c=500, 5 x 8s interleaved
+  server CPUs 0,1,2,3,6,7,8,9 (--threads=8 unless mode@threads; go GOMAXPROCS=8), client CPUs 4,5,10,11
+  concurrency bounds: serve() max_concurrent_requests at its default (nothing: no cap); HTTP.jl listen! defaults (no HTTP/1 connection cap); bare_pool POOL=nthreads(:default)
+  julia: julia version 1.13.4; go version go1.27.1 linux/amd64
+servers up and warm in 5.0 s (-r0): bare_spawn@8,1%control
+servers up and warm in 11.1 s (-r1): bare_spawn@8,1%control bare_marked_listen@8,1@N%candidate
+servers up and warm in 10.0 s (-r2): bare_marked_listen@8,1@N%candidate bare_spawn@8,1%control
+servers up and warm in 10.0 s (-r3): bare_spawn@8,1%control bare_marked_listen@8,1@N%candidate
+servers up and warm in 10.1 s (-r4): bare_marked_listen@8,1@N%candidate bare_spawn@8,1%control
+servers up and warm in 10.0 s (-r5): bare_spawn@8,1%control bare_marked_listen@8,1@N%candidate
+
+| mode | rps | p50 ms | p90 ms | p99 ms | p99.9 ms | max ms | share > 1 s | requests per connection: min / p1 / p10 / median / max | Jain | longest wait per connection: median / p90 ms | GC: collections / ms | RSS MB | swap in / out (pages, summed) | listen overflows (summed) | oha rps |
+|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| bare_spawn@8,1%control | 4874 [4804–4945] | 13.218 [13.06–13.295] | 96.666 [90.635–103.169] | 2292.37 [2110.2–2454.2] | 8038.8 [6863.63–8071.26] | 8097.39 [8064.71–8102.02] | 0.022 [0.019–0.024] | 1 / 1 / 2 / 77 / 257 | 0.694 [0.644–0.738] | 2980.61 / 8013.6 | 64 [62–67] / 160.1 [153.9–171.4] | 819 [799–824] | 0 / 0 | 0 | 0 [0–0] |
+| bare_marked_listen@8,1@N%candidate | 4960 [4934–4963] | 100.165 [100.089–100.668] | 106.522 [106.457–107.07] | 114.117 [113.129–114.416] | 121.338 [120.245–123.064] | 136.612 [133.103–143.354] | 0 [0–0] | 79 / 79 / 80 / 80 / 83 | 1 [1–1] | 114.566 / 120.669 | 72 [68–73] / 156.6 [148.9–163.4] | 809 [790–812] | 0 / 0 | 0 | 0 [0–0] |
+results: ~/app/Nitro.jl/.claude/worktrees/bench-618-v4-evidence/bench/results/fairness-20261126-133611.tsv
+[13:39:04] sampler summary for 618ce-cell81 (~/app/Nitro.jl/.claude/worktrees/bench-618-v4-evidence/bench/results/quiet-618ce-cell81-20261126-133321.tsv):
+  samples 31 every 5s; load1 min 0.48 median 5.30 max 7.47
+  samples with a foreign julia/oha/go-server: 0
+  samples with an outside process above 5% CPU: 5  [node peak 12.9%]  [tmux: peak 6.5%]  [top peak 6.7%]
+  block exit status 0
+[2026-11-26 13:39:04] step cell81: exit 0 after 5 min
+[2026-11-26 13:39:04] cache check cell81: no cache file created or replaced
+[2026-11-26 13:39:04] step cell80: start
+[13:39:04] quiet gate for 618ce-cell80: load1 < 0.5 and no julia/oha/go-server (at most 1800s)
+[13:42:14] gate passed after 190s (load1 0.45); running: env FRESH=1 BACKLOG=1024 ROTATE=1 THROWAWAY=1 PROBE=0 ROUTE=/aggregate?n=100000&op=groupby JULIAS=control=~/app/julia-618-master/bin/julia-pin-control,~/app/julia-618-master/envs/server-master candidate=~/app/julia-618-master/bin/julia-v4,~/app/julia-618-master/envs/server-master ~/app/Nitro.jl/.claude/worktrees/bench-618-v4-evidence/bench/socket/fairness.sh bare_spawn@8,0%control bare_marked_listen@8,0@N%candidate 5 8s
+fairness bench: modes [bare_spawn@8,0%control bare_marked_listen@8,0@N%candidate], /aggregate?n=100000&op=groupby, c=500, 5 x 8s interleaved
+  server CPUs 0,1,2,3,6,7,8,9 (--threads=8 unless mode@threads; go GOMAXPROCS=8), client CPUs 4,5,10,11
+  concurrency bounds: serve() max_concurrent_requests at its default (nothing: no cap); HTTP.jl listen! defaults (no HTTP/1 connection cap); bare_pool POOL=nthreads(:default)
+  julia: julia version 1.13.4; go version go1.27.1 linux/amd64
+servers up and warm in 5.0 s (-r0): bare_spawn@8,0%control
+servers up and warm in 10.0 s (-r1): bare_spawn@8,0%control bare_marked_listen@8,0@N%candidate
+servers up and warm in 10.0 s (-r2): bare_marked_listen@8,0@N%candidate bare_spawn@8,0%control
+servers up and warm in 10.0 s (-r3): bare_spawn@8,0%control bare_marked_listen@8,0@N%candidate
+servers up and warm in 10.0 s (-r4): bare_marked_listen@8,0@N%candidate bare_spawn@8,0%control
+servers up and warm in 10.0 s (-r5): bare_spawn@8,0%control bare_marked_listen@8,0@N%candidate
+
+| mode | rps | p50 ms | p90 ms | p99 ms | p99.9 ms | max ms | share > 1 s | requests per connection: min / p1 / p10 / median / max | Jain | longest wait per connection: median / p90 ms | GC: collections / ms | RSS MB | swap in / out (pages, summed) | listen overflows (summed) | oha rps |
+|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| bare_spawn@8,0%control | 5033 [5024–5039] | 11.107 [11.024–11.199] | 137.86 [130.342–146.04] | 1926.78 [1895.11–2208.16] | 5923.35 [4504.66–6572.02] | 8049.3 [6052.77–8088.04] | 0.021 [0.02–0.025] | 1 / 1 / 24 / 80 / 212 | 0.781 [0.751–0.838] | 2659.49 / 5316.34 | 64 [63–68] / 159.5 [155.9–179.3] | 791 [787–807] | 0 / 0 | 0 | 0 [0–0] |
+| bare_marked_listen@8,0@N%candidate | 5099 [5073–5110] | 97.441 [97.086–97.823] | 103.559 [103.421–104.017] | 111.382 [111.229–111.673] | 119.769 [119.558–122.47] | 142.442 [134.375–145.734] | 0 [0–0] | 81 / 81 / 82 / 83 / 85 | 1 [1–1] | 112.124 / 119.037 | 74 [70–74] / 165.8 [159.6–169.7] | 749 [748–756] | 0 / 0 | 0 | 0 [0–0] |
+results: ~/app/Nitro.jl/.claude/worktrees/bench-618-v4-evidence/bench/results/fairness-20261126-134214.tsv
+[13:45:05] sampler summary for 618ce-cell80 (~/app/Nitro.jl/.claude/worktrees/bench-618-v4-evidence/bench/results/quiet-618ce-cell80-20261126-133904.tsv):
+  samples 31 every 5s; load1 min 0.45 median 5.16 max 6.31
+  samples with a foreign julia/oha/go-server: 0
+  samples with an outside process above 5% CPU: 13  [node peak 25.8%]  [tmux: peak 6.7%]
+  block exit status 0
+[2026-11-26 13:45:05] step cell80: exit 0 after 6 min
+[2026-11-26 13:45:05] cache check cell80: no cache file created or replaced
+[2026-11-26 13:45:05] step floorfib: start
+[13:45:06] quiet gate for fibabba: load1 < 0.5 and no julia/oha/go-server (at most 1800s)
+[13:47:46] gate passed after 160s (load1 0.45); running: ~/app/Nitro.jl/.claude/worktrees/bench-618-v4-evidence/bench/tasks/rounds_fifo.sh --run fibabba_block ~/app/Nitro.jl/.claude/worktrees/bench-618-v4-evidence/bench/julia/evidence/candidate-v4-20261126/raw/floorfib/attempt-fibabba-20261126-134506.tsv
+multiq_variant: VARIANT=A
+nested: julia 1.15.0-DEV.974 (419aba7972/local), threads 8,1, variant A
+nested: A fib_fine: result matches the serial reference; every one of 2178308 spawned tasks completed, in 3 counted runs
+multiq_variant: VARIANT=A
+nested: julia 1.15.0-DEV.974 (419aba7972/local), threads 8,1, variant A
+nested: A fib_fine: result matches the serial reference; every one of 2178308 spawned tasks completed, in 3 counted runs
+multiq_variant: VARIANT=A
+nested: julia 1.15.0-DEV.974 (419aba7972*/local), threads 8,1, variant A
+nested: A fib_fine: result matches the serial reference; every one of 2178308 spawned tasks completed, in 3 counted runs
+multiq_variant: VARIANT=N-none, F queue: class mark, serve g, 0 rings, pop samples 2, descendants R (into the R heaps), request-side weight 2/4, marks none
+nested: julia 1.15.0-DEV.976 (1bffccdc2f/native), threads 8,1, variant N-none
+nested: N-none fib_fine: result matches the serial reference; every one of 2178308 spawned tasks completed, in 3 counted runs
+multiq_variant: VARIANT=N-none, F queue: class mark, serve g, 0 rings, pop samples 2, descendants R (into the R heaps), request-side weight 2/4, marks none
+nested: julia 1.15.0-DEV.977 (1c676fcdb3/native), threads 8,1, variant N-none
+nested: N-none fib_fine: result matches the serial reference; every one of 2178308 spawned tasks completed, in 3 counted runs
+multiq_variant: VARIANT=A
+nested: julia 1.15.0-DEV.974 (419aba7972*/local), threads 8,1, variant A
+nested: A fib_fine: result matches the serial reference; every one of 2178308 spawned tasks completed, in 3 counted runs
+multiq_variant: VARIANT=N-none, F queue: class mark, serve g, 0 rings, pop samples 2, descendants R (into the R heaps), request-side weight 2/4, marks none
+nested: julia 1.15.0-DEV.976 (1bffccdc2f/native), threads 8,1, variant N-none
+nested: N-none fib_fine: result matches the serial reference; every one of 2178308 spawned tasks completed, in 3 counted runs
+multiq_variant: VARIANT=N-none, F queue: class mark, serve g, 0 rings, pop samples 2, descendants R (into the R heaps), request-side weight 2/4, marks none
+nested: julia 1.15.0-DEV.977 (1c676fcdb3/native), threads 8,1, variant N-none
+nested: N-none fib_fine: result matches the serial reference; every one of 2178308 spawned tasks completed, in 3 counted runs
+multiq_variant: VARIANT=A
+nested: julia 1.15.0-DEV.974 (419aba7972/local), threads 8,1, variant A
+nested: A fib_fine: result matches the serial reference; every one of 2178308 spawned tasks completed, in 3 counted runs
+multiq_variant: VARIANT=N-none, F queue: class mark, serve g, 0 rings, pop samples 2, descendants R (into the R heaps), request-side weight 2/4, marks none
+nested: julia 1.15.0-DEV.976 (1bffccdc2f/native), threads 8,1, variant N-none
+nested: N-none fib_fine: result matches the serial reference; every one of 2178308 spawned tasks completed, in 3 counted runs
+multiq_variant: VARIANT=N-none, F queue: class mark, serve g, 0 rings, pop samples 2, descendants R (into the R heaps), request-side weight 2/4, marks none
+nested: julia 1.15.0-DEV.977 (1c676fcdb3/native), threads 8,1, variant N-none
+nested: N-none fib_fine: result matches the serial reference; every one of 2178308 spawned tasks completed, in 3 counted runs
+multiq_variant: VARIANT=A
+nested: julia 1.15.0-DEV.974 (419aba7972/local), threads 8,1, variant A
+nested: A fib_fine: result matches the serial reference; every one of 2178308 spawned tasks completed, in 3 counted runs
+multiq_variant: VARIANT=A
+nested: julia 1.15.0-DEV.974 (419aba7972*/local), threads 8,1, variant A
+nested: A fib_fine: result matches the serial reference; every one of 2178308 spawned tasks completed, in 3 counted runs
+multiq_variant: VARIANT=N-none, F queue: class mark, serve g, 0 rings, pop samples 2, descendants R (into the R heaps), request-side weight 2/4, marks none
+nested: julia 1.15.0-DEV.977 (1c676fcdb3/native), threads 8,1, variant N-none
+nested: N-none fib_fine: result matches the serial reference; every one of 2178308 spawned tasks completed, in 3 counted runs
+multiq_variant: VARIANT=A
+nested: julia 1.15.0-DEV.974 (419aba7972/local), threads 8,1, variant A
+nested: A fib_fine: result matches the serial reference; every one of 2178308 spawned tasks completed, in 3 counted runs
+multiq_variant: VARIANT=A
+nested: julia 1.15.0-DEV.974 (419aba7972*/local), threads 8,1, variant A
+nested: A fib_fine: result matches the serial reference; every one of 2178308 spawned tasks completed, in 3 counted runs
+multiq_variant: VARIANT=N-none, F queue: class mark, serve g, 0 rings, pop samples 2, descendants R (into the R heaps), request-side weight 2/4, marks none
+nested: julia 1.15.0-DEV.976 (1bffccdc2f/native), threads 8,1, variant N-none
+nested: N-none fib_fine: result matches the serial reference; every one of 2178308 spawned tasks completed, in 3 counted runs
+multiq_variant: VARIANT=A
+nested: julia 1.15.0-DEV.974 (419aba7972/local), threads 8,1, variant A
+nested: A fib_fine: result matches the serial reference; every one of 2178308 spawned tasks completed, in 3 counted runs
+multiq_variant: VARIANT=A
+nested: julia 1.15.0-DEV.974 (419aba7972*/local), threads 8,1, variant A
+nested: A fib_fine: result matches the serial reference; every one of 2178308 spawned tasks completed, in 3 counted runs
+multiq_variant: VARIANT=N-none, F queue: class mark, serve g, 0 rings, pop samples 2, descendants R (into the R heaps), request-side weight 2/4, marks none
+nested: julia 1.15.0-DEV.976 (1bffccdc2f/native), threads 8,1, variant N-none
+nested: N-none fib_fine: result matches the serial reference; every one of 2178308 spawned tasks completed, in 3 counted runs
+multiq_variant: VARIANT=N-none, F queue: class mark, serve g, 0 rings, pop samples 2, descendants R (into the R heaps), request-side weight 2/4, marks none
+nested: julia 1.15.0-DEV.977 (1c676fcdb3/native), threads 8,1, variant N-none
+nested: N-none fib_fine: result matches the serial reference; every one of 2178308 spawned tasks completed, in 3 counted runs
+multiq_variant: VARIANT=A
+nested: julia 1.15.0-DEV.974 (419aba7972*/local), threads 8,1, variant A
+nested: A fib_fine: result matches the serial reference; every one of 2178308 spawned tasks completed, in 3 counted runs
+multiq_variant: VARIANT=N-none, F queue: class mark, serve g, 0 rings, pop samples 2, descendants R (into the R heaps), request-side weight 2/4, marks none
+nested: julia 1.15.0-DEV.976 (1bffccdc2f/native), threads 8,1, variant N-none
+nested: N-none fib_fine: result matches the serial reference; every one of 2178308 spawned tasks completed, in 3 counted runs
+multiq_variant: VARIANT=N-none, F queue: class mark, serve g, 0 rings, pop samples 2, descendants R (into the R heaps), request-side weight 2/4, marks none
+nested: julia 1.15.0-DEV.977 (1c676fcdb3/native), threads 8,1, variant N-none
+nested: N-none fib_fine: result matches the serial reference; every one of 2178308 spawned tasks completed, in 3 counted runs
+multiq_variant: VARIANT=A
+nested: julia 1.15.0-DEV.974 (419aba7972/local), threads 8,1, variant A
+nested: A fib_fine: result matches the serial reference; every one of 2178308 spawned tasks completed, in 3 counted runs
+multiq_variant: VARIANT=N-none, F queue: class mark, serve g, 0 rings, pop samples 2, descendants R (into the R heaps), request-side weight 2/4, marks none
+nested: julia 1.15.0-DEV.976 (1bffccdc2f/native), threads 8,1, variant N-none
+nested: N-none fib_fine: result matches the serial reference; every one of 2178308 spawned tasks completed, in 3 counted runs
+multiq_variant: VARIANT=N-none, F queue: class mark, serve g, 0 rings, pop samples 2, descendants R (into the R heaps), request-side weight 2/4, marks none
+nested: julia 1.15.0-DEV.977 (1c676fcdb3/native), threads 8,1, variant N-none
+nested: N-none fib_fine: result matches the serial reference; every one of 2178308 spawned tasks completed, in 3 counted runs
+multiq_variant: VARIANT=A
+nested: julia 1.15.0-DEV.974 (419aba7972/local), threads 8,1, variant A
+nested: A fib_fine: result matches the serial reference; every one of 2178308 spawned tasks completed, in 3 counted runs
+multiq_variant: VARIANT=A
+nested: julia 1.15.0-DEV.974 (419aba7972*/local), threads 8,1, variant A
+nested: A fib_fine: result matches the serial reference; every one of 2178308 spawned tasks completed, in 3 counted runs
+multiq_variant: VARIANT=N-none, F queue: class mark, serve g, 0 rings, pop samples 2, descendants R (into the R heaps), request-side weight 2/4, marks none
+nested: julia 1.15.0-DEV.977 (1c676fcdb3/native), threads 8,1, variant N-none
+nested: N-none fib_fine: result matches the serial reference; every one of 2178308 spawned tasks completed, in 3 counted runs
+multiq_variant: VARIANT=A
+nested: julia 1.15.0-DEV.974 (419aba7972/local), threads 8,1, variant A
+nested: A fib_fine: result matches the serial reference; every one of 2178308 spawned tasks completed, in 3 counted runs
+multiq_variant: VARIANT=A
+nested: julia 1.15.0-DEV.974 (419aba7972*/local), threads 8,1, variant A
+nested: A fib_fine: result matches the serial reference; every one of 2178308 spawned tasks completed, in 3 counted runs
+multiq_variant: VARIANT=N-none, F queue: class mark, serve g, 0 rings, pop samples 2, descendants R (into the R heaps), request-side weight 2/4, marks none
+nested: julia 1.15.0-DEV.976 (1bffccdc2f/native), threads 8,1, variant N-none
+nested: N-none fib_fine: result matches the serial reference; every one of 2178308 spawned tasks completed, in 3 counted runs
+multiq_variant: VARIANT=A
+nested: julia 1.15.0-DEV.974 (419aba7972/local), threads 8,1, variant A
+nested: A fib_fine: result matches the serial reference; every one of 2178308 spawned tasks completed, in 3 counted runs
+multiq_variant: VARIANT=A
+nested: julia 1.15.0-DEV.974 (419aba7972*/local), threads 8,1, variant A
+nested: A fib_fine: result matches the serial reference; every one of 2178308 spawned tasks completed, in 3 counted runs
+multiq_variant: VARIANT=N-none, F queue: class mark, serve g, 0 rings, pop samples 2, descendants R (into the R heaps), request-side weight 2/4, marks none
+nested: julia 1.15.0-DEV.976 (1bffccdc2f/native), threads 8,1, variant N-none
+nested: N-none fib_fine: result matches the serial reference; every one of 2178308 spawned tasks completed, in 3 counted runs
+multiq_variant: VARIANT=N-none, F queue: class mark, serve g, 0 rings, pop samples 2, descendants R (into the R heaps), request-side weight 2/4, marks none
+nested: julia 1.15.0-DEV.977 (1c676fcdb3/native), threads 8,1, variant N-none
+nested: N-none fib_fine: result matches the serial reference; every one of 2178308 spawned tasks completed, in 3 counted runs
+multiq_variant: VARIANT=A
+nested: julia 1.15.0-DEV.974 (419aba7972*/local), threads 8,1, variant A
+nested: A fib_fine: result matches the serial reference; every one of 2178308 spawned tasks completed, in 3 counted runs
+multiq_variant: VARIANT=N-none, F queue: class mark, serve g, 0 rings, pop samples 2, descendants R (into the R heaps), request-side weight 2/4, marks none
+nested: julia 1.15.0-DEV.976 (1bffccdc2f/native), threads 8,1, variant N-none
+nested: N-none fib_fine: result matches the serial reference; every one of 2178308 spawned tasks completed, in 3 counted runs
+multiq_variant: VARIANT=N-none, F queue: class mark, serve g, 0 rings, pop samples 2, descendants R (into the R heaps), request-side weight 2/4, marks none
+nested: julia 1.15.0-DEV.977 (1c676fcdb3/native), threads 8,1, variant N-none
+nested: N-none fib_fine: result matches the serial reference; every one of 2178308 spawned tasks completed, in 3 counted runs
+multiq_variant: VARIANT=A
+nested: julia 1.15.0-DEV.974 (419aba7972/local), threads 8,1, variant A
+nested: A fib_fine: result matches the serial reference; every one of 2178308 spawned tasks completed, in 3 counted runs
+multiq_variant: VARIANT=N-none, F queue: class mark, serve g, 0 rings, pop samples 2, descendants R (into the R heaps), request-side weight 2/4, marks none
+nested: julia 1.15.0-DEV.976 (1bffccdc2f/native), threads 8,1, variant N-none
+nested: N-none fib_fine: result matches the serial reference; every one of 2178308 spawned tasks completed, in 3 counted runs
+multiq_variant: VARIANT=N-none, F queue: class mark, serve g, 0 rings, pop samples 2, descendants R (into the R heaps), request-side weight 2/4, marks none
+nested: julia 1.15.0-DEV.977 (1c676fcdb3/native), threads 8,1, variant N-none
+nested: N-none fib_fine: result matches the serial reference; every one of 2178308 spawned tasks completed, in 3 counted runs
+multiq_variant: VARIANT=A
+nested: julia 1.15.0-DEV.974 (419aba7972/local), threads 8,1, variant A
+nested: A fib_fine: result matches the serial reference; every one of 2178308 spawned tasks completed, in 3 counted runs
+multiq_variant: VARIANT=A
+nested: julia 1.15.0-DEV.974 (419aba7972*/local), threads 8,1, variant A
+nested: A fib_fine: result matches the serial reference; every one of 2178308 spawned tasks completed, in 3 counted runs
+multiq_variant: VARIANT=N-none, F queue: class mark, serve g, 0 rings, pop samples 2, descendants R (into the R heaps), request-side weight 2/4, marks none
+nested: julia 1.15.0-DEV.977 (1c676fcdb3/native), threads 8,1, variant N-none
+nested: N-none fib_fine: result matches the serial reference; every one of 2178308 spawned tasks completed, in 3 counted runs
+multiq_variant: VARIANT=A
+nested: julia 1.15.0-DEV.974 (419aba7972/local), threads 8,1, variant A
+nested: A fib_fine: result matches the serial reference; every one of 2178308 spawned tasks completed, in 3 counted runs
+multiq_variant: VARIANT=A
+nested: julia 1.15.0-DEV.974 (419aba7972*/local), threads 8,1, variant A
+nested: A fib_fine: result matches the serial reference; every one of 2178308 spawned tasks completed, in 3 counted runs
+multiq_variant: VARIANT=N-none, F queue: class mark, serve g, 0 rings, pop samples 2, descendants R (into the R heaps), request-side weight 2/4, marks none
+nested: julia 1.15.0-DEV.976 (1bffccdc2f/native), threads 8,1, variant N-none
+nested: N-none fib_fine: result matches the serial reference; every one of 2178308 spawned tasks completed, in 3 counted runs
+[13:56:45] sampler summary for fibabba (~/app/Nitro.jl/.claude/worktrees/bench-618-v4-evidence/bench/results/quiet-fibabba-20261126-134506.tsv):
+  samples 97 every 5s; load1 min 0.45 median 6.09 max 7.07
+  samples with a foreign julia/oha/go-server: 0
+  samples with an outside process above 5% CPU: 25  [node peak 103.2%]  [tmux: peak 6.5%]  [top peak 6.5%]  [claude peak 16.1%]
+  block exit status 0
+[13:56:45] rounds_fifo: fibabba done
+[13:56:45] rounds_fifo: done (status 0); next: julia ~/app/Nitro.jl/.claude/worktrees/bench-618-v4-evidence/bench/tasks/aggregate_fifo.jl ~/app/Nitro.jl/.claude/worktrees/bench-618-v4-evidence/bench/julia/evidence/candidate-v4-20261126/raw/floorfib
+[2026-11-26 13:56:45] step floorfib: exit 0 after 11 min
+[2026-11-26 13:56:45] cache check floorfib: no cache file created or replaced
+[2026-11-26 13:56:45] step floorh0: start
+[13:56:45] quiet gate for costrounds: load1 < 0.5 and no julia/oha/go-server (at most 1800s)
+[13:59:35] gate passed after 170s (load1 0.45); running: ~/app/Nitro.jl/.claude/worktrees/bench-618-v4-evidence/bench/tasks/rounds_fifo.sh --run costrounds_block ~/app/Nitro.jl/.claude/worktrees/bench-618-v4-evidence/bench/julia/evidence/candidate-v4-20261126/raw/floorh0/attempt-costrounds-spawn-20261126-135645.tsv ~/app/Nitro.jl/.claude/worktrees/bench-618-v4-evidence/bench/julia/evidence/candidate-v4-20261126/raw/floorh0/attempt-costrounds-micro-20261126-135645.tsv
+multiq_variant: VARIANT=A
+spawn_order: julia 1.15.0-DEV.974 (419aba7972 2026-11-24 17:01 UTC), threads 8,0, guard 1, a plain @spawn from :interactive lands on :default, :default tids [1, 2, 3, 4, 5, 6, 7, 8], D = 8.0 s, variant A
+multiq_variant: VARIANT=A
+spawn_order: julia 1.15.0-DEV.974 (419aba7972 2026-11-24 17:01 UTC), threads 8,0, guard 1, a plain @spawn from :interactive lands on :default, :default tids [1, 2, 3, 4, 5, 6, 7, 8], D = 8.0 s, variant A
+multiq_variant: VARIANT=A
+spawn_order: julia 1.15.0-DEV.974 (419aba7972* 2026-11-24 17:01 UTC), threads 8,0, guard 1, a plain @spawn from :interactive lands on :default, :default tids [1, 2, 3, 4, 5, 6, 7, 8], D = 8.0 s, variant A
+multiq_variant: VARIANT=N-none, F queue: class mark, serve g, 0 rings, pop samples 2, descendants R (into the R heaps), request-side weight 2/4, marks none
+spawn_order: julia 1.15.0-DEV.976 (1bffccdc2f 2026-11-26 03:26 UTC), threads 8,0, guard 1, a plain @spawn from :interactive lands on :default, :default tids [1, 2, 3, 4, 5, 6, 7, 8], D = 8.0 s, variant N-none
+multiq_variant: VARIANT=N-none, F queue: class mark, serve g, 0 rings, pop samples 2, descendants R (into the R heaps), request-side weight 2/4, marks none
+spawn_order: julia 1.15.0-DEV.977 (1c676fcdb3 2026-11-26 03:27 UTC), threads 8,0, guard 1, a plain @spawn from :interactive lands on :default, :default tids [1, 2, 3, 4, 5, 6, 7, 8], D = 8.0 s, variant N-none
+multiq_variant: VARIANT=A
+spawn_order: julia 1.15.0-DEV.974 (419aba7972* 2026-11-24 17:01 UTC), threads 8,0, guard 1, a plain @spawn from :interactive lands on :default, :default tids [1, 2, 3, 4, 5, 6, 7, 8], D = 8.0 s, variant A
+multiq_variant: VARIANT=N-none, F queue: class mark, serve g, 0 rings, pop samples 2, descendants R (into the R heaps), request-side weight 2/4, marks none
+spawn_order: julia 1.15.0-DEV.976 (1bffccdc2f 2026-11-26 03:26 UTC), threads 8,0, guard 1, a plain @spawn from :interactive lands on :default, :default tids [1, 2, 3, 4, 5, 6, 7, 8], D = 8.0 s, variant N-none
+multiq_variant: VARIANT=N-none, F queue: class mark, serve g, 0 rings, pop samples 2, descendants R (into the R heaps), request-side weight 2/4, marks none
+spawn_order: julia 1.15.0-DEV.977 (1c676fcdb3 2026-11-26 03:27 UTC), threads 8,0, guard 1, a plain @spawn from :interactive lands on :default, :default tids [1, 2, 3, 4, 5, 6, 7, 8], D = 8.0 s, variant N-none
+multiq_variant: VARIANT=A
+spawn_order: julia 1.15.0-DEV.974 (419aba7972 2026-11-24 17:01 UTC), threads 8,0, guard 1, a plain @spawn from :interactive lands on :default, :default tids [1, 2, 3, 4, 5, 6, 7, 8], D = 8.0 s, variant A
+multiq_variant: VARIANT=N-none, F queue: class mark, serve g, 0 rings, pop samples 2, descendants R (into the R heaps), request-side weight 2/4, marks none
+spawn_order: julia 1.15.0-DEV.976 (1bffccdc2f 2026-11-26 03:26 UTC), threads 8,0, guard 1, a plain @spawn from :interactive lands on :default, :default tids [1, 2, 3, 4, 5, 6, 7, 8], D = 8.0 s, variant N-none
+multiq_variant: VARIANT=N-none, F queue: class mark, serve g, 0 rings, pop samples 2, descendants R (into the R heaps), request-side weight 2/4, marks none
+spawn_order: julia 1.15.0-DEV.977 (1c676fcdb3 2026-11-26 03:27 UTC), threads 8,0, guard 1, a plain @spawn from :interactive lands on :default, :default tids [1, 2, 3, 4, 5, 6, 7, 8], D = 8.0 s, variant N-none
+multiq_variant: VARIANT=A
+spawn_order: julia 1.15.0-DEV.974 (419aba7972 2026-11-24 17:01 UTC), threads 8,0, guard 1, a plain @spawn from :interactive lands on :default, :default tids [1, 2, 3, 4, 5, 6, 7, 8], D = 8.0 s, variant A
+multiq_variant: VARIANT=A
+spawn_order: julia 1.15.0-DEV.974 (419aba7972* 2026-11-24 17:01 UTC), threads 8,0, guard 1, a plain @spawn from :interactive lands on :default, :default tids [1, 2, 3, 4, 5, 6, 7, 8], D = 8.0 s, variant A
+multiq_variant: VARIANT=N-none, F queue: class mark, serve g, 0 rings, pop samples 2, descendants R (into the R heaps), request-side weight 2/4, marks none
+spawn_order: julia 1.15.0-DEV.977 (1c676fcdb3 2026-11-26 03:27 UTC), threads 8,0, guard 1, a plain @spawn from :interactive lands on :default, :default tids [1, 2, 3, 4, 5, 6, 7, 8], D = 8.0 s, variant N-none
+multiq_variant: VARIANT=A
+spawn_order: julia 1.15.0-DEV.974 (419aba7972 2026-11-24 17:01 UTC), threads 8,0, guard 1, a plain @spawn from :interactive lands on :default, :default tids [1, 2, 3, 4, 5, 6, 7, 8], D = 8.0 s, variant A
+multiq_variant: VARIANT=A
+spawn_order: julia 1.15.0-DEV.974 (419aba7972* 2026-11-24 17:01 UTC), threads 8,0, guard 1, a plain @spawn from :interactive lands on :default, :default tids [1, 2, 3, 4, 5, 6, 7, 8], D = 8.0 s, variant A
+multiq_variant: VARIANT=N-none, F queue: class mark, serve g, 0 rings, pop samples 2, descendants R (into the R heaps), request-side weight 2/4, marks none
+spawn_order: julia 1.15.0-DEV.976 (1bffccdc2f 2026-11-26 03:26 UTC), threads 8,0, guard 1, a plain @spawn from :interactive lands on :default, :default tids [1, 2, 3, 4, 5, 6, 7, 8], D = 8.0 s, variant N-none
+multiq_variant: VARIANT=A
+spawn_order: julia 1.15.0-DEV.974 (419aba7972 2026-11-24 17:01 UTC), threads 8,0, guard 1, a plain @spawn from :interactive lands on :default, :default tids [1, 2, 3, 4, 5, 6, 7, 8], D = 8.0 s, variant A
+multiq_variant: VARIANT=A
+spawn_order: julia 1.15.0-DEV.974 (419aba7972* 2026-11-24 17:01 UTC), threads 8,0, guard 1, a plain @spawn from :interactive lands on :default, :default tids [1, 2, 3, 4, 5, 6, 7, 8], D = 8.0 s, variant A
+multiq_variant: VARIANT=N-none, F queue: class mark, serve g, 0 rings, pop samples 2, descendants R (into the R heaps), request-side weight 2/4, marks none
+spawn_order: julia 1.15.0-DEV.976 (1bffccdc2f 2026-11-26 03:26 UTC), threads 8,0, guard 1, a plain @spawn from :interactive lands on :default, :default tids [1, 2, 3, 4, 5, 6, 7, 8], D = 8.0 s, variant N-none
+multiq_variant: VARIANT=N-none, F queue: class mark, serve g, 0 rings, pop samples 2, descendants R (into the R heaps), request-side weight 2/4, marks none
+spawn_order: julia 1.15.0-DEV.977 (1c676fcdb3 2026-11-26 03:27 UTC), threads 8,0, guard 1, a plain @spawn from :interactive lands on :default, :default tids [1, 2, 3, 4, 5, 6, 7, 8], D = 8.0 s, variant N-none
+multiq_variant: VARIANT=A
+spawn_order: julia 1.15.0-DEV.974 (419aba7972* 2026-11-24 17:01 UTC), threads 8,0, guard 1, a plain @spawn from :interactive lands on :default, :default tids [1, 2, 3, 4, 5, 6, 7, 8], D = 8.0 s, variant A
+multiq_variant: VARIANT=N-none, F queue: class mark, serve g, 0 rings, pop samples 2, descendants R (into the R heaps), request-side weight 2/4, marks none
+spawn_order: julia 1.15.0-DEV.976 (1bffccdc2f 2026-11-26 03:26 UTC), threads 8,0, guard 1, a plain @spawn from :interactive lands on :default, :default tids [1, 2, 3, 4, 5, 6, 7, 8], D = 8.0 s, variant N-none
+multiq_variant: VARIANT=N-none, F queue: class mark, serve g, 0 rings, pop samples 2, descendants R (into the R heaps), request-side weight 2/4, marks none
+spawn_order: julia 1.15.0-DEV.977 (1c676fcdb3 2026-11-26 03:27 UTC), threads 8,0, guard 1, a plain @spawn from :interactive lands on :default, :default tids [1, 2, 3, 4, 5, 6, 7, 8], D = 8.0 s, variant N-none
+multiq_variant: VARIANT=A
+spawn_order: julia 1.15.0-DEV.974 (419aba7972 2026-11-24 17:01 UTC), threads 8,0, guard 1, a plain @spawn from :interactive lands on :default, :default tids [1, 2, 3, 4, 5, 6, 7, 8], D = 8.0 s, variant A
+multiq_variant: VARIANT=N-none, F queue: class mark, serve g, 0 rings, pop samples 2, descendants R (into the R heaps), request-side weight 2/4, marks none
+spawn_order: julia 1.15.0-DEV.976 (1bffccdc2f 2026-11-26 03:26 UTC), threads 8,0, guard 1, a plain @spawn from :interactive lands on :default, :default tids [1, 2, 3, 4, 5, 6, 7, 8], D = 8.0 s, variant N-none
+multiq_variant: VARIANT=N-none, F queue: class mark, serve g, 0 rings, pop samples 2, descendants R (into the R heaps), request-side weight 2/4, marks none
+spawn_order: julia 1.15.0-DEV.977 (1c676fcdb3 2026-11-26 03:27 UTC), threads 8,0, guard 1, a plain @spawn from :interactive lands on :default, :default tids [1, 2, 3, 4, 5, 6, 7, 8], D = 8.0 s, variant N-none
+multiq_variant: VARIANT=A
+spawn_order: julia 1.15.0-DEV.974 (419aba7972 2026-11-24 17:01 UTC), threads 8,0, guard 1, a plain @spawn from :interactive lands on :default, :default tids [1, 2, 3, 4, 5, 6, 7, 8], D = 8.0 s, variant A
+multiq_variant: VARIANT=A
+spawn_order: julia 1.15.0-DEV.974 (419aba7972* 2026-11-24 17:01 UTC), threads 8,0, guard 1, a plain @spawn from :interactive lands on :default, :default tids [1, 2, 3, 4, 5, 6, 7, 8], D = 8.0 s, variant A
+multiq_variant: VARIANT=N-none, F queue: class mark, serve g, 0 rings, pop samples 2, descendants R (into the R heaps), request-side weight 2/4, marks none
+spawn_order: julia 1.15.0-DEV.977 (1c676fcdb3 2026-11-26 03:27 UTC), threads 8,0, guard 1, a plain @spawn from :interactive lands on :default, :default tids [1, 2, 3, 4, 5, 6, 7, 8], D = 8.0 s, variant N-none
+multiq_variant: VARIANT=A
+spawn_order: julia 1.15.0-DEV.974 (419aba7972 2026-11-24 17:01 UTC), threads 8,0, guard 1, a plain @spawn from :interactive lands on :default, :default tids [1, 2, 3, 4, 5, 6, 7, 8], D = 8.0 s, variant A
+multiq_variant: VARIANT=A
+spawn_order: julia 1.15.0-DEV.974 (419aba7972* 2026-11-24 17:01 UTC), threads 8,0, guard 1, a plain @spawn from :interactive lands on :default, :default tids [1, 2, 3, 4, 5, 6, 7, 8], D = 8.0 s, variant A
+multiq_variant: VARIANT=N-none, F queue: class mark, serve g, 0 rings, pop samples 2, descendants R (into the R heaps), request-side weight 2/4, marks none
+spawn_order: julia 1.15.0-DEV.976 (1bffccdc2f 2026-11-26 03:26 UTC), threads 8,0, guard 1, a plain @spawn from :interactive lands on :default, :default tids [1, 2, 3, 4, 5, 6, 7, 8], D = 8.0 s, variant N-none
+multiq_variant: VARIANT=A
+spawn_order: julia 1.15.0-DEV.974 (419aba7972 2026-11-24 17:01 UTC), threads 8,0, guard 1, a plain @spawn from :interactive lands on :default, :default tids [1, 2, 3, 4, 5, 6, 7, 8], D = 8.0 s, variant A
+multiq_variant: VARIANT=A
+spawn_order: julia 1.15.0-DEV.974 (419aba7972* 2026-11-24 17:01 UTC), threads 8,0, guard 1, a plain @spawn from :interactive lands on :default, :default tids [1, 2, 3, 4, 5, 6, 7, 8], D = 8.0 s, variant A
+multiq_variant: VARIANT=N-none, F queue: class mark, serve g, 0 rings, pop samples 2, descendants R (into the R heaps), request-side weight 2/4, marks none
+spawn_order: julia 1.15.0-DEV.976 (1bffccdc2f 2026-11-26 03:26 UTC), threads 8,0, guard 1, a plain @spawn from :interactive lands on :default, :default tids [1, 2, 3, 4, 5, 6, 7, 8], D = 8.0 s, variant N-none
+multiq_variant: VARIANT=N-none, F queue: class mark, serve g, 0 rings, pop samples 2, descendants R (into the R heaps), request-side weight 2/4, marks none
+spawn_order: julia 1.15.0-DEV.977 (1c676fcdb3 2026-11-26 03:27 UTC), threads 8,0, guard 1, a plain @spawn from :interactive lands on :default, :default tids [1, 2, 3, 4, 5, 6, 7, 8], D = 8.0 s, variant N-none
+multiq_variant: VARIANT=A
+spawn_order: julia 1.15.0-DEV.974 (419aba7972* 2026-11-24 17:01 UTC), threads 8,0, guard 1, a plain @spawn from :interactive lands on :default, :default tids [1, 2, 3, 4, 5, 6, 7, 8], D = 8.0 s, variant A
+multiq_variant: VARIANT=N-none, F queue: class mark, serve g, 0 rings, pop samples 2, descendants R (into the R heaps), request-side weight 2/4, marks none
+spawn_order: julia 1.15.0-DEV.976 (1bffccdc2f 2026-11-26 03:26 UTC), threads 8,0, guard 1, a plain @spawn from :interactive lands on :default, :default tids [1, 2, 3, 4, 5, 6, 7, 8], D = 8.0 s, variant N-none
+multiq_variant: VARIANT=N-none, F queue: class mark, serve g, 0 rings, pop samples 2, descendants R (into the R heaps), request-side weight 2/4, marks none
+spawn_order: julia 1.15.0-DEV.977 (1c676fcdb3 2026-11-26 03:27 UTC), threads 8,0, guard 1, a plain @spawn from :interactive lands on :default, :default tids [1, 2, 3, 4, 5, 6, 7, 8], D = 8.0 s, variant N-none
+multiq_variant: VARIANT=A
+spawn_order: julia 1.15.0-DEV.974 (419aba7972 2026-11-24 17:01 UTC), threads 8,0, guard 1, a plain @spawn from :interactive lands on :default, :default tids [1, 2, 3, 4, 5, 6, 7, 8], D = 8.0 s, variant A
+multiq_variant: VARIANT=N-none, F queue: class mark, serve g, 0 rings, pop samples 2, descendants R (into the R heaps), request-side weight 2/4, marks none
+spawn_order: julia 1.15.0-DEV.976 (1bffccdc2f 2026-11-26 03:26 UTC), threads 8,0, guard 1, a plain @spawn from :interactive lands on :default, :default tids [1, 2, 3, 4, 5, 6, 7, 8], D = 8.0 s, variant N-none
+multiq_variant: VARIANT=N-none, F queue: class mark, serve g, 0 rings, pop samples 2, descendants R (into the R heaps), request-side weight 2/4, marks none
+spawn_order: julia 1.15.0-DEV.977 (1c676fcdb3 2026-11-26 03:27 UTC), threads 8,0, guard 1, a plain @spawn from :interactive lands on :default, :default tids [1, 2, 3, 4, 5, 6, 7, 8], D = 8.0 s, variant N-none
+multiq_variant: VARIANT=A
+spawn_order: julia 1.15.0-DEV.974 (419aba7972 2026-11-24 17:01 UTC), threads 8,0, guard 1, a plain @spawn from :interactive lands on :default, :default tids [1, 2, 3, 4, 5, 6, 7, 8], D = 8.0 s, variant A
+multiq_variant: VARIANT=A
+spawn_order: julia 1.15.0-DEV.974 (419aba7972* 2026-11-24 17:01 UTC), threads 8,0, guard 1, a plain @spawn from :interactive lands on :default, :default tids [1, 2, 3, 4, 5, 6, 7, 8], D = 8.0 s, variant A
+multiq_variant: VARIANT=N-none, F queue: class mark, serve g, 0 rings, pop samples 2, descendants R (into the R heaps), request-side weight 2/4, marks none
+spawn_order: julia 1.15.0-DEV.977 (1c676fcdb3 2026-11-26 03:27 UTC), threads 8,0, guard 1, a plain @spawn from :interactive lands on :default, :default tids [1, 2, 3, 4, 5, 6, 7, 8], D = 8.0 s, variant N-none
+multiq_variant: VARIANT=A
+spawn_order: julia 1.15.0-DEV.974 (419aba7972 2026-11-24 17:01 UTC), threads 8,0, guard 1, a plain @spawn from :interactive lands on :default, :default tids [1, 2, 3, 4, 5, 6, 7, 8], D = 8.0 s, variant A
+multiq_variant: VARIANT=A
+spawn_order: julia 1.15.0-DEV.974 (419aba7972* 2026-11-24 17:01 UTC), threads 8,0, guard 1, a plain @spawn from :interactive lands on :default, :default tids [1, 2, 3, 4, 5, 6, 7, 8], D = 8.0 s, variant A
+multiq_variant: VARIANT=N-none, F queue: class mark, serve g, 0 rings, pop samples 2, descendants R (into the R heaps), request-side weight 2/4, marks none
+spawn_order: julia 1.15.0-DEV.976 (1bffccdc2f 2026-11-26 03:26 UTC), threads 8,0, guard 1, a plain @spawn from :interactive lands on :default, :default tids [1, 2, 3, 4, 5, 6, 7, 8], D = 8.0 s, variant N-none
+[14:45:35] sampler summary for costrounds (~/app/Nitro.jl/.claude/worktrees/bench-618-v4-evidence/bench/results/quiet-costrounds-20261126-135645.tsv):
+  samples 496 every 5s; load1 min 0.45 median 3.02 max 4.41
+  samples with a foreign julia/oha/go-server: 0
+  samples with an outside process above 5% CPU: 135  [git-remote-http peak 6.7%]  [sshd peak 6.7%]  [containerd peak 6.5%]  [node peak 103.3%]  [mysqld peak 6.5%]  [tmux: peak 6.7%]  [agy peak 13.3%]  [kcompactd0 peak 43.3%]  [top peak 6.7%]  [claude peak 16.1%]
+  block exit status 0
+[14:45:35] rounds_fifo: costrounds done
+[14:45:35] rounds_fifo: done (status 0); next: julia ~/app/Nitro.jl/.claude/worktrees/bench-618-v4-evidence/bench/tasks/aggregate_fifo.jl ~/app/Nitro.jl/.claude/worktrees/bench-618-v4-evidence/bench/julia/evidence/candidate-v4-20261126/raw/floorh0
+[2026-11-26 14:45:35] step floorh0: exit 0 after 48 min
+[2026-11-26 14:45:35] cache check floorh0: no cache file created or replaced
+[2026-11-26 14:45:35] step pfib2: start
+[14:45:35] quiet gate for 618ce-pfib2: load1 < 0.5 and no julia/oha/go-server (at most 1800s)
+[14:47:25] gate passed after 110s (load1 0.42); running: bench/julia/candidate_evidence.sh --run pfib_block ~/app/Nitro.jl/.claude/worktrees/bench-618-v4-evidence/bench/julia/evidence/candidate-v4-20261126/raw/pfib2/pfib.tsv 6 2 0,1,2 ctl:control:none ctl2:control2:none cand:candidate:none root:candidate:root all:candidate:all byp:bypass:none
+[14:50:15] sampler summary for 618ce-pfib2 (~/app/Nitro.jl/.claude/worktrees/bench-618-v4-evidence/bench/results/quiet-618ce-pfib2-20261126-144535.tsv):
+  samples 31 every 5s; load1 min 0.42 median 1.66 max 2.02
+  samples with a foreign julia/oha/go-server: 0
+  samples with an outside process above 5% CPU: 8  [git-remote-http peak 6.7%]  [node peak 16.7%]  [tmux: peak 6.5%]
+  block exit status 0
+[2026-11-26 14:50:15] step pfib2: exit 0 after 4 min
+[2026-11-26 14:50:15] cache check pfib2: no cache file created or replaced
+[2026-11-26 14:50:15] step pfib81: start
+[14:50:15] quiet gate for 618ce-pfib81: load1 < 0.5 and no julia/oha/go-server (at most 1800s)
+[14:51:46] gate passed after 90s (load1 0.43); running: bench/julia/candidate_evidence.sh --run pfib_block ~/app/Nitro.jl/.claude/worktrees/bench-618-v4-evidence/bench/julia/evidence/candidate-v4-20261126/raw/pfib81/pfib.tsv 6 8,1 0,1,2,3,6,7,8,9 ctl:control:none ctl2:control2:none cand:candidate:none root:candidate:root all:candidate:all byp:bypass:none
+[14:54:34] sampler summary for 618ce-pfib81 (~/app/Nitro.jl/.claude/worktrees/bench-618-v4-evidence/bench/results/quiet-618ce-pfib81-20261126-145015.tsv):
+  samples 31 every 5s; load1 min 0.43 median 5.93 max 7.20
+  samples with a foreign julia/oha/go-server: 0
+  samples with an outside process above 5% CPU: 7  [node peak 12.9%]  [tmux: peak 6.7%]  [agy peak 10.0%]  [top peak 6.5%]
+  block exit status 0
+[2026-11-26 14:54:34] step pfib81: exit 0 after 4 min
+[2026-11-26 14:54:34] cache check pfib81: no cache file created or replaced
+[2026-11-26 14:54:34] step spawnpath: start
+[14:54:35] quiet gate for costrounds: load1 < 0.5 and no julia/oha/go-server (at most 1800s)
+[14:57:25] gate passed after 170s (load1 0.47); running: ~/app/Nitro.jl/.claude/worktrees/bench-618-v4-evidence/bench/tasks/rounds_fifo.sh --run costrounds_block ~/app/Nitro.jl/.claude/worktrees/bench-618-v4-evidence/bench/julia/evidence/candidate-v4-20261126/raw/spawnpath/attempt-costrounds-spawn-20261126-145435.tsv ~/app/Nitro.jl/.claude/worktrees/bench-618-v4-evidence/bench/julia/evidence/candidate-v4-20261126/raw/spawnpath/attempt-costrounds-micro-20261126-145435.tsv
+multiq_variant: VARIANT=A
+spawn_order: julia 1.15.0-DEV.974 (419aba7972 2026-11-24 17:01 UTC), threads 8,0, guard 1, a plain @spawn from :interactive lands on :default, :default tids [1, 2, 3, 4, 5, 6, 7, 8], D = 8.0 s, variant A
+multiq_variant: VARIANT=A
+spawn_order: julia 1.15.0-DEV.974 (419aba7972 2026-11-24 17:01 UTC), threads 8,0, guard 1, a plain @spawn from :interactive lands on :default, :default tids [1, 2, 3, 4, 5, 6, 7, 8], D = 8.0 s, variant A
+multiq_variant: VARIANT=N, F queue: class mark, serve g, 0 rings, pop samples 2, descendants R (into the R heaps), request-side weight 2/4, marks handlers+clients
+spawn_order: julia 1.15.0-DEV.976 (1bffccdc2f 2026-11-26 03:26 UTC), threads 8,0, guard 1, a plain @spawn from :interactive lands on :default, :default tids [1, 2, 3, 4, 5, 6, 7, 8], D = 8.0 s, variant N
+multiq_variant: VARIANT=N, F queue: class mark, serve g, 0 rings, pop samples 2, descendants R (into the R heaps), request-side weight 2/4, marks handlers+clients
+spawn_order: julia 1.15.0-DEV.976 (1bffccdc2f 2026-11-26 03:26 UTC), threads 8,0, guard 1, a plain @spawn from :interactive lands on :default, :default tids [1, 2, 3, 4, 5, 6, 7, 8], D = 8.0 s, variant N
+multiq_variant: VARIANT=A
+spawn_order: julia 1.15.0-DEV.974 (419aba7972 2026-11-24 17:01 UTC), threads 8,0, guard 1, a plain @spawn from :interactive lands on :default, :default tids [1, 2, 3, 4, 5, 6, 7, 8], D = 8.0 s, variant A
+multiq_variant: VARIANT=A
+spawn_order: julia 1.15.0-DEV.974 (419aba7972 2026-11-24 17:01 UTC), threads 8,0, guard 1, a plain @spawn from :interactive lands on :default, :default tids [1, 2, 3, 4, 5, 6, 7, 8], D = 8.0 s, variant A
+multiq_variant: VARIANT=N, F queue: class mark, serve g, 0 rings, pop samples 2, descendants R (into the R heaps), request-side weight 2/4, marks handlers+clients
+spawn_order: julia 1.15.0-DEV.976 (1bffccdc2f 2026-11-26 03:26 UTC), threads 8,0, guard 1, a plain @spawn from :interactive lands on :default, :default tids [1, 2, 3, 4, 5, 6, 7, 8], D = 8.0 s, variant N
+multiq_variant: VARIANT=N, F queue: class mark, serve g, 0 rings, pop samples 2, descendants R (into the R heaps), request-side weight 2/4, marks handlers+clients
+spawn_order: julia 1.15.0-DEV.976 (1bffccdc2f 2026-11-26 03:26 UTC), threads 8,0, guard 1, a plain @spawn from :interactive lands on :default, :default tids [1, 2, 3, 4, 5, 6, 7, 8], D = 8.0 s, variant N
+multiq_variant: VARIANT=A
+spawn_order: julia 1.15.0-DEV.974 (419aba7972 2026-11-24 17:01 UTC), threads 8,0, guard 1, a plain @spawn from :interactive lands on :default, :default tids [1, 2, 3, 4, 5, 6, 7, 8], D = 8.0 s, variant A
+multiq_variant: VARIANT=A
+spawn_order: julia 1.15.0-DEV.974 (419aba7972 2026-11-24 17:01 UTC), threads 8,0, guard 1, a plain @spawn from :interactive lands on :default, :default tids [1, 2, 3, 4, 5, 6, 7, 8], D = 8.0 s, variant A
+multiq_variant: VARIANT=N, F queue: class mark, serve g, 0 rings, pop samples 2, descendants R (into the R heaps), request-side weight 2/4, marks handlers+clients
+spawn_order: julia 1.15.0-DEV.976 (1bffccdc2f 2026-11-26 03:26 UTC), threads 8,0, guard 1, a plain @spawn from :interactive lands on :default, :default tids [1, 2, 3, 4, 5, 6, 7, 8], D = 8.0 s, variant N
+multiq_variant: VARIANT=N, F queue: class mark, serve g, 0 rings, pop samples 2, descendants R (into the R heaps), request-side weight 2/4, marks handlers+clients
+spawn_order: julia 1.15.0-DEV.976 (1bffccdc2f 2026-11-26 03:26 UTC), threads 8,0, guard 1, a plain @spawn from :interactive lands on :default, :default tids [1, 2, 3, 4, 5, 6, 7, 8], D = 8.0 s, variant N
+multiq_variant: VARIANT=A
+spawn_order: julia 1.15.0-DEV.974 (419aba7972 2026-11-24 17:01 UTC), threads 8,0, guard 1, a plain @spawn from :interactive lands on :default, :default tids [1, 2, 3, 4, 5, 6, 7, 8], D = 8.0 s, variant A
+[15:08:53] sampler summary for costrounds (~/app/Nitro.jl/.claude/worktrees/bench-618-v4-evidence/bench/results/quiet-costrounds-20261126-145435.tsv):
+  samples 124 every 5s; load1 min 0.47 median 3.34 max 4.49
+  samples with a foreign julia/oha/go-server: 0
+  samples with an outside process above 5% CPU: 31  [git-remote-http peak 9.7%]  [node peak 106.5%]  [tmux: peak 6.7%]  [top peak 6.7%]  [claude peak 12.9%]
+  block exit status 0
+[15:08:53] rounds_fifo: costrounds done
+[15:08:53] rounds_fifo: done (status 0); next: julia ~/app/Nitro.jl/.claude/worktrees/bench-618-v4-evidence/bench/tasks/aggregate_fifo.jl ~/app/Nitro.jl/.claude/worktrees/bench-618-v4-evidence/bench/julia/evidence/candidate-v4-20261126/raw/spawnpath
+[2026-11-26 15:08:53] step spawnpath: exit 0 after 14 min
+[2026-11-26 15:08:53] cache check spawnpath: no cache file created or replaced
+[2026-11-26 15:08:53] step arm: start
+[15:08:53] quiet gate for fibabba: load1 < 0.5 and no julia/oha/go-server (at most 1800s)
+[15:10:44] gate passed after 110s (load1 0.48); running: ~/app/Nitro.jl/.claude/worktrees/bench-618-v4-evidence/bench/tasks/rounds_fifo.sh --run fibabba_block ~/app/Nitro.jl/.claude/worktrees/bench-618-v4-evidence/bench/julia/evidence/candidate-v4-20261126/raw/arm/attempt-fibabba-20261126-150853.tsv
+multiq_variant: VARIANT=A
+nested: julia 1.15.0-DEV.974 (419aba7972/local), threads 8,1, variant A
+nested: A fib_fine: result matches the serial reference; every one of 2178308 spawned tasks completed, in 3 counted runs
+multiq_variant: VARIANT=A
+nested: julia 1.15.0-DEV.974 (419aba7972/local), threads 8,1, variant A
+nested: A fib_fine: result matches the serial reference; every one of 2178308 spawned tasks completed, in 3 counted runs
+multiq_variant: VARIANT=N-none, F queue: class mark, serve g, 0 rings, pop samples 2, descendants R (into the R heaps), request-side weight 2/4, marks none
+nested: julia 1.15.0-DEV.976 (1bffccdc2f/native), threads 8,1, variant N-none
+nested: N-none fib_fine: result matches the serial reference; every one of 2178308 spawned tasks completed, in 3 counted runs
+multiq_variant: VARIANT=N-arm, F queue: class mark, serve g, 16 rings, pop samples 2, descendants R (into the R heaps), request-side weight 2/4, marks none
+nested: julia 1.15.0-DEV.976 (1bffccdc2f/native), threads 8,1, variant N-arm
+nested: N-arm fib_fine: result matches the serial reference; every one of 2178308 spawned tasks completed, in 3 counted runs
+multiq_variant: VARIANT=N-none, F queue: class mark, serve g, 0 rings, pop samples 2, descendants R (into the R heaps), request-side weight 2/4, marks none
+nested: julia 1.15.0-DEV.976 (1bffccdc2f/native), threads 8,1, variant N-none
+nested: N-none fib_fine: result matches the serial reference; every one of 2178308 spawned tasks completed, in 3 counted runs
+multiq_variant: VARIANT=N-arm, F queue: class mark, serve g, 16 rings, pop samples 2, descendants R (into the R heaps), request-side weight 2/4, marks none
+nested: julia 1.15.0-DEV.976 (1bffccdc2f/native), threads 8,1, variant N-arm
+nested: N-arm fib_fine: result matches the serial reference; every one of 2178308 spawned tasks completed, in 3 counted runs
+multiq_variant: VARIANT=A
+nested: julia 1.15.0-DEV.974 (419aba7972/local), threads 8,1, variant A
+nested: A fib_fine: result matches the serial reference; every one of 2178308 spawned tasks completed, in 3 counted runs
+multiq_variant: VARIANT=N-arm, F queue: class mark, serve g, 16 rings, pop samples 2, descendants R (into the R heaps), request-side weight 2/4, marks none
+nested: julia 1.15.0-DEV.976 (1bffccdc2f/native), threads 8,1, variant N-arm
+nested: N-arm fib_fine: result matches the serial reference; every one of 2178308 spawned tasks completed, in 3 counted runs
+multiq_variant: VARIANT=A
+nested: julia 1.15.0-DEV.974 (419aba7972/local), threads 8,1, variant A
+nested: A fib_fine: result matches the serial reference; every one of 2178308 spawned tasks completed, in 3 counted runs
+multiq_variant: VARIANT=N-none, F queue: class mark, serve g, 0 rings, pop samples 2, descendants R (into the R heaps), request-side weight 2/4, marks none
+nested: julia 1.15.0-DEV.976 (1bffccdc2f/native), threads 8,1, variant N-none
+nested: N-none fib_fine: result matches the serial reference; every one of 2178308 spawned tasks completed, in 3 counted runs
+multiq_variant: VARIANT=A
+nested: julia 1.15.0-DEV.974 (419aba7972/local), threads 8,1, variant A
+nested: A fib_fine: result matches the serial reference; every one of 2178308 spawned tasks completed, in 3 counted runs
+multiq_variant: VARIANT=N-none, F queue: class mark, serve g, 0 rings, pop samples 2, descendants R (into the R heaps), request-side weight 2/4, marks none
+nested: julia 1.15.0-DEV.976 (1bffccdc2f/native), threads 8,1, variant N-none
+nested: N-none fib_fine: result matches the serial reference; every one of 2178308 spawned tasks completed, in 3 counted runs
+multiq_variant: VARIANT=N-arm, F queue: class mark, serve g, 16 rings, pop samples 2, descendants R (into the R heaps), request-side weight 2/4, marks none
+nested: julia 1.15.0-DEV.976 (1bffccdc2f/native), threads 8,1, variant N-arm
+nested: N-arm fib_fine: result matches the serial reference; every one of 2178308 spawned tasks completed, in 3 counted runs
+multiq_variant: VARIANT=N-none, F queue: class mark, serve g, 0 rings, pop samples 2, descendants R (into the R heaps), request-side weight 2/4, marks none
+nested: julia 1.15.0-DEV.976 (1bffccdc2f/native), threads 8,1, variant N-none
+nested: N-none fib_fine: result matches the serial reference; every one of 2178308 spawned tasks completed, in 3 counted runs
+multiq_variant: VARIANT=N-arm, F queue: class mark, serve g, 16 rings, pop samples 2, descendants R (into the R heaps), request-side weight 2/4, marks none
+nested: julia 1.15.0-DEV.976 (1bffccdc2f/native), threads 8,1, variant N-arm
+nested: N-arm fib_fine: result matches the serial reference; every one of 2178308 spawned tasks completed, in 3 counted runs
+multiq_variant: VARIANT=A
+nested: julia 1.15.0-DEV.974 (419aba7972/local), threads 8,1, variant A
+nested: A fib_fine: result matches the serial reference; every one of 2178308 spawned tasks completed, in 3 counted runs
+multiq_variant: VARIANT=N-arm, F queue: class mark, serve g, 16 rings, pop samples 2, descendants R (into the R heaps), request-side weight 2/4, marks none
+nested: julia 1.15.0-DEV.976 (1bffccdc2f/native), threads 8,1, variant N-arm
+nested: N-arm fib_fine: result matches the serial reference; every one of 2178308 spawned tasks completed, in 3 counted runs
+multiq_variant: VARIANT=A
+nested: julia 1.15.0-DEV.974 (419aba7972/local), threads 8,1, variant A
+nested: A fib_fine: result matches the serial reference; every one of 2178308 spawned tasks completed, in 3 counted runs
+multiq_variant: VARIANT=N-none, F queue: class mark, serve g, 0 rings, pop samples 2, descendants R (into the R heaps), request-side weight 2/4, marks none
+nested: julia 1.15.0-DEV.976 (1bffccdc2f/native), threads 8,1, variant N-none
+nested: N-none fib_fine: result matches the serial reference; every one of 2178308 spawned tasks completed, in 3 counted runs
+[15:14:15] sampler summary for fibabba (~/app/Nitro.jl/.claude/worktrees/bench-618-v4-evidence/bench/results/quiet-fibabba-20261126-150853.tsv):
+  samples 38 every 5s; load1 min 0.48 median 5.70 max 6.74
+  samples with a foreign julia/oha/go-server: 0
+  samples with an outside process above 5% CPU: 11  [git-remote-http peak 6.5%]  [node peak 25.8%]  [tmux: peak 6.7%]  [top peak 6.5%]
+  block exit status 0
+[15:14:15] rounds_fifo: fibabba done
+[15:14:15] rounds_fifo: done (status 0); next: julia ~/app/Nitro.jl/.claude/worktrees/bench-618-v4-evidence/bench/tasks/aggregate_fifo.jl ~/app/Nitro.jl/.claude/worktrees/bench-618-v4-evidence/bench/julia/evidence/candidate-v4-20261126/raw/arm
+[2026-11-26 15:14:15] step arm: exit 0 after 5 min
+[2026-11-26 15:14:15] cache check arm: no cache file created or replaced
+[2026-11-26 15:14:15] step tests: start
+[2026-11-26 15:17:30] tests control: exit 0 after 195 s; SUCCESS
+[2026-11-26 15:20:47] tests candidate: exit 0 after 197 s; SUCCESS
+[2026-11-26 15:20:47] step tests: exit 0 after 6 min
+[2026-11-26 15:20:47] cache check tests: no cache file created or replaced
+[2026-11-26 15:20:47] step repro: start
+[15:20:47] quiet gate for 618ce-repro: load1 < 0.5 and no julia/oha/go-server (at most 1800s)
+[15:22:17] gate passed after 90s (load1 0.48); running: bench/julia/candidate_evidence.sh --run repro_block ~/app/Nitro.jl/.claude/worktrees/bench-618-v4-evidence/bench/julia/evidence/candidate-v4-20261126/raw/repro/repro.tsv 3 8,1|starved.jl|plain 8,1|starved.jl|fair 8,1|fib_fine.jl| 2|pfib.jl|none 2|pfib.jl|root 2|pfib.jl|all
+[15:26:23] sampler summary for 618ce-repro (~/app/Nitro.jl/.claude/worktrees/bench-618-v4-evidence/bench/results/quiet-618ce-repro-20261126-152047.tsv):
+  samples 45 every 5s; load1 min 0.48 median 4.09 max 6.24
+  samples with a foreign julia/oha/go-server: 0
+  samples with an outside process above 5% CPU: 9  [node peak 13.3%]  [tmux: peak 6.7%]
+  block exit status 0
+[2026-11-26 15:26:23] step repro: exit 0 after 5 min
+[2026-11-26 15:26:23] cache check repro: no cache file created or replaced
+[2026-11-26 15:26:23] step repro_gh: start
+[15:26:23] quiet gate for 618ce-repro_gh: load1 < 0.5 and no julia/oha/go-server (at most 1800s)
+[15:28:34] gate passed after 130s (load1 0.48); running: bench/julia/candidate_evidence.sh --run repro_block ~/app/Nitro.jl/.claude/worktrees/bench-618-v4-evidence/bench/julia/evidence/candidate-v4-20261126/raw/repro_gh/repro.tsv 3 8,0|spawn_path.jl|plain 50 8,0|spawn_path.jl|fair 50 8,0|spawn_path.jl|plain 500 8,0|spawn_path.jl|fair 500 8,1|armed.jl|unarmed 8,1|armed.jl|armed
+[15:33:41] sampler summary for 618ce-repro_gh (~/app/Nitro.jl/.claude/worktrees/bench-618-v4-evidence/bench/results/quiet-618ce-repro_gh-20261126-152623.tsv):
+  samples 56 every 5s; load1 min 0.48 median 5.00 max 6.45
+  samples with a foreign julia/oha/go-server: 0
+  samples with an outside process above 5% CPU: 15  [git-remote-http peak 10.0%]  [node peak 50.0%]  [tmux: peak 6.5%]  [claude peak 6.5%]
+  block exit status 0
+[2026-11-26 15:33:41] step repro_gh: exit 0 after 7 min
+[2026-11-26 15:33:41] cache check repro_gh: no cache file created or replaced
+[2026-11-26 15:33:41] step mwe: start
+[15:33:41] quiet gate for 618ce-mwe: load1 < 0.5 and no julia/oha/go-server (at most 1800s)
+[15:36:32] gate passed after 170s (load1 0.43); running: bench/julia/candidate_evidence.sh --run mwe_block ~/app/Nitro.jl/.claude/worktrees/bench-618-v4-evidence/bench/julia/evidence/candidate-v4-20261126/raw/mwe
+[15:36:49] sampler summary for 618ce-mwe (~/app/Nitro.jl/.claude/worktrees/bench-618-v4-evidence/bench/results/quiet-618ce-mwe-20261126-153341.tsv):
+  samples 3 every 5s; load1 min 0.43 median 1.04 max 2.26
+  samples with a foreign julia/oha/go-server: 0
+  samples with an outside process above 5% CPU: 2  [node peak 12.9%]  [claude peak 10.0%]
+  block exit status 0
+[2026-11-26 15:36:49] step mwe: exit 0 after 3 min
+[2026-11-26 15:36:49] cache check mwe: no cache file created or replaced
+[2026-11-26 15:36:49] step report: start
+[2026-11-26 15:36:51] step report: exit 0 after 0 min
+[2026-11-26 15:36:51] cache check report: no cache file created or replaced
+[2026-11-26 15:36:51] driver done: every step finished

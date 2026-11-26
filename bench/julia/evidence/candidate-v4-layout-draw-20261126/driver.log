@@ -1,0 +1,266 @@
+[2026-11-26 15:49:34] driver start: steps [prep pfib81 arm], OUT ~/app/Nitro.jl/.claude/worktrees/bench-618-v4-evidence/bench/julia/evidence/candidate-v4-layout-draw-20261126, SMOKE=0
+[2026-11-26 15:49:34] build control: ~/app/julia-618-master/bin/julia-pin-control: 1.15.0-DEV.974 419aba7972
+[2026-11-26 15:49:34] build control2: ~/app/julia-618-master/bin/julia-v3: 1.15.0-DEV.976 2db177599e
+[2026-11-26 15:49:35] build candidate: ~/app/julia-618-master/bin/julia-v4: 1.15.0-DEV.976 1bffccdc2f
+[2026-11-26 15:49:35] build bypass: ~/app/julia-618-master/bin/julia-v3-validate-off: 1.15.0-DEV.977 06d4f771fa*
+[2026-11-26 15:49:35] build timens: ~/app/julia-618-master/bin/julia-v4-validate-off: 1.15.0-DEV.977 bc7af35ce6*
+[2026-11-26 15:49:36] step prep: start
+Precompiling project...
+   0.3 s  ✓ Statistics
+   0.3 s  ✓ Compat
+   0.5 s  ✓ Preferences
+   0.2 s  ✓ Compat → CompatLinearAlgebraExt
+   0.6 s  ✓ StructUtils
+   0.2 s  ✓ PrecompileTools
+   8.5 s  ✓ Parsers
+   5.5 s  ✓ JSON
+   2.4 s  ✓ BenchmarkTools
+  9 dependencies successfully precompiled in 17 seconds. 8 already precompiled.
+Precompiling project...
+   0.2 s  ✓ EnumX
+   0.3 s  ✓ JSON → JSONSerializationExt
+   0.3 s  ✓ TranscodingStreams
+   0.3 s  ✓ URIs
+   0.2 s  ✓ CodecZlib
+  14.3 s  ✓ Reseau
+  24.2 s  ✓ HTTP
+  7 dependencies successfully precompiled in 39 seconds. 16 already precompiled.
+Precompiling project...
+   0.3 s  ✓ Statistics
+   0.3 s  ✓ Compat
+   0.5 s  ✓ Preferences
+   0.2 s  ✓ Compat → CompatLinearAlgebraExt
+   0.6 s  ✓ StructUtils
+   0.2 s  ✓ PrecompileTools
+   8.4 s  ✓ Parsers
+   5.6 s  ✓ JSON
+   2.4 s  ✓ BenchmarkTools
+  9 dependencies successfully precompiled in 17 seconds. 8 already precompiled.
+Precompiling project...
+   0.2 s  ✓ EnumX
+   0.3 s  ✓ JSON → JSONSerializationExt
+   0.3 s  ✓ TranscodingStreams
+   0.3 s  ✓ URIs
+   0.2 s  ✓ CodecZlib
+  14.2 s  ✓ Reseau
+  23.9 s  ✓ HTTP
+  7 dependencies successfully precompiled in 38 seconds. 16 already precompiled.
+[2026-11-26 15:51:33] step prep: exit 0 after 1 min
+[2026-11-26 15:51:33] cache check prep: CACHE FILES CREATED OR REPLACED during the step (path size inode):
+~/app/julia-618-master/depot-v3-validate-off/compiled/v1.15/BenchmarkTools/ZXPQo_SHTWo_cd978420d971fb82.ji 3816403 22284174
+~/app/julia-618-master/depot-v3-validate-off/compiled/v1.15/BenchmarkTools/ZXPQo_SHTWo_cd978420d971fb82.so 378328 22284175
+~/app/julia-618-master/depot-v3-validate-off/compiled/v1.15/CodecZlib/1TI30_fDCd1_e5a85d8b6dd2b2b3.ji 171412 22284188
+~/app/julia-618-master/depot-v3-validate-off/compiled/v1.15/Compat/GSFWK_46Q0J_0e03e4799b166e42.ji 124555 22284164
+~/app/julia-618-master/depot-v3-validate-off/compiled/v1.15/CompatLinearAlgebraExt/ljs2z_46Q0J_b38732b33faf71be.ji 9902 22284156
+~/app/julia-618-master/depot-v3-validate-off/compiled/v1.15/EnumX/yh1Fz_fDCd1_2e4bfa6b91a4da06.ji 62406 22284192
+~/app/julia-618-master/depot-v3-validate-off/compiled/v1.15/HTTP/zXWya_51lZg_91d3d19e05f68b5d.ji 17218251 22284184
+~/app/julia-618-master/depot-v3-validate-off/compiled/v1.15/HTTP/zXWya_51lZg_91d3d19e05f68b5d.so 5636088 22284186
+~/app/julia-618-master/depot-v3-validate-off/compiled/v1.15/JSONSerializationExt/QneaF_fDCd1_25564f775e5754aa.ji 12211 22284187
+~/app/julia-618-master/depot-v3-validate-off/compiled/v1.15/JSON/uf6oy_NcDYh_cd6019733126f93e.ji 5888351 22284171
+~/app/julia-618-master/depot-v3-validate-off/compiled/v1.15/JSON/uf6oy_NcDYh_cd6019733126f93e.so 1032896 22284172
+~/app/julia-618-master/depot-v3-validate-off/compiled/v1.15/Parsers/833b9_m6nX4_2ff52ed1ad27403e.ji 12940762 22284165
+~/app/julia-618-master/depot-v3-validate-off/compiled/v1.15/Parsers/833b9_m6nX4_2ff52ed1ad27403e.so 1336720 22284168
+~/app/julia-618-master/depot-v3-validate-off/compiled/v1.15/PrecompileTools/AQ9Mk_hJhzi_5363713ca69ff7d3.ji 55166 22284166
+~/app/julia-618-master/depot-v3-validate-off/compiled/v1.15/Preferences/pWSk8_46Q0J_cd38e05375966c27.ji 203262 22284159
+~/app/julia-618-master/depot-v3-validate-off/compiled/v1.15/Preferences/pWSk8_46Q0J_cd38e05375966c27.so 31944 22284160
+~/app/julia-618-master/depot-v3-validate-off/compiled/v1.15/Reseau/vKBJ8_cbT1f_01e121712f2fa219.ji 12745033 22284182
+~/app/julia-618-master/depot-v3-validate-off/compiled/v1.15/Reseau/vKBJ8_cbT1f_01e121712f2fa219.so 2907504 22284183
+~/app/julia-618-master/depot-v3-validate-off/compiled/v1.15/Statistics/ERcPL_46Q0J_d22ee0fb4d8d2fbf.ji 402962 22284154
+~/app/julia-618-master/depot-v3-validate-off/compiled/v1.15/StructUtils/vyJDy_46Q0J_9f71e72f614e2800.ji 1209942 22284169
+~/app/julia-618-master/depot-v3-validate-off/compiled/v1.15/StructUtils/vyJDy_46Q0J_9f71e72f614e2800.so 10512 22284163
+~/app/julia-618-master/depot-v3-validate-off/compiled/v1.15/TranscodingStreams/eJQ7D_fDCd1_5e01dafcf9c68662.ji 369555 22284176
+~/app/julia-618-master/depot-v3-validate-off/compiled/v1.15/TranscodingStreams/eJQ7D_fDCd1_5e01dafcf9c68662.so 10512 22284178
+~/app/julia-618-master/depot-v3-validate-off/compiled/v1.15/URIs/eec2u_fDCd1_d3aded5f4945e10f.ji 352267 22284197
+~/app/julia-618-master/depot-v3-validate-off/compiled/v1.15/URIs/eec2u_fDCd1_d3aded5f4945e10f.so 22840 22284193
+~/app/julia-618-master/depot-v4-validate-off/compiled/v1.15/BenchmarkTools/ZXPQo_fE8J8_e847dc4efceb0d15.ji 3816435 23855942
+~/app/julia-618-master/depot-v4-validate-off/compiled/v1.15/BenchmarkTools/ZXPQo_fE8J8_e847dc4efceb0d15.so 378376 23855943
+~/app/julia-618-master/depot-v4-validate-off/compiled/v1.15/CodecZlib/1TI30_szhzH_48612716e9245a4b.ji 171412 23855954
+~/app/julia-618-master/depot-v4-validate-off/compiled/v1.15/Compat/GSFWK_dXCxd_e28ef0cb8b5bb478.ji 124555 23855932
+~/app/julia-618-master/depot-v4-validate-off/compiled/v1.15/CompatLinearAlgebraExt/ljs2z_dXCxd_c4f2f9d6ecd2acda.ji 9902 23855924
+~/app/julia-618-master/depot-v4-validate-off/compiled/v1.15/EnumX/yh1Fz_szhzH_02e1e98d7ad707ca.ji 62406 23855960
+~/app/julia-618-master/depot-v4-validate-off/compiled/v1.15/HTTP/zXWya_23FB5_2102edf258aa20b7.ji 17218315 23855957
+~/app/julia-618-master/depot-v4-validate-off/compiled/v1.15/HTTP/zXWya_23FB5_2102edf258aa20b7.so 5638096 23855959
+~/app/julia-618-master/depot-v4-validate-off/compiled/v1.15/JSONSerializationExt/QneaF_szhzH_a0fabf8343dec1a1.ji 12211 23855955
+~/app/julia-618-master/depot-v4-validate-off/compiled/v1.15/JSON/uf6oy_YvfN4_bff43b809bca717b.ji 5888351 23855939
+~/app/julia-618-master/depot-v4-validate-off/compiled/v1.15/JSON/uf6oy_YvfN4_bff43b809bca717b.so 1032824 23855940
+~/app/julia-618-master/depot-v4-validate-off/compiled/v1.15/Parsers/833b9_bpkUB_3ec31721f6864344.ji 12940762 23855933
+~/app/julia-618-master/depot-v4-validate-off/compiled/v1.15/Parsers/833b9_bpkUB_3ec31721f6864344.so 1336160 23855936
+~/app/julia-618-master/depot-v4-validate-off/compiled/v1.15/PrecompileTools/AQ9Mk_uaOyf_7042cd79f7a9bdfc.ji 55166 23855934
+~/app/julia-618-master/depot-v4-validate-off/compiled/v1.15/Preferences/pWSk8_dXCxd_957378e7c2cae4bc.ji 203262 23855927
+[2026-11-26 15:51:33] cache check prep: logged, not fatal (untimed step or smoke)
+[2026-11-26 15:51:33] step pfib81: start
+[15:51:33] quiet gate for 618ce-pfib81: load1 < 0.5 and no julia/oha/go-server (at most 1800s)
+[15:53:33] gate passed after 120s (load1 0.49); running: ./candidate_evidence.sh --run pfib_block ~/app/Nitro.jl/.claude/worktrees/bench-618-v4-evidence/bench/julia/evidence/candidate-v4-layout-draw-20261126/raw/pfib81/pfib.tsv 10 8,1 0,1,2,3,6,7,8,9 ctl:control:none a3:control2:all a4:candidate:all a3o:bypass:all a4o:timens:all
+[15:57:40] sampler summary for 618ce-pfib81 (~/app/Nitro.jl/.claude/worktrees/bench-618-v4-evidence/bench/results/quiet-618ce-pfib81-20261126-155133.tsv):
+  samples 45 every 5s; load1 min 0.49 median 6.17 max 7.35
+  samples with a foreign julia/oha/go-server: 0
+  samples with an outside process above 5% CPU: 9  [node peak 48.4%]  [tmux: peak 6.5%]  [claude peak 6.7%]
+  block exit status 0
+[2026-11-26 15:57:40] step pfib81: exit 0 after 6 min
+[2026-11-26 15:57:40] cache check pfib81: no cache file created or replaced
+[2026-11-26 15:57:40] step arm: start
+[15:57:40] quiet gate for fibabba: load1 < 0.5 and no julia/oha/go-server (at most 1800s)
+[16:00:31] gate passed after 170s (load1 0.48); running: ~/app/Nitro.jl/.claude/worktrees/bench-618-v4-evidence/bench/tasks/rounds_fifo.sh --run fibabba_block ~/app/Nitro.jl/.claude/worktrees/bench-618-v4-evidence/bench/julia/evidence/candidate-v4-layout-draw-20261126/raw/arm/attempt-fibabba-20261126-155740.tsv
+multiq_variant: VARIANT=A
+nested: julia 1.15.0-DEV.974 (419aba7972/local), threads 8,1, variant A
+nested: A fib_fine: result matches the serial reference; every one of 2178308 spawned tasks completed, in 3 counted runs
+multiq_variant: VARIANT=A
+nested: julia 1.15.0-DEV.974 (419aba7972/local), threads 8,1, variant A
+nested: A fib_fine: result matches the serial reference; every one of 2178308 spawned tasks completed, in 3 counted runs
+multiq_variant: VARIANT=N-none, F queue: class mark, serve g, 0 rings, pop samples 2, descendants R (into the R heaps), request-side weight 2/4, marks none
+nested: julia 1.15.0-DEV.976 (2db177599e/native), threads 8,1, variant N-none
+nested: N-none fib_fine: result matches the serial reference; every one of 2178308 spawned tasks completed, in 3 counted runs
+multiq_variant: VARIANT=N-none, F queue: class mark, serve g, 0 rings, pop samples 2, descendants R (into the R heaps), request-side weight 2/4, marks none
+nested: julia 1.15.0-DEV.976 (1bffccdc2f/native), threads 8,1, variant N-none
+nested: N-none fib_fine: result matches the serial reference; every one of 2178308 spawned tasks completed, in 3 counted runs
+multiq_variant: VARIANT=N-none, F queue: class mark, serve g, 0 rings, pop samples 2, descendants R (into the R heaps), request-side weight 2/4, marks none
+nested: julia 1.15.0-DEV.977 (06d4f771fa*/native), threads 8,1, variant N-none
+nested: N-none fib_fine: result matches the serial reference; every one of 2178308 spawned tasks completed, in 3 counted runs
+multiq_variant: VARIANT=N-none, F queue: class mark, serve g, 0 rings, pop samples 2, descendants R (into the R heaps), request-side weight 2/4, marks none
+nested: julia 1.15.0-DEV.977 (bc7af35ce6*/native), threads 8,1, variant N-none
+nested: N-none fib_fine: result matches the serial reference; every one of 2178308 spawned tasks completed, in 3 counted runs
+multiq_variant: VARIANT=N-none, F queue: class mark, serve g, 0 rings, pop samples 2, descendants R (into the R heaps), request-side weight 2/4, marks none
+nested: julia 1.15.0-DEV.976 (2db177599e/native), threads 8,1, variant N-none
+nested: N-none fib_fine: result matches the serial reference; every one of 2178308 spawned tasks completed, in 3 counted runs
+multiq_variant: VARIANT=N-none, F queue: class mark, serve g, 0 rings, pop samples 2, descendants R (into the R heaps), request-side weight 2/4, marks none
+nested: julia 1.15.0-DEV.976 (1bffccdc2f/native), threads 8,1, variant N-none
+nested: N-none fib_fine: result matches the serial reference; every one of 2178308 spawned tasks completed, in 3 counted runs
+multiq_variant: VARIANT=N-none, F queue: class mark, serve g, 0 rings, pop samples 2, descendants R (into the R heaps), request-side weight 2/4, marks none
+nested: julia 1.15.0-DEV.977 (06d4f771fa*/native), threads 8,1, variant N-none
+nested: N-none fib_fine: result matches the serial reference; every one of 2178308 spawned tasks completed, in 3 counted runs
+multiq_variant: VARIANT=N-none, F queue: class mark, serve g, 0 rings, pop samples 2, descendants R (into the R heaps), request-side weight 2/4, marks none
+nested: julia 1.15.0-DEV.977 (bc7af35ce6*/native), threads 8,1, variant N-none
+nested: N-none fib_fine: result matches the serial reference; every one of 2178308 spawned tasks completed, in 3 counted runs
+multiq_variant: VARIANT=A
+nested: julia 1.15.0-DEV.974 (419aba7972/local), threads 8,1, variant A
+nested: A fib_fine: result matches the serial reference; every one of 2178308 spawned tasks completed, in 3 counted runs
+multiq_variant: VARIANT=N-none, F queue: class mark, serve g, 0 rings, pop samples 2, descendants R (into the R heaps), request-side weight 2/4, marks none
+nested: julia 1.15.0-DEV.976 (1bffccdc2f/native), threads 8,1, variant N-none
+nested: N-none fib_fine: result matches the serial reference; every one of 2178308 spawned tasks completed, in 3 counted runs
+multiq_variant: VARIANT=N-none, F queue: class mark, serve g, 0 rings, pop samples 2, descendants R (into the R heaps), request-side weight 2/4, marks none
+nested: julia 1.15.0-DEV.977 (06d4f771fa*/native), threads 8,1, variant N-none
+nested: N-none fib_fine: result matches the serial reference; every one of 2178308 spawned tasks completed, in 3 counted runs
+multiq_variant: VARIANT=N-none, F queue: class mark, serve g, 0 rings, pop samples 2, descendants R (into the R heaps), request-side weight 2/4, marks none
+nested: julia 1.15.0-DEV.977 (bc7af35ce6*/native), threads 8,1, variant N-none
+nested: N-none fib_fine: result matches the serial reference; every one of 2178308 spawned tasks completed, in 3 counted runs
+multiq_variant: VARIANT=A
+nested: julia 1.15.0-DEV.974 (419aba7972/local), threads 8,1, variant A
+nested: A fib_fine: result matches the serial reference; every one of 2178308 spawned tasks completed, in 3 counted runs
+multiq_variant: VARIANT=N-none, F queue: class mark, serve g, 0 rings, pop samples 2, descendants R (into the R heaps), request-side weight 2/4, marks none
+nested: julia 1.15.0-DEV.976 (2db177599e/native), threads 8,1, variant N-none
+nested: N-none fib_fine: result matches the serial reference; every one of 2178308 spawned tasks completed, in 3 counted runs
+multiq_variant: VARIANT=N-none, F queue: class mark, serve g, 0 rings, pop samples 2, descendants R (into the R heaps), request-side weight 2/4, marks none
+nested: julia 1.15.0-DEV.977 (06d4f771fa*/native), threads 8,1, variant N-none
+nested: N-none fib_fine: result matches the serial reference; every one of 2178308 spawned tasks completed, in 3 counted runs
+multiq_variant: VARIANT=N-none, F queue: class mark, serve g, 0 rings, pop samples 2, descendants R (into the R heaps), request-side weight 2/4, marks none
+nested: julia 1.15.0-DEV.977 (bc7af35ce6*/native), threads 8,1, variant N-none
+nested: N-none fib_fine: result matches the serial reference; every one of 2178308 spawned tasks completed, in 3 counted runs
+multiq_variant: VARIANT=A
+nested: julia 1.15.0-DEV.974 (419aba7972/local), threads 8,1, variant A
+nested: A fib_fine: result matches the serial reference; every one of 2178308 spawned tasks completed, in 3 counted runs
+multiq_variant: VARIANT=N-none, F queue: class mark, serve g, 0 rings, pop samples 2, descendants R (into the R heaps), request-side weight 2/4, marks none
+nested: julia 1.15.0-DEV.976 (2db177599e/native), threads 8,1, variant N-none
+nested: N-none fib_fine: result matches the serial reference; every one of 2178308 spawned tasks completed, in 3 counted runs
+multiq_variant: VARIANT=N-none, F queue: class mark, serve g, 0 rings, pop samples 2, descendants R (into the R heaps), request-side weight 2/4, marks none
+nested: julia 1.15.0-DEV.976 (1bffccdc2f/native), threads 8,1, variant N-none
+nested: N-none fib_fine: result matches the serial reference; every one of 2178308 spawned tasks completed, in 3 counted runs
+multiq_variant: VARIANT=N-none, F queue: class mark, serve g, 0 rings, pop samples 2, descendants R (into the R heaps), request-side weight 2/4, marks none
+nested: julia 1.15.0-DEV.977 (bc7af35ce6*/native), threads 8,1, variant N-none
+nested: N-none fib_fine: result matches the serial reference; every one of 2178308 spawned tasks completed, in 3 counted runs
+multiq_variant: VARIANT=A
+nested: julia 1.15.0-DEV.974 (419aba7972/local), threads 8,1, variant A
+nested: A fib_fine: result matches the serial reference; every one of 2178308 spawned tasks completed, in 3 counted runs
+multiq_variant: VARIANT=N-none, F queue: class mark, serve g, 0 rings, pop samples 2, descendants R (into the R heaps), request-side weight 2/4, marks none
+nested: julia 1.15.0-DEV.976 (2db177599e/native), threads 8,1, variant N-none
+nested: N-none fib_fine: result matches the serial reference; every one of 2178308 spawned tasks completed, in 3 counted runs
+multiq_variant: VARIANT=N-none, F queue: class mark, serve g, 0 rings, pop samples 2, descendants R (into the R heaps), request-side weight 2/4, marks none
+nested: julia 1.15.0-DEV.976 (1bffccdc2f/native), threads 8,1, variant N-none
+nested: N-none fib_fine: result matches the serial reference; every one of 2178308 spawned tasks completed, in 3 counted runs
+multiq_variant: VARIANT=N-none, F queue: class mark, serve g, 0 rings, pop samples 2, descendants R (into the R heaps), request-side weight 2/4, marks none
+nested: julia 1.15.0-DEV.977 (06d4f771fa*/native), threads 8,1, variant N-none
+nested: N-none fib_fine: result matches the serial reference; every one of 2178308 spawned tasks completed, in 3 counted runs
+multiq_variant: VARIANT=A
+nested: julia 1.15.0-DEV.974 (419aba7972/local), threads 8,1, variant A
+nested: A fib_fine: result matches the serial reference; every one of 2178308 spawned tasks completed, in 3 counted runs
+multiq_variant: VARIANT=N-none, F queue: class mark, serve g, 0 rings, pop samples 2, descendants R (into the R heaps), request-side weight 2/4, marks none
+nested: julia 1.15.0-DEV.976 (2db177599e/native), threads 8,1, variant N-none
+nested: N-none fib_fine: result matches the serial reference; every one of 2178308 spawned tasks completed, in 3 counted runs
+multiq_variant: VARIANT=N-none, F queue: class mark, serve g, 0 rings, pop samples 2, descendants R (into the R heaps), request-side weight 2/4, marks none
+nested: julia 1.15.0-DEV.976 (1bffccdc2f/native), threads 8,1, variant N-none
+nested: N-none fib_fine: result matches the serial reference; every one of 2178308 spawned tasks completed, in 3 counted runs
+multiq_variant: VARIANT=N-none, F queue: class mark, serve g, 0 rings, pop samples 2, descendants R (into the R heaps), request-side weight 2/4, marks none
+nested: julia 1.15.0-DEV.977 (06d4f771fa*/native), threads 8,1, variant N-none
+nested: N-none fib_fine: result matches the serial reference; every one of 2178308 spawned tasks completed, in 3 counted runs
+multiq_variant: VARIANT=N-none, F queue: class mark, serve g, 0 rings, pop samples 2, descendants R (into the R heaps), request-side weight 2/4, marks none
+nested: julia 1.15.0-DEV.977 (bc7af35ce6*/native), threads 8,1, variant N-none
+nested: N-none fib_fine: result matches the serial reference; every one of 2178308 spawned tasks completed, in 3 counted runs
+multiq_variant: VARIANT=N-none, F queue: class mark, serve g, 0 rings, pop samples 2, descendants R (into the R heaps), request-side weight 2/4, marks none
+nested: julia 1.15.0-DEV.976 (2db177599e/native), threads 8,1, variant N-none
+nested: N-none fib_fine: result matches the serial reference; every one of 2178308 spawned tasks completed, in 3 counted runs
+multiq_variant: VARIANT=N-none, F queue: class mark, serve g, 0 rings, pop samples 2, descendants R (into the R heaps), request-side weight 2/4, marks none
+nested: julia 1.15.0-DEV.976 (1bffccdc2f/native), threads 8,1, variant N-none
+nested: N-none fib_fine: result matches the serial reference; every one of 2178308 spawned tasks completed, in 3 counted runs
+multiq_variant: VARIANT=N-none, F queue: class mark, serve g, 0 rings, pop samples 2, descendants R (into the R heaps), request-side weight 2/4, marks none
+nested: julia 1.15.0-DEV.977 (06d4f771fa*/native), threads 8,1, variant N-none
+nested: N-none fib_fine: result matches the serial reference; every one of 2178308 spawned tasks completed, in 3 counted runs
+multiq_variant: VARIANT=N-none, F queue: class mark, serve g, 0 rings, pop samples 2, descendants R (into the R heaps), request-side weight 2/4, marks none
+nested: julia 1.15.0-DEV.977 (bc7af35ce6*/native), threads 8,1, variant N-none
+nested: N-none fib_fine: result matches the serial reference; every one of 2178308 spawned tasks completed, in 3 counted runs
+multiq_variant: VARIANT=A
+nested: julia 1.15.0-DEV.974 (419aba7972/local), threads 8,1, variant A
+nested: A fib_fine: result matches the serial reference; every one of 2178308 spawned tasks completed, in 3 counted runs
+multiq_variant: VARIANT=N-none, F queue: class mark, serve g, 0 rings, pop samples 2, descendants R (into the R heaps), request-side weight 2/4, marks none
+nested: julia 1.15.0-DEV.976 (1bffccdc2f/native), threads 8,1, variant N-none
+nested: N-none fib_fine: result matches the serial reference; every one of 2178308 spawned tasks completed, in 3 counted runs
+multiq_variant: VARIANT=N-none, F queue: class mark, serve g, 0 rings, pop samples 2, descendants R (into the R heaps), request-side weight 2/4, marks none
+nested: julia 1.15.0-DEV.977 (06d4f771fa*/native), threads 8,1, variant N-none
+nested: N-none fib_fine: result matches the serial reference; every one of 2178308 spawned tasks completed, in 3 counted runs
+multiq_variant: VARIANT=N-none, F queue: class mark, serve g, 0 rings, pop samples 2, descendants R (into the R heaps), request-side weight 2/4, marks none
+nested: julia 1.15.0-DEV.977 (bc7af35ce6*/native), threads 8,1, variant N-none
+nested: N-none fib_fine: result matches the serial reference; every one of 2178308 spawned tasks completed, in 3 counted runs
+multiq_variant: VARIANT=A
+nested: julia 1.15.0-DEV.974 (419aba7972/local), threads 8,1, variant A
+nested: A fib_fine: result matches the serial reference; every one of 2178308 spawned tasks completed, in 3 counted runs
+multiq_variant: VARIANT=N-none, F queue: class mark, serve g, 0 rings, pop samples 2, descendants R (into the R heaps), request-side weight 2/4, marks none
+nested: julia 1.15.0-DEV.976 (2db177599e/native), threads 8,1, variant N-none
+nested: N-none fib_fine: result matches the serial reference; every one of 2178308 spawned tasks completed, in 3 counted runs
+multiq_variant: VARIANT=N-none, F queue: class mark, serve g, 0 rings, pop samples 2, descendants R (into the R heaps), request-side weight 2/4, marks none
+nested: julia 1.15.0-DEV.977 (06d4f771fa*/native), threads 8,1, variant N-none
+nested: N-none fib_fine: result matches the serial reference; every one of 2178308 spawned tasks completed, in 3 counted runs
+multiq_variant: VARIANT=N-none, F queue: class mark, serve g, 0 rings, pop samples 2, descendants R (into the R heaps), request-side weight 2/4, marks none
+nested: julia 1.15.0-DEV.977 (bc7af35ce6*/native), threads 8,1, variant N-none
+nested: N-none fib_fine: result matches the serial reference; every one of 2178308 spawned tasks completed, in 3 counted runs
+multiq_variant: VARIANT=A
+nested: julia 1.15.0-DEV.974 (419aba7972/local), threads 8,1, variant A
+nested: A fib_fine: result matches the serial reference; every one of 2178308 spawned tasks completed, in 3 counted runs
+multiq_variant: VARIANT=N-none, F queue: class mark, serve g, 0 rings, pop samples 2, descendants R (into the R heaps), request-side weight 2/4, marks none
+nested: julia 1.15.0-DEV.976 (2db177599e/native), threads 8,1, variant N-none
+nested: N-none fib_fine: result matches the serial reference; every one of 2178308 spawned tasks completed, in 3 counted runs
+multiq_variant: VARIANT=N-none, F queue: class mark, serve g, 0 rings, pop samples 2, descendants R (into the R heaps), request-side weight 2/4, marks none
+nested: julia 1.15.0-DEV.976 (1bffccdc2f/native), threads 8,1, variant N-none
+nested: N-none fib_fine: result matches the serial reference; every one of 2178308 spawned tasks completed, in 3 counted runs
+multiq_variant: VARIANT=N-none, F queue: class mark, serve g, 0 rings, pop samples 2, descendants R (into the R heaps), request-side weight 2/4, marks none
+nested: julia 1.15.0-DEV.977 (bc7af35ce6*/native), threads 8,1, variant N-none
+nested: N-none fib_fine: result matches the serial reference; every one of 2178308 spawned tasks completed, in 3 counted runs
+multiq_variant: VARIANT=A
+nested: julia 1.15.0-DEV.974 (419aba7972/local), threads 8,1, variant A
+nested: A fib_fine: result matches the serial reference; every one of 2178308 spawned tasks completed, in 3 counted runs
+multiq_variant: VARIANT=N-none, F queue: class mark, serve g, 0 rings, pop samples 2, descendants R (into the R heaps), request-side weight 2/4, marks none
+nested: julia 1.15.0-DEV.976 (2db177599e/native), threads 8,1, variant N-none
+nested: N-none fib_fine: result matches the serial reference; every one of 2178308 spawned tasks completed, in 3 counted runs
+multiq_variant: VARIANT=N-none, F queue: class mark, serve g, 0 rings, pop samples 2, descendants R (into the R heaps), request-side weight 2/4, marks none
+nested: julia 1.15.0-DEV.976 (1bffccdc2f/native), threads 8,1, variant N-none
+nested: N-none fib_fine: result matches the serial reference; every one of 2178308 spawned tasks completed, in 3 counted runs
+multiq_variant: VARIANT=N-none, F queue: class mark, serve g, 0 rings, pop samples 2, descendants R (into the R heaps), request-side weight 2/4, marks none
+nested: julia 1.15.0-DEV.977 (06d4f771fa*/native), threads 8,1, variant N-none
+nested: N-none fib_fine: result matches the serial reference; every one of 2178308 spawned tasks completed, in 3 counted runs
+[16:09:57] sampler summary for fibabba (~/app/Nitro.jl/.claude/worktrees/bench-618-v4-evidence/bench/results/quiet-fibabba-20261126-155740.tsv):
+  samples 102 every 5s; load1 min 0.48 median 5.90 max 6.96
+  samples with a foreign julia/oha/go-server: 0
+  samples with an outside process above 5% CPU: 22  [node peak 29.0%]  [tmux: peak 6.7%]  [claude peak 6.7%]
+  block exit status 0
+[16:09:57] rounds_fifo: fibabba done
+[16:09:57] rounds_fifo: done (status 0); next: julia ~/app/Nitro.jl/.claude/worktrees/bench-618-v4-evidence/bench/tasks/aggregate_fifo.jl ~/app/Nitro.jl/.claude/worktrees/bench-618-v4-evidence/bench/julia/evidence/candidate-v4-layout-draw-20261126/raw/arm
+[2026-11-26 16:09:57] step arm: exit 0 after 12 min
+[2026-11-26 16:09:57] cache check arm: no cache file created or replaced
+[2026-11-26 16:09:57] driver done: every step finished

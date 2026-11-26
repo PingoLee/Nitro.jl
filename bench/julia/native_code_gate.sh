@@ -6,13 +6,14 @@
 # addresses, immediates that are addresses, symbol suffixes and comments) and prints, a function a
 # line, IDENTICAL or DIFFERS with the number of differing lines. Exit 0 when every function present
 # on both is identical. The normalised blocks stay in $GATE_OUT (default a temporary directory).
+# GATE_EXTRA="--fair" adds unmarked_code.jl's extra functions (the default set is unchanged).
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 A="$1" B="$2" LA="${3:-A}" LB="${4:-B}"
 O="${GATE_OUT:-$(mktemp -d)}"; mkdir -p "$O"
 for side in A B; do
   jl="$A"; [ "$side" = B ] && jl="$B"
-  "$jl" --startup-file=no "$HERE/unmarked_code.jl" --full --heaps > "$O/raw-$side.txt" 2>&1 || { echo "unmarked_code.jl failed on $jl"; exit 2; }
+  "$jl" --startup-file=no "$HERE/unmarked_code.jl" --full --heaps ${GATE_EXTRA:-} > "$O/raw-$side.txt" 2>&1 || { echo "unmarked_code.jl failed on $jl"; exit 2; }
   awk -v dir="$O" -v side="$side" '
     /^--- native code of / { name = substr($0, 20); gsub(/[^A-Za-z0-9_.]/, "_", name); f = dir "/" side "-" name ".s"; next }
     /^--- end of / { f = ""; next }

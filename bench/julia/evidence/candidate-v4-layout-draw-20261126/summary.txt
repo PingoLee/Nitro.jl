@@ -1,0 +1,21 @@
+Builds: master = pin-control 419aba7972; v3 = 2db177599e; v4 = 1bffccdc2f; v3off = 06d4f771fa*; v4off = bc7af35ce6*
+
+pfib(25), every spawn marked, 8,1
+  v3    against master 0.387 [0.37–0.398] (10)
+  v4    against master 0.391 [0.384–0.4] (10)
+  v3off against master 0.384 [0.377–0.4] (10)
+  v4off against master 0.39 [0.382–0.401] (10)
+  v4/v3 per round:       1.028 1.009 1.037 1.028 1.038 1.0 1.002 1.011 1.005 1.001   median 1.01, above 1 in 10 of 10
+  v4off/v3off per round: 0.996 1.02 1.025 1.004 1.026 0.991 1.019 1.016 1.04 0.983   median 1.017, above 1 in 7 of 10
+  THE SAME SIGN IN BOTH PAIRS: v4/v3 1.01, v4off/v3off 1.017
+
+fib_fine, nothing marked, 8,1
+  v3    against master 0.986 [0.965–1.026] (10)
+  v4    against master 0.978 [0.961–1.001] (10)
+  v3off against master 0.976 [0.946–1.0] (10)
+  v4off against master 0.996 [0.965–1.01] (10)
+  v4/v3 per round:       0.972 0.998 1.029 0.969 0.969 0.992 0.964 0.993 1.011 1.015   median 0.992, above 1 in 3 of 10
+  v4off/v3off per round: 1.039 1.019 1.01 1.007 1.019 1.031 0.991 1.021 1.022 1.022   median 1.02, above 1 in 9 of 10
+  NOT REPEATED: v4/v3 0.992, v4off/v3off 1.02
+
+READINGS: pfib(25), every spawn marked, 8,1 => THE SAME SIGN IN BOTH PAIRS; fib_fine, nothing marked, 8,1 => NOT REPEATED
