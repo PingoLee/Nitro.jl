@@ -62,6 +62,21 @@
 # Channel worker pool, C = 500, 8,1 and 8,0), jperf (part B: perf_unmarked.sh a1g1 on july, july-n,
 # base and control at 8,1, labels july julyn base ctl), jplain81; cuttable jplain80 (/plaintext, oha,
 # c = 500). Results in results/s3 (s3-smoke). Report: master_measure_report.jl <OUT>, section S3.
+#
+# SESSION=4 (agent-config #82 Idea 24): JuliaLang/julia#62284 as it is today, its head 293a8f6a7d
+# (w84) against its merge-base with master 35e14589f4 (w84-base, untouched), both with the master
+# trees' Make.user, beside control and control2. Nothing marked anywhere. Steps:
+#   wstall (part A, untimed, nothing else on the box): bench/tasks/stall.sh, the posted script
+#     unchanged, TIMEOUT_S 120, the real binaries: base (#62285's head, partr: the positive control)
+#     first, then w84, w84-base and control, interleaved, 10 runs; then 10 more of the three. A run on
+#     w84 that is not ok gets W84_MORE (20) more runs of w84 alone.
+#   wtasks (tasks.jl SpawnWait at 8,1), wspawn (H = 0, C = 50 and 500, :interactive clients, 8,1),
+#     wpool81 and wpool80 (the Channel worker pool, C = 500): columns w84-base w84 control control2,
+#     W_ROUNDS (12, a multiple of the four columns) rotated rounds, one throwaway slot first;
+#   wperf (perf_unmarked.sh a1g1 at 8,1 on w84-base and w84, labels wbase w84);
+#   wplain81 (/plaintext under oha, c = 500, 8,1, the four columns, WP_ROUNDS 6).
+# Cut order (DEADLINE): wplain81, wperf, wpool80. Results in results/s4 (s4-smoke). Report:
+# master_measure_report.jl <OUT>, section S4.
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
@@ -70,17 +85,18 @@ B="$J/bin"
 T="$HOME/app/julia-618/bin"
 export SMOKE="${SMOKE:-0}"
 export SESSION="${SESSION:-2}"
+W84_MORE="${W84_MORE:-20}"
 # A block reached through `--run` (behind quiet.sh, which reassigns an exported OUT) takes the
 # parent's results directory from S2_OUT.
 [ "${1:-}" = --run ] && [ -n "${S2_OUT:-}" ] && OUT="$S2_OUT"
 if [ "$SMOKE" = 1 ]; then
   export TD="${TD:-1}" NOGATE=1
   OUT="${OUT:-$J/results/s$SESSION-smoke}"
-  A_ROUNDS=1 B_ROUNDS=1 C_ROUNDS=1 CM_ROUNDS=1 E1_ROUNDS=1 J_ROUNDS=1
+  A_ROUNDS=1 B_ROUNDS=1 C_ROUNDS=1 CM_ROUNDS=1 E1_ROUNDS=1 J_ROUNDS=1 W_ROUNDS=1 WP_ROUNDS=1 STALL_RUNS=1 W84_MORE=1
 else
   OUT="${OUT:-$J/results/s$SESSION}"
   A_ROUNDS="${A_ROUNDS:-15}" B_ROUNDS="${B_ROUNDS:-5}" C_ROUNDS="${C_ROUNDS:-6}" CM_ROUNDS="${CM_ROUNDS:-5}" E1_ROUNDS="${E1_ROUNDS:-6}"
-  J_ROUNDS="${J_ROUNDS:-10}"
+  J_ROUNDS="${J_ROUNDS:-10}" W_ROUNDS="${W_ROUNDS:-12}" WP_ROUNDS="${WP_ROUNDS:-6}" STALL_RUNS="${STALL_RUNS:-10}"
 fi
 mkdir -p "$OUT"
 export S2_OUT="$OUT"
@@ -89,17 +105,20 @@ export S2_OUT="$OUT"
 export S2_DRIVER_PID="${S2_DRIVER_PID:-$$}"
 LOG="$OUT/driver.log"
 export PATH="$HOME/.local/go/bin:$HOME/.local/bin:$HOME/.juliaup/bin:$PATH"
-export JLS="control=$B/julia-control control2=$B/julia-control2 mark=$B/julia-mark mark-inline=$B/julia-mark-inline mark-bypass=$B/julia-mark-bypass mark-validate=$B/julia-mark-validate mark-all=$B/julia-mark-all mark-inline-validate=$B/julia-mark-inline-validate ws=$T/julia-ws base=$T/julia-base july=$B/julia-july july-n=$B/julia-july-n"
+export JLS="control=$B/julia-control control2=$B/julia-control2 mark=$B/julia-mark mark-inline=$B/julia-mark-inline mark-bypass=$B/julia-mark-bypass mark-validate=$B/julia-mark-validate mark-all=$B/julia-mark-all mark-inline-validate=$B/julia-mark-inline-validate ws=$T/julia-ws base=$T/julia-base july=$B/julia-july july-n=$B/julia-july-n w84=$B/julia-w84 w84-base=$B/julia-w84-base"
 EM="$J/envs/micro-master" EJ="$J/envs/micro-july" SM="$J/envs/server-master" SJ="$J/envs/server-july"
-export MICRO_PROJECT="$EM" MICRO_PROJECTS="ws=$EJ base=$EJ july=$EJ july-n=$EJ"
+export MICRO_PROJECT="$EM" MICRO_PROJECTS="ws=$EJ base=$EJ july=$EJ july-n=$EJ w84=$EJ w84-base=$EJ"
 JULIAS4="control=$B/julia-control,$SM mark=$B/julia-mark,$SM ws=$T/julia-ws,$SJ base=$T/julia-base,$SJ"
 # Session 3's server columns: the merge-base builds and base load the July environments, the two
 # controls master's.
 JULIAS5="july=$B/julia-july,$SJ july-n=$B/julia-july-n,$SJ base=$T/julia-base,$SJ control=$B/julia-control,$SM control2=$B/julia-control2,$SM"
+# Session 4's server columns: #62284's two trees (1.14.0-DEV) load the July environments, the controls master's.
+JULIAS6="w84-base=$B/julia-w84-base,$SJ w84=$B/julia-w84,$SJ control=$B/julia-control,$SM control2=$B/julia-control2,$SM"
 CPUS8="0,1,2,3,6,7,8,9"
 AGG="/aggregate?n=100000&op=groupby"
 FIVE="A%control A%control2 N-none%mark N-none%mark-inline N-none%mark-bypass"
 JULY5="A%july A%july-n A%base A%control A%control2"
+W4="A%w84-base A%w84 A%control A%control2"
 WIN_DUR_S="${WIN_DUR_S:-300}"
 
 log() { echo "[$(date '+%F %T')] $*" | tee -a "$LOG"; }
@@ -294,10 +313,11 @@ step_pfib() {    # step, rounds, columns...
 }
 
 # ---------------------------------------------------------------- the Channel worker pool cell
-pool_rounds() {  # tsv, rounds, columns...
-  local tsv="$1" n="$2" r v cc layout clients; shift 2
+pool_rounds() {  # tsv, rounds, columns... (POOL_CELLS: "8,1 interactive;8,0 default" by default)
+  local tsv="$1" n="$2" r v cc layout clients cells; shift 2
+  IFS=';' read -r -a cells <<<"${POOL_CELLS:-8,1 interactive;8,0 default}"
   for r in 0 $(seq 1 "$n"); do
-    for cc in "8,1 interactive" "8,0 default"; do
+    for cc in "${cells[@]}"; do
       read -r layout clients <<<"$cc"
       if [ "$r" = 0 ]; then   # the throwaway slot: the first column, the first cell
         CPUS="$CPUS8" rf --run spawn 0 "$(dirname "$tsv")/throwaway-pool.tsv" "$layout" "$clients" "$1" "500:0" pool "${TD:-8}" || return 1
@@ -323,6 +343,36 @@ step_jperf() {
     PU_BUILDS="july:$B/julia-july:$J/depot-july julyn:$B/julia-july-n:$J/depot-july-n base:$T/julia-base:$HOME/app/julia-618/depot-base ctl:$B/julia-control:$J/depot-control" \
     "$HERE/perf_unmarked.sh" >>"$LOG" 2>&1
   rc=$?; objcache_log jperf "$o0"; return "$rc"
+}
+
+# ---------------------------------------------------------------- session 4
+# The real binary behind a wrapper (stall.sh wants it: a wrapper's `exec` would do, a launcher would not).
+real_bin() { sed -n 's/^exec "\(.*\)" "\$@"$/\1/p' "$1"; }
+# Part A: the stall script, untimed. base (the positive control) first in every run, then w84, w84-base
+# and control, interleaved, STALL_RUNS runs; then STALL_RUNS more of the three; then, if w84 was not
+# ok in some run, W84_MORE runs of w84 alone. A stall is a RESULT, never a stop.
+step_wstall() {
+  local d="$OUT/wstall" b84 bb bc bbase
+  b84="$(real_bin "$B/julia-w84")" bb="$(real_bin "$B/julia-w84-base")" bc="$(real_bin "$B/julia-control")" bbase="$(real_bin "$T/julia-base")"
+  mkdir -p "$d"
+  OUT="$d/first" RUNS="$STALL_RUNS" TIMEOUT_S=120 BUILDS="base=$bbase w84=$b84 w84-base=$bb control=$bc" \
+    "$ROOT/bench/tasks/stall.sh" >>"$LOG" 2>&1
+  OUT="$d/second" RUNS="$STALL_RUNS" TIMEOUT_S=120 BUILDS="w84=$b84 w84-base=$bb control=$bc" \
+    "$ROOT/bench/tasks/stall.sh" >>"$LOG" 2>&1
+  if awk -F'\t' '$1 == "w84" && $3 != "ok" { bad = 1 } END { exit !bad }' "$d/first/runs.tsv" "$d/second/runs.tsv"; then
+    log "RESULT: wstall: w84 was not ok in some run; $W84_MORE more runs of w84 alone"
+    OUT="$d/w84-more" RUNS="$W84_MORE" TIMEOUT_S=120 BUILDS="w84=$b84" "$ROOT/bench/tasks/stall.sh" >>"$LOG" 2>&1
+  fi
+  return 0
+}
+step_wperf() {
+  local n="${PERF_N:-3000000}" pairs="${PERF_PAIRS:-5}"
+  [ "$SMOKE" = 1 ] && { n=100000; pairs=1; }
+  local o0 rc; o0="$(objsnap)"
+  FROM= PERF_UNMARKED_OUT="$OUT/wperf" N="$n" PAIRS="$pairs" STEPS=a1g1 PU_LAYOUTS="8,1:$CPUS8" \
+    PU_BUILDS="wbase:$B/julia-w84-base:$J/depot-w84-base w84:$B/julia-w84:$J/depot-w84" \
+    "$HERE/perf_unmarked.sh" >>"$LOG" 2>&1
+  rc=$?; objcache_log wperf "$o0"; return "$rc"
 }
 
 # ---------------------------------------------------------------- part D
@@ -408,6 +458,11 @@ if [ "$SESSION" = 3 ]; then
   CUTTABLE=" jplain80 "
   DEFAULT_STEPS="jtasks jspawn jpool jperf jplain81 jplain80"
 fi
+if [ "$SESSION" = 4 ]; then
+  UNTIMED=" wstall "
+  CUTTABLE=" wpool80 wperf wplain81 "
+  DEFAULT_STEPS="wstall wtasks wspawn wpool81 wpool80 wperf wplain81"
+fi
 STEPS="${STEPS:-$DEFAULT_STEPS}"
 if [ -n "${FROM:-}" ]; then
   STEPS="$(echo "$STEPS" | tr ' ' '\n' | sed -n "/^${FROM}\$/,\$p" | tr '\n' ' ')"
@@ -415,7 +470,7 @@ if [ -n "${FROM:-}" ]; then
 fi
 
 log "driver start: session $SESSION, steps [$STEPS], OUT $OUT, SMOKE=$SMOKE, rounds A $A_ROUNDS B $B_ROUNDS C $C_ROUNDS mixed-C $CM_ROUNDS E1 $E1_ROUNDS S3 $J_ROUNDS${DEADLINE:+, deadline $(date -d @"$DEADLINE" '+%F %T') for [$CUTTABLE]}"
-for w in control control2 mark mark-inline mark-bypass mark-validate mark-all mark-inline-validate july july-n; do
+for w in control control2 mark mark-inline mark-bypass mark-validate mark-all mark-inline-validate july july-n w84 w84-base; do
   log "build $w: $("$B/julia-$w" --startup-file=no -e 'print(VERSION, " ", Base.GIT_VERSION_INFO.commit_short)' 2>&1 | head -1)"
 done
 for w in ws base; do log "build $w: $("$T/julia-$w" --startup-file=no -e 'print(VERSION, " ", Base.GIT_VERSION_INFO.commit_short)' 2>&1 | head -1)"; done
@@ -460,6 +515,14 @@ for s in $STEPS; do
     jperf) step_jperf ;;
     jplain81) SERVER_JULIAS="$JULIAS5" step_server jplain81 /plaintext "bare_spawn@8,1%july bare_spawn@8,1%july-n bare_spawn@8,1%base bare_spawn@8,1%control bare_spawn@8,1%control2" "$J_ROUNDS" OHA=1 CLIENT_CPU=1 ;;
     jplain80) SERVER_JULIAS="$JULIAS5" step_server jplain80 /plaintext "bare_spawn@8,0%july bare_spawn@8,0%july-n bare_spawn@8,0%base bare_spawn@8,0%control bare_spawn@8,0%control2" "$J_ROUNDS" OHA=1 CLIENT_CPU=1 ;;
+    wstall) step_wstall ;;
+    wtasks) step_micro wtasks 8,1 "$CPUS8" "$W4" "$W_ROUNDS" ;;
+    wspawn) step_h0 wspawn "8,1 interactive" "$W4" "$W_ROUNDS" ;;
+    wpool81|wpool80) mkdir -p "$OUT/$s"; rm -f "$OUT/$s/pool.tsv"
+           cells="8,1 interactive"; [ "$s" = wpool80 ] && cells="8,0 default"
+           export POOL_CELLS="$cells"; gated "618s4-$s" "$0" --run pool_rounds "$OUT/$s/pool.tsv" "$W_ROUNDS" $W4 >>"$LOG" 2>&1 ;;
+    wperf) step_wperf ;;
+    wplain81) SERVER_JULIAS="$JULIAS6" step_server wplain81 /plaintext "bare_spawn@8,1%w84-base bare_spawn@8,1%w84 bare_spawn@8,1%control bare_spawn@8,1%control2" "$WP_ROUNDS" OHA=1 CLIENT_CPU=1 ;;
     *) stop "unknown step $s" ;;
   esac
   rc=$?

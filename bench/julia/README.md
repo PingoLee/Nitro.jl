@@ -225,6 +225,28 @@ Agent-config #82 Idea 17, session 2. Local experiments, not proposed to Julia. F
   JIT object caches (`objcache*/data.mdb`, Julia 1.14 and later) changed; blocks `rounds_fifo.sh` gates
   itself are not covered.
 
+### `SESSION=4`: JuliaLang/julia#62284 as it is today (#618, agent-config #82 Idea 24)
+
+On 2026-11-23 the gain of #62285's branch under partr and its stall were put down to "the spinner series, #62284". What was measured was the July version of that series, inside #62285's branch, and #62284 was rewritten afterwards. `SESSION=4` measures the PR as it is: its head **`293a8f6a7d`** (`w84`) against its merge-base with master **`35e14589f4`** (`w84-base`, untouched). Both are built under `~/app/julia-618-master/` with the master trees' multi-target `Make.user`, as worktrees of the clone, and timed beside `control` and `control2`. Nothing is marked anywhere. Local only: nothing was posted to, or drafted for, JuliaLang.
+
+- **Builds.** Both report `1.14.0-DEV` (master moved to 1.15 after the merge-base) and load `envs/{micro,server}-july` with the same package versions as the other trees. The `w84` build reports `293a8f6a7d*`: `version_git.sh` saw an uncommitted file during the build, although the tree was clean at its start and is clean now. The report maps both spellings to `w84`.
+- **Steps.**
+  - `wstall`, part A, untimed: `bench/tasks/stall.sh` with the real binaries. `base` (#62285's partr build, the positive control) runs first, then `w84`, `w84-base` and `control`, interleaved for 10 runs; then 10 more runs of the three. A run on `w84` that is not ok adds `W84_MORE` runs of `w84` alone.
+  - `wtasks`, `wspawn`, `wpool81` and `wpool80`: SpawnWait; the spawn path at H = 0, C = 50 and 500, `:interactive`, 8,1; and the Channel pool at C = 500. Each runs on the four columns, 12 rotated rounds.
+  - `wperf`: `perf_unmarked.sh a1g1` on `w84-base` and `w84`.
+  - `wplain81`: `/plaintext` under oha, 6 rounds.
+  - Cut order: `wplain81`, `wperf`, `wpool80`.
+- **Pool steps.** `pool_rounds` takes `POOL_CELLS`, so the pool's two layouts can be separate steps.
+- **Report:** `master_measure_report.jl <OUT>`, section S4.
+  - It gives every ratio as a speed, with the bar fixed before the run: w84/w84-base is read only beyond 5% and beyond 3 × |control2/control − 1|.
+  - Each cell reads A GAIN, A LOSS or NOT READABLE, with the July version's ratio beside it (another day, another pair of builds, not rerun).
+- **Results** (2026-11-26, local under `~/app/julia-618-master/results/s4`; the #618 comment of that day has the tables):
+  - Part A: the positive control stalled in 2 of 10 runs, and `w84`, `w84-base` and `control` passed 20 of 20 each.
+  - Part B: w84/w84-base reads A GAIN in every cell.
+    - SpawnWait 1.58×; the `8,1` spawn path 1.46× and 1.45×.
+    - The pool 1.15× at `8,1` and 1.18× at `8,0`; `/plaintext` at `8,1` 1.06×, with p99 12.5 ms against 13.4.
+  - On SpawnWait, the default threads run 3.9× fewer user instructions per operation and sleep about 20× less often.
+
 ## The PR candidate (#618, session 4)
 
 The measured design in the form a reviewer of Julia would receive it: the port's two commits rebased on

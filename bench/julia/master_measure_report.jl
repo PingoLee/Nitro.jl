@@ -7,7 +7,8 @@
 # (a570d2c9d9; split by variant: mark = nothing marked, markN = N, markArm = N-arm), inline (ca2a5c7f0b),
 # bypass (ffa1184f7b*), ws and base (#62285's head 84961e79ff, work-stealing and partr); session 3
 # (SESSION=3, section S3): july (6ac8c4f030, the merge-base, the master trees' Make.user) and july-n
-# (6ac8c4f030*, the same commit with base's Make.user: a native sysimage).
+# (6ac8c4f030*, the same commit with base's Make.user: a native sysimage); session 4 (SESSION=4,
+# section S4): w84 (JuliaLang/julia#62284's head 293a8f6a7d) and w84-base (its merge-base 35e14589f4).
 # A ratio is "slower" as its metric says: times (fib_fine, tasks.jl ns, pfib) above 1 are slower,
 # throughputs (rps) below 1 are slower. Each tree is read only against its own base.
 using Dates, Printf
@@ -40,6 +41,8 @@ function col_of(commit::AbstractString, variant::AbstractString = "A")
     c == "84961e79ff/partr" && return "base"
     c == "6ac8c4f030" && return "july"
     c == "6ac8c4f030*" && return "july-n"
+    (c == "293a8f6a7d" || c == "293a8f6a7d*") && return "w84"   # the w84 build reports a `*` (see README)
+    c == "35e14589f4" && return "w84-base"
     if c == "a570d2c9d9"
         variant == "N-none" && return "mark"
         variant == "N-arm" && return "markArm"
@@ -584,4 +587,98 @@ if any(isdir(joinpath(OUT, s)) for s in ("jtasks", "jspawn", "jpool", "jperf", "
         foreach(l -> println(io, l), summary)
     end
     isdir(joinpath(OUT, "jperf")) && println(io, "\nPart B: `PU_COLS=\"july julyn base ctl\" PU_REPORT_LAYOUTS=8,1 julia bench/julia/perf_report.jl $(joinpath(OUT, "jperf"))`.")
+end
+
+# ------------------------------------------------------------------------------------------ session 4
+# JuliaLang/julia#62284 today (SESSION=4): its head against its merge-base, beside master twice. Every
+# ratio is a SPEED against its reference: above 1 is faster. The bar, fixed before the run: one build
+# is one layout draw, so w84/w84-base is read only beyond 5% and beyond 3 × |control2/control − 1|.
+const S4_COLS = ["w84-base", "w84", "ctl", "ctl2"]
+# The July version's ratio (base/july-n, 2026-11-23): another day, another pair of builds, not rerun.
+const S4_JULY = Dict("tasks.jl SpawnWait, 8,1" => "1.62", "spawn path H = 0, C = 50, :interactive, 8,1" => "1.30",
+                     "spawn path H = 0, C = 500, :interactive, 8,1" => "1.26", "Channel worker pool, C = 500, :interactive, 8,1" => "1.75",
+                     "Channel worker pool, C = 500, :default, 8,0" => "1.00", "/plaintext, oha, c = 500, 8,1" => "1.07")
+function s4_cell(name, cell::Cell, lower, unit, summary)
+    isempty(cell) && return
+    println(io, "\n### $name ($unit)\n")
+    columns_table(cell, S4_COLS, unit)
+    w, f = speed(cell, "w84", "w84-base", lower), speed(cell, "ctl2", "ctl", lower)
+    println(io, "\n| speed per round (above 1 is faster) | median [min–max] | faster in |\n|---|--:|--:|")
+    for (r, what) in ((w, "w84/w84-base: the PR"), (f, "control2/control: the floor"))
+        isempty(r) || println(io, "| $what | $(fmt(r; f = f3)) | $(count(>(1), r)) of $(length(r)) |")
+    end
+    mw, mf = med(w), med(f)
+    bar = max(0.05, 3 * abs(mf - 1))
+    v = isnan(mw) ? "-" : mw > 1 + bar ? "**A GAIN** (faster in $(count(>(1), w)) of $(length(w)) rounds)" :
+        mw < 1 - bar ? "**A LOSS** (slower in $(count(<(1), w)) of $(length(w)) rounds)" :
+        "**NOT READABLE** ($(f3(mw)), faster in $(count(>(1), w)) of $(length(w)) rounds)"
+    july = get(S4_JULY, name, "-")
+    println(io, "\nBar: beyond $(f3(bar)). Reading: $v. The July version (base/july-n, another day, another pair of builds, not rerun): $july.")
+    push!(summary, "| $name | " * join([fg(med(values_of(cell, c))) for c in S4_COLS], " · ") * " | $(f3(mw)) | $(f3(mf)) | $(f3(bar)) | $v | $july |")
+end
+const S4_SERVER_COL = Dict("w84-base" => "w84-base", "w84" => "w84", "control" => "ctl", "control2" => "ctl2")
+if any(isdir(joinpath(OUT, s)) for s in ("wstall", "wtasks", "wspawn", "wpool81", "wpool80", "wperf", "wplain81"))
+    println(io, "\n## S4. JuliaLang/julia#62284 today: its head (w84, 293a8f6a7d) against its merge-base (w84-base, 35e14589f4)\n")
+    println(io, "Columns: w84-base, w84, ctl and ctl2 (master 4b0df1484a, twice). Nothing marked. Every ratio is a SPEED: above 1 is faster.")
+    st = vcat([readtsv(joinpath(OUT, "wstall", d, "runs.tsv")) for d in ("first", "second", "w84-more")]...)
+    if !isempty(st)
+        println(io, "\n### Part A: the stall script (untimed; base, #62285's partr build, is the positive control)\n")
+        println(io, "| build | ok | stuck | timeout | other | of |\n|---|--:|--:|--:|--:|--:|")
+        for b in ("base", "w84", "w84-base", "control")
+            rs = filter(r -> r["build"] == b, st)
+            isempty(rs) && continue
+            k(o) = count(r -> r["outcome"] == o, rs)
+            println(io, "| $b | $(k("ok")) | $(k("stuck")) | $(k("timeout")) | $(k("other")) | $(length(rs)) |")
+        end
+        bad = filter(r -> r["outcome"] != "ok", st)
+        isempty(bad) || println(io, "\nRuns that were not ok:\n")
+        for r in bad
+            println(io, "- $(r["build"]) run $(r["run"]): $(r["outcome"]) after $(r["seconds"]) s, $(r["ok_lines"]) ok lines; last: $(r["last_line"])")
+        end
+    end
+    summary = String[]
+    mp = joinpath(OUT, "wtasks", "costrounds-micro.tsv")
+    if isfile(mp)
+        local c = Cell()
+        for l in eachline(mp)
+            v = split(l, '\t')
+            length(v) >= 11 && v[7] == "SpawnWait" && startswith(v[8], "ns_per_op=") || continue
+            add!(c, parse(Int, v[1]), col_of(replace(v[end], "build=" => ""), split(v[4], '%')[1]), num(replace(v[8], "ns_per_op=" => "")))
+        end
+        s4_cell("tasks.jl SpawnWait, 8,1", c, true, "ns/op", summary)
+    end
+    rows = readtsv(joinpath(OUT, "wspawn", "costrounds-spawn.tsv"))
+    for C in ("50", "500")
+        local c = Cell()
+        for r in rows
+            (r["threads"] == "8,1" && r["clients"] == "interactive" && r["c"] == C) || continue
+            add!(c, parse(Int, r["round"]), col_of(r["commit"], r["variant"]), num(r["rps"]))
+        end
+        s4_cell("spawn path H = 0, C = $C, :interactive, 8,1", c, false, "req/s", summary)
+    end
+    for (step, lay, cl) in (("wpool81", "8,1", "interactive"), ("wpool80", "8,0", "default"))
+        local c = Cell()
+        for r in readtsv(joinpath(OUT, step, "pool.tsv"))
+            r["threads"] == lay && r["clients"] == cl || continue
+            add!(c, parse(Int, r["round"]), col_of(r["commit"], r["variant"]), num(r["rps"]))
+        end
+        s4_cell("Channel worker pool, C = 500, :$cl, $lay", c, false, "req/s", summary)
+    end
+    local c = Cell(); local p99 = Dict{String,Vector{Float64}}()
+    for r in fairness_rows("wplain81")
+        flayout(r["mode"]) == "8,1" || continue
+        local m = match(r"%(\w[\w-]*)$", r["mode"]); m === nothing && continue
+        haskey(S4_SERVER_COL, m[1]) || continue
+        add!(c, parse(Int, r["round"]), S4_SERVER_COL[m[1]], num(r["oha_rps"]))
+        parse(Int, r["round"]) > 0 && push!(get!(() -> Float64[], p99, S4_SERVER_COL[m[1]]), num(get(r, "oha_p99_ms", get(r, "p99_ms", "NaN"))))
+    end
+    s4_cell("/plaintext, oha, c = 500, 8,1", c, false, "oha rps", summary)
+    isempty(p99) || println(io, "\n/plaintext p99 (ms), median [min–max]: " * join(["$k $(fmt(p99[k]))" for k in S4_COLS if haskey(p99, k)], "; "))
+    if !isempty(summary)
+        println(io, "\n### The table (medians; speeds above 1 are faster)\n")
+        println(io, "| cell | w84-base · w84 · control · control2 | w84/w84-base | control2/control | bar | reading | July version (base/july-n, 2026-11-23, not rerun) |")
+        println(io, "|---|---|--:|--:|--:|---|--:|")
+        foreach(l -> println(io, l), summary)
+    end
+    isdir(joinpath(OUT, "wperf")) && println(io, "\nSpawnWait, where the time is: `PU_COLS=\"wbase w84\" PU_REPORT_LAYOUTS=8,1 julia bench/julia/perf_report.jl $(joinpath(OUT, "wperf"))`.")
 end
