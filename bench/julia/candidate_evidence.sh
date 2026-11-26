@@ -14,7 +14,7 @@
 # Results go to OUT (default bench/results/candidate-evidence-<date>): raw/<step>/ (the TSVs),
 # environment.md, results.md (written by candidate_evidence_report.jl, never by hand), driver.log.
 # CE_PREV=<an earlier evidence directory> (with CE_PREV_NAME, CE_THIS_NAME) adds to results.md a table of
-# the two runs' medians, row by row. PFIB_COLS and ARM_COLS replace rows f's and h's columns (a
+# the two runs' medians, row by row. PFIB_COLS, SPAWN_COLS and ARM_COLS replace rows f's, g's and h's columns (a
 # diagnostic run on other builds; the report then reads only the default columns).
 #
 # Rows and steps (rounds in brackets; a fresh process a round, columns rotated, one throwaway slot):
@@ -374,7 +374,7 @@ for s in $STEPS; do
     floorh0) step_h0 floorh0 "8,0 default" "$FLOOR_COLS" "$FLOOR_ROUNDS" ;;
     pfib2) step_pfib pfib2 2 0,1,2 ;;
     pfib81) step_pfib pfib81 8,1 "$CPUS8" ;;
-    spawnpath) step_h0 spawnpath "8,0 default" "A%control N%candidate" "$SPAWN_ROUNDS" ;;
+    spawnpath) step_h0 spawnpath "8,0 default" "${SPAWN_COLS:-A%control N%candidate}" "$SPAWN_ROUNDS" ;;
     arm) step_fib arm 8,1 "$CPUS8" "${ARM_COLS:-A%control N-none%candidate N-arm%candidate}" "$ARM_ROUNDS" ;;
     tests) step_tests ;;
     repro) step_repro repro "${REPRO_CORE[@]}" ;;

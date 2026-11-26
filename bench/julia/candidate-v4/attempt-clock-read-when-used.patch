@@ -1,0 +1,74 @@
+diff --git a/base/partr.jl b/base/partr.jl
+index 80c8607237..8d113309fb 100644
+--- a/base/partr.jl
++++ b/base/partr.jl
+@@ -301,8 +301,9 @@ r_multiq_check_empty() = _multiq_check_empty(r_heaps)
+ # - stock's heaps, for everything else (L).
+ #
+ # A pop that finds both the request side (R heaps, then rings) and L with work splits the
+-# thread's time: the clock is read at every pop, the interval since a thread's previous pop is
+-# credited to the side of the task that ran in it when that pop found both sides with work, with
++# thread's time: the interval since a thread's previous pop is credited to the side of the task
++# that ran in it when that pop found both sides with work (the clock is read only for such an
++# interval: at the pop that opens it and at the one that closes it), with
+ # weight w (JULIA_SCHED_FAIR_WEIGHT, 1/4, 1/2 or 3/4; default 1/2) for the request side, capped at
+ # 10 ms an interval, and the request side goes first while its balance is negative.
+ #
+@@ -434,7 +435,7 @@ end
+ # start-up) grows them.
+ mutable struct sstate
+     bal::Int        # request-side time minus L time, weighted, kept within twice the cap
+-    stamp::UInt64   # the clock at this thread's previous pop
++    stamp::UInt64   # the clock at this thread's previous pop, if that pop read it (see `k`)
+     last::Int       # the side of the task that pop returned: 0 none, 1 request, 2 L
+     k::Int          # 1 when that pop found both sides with work
+     wake::Vector{UInt64}   # the ring pop's owners to wake, one bit a thread id (see `f_pop!`)
+@@ -731,26 +732,30 @@ end
+     lw = !stock_multiq_check_empty()
+     rr = !r_multiq_check_empty()
+     rf = ring_any(rs)
+-    # The clock at every pop: the interval since this thread's previous pop is the run of the task
+-    # that pop returned (`s.last`'s side), credited only when that pop found both sides with work.
+-    now = s_stamp()
+-    if s.last != 0 && s.k != 0
+-        d = now > s.stamp ? Int(now - s.stamp) : 0
+-        cap = @atomic :monotonic fp.cap
+-        if d > cap
+-            d = cap
+-        end
+-        w4 = @atomic :monotonic fp.w4
+-        b = s.last == 1 ? s.bal + d * (4 - w4) : s.bal - d * w4
+-        if b > 2 * cap
+-            b = 2 * cap
+-        elseif b < -2 * cap
+-            b = -2 * cap
++    # The interval since this thread's previous pop is the run of the task that pop returned
++    # (`s.last`'s side), credited only when that pop found both sides with work. The clock is read
++    # only when its value is used: to close that interval, or to open one at this pop.
++    both = lw && (rr || rf)
++    if s.k != 0 || both
++        now = s_stamp()
++        if s.last != 0 && s.k != 0
++            d = now > s.stamp ? Int(now - s.stamp) : 0
++            cap = @atomic :monotonic fp.cap
++            if d > cap
++                d = cap
++            end
++            w4 = @atomic :monotonic fp.w4
++            b = s.last == 1 ? s.bal + d * (4 - w4) : s.bal - d * w4
++            if b > 2 * cap
++                b = 2 * cap
++            elseif b < -2 * cap
++                b = -2 * cap
++            end
++            s.bal = b
+         end
+-        s.bal = b
++        s.stamp = now
+     end
+-    s.stamp = now
+-    s.k = lw && (rr || rf) ? 1 : 0
++    s.k = both ? 1 : 0
+     side = 0
+     if lw && (rr || rf)
+         rfirst = s.bal < 0
