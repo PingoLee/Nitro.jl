@@ -1,0 +1,6 @@
+label	path	commit_short
+control	~/app/julia-618-master/bin/julia-pin-control	419aba7972
+control2	~/app/julia-618-master/bin/julia-pin-control2	419aba7972*
+candidate	~/app/julia-618-master/bin/julia-v4	1bffccdc2f
+bypass	~/app/julia-618-master/bin/julia-v3	2db177599e
+timens	~/app/julia-618-master/bin/julia-v2	2caefffc63

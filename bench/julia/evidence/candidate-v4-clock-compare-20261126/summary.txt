@@ -1,0 +1,54 @@
+f pfib(25) root marked, 2 threads
+  v2  0.937 [0.928–0.945] (12 rounds)
+  v3  0.895 [0.887–0.905] (12 rounds)
+  v4  0.937 [0.924–0.945] (12 rounds)
+  v4/v3 per round: 1.05 1.052 1.062 1.043 1.041 1.035 1.05 1.038 1.045 1.053 1.04 1.041
+  BETTER: median 1.044, above 1 in 12 of 12, below 1 in 0
+
+f pfib(25) every spawn marked, 2 threads
+  v2  0.431 [0.42–0.437] (12 rounds)
+  v3  0.41 [0.398–0.425] (12 rounds)
+  v4  0.42 [0.415–0.432] (12 rounds)
+  v4/v3 per round: 1.014 1.029 1.045 1.006 1.014 1.056 1.05 1.017 1.035 1.018 1.048 0.979
+  BETTER: median 1.023, above 1 in 11 of 12, below 1 in 1   (a WORSE here blocks; it cannot adopt)
+
+f pfib(25) root marked, 8,1
+  v2  0.902 [0.882–0.92] (12 rounds)
+  v3  0.884 [0.863–0.891] (12 rounds)
+  v4  0.898 [0.877–0.908] (12 rounds)
+  v4/v3 per round: 1.02 1.01 1.02 1.007 1.016 1.025 1.023 1.008 1.022 1.017 1.007 1.037
+  BETTER: median 1.018, above 1 in 12 of 12, below 1 in 0
+
+f pfib(25) every spawn marked, 8,1
+  v2  0.392 [0.383–0.398] (12 rounds)
+  v3  0.391 [0.384–0.4] (12 rounds)
+  v4  0.385 [0.37–0.389] (12 rounds)
+  v4/v3 per round: 0.979 0.972 0.974 0.992 0.983 0.995 0.998 0.978 0.999 0.939 0.974 0.982
+  WORSE: median 0.981, above 1 in 0 of 12, below 1 in 12   (a WORSE here blocks; it cannot adopt)
+
+g everything marked on the spawn path, C = 50, 8,0
+  v2  0.85 [0.84–0.857] (12 rounds)
+  v3  0.824 [0.813–0.835] (12 rounds)
+  v4  0.825 [0.816–0.831] (12 rounds)
+  v4/v3 per round: 0.996 1.001 1.006 1.012 1.003 1.008 0.991 0.995 0.991 1.0 1.002 1.011
+  SAME: median 1.002, above 1 in 8 of 12, below 1 in 4   (a WORSE here blocks; it cannot adopt)
+
+g everything marked on the spawn path, C = 500, 8,0
+  v2  0.841 [0.834–0.85] (12 rounds)
+  v3  0.822 [0.809–0.826] (12 rounds)
+  v4  0.823 [0.816–0.83] (12 rounds)
+  v4/v3 per round: 1.007 1.007 1.009 1.01 1.027 1.005 0.99 0.999 0.994 0.993 1.005 1.014
+  SAME: median 1.006, above 1 in 8 of 12, below 1 in 4   (a WORSE here blocks; it cannot adopt)
+
+h v2: never marked against master 1.004 [0.987–1.038]; after one marked task against master 0.967 [0.951–0.992]
+h v3: never marked against master 1.008 [0.957–1.02]; after one marked task against master 0.952 [0.937–0.963]
+h v4: never marked against master 0.988 [0.961–1.011]; after one marked task against master 0.962 [0.938–0.975]
+h fib_fine after one marked task, against the same build never marked, 8,1
+  v2  0.962 [0.932–0.98] (12 rounds)
+  v3  0.945 [0.941–0.993] (12 rounds)
+  v4  0.968 [0.951–0.991] (12 rounds)
+  v4/v3 per round: 1.023 1.043 1.007 1.039 1.007 1.019 0.994 1.032 0.973 1.028 1.053 1.025
+  BETTER: median 1.024, above 1 in 10 of 12, below 1 in 2
+
+READINGS: f pfib(25) root marked, 2 threads => BETTER; f pfib(25) every spawn marked, 2 threads => BETTER; f pfib(25) root marked, 8,1 => BETTER; f pfib(25) every spawn marked, 8,1 => WORSE; g everything marked on the spawn path, C = 50, 8,0 => SAME; g everything marked on the spawn path, C = 500, 8,0 => SAME; h fib_fine after one marked task, against the same build never marked, 8,1 => BETTER
+BLOCK: KEEP v3 (a line reads WORSE) — the decision also needs the equivalence and every check

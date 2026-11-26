@@ -390,3 +390,53 @@ The credited share reads 50.0% at w = 1/2 on the new clock. No assert of the val
 - The shared bodies add at most about a point, within the spread.
 
 **Builds and trees** under `~/app/julia-618-master/`: `v3`, `v3-validate` (the local branches `nitro-618-fair-candidate-v3` and `…-v3-validate`), `v3-validate-off` (switch false) and `v3-bypass` (`…-v3-bypass`). Notes are in `notes-s6.md`, the checks in `results/s6-checks/`.
+
+## The PR candidate, fourth version (#618, session 7)
+
+v3 with one clock read removed: in `fair_deletemin` the clock is read only when its value is used. Same base, `419aba7972`, and same controls (`pin-control`, `pin-control2`). Local only: nothing was pushed to, or proposed on, JuliaLang. **It was not adopted: v3 stays the candidate.**
+
+**What changed from v3, and why.** v3 read `time_ns()` at every pop while the pool flag was set. The value was used in two cases only: to close the interval the previous pop opened (`s.k != 0`: that pop found both sides with work), or to open one at this pop (both sides have work now). Otherwise it was stored in `s.stamp` and never read before the next store. v4 reads it only in those two cases:
+
+```julia
+both = lw && (rr || rf)
+if s.k != 0 || both
+    now = s_stamp()
+    if s.last != 0 && s.k != 0
+        # the credit, unchanged
+    end
+    s.stamp = now
+end
+s.k = both ? 1 : 0
+```
+
+No account changes. The rows that paid the clock most, pfib(25) with the root marked and unmarked work after one marked task, mostly pop with one side empty, so v4 reads no clock there at all. The block comment, the comment above the read and the `stamp` field's comment now say when the clock is read. NEWS, the docstring and the manual never named the clock, and are unchanged.
+
+**The equivalence, off the scheduler, before any build:** `clock_read_equiv.jl` holds v3's and v4's account updates as two pure functions over the same state (`bal`, `stamp`, `last`, `k`) and the same inputs: the three emptiness flags, a clock value, and the pop's outcome, turned into a side by each rule's own `rfirst`.
+- 10^6 random pop sequences (24.5 M pops) cover all eight flag combinations, empty returns, clock steps above the cap, the balance at its limit and the three weights, at the real cap and at a small one.
+- At every step the two rules give the same balance, the same choice (`rfirst`), the same `last` and the same `k`. The stamps differ at 9.45 M steps, and at none of them does the next pop read the stamp.
+- **The negative control** is a rule that reads the clock only when both sides have work now (the `s.k != 0` arm dropped). It fails at the fifth pop of the first sequence: a pop with nothing anywhere, after a pop that found both sides with work, must close that pop's interval, and the control never does.
+
+| File in `candidate-v4/` | sha256 | What |
+|---|---|---|
+| `attempt-clock-read-when-used.patch` | `7c694b78799263c4ad11f163a851fa35a6f196f45c6caae675b1939900fb9589` | v3 → v4, on top of `candidate-v3/0001` + `0002` (`git apply` gives v4; +26 −21, `base/partr.jl` only) |
+
+**Not adopted, by the rule fixed before the block** (`evidence/candidate-v4-clock-compare-20261126/`, its README; `clock_compare_report.jl`). Rows f, g and h ran on v2, v3 and v4 in one block, 12 rounds each, with master as the reference. A line reads BETTER if the median of v4/v3 is at least 1.015 and v4/v3 is above 1 in at least 10 of 12 rounds, and WORSE if the median is at most 0.985 and v4/v3 is below 1 in at least 10 of 12. v4 was to be adopted only if a deciding line read BETTER and no line of f, g or h read WORSE.
+
+| line (speed against master) | v2 | v3 | v4 | v4/v3 | reading |
+|---|---|---|---|---|---|
+| f pfib(25) root marked, 2 threads | 0.937 | 0.895 | 0.937 | 1.044, 12 of 12 above | BETTER |
+| f root marked, 8,1 | 0.902 | 0.884 | 0.898 | 1.018, 12 of 12 above | BETTER |
+| f every spawn marked, 2 threads | 0.431 | 0.410 | 0.420 | 1.023, 11 of 12 above | BETTER |
+| f every spawn marked, 8,1 | 0.392 | 0.391 | 0.385 | 0.981, 12 of 12 below | **WORSE** |
+| g everything marked, C = 50 / 500 | 0.850 / 0.841 | 0.824 / 0.822 | 0.825 / 0.823 | 1.002 / 1.006 | SAME |
+| h after one marked task, against never marked | 0.962 | 0.945 | 0.968 | 1.024, 10 of 12 above | BETTER |
+
+- The removed read was worth what the diagnostic of session 6 put on the clock: root-marked pfib(25) returns to v2's speed at 2 threads (0.937), and the cost after one marked task falls from 5.5% to 3.2%.
+- At 8,1 with every spawn marked, v4 is 1.9% slower than v3, in every round, and at 2 threads the same line is 2.3% faster. With every spawn marked, stock's heaps are almost always empty, so v4 skips nearly every read there. Not separated (inferred): `fair_deletemin`'s own code changed, and one build of each version is one layout draw, which can repeat a difference in every round.
+- The checks are those of v3, all green on `v4-validate` and `v4`.
+  - `native_code_gate.sh` reports the twelve compared functions identical to v3's, since the change is inside the `@noinline` `fair_deletemin`.
+  - The credited share reads 25.3 / 50.0 / 74.8% at w = 1/4, 1/2, 3/4.
+  - Julia's seven test sets give master's counts (7,357,256 passed, 12 broken).
+- The validation needed no clock read of its own. Its sums take the interval from the credit arm, which v4 still reads, and its run sums from `v_gcount`'s own read.
+
+**Trees** under `~/app/julia-618-master/`: `v4`, `v4-validate`, `v4-validate-off` and `v4-bypass`, with the local branches `nitro-618-fair-candidate-v4` (`46552a2c20`, `1bffccdc2f`), `…-v4-validate` (`bc7af35ce6`) and `…-v4-bypass` (`1c676fcdb3`). Notes are in `notes-s7.md`, the checks in `results/s7-checks/`. `candidate_evidence.sh` gained `SPAWN_COLS`, a column override for row g (the default is unchanged).
