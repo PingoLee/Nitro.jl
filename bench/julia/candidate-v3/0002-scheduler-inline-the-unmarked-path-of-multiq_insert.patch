@@ -1,0 +1,45 @@
+From 2db177599ed2fa2532db0fab93302276269727ec Mon Sep 17 00:00:00 2001
+From: PingoLee <eurafael@msn.com>
+Date: Tue, 24 Nov 2026 14:50:43 -0300
+Subject: [PATCH 2/2] scheduler: inline the unmarked path of `multiq_insert`
+
+Test the task's class and the flag in `multiq_insert`, now inlined into
+`enq_work`, and move the rest of the insert into a separate function, so
+that until something is marked `enq_work` calls the stock insert directly.
+
+Assisted-by: Claude Code (Opus 5.5)
+---
+ base/partr.jl | 15 +++++++++++++--
+ 1 file changed, 13 insertions(+), 2 deletions(-)
+
+diff --git a/base/partr.jl b/base/partr.jl
+index 3dd85c9d0f..80c8607237 100644
+--- a/base/partr.jl
++++ b/base/partr.jl
+@@ -659,10 +659,21 @@ end
+     return false
+ end
+ 
+-function multiq_insert(task::Task, priority::UInt16)
++# Inlined into `enq_work`: with nothing marked, stock's insert is one call deep, and this wrapper
++# adds no frame, safepoint or call of its own.
++@inline function multiq_insert(task::Task, priority::UInt16)
+     c = sched_class(task)
++    if c == C_NONE && !(@atomic :monotonic fl.on)
++        return stock_multiq_insert(task, priority)
++    end
++    return fair_insert_entry(task, priority, c)
++end
++
++# The rest of the insert, out of line: a task with no class while the flag is set (a descendant, or
++# stock's), and every classed task.
++@noinline function fair_insert_entry(task::Task, priority::UInt16, c::UInt8)
+     if c == C_NONE
+-        if !(@atomic :monotonic fl.on) || !fair_descendant(task)
++        if !fair_descendant(task)
+             return stock_multiq_insert(task, priority)
+         end
+         c = C_R
+-- 
+2.43.0
+

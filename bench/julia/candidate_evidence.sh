@@ -13,6 +13,9 @@
 #   setsid nohup bench/julia/candidate_evidence.sh C C2 P > driver.out 2>&1 < /dev/null &
 # Results go to OUT (default bench/results/candidate-evidence-<date>): raw/<step>/ (the TSVs),
 # environment.md, results.md (written by candidate_evidence_report.jl, never by hand), driver.log.
+# CE_PREV=<an earlier evidence directory> (with CE_PREV_NAME, CE_THIS_NAME) adds to results.md a table of
+# the two runs' medians, row by row. PFIB_COLS and ARM_COLS replace rows f's and h's columns (a
+# diagnostic run on other builds; the report then reads only the default columns).
 #
 # Rows and steps (rounds in brackets; a fresh process a round, columns rotated, one throwaway slot):
 #   a, b  starved   the starved cell, 500 clients x 2 ms, :interactive clients, 8,1:
@@ -270,7 +273,7 @@ pfib_block() {   # tsv, rounds, layout, cpus, columns...
     for c in $(rotated "$r" "$@"); do pfib_one "$tsv" "$r" "$layout" "$cpus" "$c"; done
   done
 }
-PFIB_COLS="ctl:control:none ctl2:control2:none cand:candidate:none root:candidate:root all:candidate:all${BP:+ byp:bypass:none}"
+PFIB_COLS="${PFIB_COLS:-ctl:control:none ctl2:control2:none cand:candidate:none root:candidate:root all:candidate:all${BP:+ byp:bypass:none}}"
 step_pfib() {    # step, layout, cpus
   local a="$OUT/raw/$1/pfib.tsv"; mkdir -p "$OUT/raw/$1"; rm -f "$a"
   printf 'round\tlabel\tmode\tlayout\tn\tmin_s\tmedian_s\tallocs\tmemory_bytes\tsamples\tmaxrss_mb\n' >"$a"
@@ -372,7 +375,7 @@ for s in $STEPS; do
     pfib2) step_pfib pfib2 2 0,1,2 ;;
     pfib81) step_pfib pfib81 8,1 "$CPUS8" ;;
     spawnpath) step_h0 spawnpath "8,0 default" "A%control N%candidate" "$SPAWN_ROUNDS" ;;
-    arm) step_fib arm 8,1 "$CPUS8" "A%control N-none%candidate N-arm%candidate" "$ARM_ROUNDS" ;;
+    arm) step_fib arm 8,1 "$CPUS8" "${ARM_COLS:-A%control N-none%candidate N-arm%candidate}" "$ARM_ROUNDS" ;;
     tests) step_tests ;;
     repro) step_repro repro "${REPRO_CORE[@]}" ;;
     repro_gh) step_repro repro_gh "${REPRO_GH[@]}" ;;
