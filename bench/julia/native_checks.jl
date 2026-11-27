@@ -11,6 +11,9 @@
 const P = Base.Partr
 hasfield(Task, :sched_class) || error("native_checks: this julia has no native mark (Task.sched_class)")
 const V = isdefined(P, :SCHED_VALIDATE) && P.SCHED_VALIDATE
+# The fifth version (#618, session 10): an opt-out class (C_STOCK), a class written only on a `:default`
+# task, the weight in thousandths set by `set_fair_weight!`, and no one-time init.
+const V5 = isdefined(P, :C_STOCK)
 # The PR candidate has no validation code: neither the switch nor the queue-depth probes. These read
 # the same state from the structures themselves.
 fair_on() = @atomic :acquire P.fl.on
@@ -27,8 +30,13 @@ println(stderr, "native_checks: ", VERSION, " ", Base.GIT_VERSION_INFO.commit_sh
 @assert all(isempty, P.rings) "rings sized in the image: $(length.(P.rings))"
 @assert all(isempty, P.r_heaps) "R heaps sized in the image: $(length.(P.r_heaps))"
 @assert isempty(P.sstates[1]) "accounts sized in the image: $(length(P.sstates[1]))"
-@assert !(@atomic P.fp.inited) "fair_init! ran before anything called it"
-@assert (@atomic P.fp.cap) == P.DEFAULT_CAP && (@atomic P.fp.w4) == 2 "the parameters are not their defaults"
+if V5
+    @assert !isdefined(P, :fair_init!) "v5 has no one-time init"
+    @assert (@atomic P.fp.cap) == P.DEFAULT_CAP && (@atomic P.fp.w) == 500 "the parameters are not their defaults"
+else
+    @assert !(@atomic P.fp.inited) "fair_init! ran before anything called it"
+    @assert (@atomic P.fp.cap) == P.DEFAULT_CAP && (@atomic P.fp.w4) == 2 "the parameters are not their defaults"
+end
 ok("sysimage state: flag unset, rings, R heaps and accounts unsized, init not run, cap and weight at their defaults")
 
 # `jl_new_task` allocates without zeroing: every new task must still start unclassed, including
@@ -62,9 +70,11 @@ err = try; Threads._spawn_set_fair(t, true); nothing; catch e; e; end
 c0 = V ? P.sched_counts() : nothing
 x = 40
 @assert fetch(Threads.@spawn :default fair=(x > 0) $x + 2) == 42
-@assert (@atomic P.fp.inited) "the first fair=true spawn did not run the init"
+V5 || @assert (@atomic P.fp.inited) "the first fair=true spawn did not run the init"
+V5 && V && @assert (@atomic P.vp.inited) "the first fair=true spawn did not run the validation's init"
 println(stderr, "native_checks: cap ", @atomic(P.fp.cap), " clock units = 10 ms (", @atomic(P.fp.cap) / 10, " per ms), ",
-        "TSC clocksource ", isdefined(P, :vp) ? @atomic(P.vp.tsc) : hasfield(typeof(P.fp), :tsc) ? @atomic(P.fp.tsc) : "-", ", weight ", @atomic(P.fp.w4), "/4")
+        "TSC clocksource ", isdefined(P, :vp) ? @atomic(P.vp.tsc) : hasfield(typeof(P.fp), :tsc) ? @atomic(P.fp.tsc) : "-",
+        ", weight ", V5 ? string(@atomic(P.fp.w), "/1000") : string(@atomic(P.fp.w4), "/4"))
 if ND >= 2
     @assert fair_on() "a marked :default spawn on a pool of $ND threads did not set the flag"
     @assert length(P.rings[2]) == 2 * ND "$(length(P.rings[2])) rings for $ND threads"
@@ -95,7 +105,16 @@ function interactive_parent()
     schedule(t)
     return fetch(t)
 end
-if NI >= 1
+if NI >= 1 && V5
+    # v5: `_spawn_set_fair` writes a class only on a `:default` task, so a marked :interactive task has
+    # none at every layout, its :default child none, and nothing is demoted at the insert.
+    c0 = V ? P.sched_counts() : nothing
+    mine, child = interactive_parent()
+    @assert mine == P.C_NONE "v5: a marked :interactive task ($NI threads) ran with class $mine"
+    @assert child == P.C_NONE "v5: its :default child ran with class $child"
+    V && (d = P.sched_counts(); @assert d.demoted == c0.demoted "v5: a demotion was counted")
+    ok("v5: marked :interactive task ($NI threads): no class written, its :default child unclassed, nothing demoted")
+elseif NI >= 1
     c0 = V ? P.sched_counts() : nothing
     mine, child = interactive_parent()
     if NI == 1
@@ -111,13 +130,35 @@ if NI >= 1
     end
 end
 
+# v5's opt-out: under a marked root, `fair=false` gives a task that takes stock's path once (counted),
+# with no class from then on, as its own child; a plain spawn beside it is still the root's R work.
+if V5
+    c0 = V ? P.sched_counts() : nothing
+    r = fetch(Threads.@spawn fair=true begin
+        o = Threads.@spawn fair=false (P.sched_class(current_task()),
+                                       fetch(Threads.@spawn P.sched_class(current_task())))
+        p = Threads.@spawn P.sched_class(current_task())
+        (fetch(o)..., fetch(p))
+    end)
+    want_o = ND >= 2 ? P.C_NONE : P.C_STOCK
+    @assert r[1] == want_o && r[2] == P.C_NONE "v5: the opted-out task ran with $(r[1]), its child with $(r[2])"
+    @assert r[3] == (ND >= 2 ? P.C_R : P.C_NONE) "v5: the plain sibling ran with $(r[3])"
+    V && ND >= 2 && (d = P.sched_counts(); @assert d.opt_out - c0.opt_out == 1 "v5: opt_out counted $(d.opt_out - c0.opt_out)")
+    ok("v5: fair=false under a marked root: the task ran with $(Int(r[1])), its child with 0, the plain sibling with $(Int(r[3]))")
+end
+
 # A sticky marked task never reaches the multiqueue: the mark changes nothing about where it runs.
+# (v5: a hand-built task starts in its creator's pool, and a class is written only on a `:default` task; the
+# main task is on `:interactive` when that pool has a thread, so there the mark writes nothing.)
 st = Task(() -> (Threads.threadid(), P.sched_class(current_task())))
+st_default = ccall(:jl_get_task_threadpoolid, Int8, (Any,), st) == P.f_tpid
 Threads._spawn_set_fair(st, true)
 schedule(st)
 tid, cls = fetch(st)
-@assert tid == Threads.threadid() && cls == P.C_F "a sticky marked task ran on tid $tid with class $cls"
-ok("a sticky marked task ran on its own thread (tid $tid) from its queue, class kept")
+want_st = V5 && !st_default ? P.C_NONE : P.C_F
+@assert tid == Threads.threadid() && cls == want_st "a sticky marked task ran on tid $tid with class $cls, expected $want_st"
+ok("a sticky marked task ran on its own thread (tid $tid) from its queue, class $(Int(cls))" *
+   (V5 && !st_default ? " (v5: built in a pool other than :default, so the mark wrote nothing)" : " kept"))
 
 # No queue keeps a task alive: a ring slot and an R-heap slot are unset when popped.
 function weak_tasks()

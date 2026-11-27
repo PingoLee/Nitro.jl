@@ -29,7 +29,7 @@ function report(path::AbstractString)
     d = JSON.parse(read(path, String))
     haskey(d, "group_per_tid") || return false
     cpm = Float64(d["cycles_per_ms"])
-    w = d["group_w4"] / 4
+    w = haskey(d, "group_w") ? Float64(d["group_w"]) : d["group_w4"] / 4
     req = d["marked_spawns"]
     tids = sort(collect(keys(d["group_per_tid"])); by = x -> parse(Int, x))
     rows = [d["group_per_tid"][t] for t in tids]

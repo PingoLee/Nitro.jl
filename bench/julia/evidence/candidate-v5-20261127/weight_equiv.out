@@ -1,0 +1,18 @@
+PROOF 1: v4 against v5, 1000000 sequences, 24517522 pops (50.3 s)
+  flag combinations (lw + 2rr + 4rf => count): 0=>3063718, 1=>3064173, 2=>3062492, 3=>3064091, 4=>3061625, 5=>3069152, 6=>3066433, 7=>3065838
+  balance_at_limit      2265573
+  empty_return          1608212
+  step_above_cap        6130083
+  w4_1                  333030
+  w4_2                  333113
+  w4_3                  333857
+  EQUAL at every step: rfirst, last, k and stamp; v5's balance is 250 times v4's
+  negative control (v5's rule, the bound left at 2 cap): fails as it must, at sequence 1, step 4: v5's balance is not 250 times v4's
+    step 2: lw=false rr=true rf=false clock+93176 o=true/false | v4 bal=0 last=1 k=0 | v5 bal=0 (0.0 x250) last=1 k=0
+    step 3: lw=true rr=true rf=true clock+1982770 o=true/false | v4 bal=0 last=2 k=1 | v5 bal=0 (0.0 x250) last=2 k=1
+    step 4: lw=true rr=true rf=true clock+90415410 o=false/true | v4 bal=-10000000 last=2 k=1 | v5 bal=-20000000 (-80000.0 x250) last=2 k=1
+PROOF 2: v5's update, 32-bit typed, checked arithmetic, 13804192 updates (0.3 s)
+  no InexactError and no overflow, intervals 0..2^63 ns forwards and backwards, every weight 1..999
+  negative control (v4's `Int(now - s.stamp)` with Int = Int32): throws InexactError past 2^31 - 1 ns (first above: 2147483648 ns), not at or below it
+RESULT: v5's account is v4's x 250 on every step, and its 32-bit model neither throws nor overflows
+exit 0

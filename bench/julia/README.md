@@ -514,3 +514,94 @@ Results:
 - Gate results (`~/app/julia-618-master/results/s9-gate/`): v3 against v3-validate-off and v4 against v4-validate-off, 13 of 13 functions IDENTICAL each.
 
 Notes are in `notes-s9.md`.
+
+## The PR candidate, fifth version (#618, session 10)
+
+v4 with five changes, all outside the unmarked path, from an outside review of v4's patch that the maintainer read on 2026-11-27. Same base, `419aba7972`, and same controls (`pin-control`, `pin-control2`). Local only: nothing was pushed to, or proposed on, JuliaLang. The weight's shell is **internal**. The launcher carried both choices, and the prompt's default for no choice is `internal` (recorded as decided without the maintainer).
+
+**The five changes, each with where it came from and its test:**
+
+- **A. `fair=false` opts out.** From the review: `fair=false` wrote nothing, so `fair_descendant` made R every unclassed task whose first enqueue was made by a classed task. A background loop that a marked request starts lazily was R for the life of the process, with its children, and the request side serves the R heaps before the rings. Now an explicit `fair=` that evaluates to false writes a third class, `C_STOCK = 0x03`; an absent keyword still writes nothing. At the task's first enqueue the insert takes stock's path and clears the class, so the task's own children are stock's unless marked. `fair_descendant` counts only F and R, so a task that still holds `C_STOCK` (a pool of one thread never reaches the multiqueue) classes nobody. The value never reaches the rings, the R heaps or the time share. **Tests:** the testset's `fair=false` set has three cases. Under a marked root, the opted-out task and its child have no class, while a plain sibling is R. Kept alive past its root, the task spawns again with no class. In a child process where nothing was ever marked, it gets no class and the flag stays unset. Also `native_checks.jl`'s v5 opt-out line (the `opt_out` counter) and `optout_check.jl` (below).
+- **B. The keyword's position.** From the review: `@spawn fair=true :default f()` ended in "wrong number of arguments". `fair=` is now accepted right before or right after the pool argument. Anywhere else (twice, or with a stray argument) is an `ArgumentError` that names the two accepted forms. The last argument is always the expression. **Tests:** the testset's `keyword` set: both positions, four rejected forms, and `fair=y` with a variable.
+- **C. A mark outside `:default` does nothing, at the spawn.** From the review: `_spawn_set_fair` wrote the class whatever the pool. On `8,1` a marked `:interactive` task kept it and its `:default` children became R; on `8,2` the insert cleared it and they did not. `_spawn_set_fair` now reads the task's pool (set on the line before in the macro) and writes a class only for `:default`, for `true` and `false` alike. A task built by hand whose pool is set after the call keeps what the call wrote. That is nothing if its pool was not `:default` then. Otherwise it is a class that the insert clears, as before, if the task is in another pool at its first enqueue. **Tests:** the testset's `a mark outside :default` set (one rule at every layout, plus a hand-built task), and `native_checks.jl` at `8,1`, `8,2` and `1`.
+- **D. The conversion.** Found by the review, never seen (the box is 64-bit): `d = now > s.stamp ? Int(now - s.stamp) : 0` converts before it clamps. Where `Int` is `Int32`, an interval over 2.147 s throws `InexactError` inside the scheduler's pop. The interval is now clamped to the cap in `UInt64` and converted after. **Test:** proof 2 in `weight_equiv.jl` (no 32-bit build: the box has no multilib toolchain).
+- **E. The weight.** From the review, v4's weight had four problems:
+  - it was in quarters;
+  - `JULIA_SCHED_FAIR_WEIGHT` was read by the first marked spawn, so a bad value let a server start and failed its first marked request;
+  - that first call fixed the weight for the process, although `fp.w4` was an atomic field read at every credited interval;
+  - `get(ENV, …)`, a lock and a `throw` sat behind every `@spawn fair=expr`.
+
+  Now the weight is an integer in thousandths (500 by default), and the account, the interval and the cap are `Int64` on every platform. The balance's bound is rescaled with it (500 caps), so that at 1/4, 1/2 and 3/4 every balance is v4's times 250 and every choice is v4's. The internal shell has no environment variable. `fair_init!`, its lock and the `inited` field are gone, and `_spawn_set_fair` only validates and writes the byte. `Base.Partr.set_fair_weight!(w::Real)` validates `0 < w < 1` (and that it rounds to 1–999 thousandths) and stores it; it may be called at any time. The manual's entry and the variable's name in NEWS, the docstrings, the block comment and the commit message are gone, and the `fair` docstring says the share is one half. The pop's arithmetic gains no branch. **Tests:** proof 1 in `weight_equiv.jl`; the testset's `the weight` set (rejects 0, 1, NaN, −0.5, 0.0004, a string and a complex; accepts 0.1, 0.9 and 1//4); the credited share at five weights (below).
+
+**Before any build, two proofs** (`weight_equiv.jl`, beside `clock_read_equiv.jl`, off the scheduler; its output is `evidence/candidate-v5-20261127/weight_equiv.out`):
+1. **v4's account update against v5's**, as two pure functions over the same inputs: the three emptiness flags, a clock value and the pop's outcome. The run covers 10^6 random pop sequences (24.5 M pops) at 1/4, 1/2 and 3/4, at the real cap and at a small one. At every step the choice, `last`, `k` and the stamp are the same, and v5's balance is exactly 250 times v4's. All eight flag combinations occur, with 2.27 M pops at the balance's limit and 6.1 M clock steps above the cap. **The negative control**, v5's rule with the bound left at v4's two caps, fails at the fourth pop of the first sequence.
+2. **v5's update with every integer typed as a 32-bit build types it** (`Int32` where the patch says `Int`, `Int64` where it says `Int64`), every operation checked: 13.8 M updates. They cover every weight from 1 to 999 against 17 edge intervals from 0 to 2^63 ns, from 8 stamps, forwards and backwards, at 7 balances, then 10^7 random cases with log-uniform intervals. There is no `InexactError` and no overflow. **The negative control**, v4's `Int(now - s.stamp)` with `Int = Int32`, throws `InexactError` from 2^31 ns, and not at or below 2^31 − 1.
+
+A 32-bit build was not possible on this box in under 30 minutes: there is no multilib `gcc` and no i386 libc headers, and installing them needs root. It was not tried: **32-bit is reasoned and modelled, not run.**
+
+**Change D, the sweep** (v5 with the validation). The clock is read at three sites:
+- the ring stamps stay `UInt64` and are only compared;
+- the credit's interval is clamped in `UInt64`, then converted;
+- the validation's run sums: `vstamp` is now `UInt64` (it was `s_stamp() % Int`, a truncation to `Int32` on a 32-bit build), the difference is clamped to `typemax(Int64)` in `UInt64` and converted, and the sums of clock differences are `Int64`.
+
+No other conversion in the patch touches a clock value.
+
+| File in `candidate-v5/` | sha256 | What |
+|---|---|---|
+| `0001-*.patch` | `6e4d76c76b6126b6142b32e04c1fbf518b379b56f09f40ab0b157bc56d33b637` | commit 1 (`af0914a825`): the design with the five changes, its tests, NEWS (no manual entry) |
+| `0002-*.patch` | `5bb4d655774ad19a02227bf22e8deed4a6768ea742e345beac1a7f9ca4a81b31` | commit 2 (`28bdb56e6b`): the unmarked insert inlined into `enq_work` (unchanged) |
+| `validate.patch` | `5ae89f4a5a8bee93f73b14607055863110dfe922b750a656edb252ecf99a2954` | the validation (`47e50381d6`), additions only (302 lines), switch on |
+| `bypass.patch` | `11f849a14a03f31fdd217f557154f39ea90e8191d94fb868ae336c2c2f4bf73a` | the bypass control on v5 (`0871cde5b4`): v4's, applied unchanged |
+
+`git am 0001-*.patch 0002-*.patch` on `419aba7972` gives v5 (checked: the diff against `nitro-618-fair-candidate-v5` is empty); `git apply` either of the others on top of it.
+
+**The validation** is v4's, re-applied, with three differences, all additions to v5:
+- the planted error and the clocksource are read once by `validate_init!`, in place of `fair_init!`; the first `Threads._spawn_set_fair` calls it, or a harness at load;
+- a counter of opted-out first enqueues, `opt_out`, is added;
+- the clock sums and `vstamp` are 64-bit (change D).
+
+**Checks** (as for v4; on `v5-validate` unless said; `~/app/julia-618-master/results/s10-checks/`):
+- the diff from v5 to v5-validate only adds lines (302), and `v5-validate-off` compiles all 13 compared functions (`fair_deletemin` included) to v5's code;
+- `native_code_gate.sh` (a report): the twelve functions of the unmarked path compile to v4's code; `fair_deletemin` does not (477 lines against v4's 494);
+- `rounds_fifo.sh PROFILE=native VALIDATE=1` is clean, and its six negative controls fail;
+- `native_checks.jl` passes at 8,1, 8,2 and 1 on both builds, and `master_checks.jl` passes at 8,1 and 8,2. `native_checks.jl` now branches on `C_STOCK`. On v5, a marked `:interactive` task has no class at every layout, a hand-built task made in the `:interactive` main task gets no class, and the opt-out under a marked root is counted. Its first run failed on that hand-built task: the check's expectation, not the patch;
+- `v2_checks.jl wake64` (ring ×3, busy, sleep) at `--threads=72` passes; `init2` is gone with `fair_init!`;
+- `wake_window.jl` ring and wake at 2,1 report 0 stuck in 19.4 M and 18.5 M rounds, and the R-side positive control 21 stuck;
+- Julia's seven test sets give master's counts on v5 (7,357,256 passed, 12 broken);
+- the testset passes 20 of 20 runs at threads.jl's five layouts, and `make check-whitespace` is clean;
+- the credited share (plain / inner) reads 10.2 / 10.2, 25.3 / 25.2, 50.0 / 50.0, 74.8 / 74.7 and 89.9 / 89.8% at 0.1, 0.25, 0.5, 0.75 and 0.9 (v4: 25.3, 50.0, 74.8);
+- **the check for change A** (`optout_check.jl`, quiet-gated, 8,1). A marked root starts a background loop with `fair=false` (a 1 ms child, then 1 ms of sleep) beside the starved cell's 500 marked clients. All 1,229 of the loop's children ran with no class. The R heaps took nothing (`r_first` 0, `r_again` 0), stock took the 1,229 (`l_first`), `opt_out` read 1, and the cell's p99 was 154.5 ms. **The positive control**, the keyword left out, sent all 1,242 children to the R heaps (`r_first` 1,243, `desc` 1,243). At this load the p99 does not tell the two apart (154.8 ms); the classes and the counters do.
+
+The harness sets the weight through `Base.Partr.set_fair_weight!` where it exists (`NATIVE_SETW` in `multiq_variant.jl`; `GROUP_W`, a fraction, beside `GROUP_W4`), so the older builds still run. `N10` and `N90` are the share's two new weights, v5 only.
+
+**The comparison block** (`evidence/candidate-v5-compare-20261127/`, its README; `compare_v5_report.jl`) ran rows f, g and h on v4 and v5, with master as the reference. It used 12 rounds, rotated columns, a fresh process a round and one throwaway slot. One yardstick line was added: `fib_fine` at 8,1 with nothing marked, on v5 and on `v5-validate-off` (the same code in two binaries). **It decides nothing.** Every ratio is a speed.
+
+| line (speed against master) | v4 | v5 | v5/v4 (rounds above 1) |
+|---|---|---|---|
+| f pfib(25) root marked, 2 threads / 8,1 | 0.930 / 0.902 | 0.944 / 0.916 | 1.014 (12 of 12) / 1.012 (11) |
+| f every spawn marked, 2 threads / 8,1 | 0.426 / 0.387 | 0.430 / 0.394 | 1.012 (10) / 1.016 (12) |
+| g everything marked, C = 50 / 500 | 0.836 / 0.834 | 0.840 / 0.836 | 1.008 (11) / 1.005 (10) |
+| h after one marked task, against master | 0.945 | 0.965 | 1.023 (11) |
+| h after one marked task, against never marked | 0.963 | 0.975 | 1.020 (9) |
+
+The yardstick's two readings are 0.991 and 0.988, 0.3 points apart. Every line differs from v4 by more than that, all in v5's favour (0.52% to 2.33%). The cause was not separated. `fair_deletemin`'s code changed (477 lines against 494), and one build of each is one layout draw: session 9 read 2.8 points between two pairs of identical code on `fib_fine`.
+
+**Builds and trees** under `~/app/julia-618-master/`: `v5`, `v5-validate`, `v5-validate-off` (switch false) and `v5-bypass`, with the local branches `nitro-618-fair-candidate-v5` (`af0914a825`, `28bdb56e6b`), `…-v5-validate` (`47e50381d6`) and `…-v5-bypass` (`0871cde5b4`); same `Make.user`, own wrappers and depots. Notes are in `notes-s10.md`, the checks in `results/s10-checks/` (`checks_s10.sh`).
+
+**Harness pieces added:**
+- `weight_equiv.jl`, the two proofs, and `optout_check.jl`, the check for change A (both above).
+- `compare_v5_report.jl`, the comparison block's report.
+- `native_checks.jl` branches on `Base.Partr.C_STOCK` (v5).
+- `multiq_variant.jl` sets the weight through `set_fair_weight!` where it exists and adds `N10` and `N90`. `server.jl` writes `group_w`, and `group_report.jl` reads it.
+- `candidate_evidence_report.jl`: the least floor is 2.0% (row e and row f's unmarked line, one rule, two-sided), and row h lists v4's evidence among the earlier readings.
+
+### The evidence of v5 (#618, session 10)
+
+`evidence/candidate-v5-20261127/` ran `candidate_evidence.sh pin-control pin-control2 v5 v5-bypass` with `CE_PREV` pointing at v4's run, so `results.md` ends with a "v4 against v5" table of the two runs' medians. The bars changed before the run in one place: row e and row f's unmarked line share **one rule**, WITHIN THE FLOOR when this PR differs from master by no more than the larger of master's second build's distance and 2.0% (what two binaries of identical code read apart on these cells), otherwise OUTSIDE THE FLOOR, with its size and against the bypass.
+
+**The run is in two sittings.** The Claude Code session ended at 03:59 while the driver was in step `spawnpath`, and the driver died with it. Steps `prep` to `pfib81` (rows a to f) had finished, every one exit 0 and with no cache write. The run resumed at 18:48 with `FROM=spawnpath` into the same directory, detached this time, and ran rows g, h and i, the reproducers and the report. The partial `spawnpath` files were set aside unused. Every row is paired within its own step (master's rounds beside the build's), so no row mixes the two sittings.
+
+- **Rows a, b, c, d, g and i pass.** The starved cell's p99 is 3086 → 151.0 ms, and the least-served client 1 → 60. Beside the fork-join, p99 is 329.0 / 325.4 ms with compute at 0.545 / 0.541. The server reads 114.1 ms at 1.021× (8,1) and 110.9 ms at 0.994× (8,0). Everything marked is 0.844× / 0.839×. Julia's seven test sets give master's counts.
+- **Row e: every cell WITHIN THE FLOOR.** `fib_fine` reads −0.57%, and the spawn path at H = 0 reads +0.40% and +0.10%, each against ±2.00%. Master's second build reads −0.07%, +0.22% and +0.07%.
+- **Row f's unmarked line is WITHIN THE FLOOR**: +0.03% at 2 threads and +0.36% at 8,1. The bypass reads 0.986 and 0.985. The stated costs are 0.942 / 0.911 with the root marked and 0.428 / 0.396 with every spawn marked.
+- **Row h**, a stated cost: 0.4% never marked against master; 4.0% after one marked task against master; 3.4% for the second against the first (the reproducer reads 2.6%).

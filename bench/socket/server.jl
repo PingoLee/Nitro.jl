@@ -589,6 +589,7 @@ function mq_body()::String
         multiq_group_reset_peaks!()
         d["cycles_per_ms"] = SHARE_CYCLES_PER_MS
         d["group_w4"] = GROUP_W4
+        d["group_w"] = GROUP_W
     end
     verdict = try
         # bare_marked_listen: the descendants (the accept loop, one per connection, whatever else

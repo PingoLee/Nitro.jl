@@ -1,0 +1,67 @@
+f pfib(25) root marked, 2 threads
+  v4  against master 0.93 [0.92–0.944] (12 rounds)
+  v5  against master 0.944 [0.932–0.964] (12 rounds)
+  v5/v4 per round: 1.033 1.007 1.018 1.014 1.017 1.012 1.018 1.001 1.008 1.014 1.025 1.013
+  v5/v4: median 1.014, above 1 in 12 of 12, below 1 in 0
+
+f pfib(25) every spawn marked, 2 threads
+  v4  against master 0.426 [0.414–0.431] (12 rounds)
+  v5  against master 0.43 [0.423–0.44] (12 rounds)
+  v5/v4 per round: 1.053 1.021 1.031 1.005 1.001 1.023 1.019 1.011 0.996 1.013 1.007 0.988
+  v5/v4: median 1.012, above 1 in 10 of 12, below 1 in 2
+
+f pfib(25) root marked, 8,1
+  v4  against master 0.902 [0.892–0.916] (12 rounds)
+  v5  against master 0.916 [0.895–0.926] (12 rounds)
+  v5/v4 per round: 1.012 1.019 1.015 1.012 1.012 1.004 1.011 1.016 1.011 1.016 1.019 0.993
+  v5/v4: median 1.012, above 1 in 11 of 12, below 1 in 1
+
+f pfib(25) every spawn marked, 8,1
+  v4  against master 0.387 [0.383–0.393] (12 rounds)
+  v5  against master 0.394 [0.387–0.401] (12 rounds)
+  v5/v4 per round: 1.032 1.024 1.029 1.004 1.017 1.009 1.008 1.033 1.001 1.012 1.016 1.017
+  v5/v4: median 1.016, above 1 in 12 of 12, below 1 in 0
+
+g everything marked on the spawn path, C = 50, 8,0
+  v4  against master 0.836 [0.826–0.844] (12 rounds)
+  v5  against master 0.84 [0.835–0.849] (12 rounds)
+  v5/v4 per round: 1.008 1.007 1.001 1.008 1.001 1.0 1.014 1.014 1.011 1.015 1.001 1.007
+  v5/v4: median 1.008, above 1 in 11 of 12, below 1 in 1
+
+g everything marked on the spawn path, C = 500, 8,0
+  v4  against master 0.834 [0.818–0.839] (12 rounds)
+  v5  against master 0.836 [0.823–0.844] (12 rounds)
+  v5/v4 per round: 1.027 1.008 1.004 1.001 0.983 1.015 1.004 1.007 0.993 1.009 1.007 1.0
+  v5/v4: median 1.005, above 1 in 10 of 12, below 1 in 2
+
+h v4: never marked against master 0.983 [0.966–1.001]; after one marked task against master 0.945 [0.924–0.962]; after one marked task against never marked 0.963 [0.936–0.984]
+h v5: never marked against master 0.991 [0.962–1.014]; after one marked task against master 0.965 [0.951–0.986]; after one marked task against never marked 0.975 [0.962–1.0]
+
+h fib_fine after one marked task, against master, 8,1
+  v4  against master 0.945 [0.924–0.962] (12 rounds)
+  v5  against master 0.965 [0.951–0.986] (12 rounds)
+  v5/v4 per round: 1.032 1.013 1.02 1.037 1.021 1.035 1.016 1.026 0.999 1.036 1.016 1.029
+  v5/v4: median 1.023, above 1 in 11 of 12, below 1 in 1
+
+h fib_fine after one marked task, against the same build never marked, 8,1
+  v4  against master 0.963 [0.936–0.984] (12 rounds)
+  v5  against master 0.975 [0.962–1.0] (12 rounds)
+  v5/v4 per round: 1.032 0.982 1.043 1.042 1.03 1.033 1.007 1.026 0.993 1.01 0.993 1.014
+  v5/v4: median 1.02, above 1 in 9 of 12, below 1 in 3
+
+yardstick fib_fine at 8,1, nothing marked (the same code in two binaries):
+  v5             against master 0.991 [0.962–1.014] (12 rounds)
+  v5-validate-off against master 0.988 [0.971–1.017] (12 rounds)
+  v5/v5-validate-off per round: 1.009 1.018 0.965 0.965 0.98 1.004 1.023 0.992 0.986 1.011 1.021 0.993; median 0.999
+  the two readings differ by 0.3 points
+
+v5 against v4, line by line (median v5/v4; the yardstick's two readings differ by 0.3 points):
+  f pfib(25) root marked, 2 threads                                               1.014 (above 1 in 12 of 12)  DIFFERS FROM v4 BY MORE THAN THE YARDSTICK: 1.38%
+  f pfib(25) every spawn marked, 2 threads                                        1.012 (above 1 in 10 of 12)  DIFFERS FROM v4 BY MORE THAN THE YARDSTICK: 1.2%
+  f pfib(25) root marked, 8,1                                                     1.012 (above 1 in 11 of 12)  DIFFERS FROM v4 BY MORE THAN THE YARDSTICK: 1.24%
+  f pfib(25) every spawn marked, 8,1                                              1.016 (above 1 in 12 of 12)  DIFFERS FROM v4 BY MORE THAN THE YARDSTICK: 1.63%
+  g everything marked on the spawn path, C = 50, 8,0                              1.008 (above 1 in 11 of 12)  DIFFERS FROM v4 BY MORE THAN THE YARDSTICK: 0.75%
+  g everything marked on the spawn path, C = 500, 8,0                             1.005 (above 1 in 10 of 12)  DIFFERS FROM v4 BY MORE THAN THE YARDSTICK: 0.52%
+  h fib_fine after one marked task, against master, 8,1                           1.023 (above 1 in 11 of 12)  DIFFERS FROM v4 BY MORE THAN THE YARDSTICK: 2.33%  [moves by more than 2%]
+  h fib_fine after one marked task, against the same build never marked, 8,1      1.02 (above 1 in 9 of 12)  DIFFERS FROM v4 BY MORE THAN THE YARDSTICK: 1.98%
+This block decides nothing.

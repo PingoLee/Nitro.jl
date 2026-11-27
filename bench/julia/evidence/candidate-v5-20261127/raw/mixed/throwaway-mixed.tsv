@@ -1,0 +1,2 @@
+julia	commit	threads	guard	variant	round	c	h_ms	d_s	rps	p50_ms	p99_ms	max_ms	count_min	count_median	jain	slow1_spawn_to_start_pct	slow1_end_to_wake_pct	fib_alone_median_s	fib_alone_min_s	fib_alone_max_s	fib_runs	fib_median_s	fib_min_s	fib_max_s	fib_walls_s	shape	hw_p50_ms	hw_p99_ms	inflight_mean	inflight_peak	slot_wait_p50_ms	slot_wait_p99_ms
+1.15.0-DEV.974	419aba7972/local	8,1	1	A	0	500	2.0	8.0	3534	15.0	2669.0	8677.0	1	57	0.598	99.9	0.0	0.8081	0.8001	0.9434	0	NaN	NaN	NaN		plain	2.0	2.038	7.076	-1	NaN	NaN
