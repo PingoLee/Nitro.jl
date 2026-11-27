@@ -682,3 +682,36 @@ if any(isdir(joinpath(OUT, s)) for s in ("wstall", "wtasks", "wspawn", "wpool81"
     end
     isdir(joinpath(OUT, "wperf")) && println(io, "\nSpawnWait, where the time is: `PU_COLS=\"wbase w84\" PU_REPORT_LAYOUTS=8,1 julia bench/julia/perf_report.jl $(joinpath(OUT, "wperf"))`.")
 end
+
+# ---------------------------------------------------------------- S5
+# The starved cell on #62284's head (SESSION=5, #618 session 9): the stock column of the starved step,
+# nothing marked, on w84, w84-base and control, with mwe.jl once on each. The reading, fixed before the run:
+# THE STARVATION HOLDS on a build whose p99 is above 1,000 ms in every round; otherwise the build reads what
+# it reads. #62284's description says it does not change the order of tasks: this is not a reading of the PR.
+const S5_COLS = ["w84", "w84-base", "ctl"]
+if any(isdir(joinpath(OUT, s)) for s in ("wstarved", "wmwe"))
+    println(io, "\n## S5. The starved cell on JuliaLang/julia#62284's head (w84, 293a8f6a7d), its merge-base (w84-base, 35e14589f4) and control (4b0df1484a)\n")
+    println(io, "500 closed-loop clients on `:interactive` each spawn a 2 ms task on `:default` and wait for it, 8,1, 8 s, nothing marked ",
+            "(these trees have no mark); a fair wait is 125 ms. A fresh process a round, the columns rotated, one throwaway slot first.\n")
+    rows = filter(r -> r["mode"] == "spawn" && parse(Int, r["round"]) > 0, readtsv(joinpath(OUT, "wstarved", "fairrounds-spawn.tsv")))
+    if !isempty(rows)
+        println(io, "| build | rounds | p99 ms (per round) | p99 ms | least-served client (tasks in 8 s) | tasks/s | reading |\n|---|--:|---|---|---|---|---|")
+        for c in S5_COLS
+            rs = sort(filter(r -> col_of(r["commit"], r["variant"]) == c, rows); by = r -> parse(Int, r["round"]))
+            isempty(rs) && continue
+            p = num.(getindex.(rs, "p99_ms"))
+            reading = all(>(1000), p) ? "THE STARVATION HOLDS (p99 above 1,000 ms in every round)" :
+                      "p99 above 1,000 ms in $(count(>(1000), p)) of $(length(p)) rounds"
+            println(io, "| $c | $(length(rs)) | $(join(round.(Int, p), ", ")) | $(fmt(p)) | $(fmt(num.(getindex.(rs, "count_min")))) | $(fmt(num.(getindex.(rs, "rps")))) | $reading |")
+        end
+    end
+    d = joinpath(OUT, "wmwe")
+    if isdir(d)
+        println(io, "\n### mwe.jl (the description's reproducer, stock), once on each\n")
+        for c in ("w84", "w84-base", "control")
+            f = joinpath(d, "mwe-$c.txt")
+            isfile(f) || continue
+            println(io, "$c:\n```\n", rstrip(read(f, String)), "\n```")
+        end
+    end
+end

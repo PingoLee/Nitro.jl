@@ -3,7 +3,7 @@
 # instructions, the calls and their targets, the frame and the safepoint polls of the optimized
 # code this build's compiler emits for this CPU. Read it on control, mark and mark-inline.
 #
-#   <julia> --startup-file=no bench/julia/unmarked_code.jl [--full] [--heaps]
+#   <julia> --startup-file=no bench/julia/unmarked_code.jl [--full] [--heaps] [--fair]
 #
 # Instructions and calls come from `code_native` (Intel syntax, no debug info); safepoint polls from
 # the optimized LLVM IR (`code_llvm`), where a poll is a volatile load of the safepoint page. `--full`
@@ -33,6 +33,10 @@ if MARK && "--heaps" in ARGS
         ("Partr.r_multiq_check_empty()", P.r_multiq_check_empty, Tuple{}),
     ])
 end
+# `--fair`: also the mark's own pop, `fair_deletemin` (the fourth version changed only its body; session 9
+# compares it between v3/v4 and their validation builds with the switch off).
+MARK && "--fair" in ARGS && isdefined(P, :fair_deletemin) &&
+    push!(targets, ("Partr.fair_deletemin()", P.fair_deletemin, Tuple{}))
 
 function summary(name, f, tt)
     io = IOBuffer()

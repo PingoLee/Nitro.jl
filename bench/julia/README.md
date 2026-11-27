@@ -247,6 +247,17 @@ On 2026-11-23 the gain of #62285's branch under partr and its stall were put dow
     - The pool 1.15× at `8,1` and 1.18× at `8,0`; `/plaintext` at `8,1` 1.06×, with p99 12.5 ms against 13.4.
   - On SpawnWait, the default threads run 3.9× fewer user instructions per operation and sleep about 20× less often.
 
+### `SESSION=5`: the starved cell on JuliaLang/julia#62284's head (#618, session 9)
+
+The stock starved cell runs on `w84`, `w84-base` and `control`: 500 closed-loop clients on `:interactive`, each spawning a 2 ms task on `:default`; 8,1; 8 s; nothing marked. It runs 5 rotated rounds, a fresh process a round, after one throwaway slot (step `wstarved`, through `step_starved`). Step `wmwe` (cuttable) then runs `candidate/mwe.jl` once on each build.
+
+The report is section S5 of `master_measure_report.jl <OUT>`: p99, the least-served client and tasks/s. A build reads THE STARVATION HOLDS when its p99 is above 1,000 ms in every round; otherwise the report says what it read. Local only, as for S3 and S4, and nothing was posted to, or drafted for, JuliaLang.
+
+**Results** (2026-11-26, under `~/app/julia-618-master/results/s5`):
+- **The starvation holds on all three.** `w84` reads p99 3112 ms [3068–3270], `w84-base` 3163 [2666–3442] and `control` 3124 [2811–3412]; the least-served client finishes 1 task on each.
+- `mwe.jl` gives p99 3138 ms on `w84`, 2878 on `w84-base` and 3279 on `control`, with a least-served client of 1, 1 and 2.
+- Inferred, not measured: #62284's two commits change when threads wake and where they park, not which waiting task a pop takes, which fits the cell reading the same on all three builds.
+
 ## The PR candidate (#618, session 4)
 
 The measured design in the form a reviewer of Julia would receive it: the port's two commits rebased on
@@ -415,7 +426,12 @@ The credited share reads 50.0% at w = 1/2 on the new clock. No assert of the val
 
 ## The PR candidate, fourth version (#618, session 7)
 
-v3 with one clock read removed: in `fair_deletemin` the clock is read only when its value is used. Same base, `419aba7972`, and same controls (`pin-control`, `pin-control2`). Local only: nothing was pushed to, or proposed on, JuliaLang. **It was not adopted: v3 stays the candidate.**
+v3 with one clock read removed: in `fair_deletemin` the clock is read only when its value is used. Same base, `419aba7972`, and same controls (`pin-control`, `pin-control2`). Local only: nothing was pushed to, or proposed on, JuliaLang. **v4 is the candidate: adopted by the maintainer on 2026-11-26 over the block's rule** (session 7's block kept v3, below). His reasons:
+
+1. with nothing marked, on a path where v3 and v4 have identical native code in all twelve compared functions, v4 read 0.988 of `master` and v3 1.008. The block itself shows a 2% difference between these two builds that is not code, so 1.9% on another line cannot be read as code;
+2. the vetoing line is the misuse of the mark, already at 0.39× of `master` (0.391 → 0.385);
+3. the WORSE threshold (1.5%) sat inside that range, and "below 1 in 10 of 12 rounds" is what one layout draw gives;
+4. the account is proved identical, and not reading a clock whose value is unused is the code a reviewer would ask for.
 
 **What changed from v3, and why.** v3 read `time_ns()` at every pop while the pool flag was set. The value was used in two cases only: to close the interval the previous pop opened (`s.k != 0`: that pop found both sides with work), or to open one at this pop (both sides have work now). Otherwise it was stored in `s.stamp` and never read before the next store. v4 reads it only in those two cases:
 
@@ -440,9 +456,15 @@ No account changes. The rows that paid the clock most, pfib(25) with the root ma
 
 | File in `candidate-v4/` | sha256 | What |
 |---|---|---|
+| `0001-*.patch` | `4e583f486a83bab0330bdb8956a7b6ffac5dc8a339b47b855695fc94577e0699` | commit 1 (`46552a2c20`): the design with the clock read only when used, its tests, NEWS, the manual |
+| `0002-*.patch` | `ae5aa976327be70ab08fefd2e78ce51a3566afebe27332abcd5a2a61d04c06b7` | commit 2 (`1bffccdc2f`): the unmarked insert inlined into `enq_work` (unchanged) |
+| `validate.patch` | `0ed5a4f85b37050e0a69b52d358c5f2c105e257258a9c3e01a6280915ccc543d` | the validation (`bc7af35ce6`), additions only (286 lines), switch on |
+| `bypass.patch` | `150ac25c796bd76f1e37089fe335b6916c10dcc9f528a86e3ef98a55e064ff73` | the bypass control on v4 (`1c676fcdb3`): stock's four heap functions in master's text under master's names |
 | `attempt-clock-read-when-used.patch` | `7c694b78799263c4ad11f163a851fa35a6f196f45c6caae675b1939900fb9589` | v3 → v4, on top of `candidate-v3/0001` + `0002` (`git apply` gives v4; +26 −21, `base/partr.jl` only) |
 
-**Not adopted, by the rule fixed before the block** (`evidence/candidate-v4-clock-compare-20261126/`, its README; `clock_compare_report.jl`). Rows f, g and h ran on v2, v3 and v4 in one block, 12 rounds each, with master as the reference. A line reads BETTER if the median of v4/v3 is at least 1.015 and v4/v3 is above 1 in at least 10 of 12 rounds, and WORSE if the median is at most 0.985 and v4/v3 is below 1 in at least 10 of 12. v4 was to be adopted only if a deciding line read BETTER and no line of f, g or h read WORSE.
+`git am 0001-*.patch 0002-*.patch` on `419aba7972` gives v4 (checked: the diff against `nitro-618-fair-candidate-v4` is empty); `git apply` either of the other two on top of it.
+
+**The block's rule kept v3** (it was overridden, above) (`evidence/candidate-v4-clock-compare-20261126/`, its README; `clock_compare_report.jl`). Rows f, g and h ran on v2, v3 and v4 in one block, 12 rounds each, with master as the reference. A line reads BETTER if the median of v4/v3 is at least 1.015 and v4/v3 is above 1 in at least 10 of 12 rounds, and WORSE if the median is at most 0.985 and v4/v3 is below 1 in at least 10 of 12. v4 was to be adopted only if a deciding line read BETTER and no line of f, g or h read WORSE.
 
 | line (speed against master) | v2 | v3 | v4 | v4/v3 | reading |
 |---|---|---|---|---|---|
@@ -462,3 +484,33 @@ No account changes. The rows that paid the clock most, pfib(25) with the root ma
 - The validation needed no clock read of its own. Its sums take the interval from the credit arm, which v4 still reads, and its run sums from `v_gcount`'s own read.
 
 **Trees** under `~/app/julia-618-master/`: `v4`, `v4-validate`, `v4-validate-off` and `v4-bypass`, with the local branches `nitro-618-fair-candidate-v4` (`46552a2c20`, `1bffccdc2f`), `…-v4-validate` (`bc7af35ce6`) and `…-v4-bypass` (`1c676fcdb3`). Notes are in `notes-s7.md`, the checks in `results/s7-checks/`. `candidate_evidence.sh` gained `SPAWN_COLS`, a column override for row g (the default is unchanged).
+
+### The evidence of v4 (#618, session 9)
+
+`evidence/candidate-v4-20261126/` ran `candidate_evidence.sh pin-control pin-control2 v4 v4-bypass` with `CE_PREV` pointing at v3's run, so `results.md` ends with a "v3 against v4" table of the two runs' medians. The trees were not rebuilt: each wrapper reports the branch commit (`1bffccdc2f`, `bc7af35ce6`, `bc7af35ce6*` with the switch off, `1c676fcdb3`). Session 7's checks were not rerun.
+
+The report's bars changed before the run, and nowhere else:
+- **Row e** has one rule. A cell is WITHIN THE FLOOR when |this PR/master − 1| ≤ max(|second build/master − 1|, 0.5%). Otherwise it reads OUTSIDE THE FLOOR, with its size, this PR against the bypass, and the rounds on each side of 1. No verdict about the path is drawn from one build of each.
+- **Row f**: only the unmarked line has a bar (one-sided, as for v3). The root-marked and every-spawn lines are stated costs.
+- **Row h** is a stated cost given three ways (never marked against master, after one marked task against master, the second against the first), beside the earlier readings.
+- A row outside its bar prints **RESULT** (outside its bar), where it used to print FAIL.
+
+Results:
+- Rows a, b, c, d, g and i pass as v3's did. The starved cell's p99 is 3234 → 151.0 ms with the least-served client 1 → 60; the server is at 1.018× (8,1) and 1.014× (8,0) of master's throughput; Julia's seven test sets give master's counts.
+- **Row e: every cell WITHIN THE FLOOR.** `fib_fine` reads −1.34% against a floor of ±1.60%; the spawn path at H = 0 reads −0.43% and −0.35% against ±0.95% and ±0.96%.
+- **Row f's unmarked line is a RESULT.** It is slower than its one-sided floor at both layouts: −1.01% against −0.50% at 2 threads, −1.37% against −1.20% at 8,1. The bypass (stock's entry points, the same binary) reads 0.985 and 0.987 there. The stated costs are 0.925 / 0.898 with the root marked and 0.421 / 0.387 with every spawn marked.
+- **Row h**: 1.8% never marked against master, 5.5% after one marked task against master, and 3.4% for the second against the first.
+
+**The series on JuliaLang/julia#62284's head** (read, not built): `git am -3` of `0001` on `293a8f6a7d` stops on one conflict hunk in each of `NEWS.md`, `base/partr.jl` and `test/threads_exec.jl`. #62284 touches none of these three files, so the conflicts come from master's drift only (`partr.jl`'s is master's `yield_os_thread` in the context).
+
+**The second layout draw** (`evidence/candidate-v4-layout-draw-20261126/`, its README; `layout_draw_report.jl`). It reruns the two lines session 7's block could not read on v3 and v4. Each version also gets a second binary, its validation build with the switch off, which the gate shows compiles to the same code. The reading was fixed before the block: THE SAME SIGN IN BOTH PAIRS, or NOT REPEATED. It decides nothing.
+- pfib(25) with every spawn marked at 8,1 reads THE SAME SIGN IN BOTH PAIRS: v4/v3 is 1.010 and v4-off/v3-off 1.017, so v4 is faster in both pairs. Session 7's 1.9% loss did not repeat.
+- `fib_fine` with nothing marked reads NOT REPEATED: v4/v3 0.992 and v4-off/v3-off 1.020. Two pairs with the same code differ by 2.8 points on this line.
+
+**Harness pieces added:**
+- `layout_draw_report.jl <dir>` is the second draw's report.
+- `unmarked_code.jl --fair` adds `Partr.fair_deletemin()` to the compared functions.
+- `native_code_gate.sh` passes `GATE_EXTRA` on to it. The default set is unchanged.
+- Gate results (`~/app/julia-618-master/results/s9-gate/`): v3 against v3-validate-off and v4 against v4-validate-off, 13 of 13 functions IDENTICAL each.
+
+Notes are in `notes-s9.md`.

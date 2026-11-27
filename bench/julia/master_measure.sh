@@ -77,6 +77,12 @@
 #   wplain81 (/plaintext under oha, c = 500, 8,1, the four columns, WP_ROUNDS 6).
 # Cut order (DEADLINE): wplain81, wperf, wpool80. Results in results/s4 (s4-smoke). Report:
 # master_measure_report.jl <OUT>, section S4.
+#
+# SESSION=5 (#618 session 9): the starved cell on #62284's head. The stock column of the starved step
+# (500 clients on :interactive, a 2 ms task each on :default, 8,1, 8 s, nothing marked: these trees
+# have no mark) on w84, w84-base and control, S5_ROUNDS (5) rotated rounds, one throwaway slot first
+# (wstarved); then bench/julia/candidate/mwe.jl once on each (wmwe, cuttable). Results in results/s5
+# (s5-smoke). Report: master_measure_report.jl <OUT>, section S5.
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
@@ -92,11 +98,12 @@ W84_MORE="${W84_MORE:-20}"
 if [ "$SMOKE" = 1 ]; then
   export TD="${TD:-1}" NOGATE=1
   OUT="${OUT:-$J/results/s$SESSION-smoke}"
-  A_ROUNDS=1 B_ROUNDS=1 C_ROUNDS=1 CM_ROUNDS=1 E1_ROUNDS=1 J_ROUNDS=1 W_ROUNDS=1 WP_ROUNDS=1 STALL_RUNS=1 W84_MORE=1
+  A_ROUNDS=1 B_ROUNDS=1 C_ROUNDS=1 CM_ROUNDS=1 E1_ROUNDS=1 J_ROUNDS=1 W_ROUNDS=1 WP_ROUNDS=1 STALL_RUNS=1 W84_MORE=1 S5_ROUNDS=1
 else
   OUT="${OUT:-$J/results/s$SESSION}"
   A_ROUNDS="${A_ROUNDS:-15}" B_ROUNDS="${B_ROUNDS:-5}" C_ROUNDS="${C_ROUNDS:-6}" CM_ROUNDS="${CM_ROUNDS:-5}" E1_ROUNDS="${E1_ROUNDS:-6}"
   J_ROUNDS="${J_ROUNDS:-10}" W_ROUNDS="${W_ROUNDS:-12}" WP_ROUNDS="${WP_ROUNDS:-6}" STALL_RUNS="${STALL_RUNS:-10}"
+  S5_ROUNDS="${S5_ROUNDS:-5}"
 fi
 mkdir -p "$OUT"
 export S2_OUT="$OUT"
@@ -119,6 +126,7 @@ AGG="/aggregate?n=100000&op=groupby"
 FIVE="A%control A%control2 N-none%mark N-none%mark-inline N-none%mark-bypass"
 JULY5="A%july A%july-n A%base A%control A%control2"
 W4="A%w84-base A%w84 A%control A%control2"
+S5="A%w84 A%w84-base A%control"
 WIN_DUR_S="${WIN_DUR_S:-300}"
 
 log() { echo "[$(date '+%F %T')] $*" | tee -a "$LOG"; }
@@ -351,6 +359,14 @@ real_bin() { sed -n 's/^exec "\(.*\)" "\$@"$/\1/p' "$1"; }
 # Part A: the stall script, untimed. base (the positive control) first in every run, then w84, w84-base
 # and control, interleaved, STALL_RUNS runs; then STALL_RUNS more of the three; then, if w84 was not
 # ok in some run, W84_MORE runs of w84 alone. A stall is a RESULT, never a stop.
+step_wmwe() {    # the PR description's reproducer once on each of session 5's builds, stock (no mark)
+  local d="$OUT/wmwe" w
+  mkdir -p "$d"
+  for w in w84 w84-base control; do
+    timeout -s KILL 120 taskset -c "$CPUS8" "$B/julia-$w" --startup-file=no --threads=8,1 "$HERE/candidate/mwe.jl" >"$d/mwe-$w.txt" 2>&1 ||
+      echo "mwe on $w: exit $?" >>"$d/mwe-$w.txt"
+  done
+}
 step_wstall() {
   local d="$OUT/wstall" b84 bb bc bbase
   b84="$(real_bin "$B/julia-w84")" bb="$(real_bin "$B/julia-w84-base")" bc="$(real_bin "$B/julia-control")" bbase="$(real_bin "$T/julia-base")"
@@ -463,6 +479,10 @@ if [ "$SESSION" = 4 ]; then
   CUTTABLE=" wpool80 wperf wplain81 "
   DEFAULT_STEPS="wstall wtasks wspawn wpool81 wpool80 wperf wplain81"
 fi
+if [ "$SESSION" = 5 ]; then
+  CUTTABLE=" wmwe "
+  DEFAULT_STEPS="wstarved wmwe"
+fi
 STEPS="${STEPS:-$DEFAULT_STEPS}"
 if [ -n "${FROM:-}" ]; then
   STEPS="$(echo "$STEPS" | tr ' ' '\n' | sed -n "/^${FROM}\$/,\$p" | tr '\n' ' ')"
@@ -516,6 +536,8 @@ for s in $STEPS; do
     jplain81) SERVER_JULIAS="$JULIAS5" step_server jplain81 /plaintext "bare_spawn@8,1%july bare_spawn@8,1%july-n bare_spawn@8,1%base bare_spawn@8,1%control bare_spawn@8,1%control2" "$J_ROUNDS" OHA=1 CLIENT_CPU=1 ;;
     jplain80) SERVER_JULIAS="$JULIAS5" step_server jplain80 /plaintext "bare_spawn@8,0%july bare_spawn@8,0%july-n bare_spawn@8,0%base bare_spawn@8,0%control bare_spawn@8,0%control2" "$J_ROUNDS" OHA=1 CLIENT_CPU=1 ;;
     wstall) step_wstall ;;
+    wstarved) step_starved wstarved "$S5" "$S5_ROUNDS" ;;
+    wmwe) gated 618s5-wmwe "$0" --run step_wmwe >>"$LOG" 2>&1 ;;
     wtasks) step_micro wtasks 8,1 "$CPUS8" "$W4" "$W_ROUNDS" ;;
     wspawn) step_h0 wspawn "8,1 interactive" "$W4" "$W_ROUNDS" ;;
     wpool81|wpool80) mkdir -p "$OUT/$s"; rm -f "$OUT/$s/pool.tsv"
