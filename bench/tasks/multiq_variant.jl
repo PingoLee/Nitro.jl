@@ -175,13 +175,21 @@ const NATIVE_BUILD = hasfield(Task, :sched_class)
 # N25 and N75 (the measurement session of the native mark): N at the request-side weights 1/4 and
 # 3/4, M-gc25-r2's and M-gc75-r2's. The build reads its weight from JULIA_SCHED_FAIR_WEIGHT once, at
 # the init this file runs at load, so the name sets it first; the check after that init confirms it.
-const _N_WEIGHT = MULTIQ_VARIANT == "N25" ? "1/4" : MULTIQ_VARIANT == "N75" ? "3/4" : nothing
+# N10 and N90 (#618 session 10, the fifth version): N at 0.1 and 0.9. A build with
+# `Base.Partr.set_fair_weight!` (v5) takes any of these through that function, at load, and reads no
+# environment variable; an earlier build takes only N25 and N75, through the variable.
+const NATIVE_SETW = NATIVE_BUILD && isdefined(Base.Partr, :set_fair_weight!)
+const _N_W = MULTIQ_VARIANT == "N25" ? 0.25 : MULTIQ_VARIANT == "N75" ? 0.75 :
+             MULTIQ_VARIANT == "N10" ? 0.1 : MULTIQ_VARIANT == "N90" ? 0.9 : nothing
+const _N_WEIGHT = NATIVE_SETW ? nothing : MULTIQ_VARIANT == "N25" ? "1/4" : MULTIQ_VARIANT == "N75" ? "3/4" : nothing
+!NATIVE_SETW && MULTIQ_VARIANT in ("N10", "N90") &&
+    error("VARIANT=$(MULTIQ_VARIANT) needs a build with Base.Partr.set_fair_weight! (the fifth version)")
 if _N_WEIGHT !== nothing
     get(ENV, "JULIA_SCHED_FAIR_WEIGHT", _N_WEIGHT) == _N_WEIGHT ||
         error("VARIANT=$(MULTIQ_VARIANT) sets JULIA_SCHED_FAIR_WEIGHT=$(_N_WEIGHT), and the environment has $(ENV["JULIA_SCHED_FAIR_WEIGHT"])")
     ENV["JULIA_SCHED_FAIR_WEIGHT"] = _N_WEIGHT
 end
-const MULTIQ_NATIVE = MULTIQ_VARIANT in ("N", "N-h", "N-none", "N-arm", "N25", "N75")
+const MULTIQ_NATIVE = MULTIQ_VARIANT in ("N", "N-h", "N-none", "N-arm", "N25", "N75", "N10", "N90")
 MULTIQ_NATIVE && !NATIVE_BUILD && error("VARIANT=$(MULTIQ_VARIANT) needs a Julia built with the native mark (bench/julia/)")
 NATIVE_BUILD && !(MULTIQ_VARIANT == "A" || MULTIQ_NATIVE) &&
     error("the runtime patch refuses to load on a build with the native mark: VARIANT=$(MULTIQ_VARIANT); use A, N, N-h or N-none")
@@ -227,9 +235,11 @@ const GROUP_CLOCK = _F_RULE in ("gc", "gc25", "gc75")
 const FIFO_INHERIT = _F_RULE in ("il", "it") ? :i : FIFO_SERVE in (:g, :g0) ? :g : :none
 const FIFO_GROUP = FIFO_INHERIT === :g
 # -g's weight for the request side, in quarters (w = GROUP_W4 / 4); g0 keeps the balance at 0.
-const GROUP_W4 = MULTIQ_NATIVE ? (w = get(ENV, "JULIA_SCHED_FAIR_WEIGHT", "1/2");
+const GROUP_W4 = NATIVE_SETW ? 0 : MULTIQ_NATIVE ? (w = get(ENV, "JULIA_SCHED_FAIR_WEIGHT", "1/2");
                                   w == "1/4" ? 1 : w == "3/4" ? 3 : w == "1/2" ? 2 : error("JULIA_SCHED_FAIR_WEIGHT=$w")) :
                  _F_RULE in ("g25", "gc25") ? 1 : _F_RULE in ("g75", "gc75") ? 3 : 2
+# The request side's weight as a fraction: v5's thousandths (set at load, below), else GROUP_W4 / 4.
+const GROUP_W = NATIVE_SETW ? (MULTIQ_NATIVE && _N_W !== nothing ? _N_W : 0.5) : GROUP_W4 / 4
 # M-a<T>: the age, in ms, past which the older sampled ring head goes before the heaps.
 const AGE_MS = FIFO_SERVE === :a ? parse(Int, _F_RULE[2:end]) : 0
 # The shares (run of 2026-11-16): both act only when a pop finds the F queue non-empty, and keep
@@ -1124,8 +1134,17 @@ if MULTIQ_NATIVE
     # The one-time init: the weight and the clock's 10 ms calibration, here at load, so it falls
     # outside every timed window (a mark would call it on the first marked spawn). It marks nothing:
     # under N-none the pool flag stays unset.
-    PARTR.fair_init!()
-    (@atomic PARTR.fp.w4) == GROUP_W4 || error("the build's weight is $(@atomic PARTR.fp.w4)/4, the harness's $(GROUP_W4)/4")
+    if NATIVE_SETW
+        # v5: no init and no environment variable; the weight is set here, through the function,
+        # and the validation build's one-time read (the negative control) is done here too.
+        PARTR.set_fair_weight!(GROUP_W)
+        (@atomic PARTR.fp.w) == round(Int64, 1000 * GROUP_W) ||
+            error("the build's weight is $(@atomic PARTR.fp.w)/1000, the harness's $(GROUP_W)")
+        isdefined(PARTR, :validate_init!) && PARTR.validate_init!()
+    else
+        PARTR.fair_init!()
+        (@atomic PARTR.fp.w4) == GROUP_W4 || error("the build's weight is $(@atomic PARTR.fp.w4)/4, the harness's $(GROUP_W4)/4")
+    end
     const SHARE_CAP = @atomic PARTR.fp.cap
     const SHARE_CYCLES_PER_MS = SHARE_CAP / 10
     # N-arm (#618, agent-config #82 Idea 17 session 2, part E1): nothing marked, as N-none, but one
@@ -2209,7 +2228,7 @@ println(stderr, "multiq_variant: VARIANT=", MULTIQ_VARIANT, MULTIQ_VALIDATE ? " 
                       (FIFO_RINGS ? ", $(_nrings()) rings, pop samples $(RINGS_D)" *
                                     (RING_OWN ? ", insert into the thread's own rings" : "") : "") *
                       (FIFO_INHERIT === :none ? "" : ", descendants $(FIFO_INHERIT === :i ? "F (into the rings)" : "R (into the R heaps)")") *
-                      (FIFO_SERVE === :g ? ", request-side weight $(GROUP_W4)/4" : FIFO_SERVE === :g0 ? ", balance never moved (L first)" : "") *
+                      (FIFO_SERVE === :g ? ", request-side weight $(NATIVE_SETW ? GROUP_W : "$(GROUP_W4)/4")" : FIFO_SERVE === :g0 ? ", balance never moved (L first)" : "") *
                       (FIFO_SERVE === :a ? ", ring head first past $(AGE_MS) ms" : "") *
                       (FIFO_SERVE === :p ? " (F first every $(SHARE_K)th accounted pop)" : "") *
                       (FIFO_SERVE in (:t, :t0) ? " (cap $(round(SHARE_CAP / SHARE_CYCLES_PER_MS; digits = 2)) ms, " *
@@ -2809,10 +2828,10 @@ end
 # while both had work must be 40-60%, over at least 50 ms of such time.
 #
 # Under -g the "F" side is the request side (the R heaps and the rings: pops F counts both), and
-# `half` checks the weight's band instead: GROUP_W4/4 of the time +-10 points (g0: not checked).
+# `half` checks the weight's band instead: GROUP_W of the time +-10 points (g0: not checked).
 function multiq_share_check(label, before, fbefore; half::Bool = false)
     FIFO_ACCOUNTS && MULTIQ_VALIDATE || return nothing
-    lo, hi = FIFO_GROUP ? (25 * GROUP_W4 - 10, 25 * GROUP_W4 + 10) : (40, 60)
+    lo, hi = FIFO_GROUP ? (100 * GROUP_W - 10, 100 * GROUP_W + 10) : (40, 60)
     now = multiq_share_counts()
     ms(c) = round(c / SHARE_CYCLES_PER_MS; digits = 1)
     pct(a, b) = a + b == 0 ? NaN : round(100 * a / (a + b); digits = 1)

@@ -1,0 +1,16 @@
+julia	commit	threads	guard	variant	round	mode	clients	c	h_ms	rps	p50_ms	p90_ms	p99_ms	max_ms	count_min	count_p1	count_median	count_max	jain	slow1_spawn_to_start_pct	slow1_end_to_wake_pct	shape	hw_p50_ms	hw_p99_ms	hw_max_ms	inflight_mean	inflight_peak	slot_wait_p50_ms	slot_wait_p99_ms
+1.15.0-DEV.974	419aba7972/local	8,1	1	A	1	pool	interactive	500	2.0	3774	132.0	136.0	139.0	141.1	61	61	61	62	1.0	93.2	5.4	plain	2.0	2.04	4.848	7.554	-1	NaN	NaN
+1.15.0-DEV.974	419aba7972/local	8,1	1	A	1	spawn	interactive	500	2.0	3773	15.0	128.0	2951.0	8132.0	1	1	57	197	0.66	99.9	0.0	plain	2.0	2.037	6.119	7.552	-1	NaN	NaN
+1.15.0-DEV.976	28bdb56e6b/native	8,1	1	N	1	spawn	interactive	500	2.0	3772	132.0	141.0	151.0	175.0	60	60	61	63	1.0	96.1	2.6	plain	2.0	2.049	6.67	7.553	-1	NaN	NaN
+1.15.0-DEV.974	419aba7972/local	8,1	1	A	2	pool	interactive	500	2.0	3774	132.1	136.0	139.0	141.9	61	61	61	62	1.0	93.3	5.3	plain	2.0	2.039	6.057	7.554	-1	NaN	NaN
+1.15.0-DEV.976	28bdb56e6b/native	8,1	1	N	2	spawn	interactive	500	2.0	3773	132.0	141.0	151.8	171.0	60	60	61	63	1.0	96.1	2.6	plain	2.0	2.046	4.864	7.552	-1	NaN	NaN
+1.15.0-DEV.974	419aba7972/local	8,1	1	A	2	spawn	interactive	500	2.0	3772	15.01	126.0	3143.0	8129.0	1	1	58	206	0.645	99.9	0.0	plain	2.0	2.039	4.924	7.553	-1	NaN	NaN
+1.15.0-DEV.974	419aba7972/local	8,1	1	A	3	pool	interactive	500	2.0	3774	132.0	136.0	139.0	141.6	61	61	61	62	1.0	93.2	5.3	plain	2.0	2.039	6.199	7.556	-1	NaN	NaN
+1.15.0-DEV.974	419aba7972/local	8,1	1	A	3	spawn	interactive	500	2.0	3773	15.0	119.1	3365.0	8131.0	1	1	54	236	0.627	99.9	0.1	plain	2.0	2.036	6.674	7.552	-1	NaN	NaN
+1.15.0-DEV.976	28bdb56e6b/native	8,1	1	N	3	spawn	interactive	500	2.0	3772	132.0	141.0	151.0	178.2	60	60	61	63	1.0	96.5	2.2	plain	2.0	2.044	6.448	7.552	-1	NaN	NaN
+1.15.0-DEV.974	419aba7972/local	8,1	1	A	4	pool	interactive	500	2.0	3773	132.6	136.0	139.0	141.9	61	61	61	62	1.0	93.4	5.2	plain	2.0	2.038	6.466	7.555	-1	NaN	NaN
+1.15.0-DEV.976	28bdb56e6b/native	8,1	1	N	4	spawn	interactive	500	2.0	3773	132.0	141.1	151.0	167.0	60	60	61	63	1.0	96.2	2.5	plain	2.0	2.047	4.992	7.551	-1	NaN	NaN
+1.15.0-DEV.974	419aba7972/local	8,1	1	A	4	spawn	interactive	500	2.0	3773	15.01	133.0	2829.0	8132.0	1	1	61	174	0.677	99.9	0.0	plain	2.0	2.036	5.992	7.552	-1	NaN	NaN
+1.15.0-DEV.974	419aba7972/local	8,1	1	A	5	pool	interactive	500	2.0	3774	132.0	136.0	139.0	141.9	61	61	61	62	1.0	93.3	5.3	plain	2.0	2.04	6.413	7.555	-1	NaN	NaN
+1.15.0-DEV.974	419aba7972/local	8,1	1	A	5	spawn	interactive	500	2.0	3772	15.0	120.0	3086.0	8132.0	1	1	55	228	0.6	99.9	0.0	plain	2.0	2.035	4.422	7.549	-1	NaN	NaN
+1.15.0-DEV.976	28bdb56e6b/native	8,1	1	N	5	spawn	interactive	500	2.0	3773	132.0	141.0	152.0	169.0	60	60	61	63	1.0	96.4	2.3	plain	2.0	2.048	7.111	7.554	-1	NaN	NaN

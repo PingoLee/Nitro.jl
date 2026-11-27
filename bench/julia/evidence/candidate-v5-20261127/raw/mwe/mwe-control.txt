@@ -1,0 +1,3 @@
+1.15.0-DEV.974  threads 8,1  tasks/s 3802  fair wait ≈ 125.0 ms
+latency ms: p50 15.0  p99 2695.0  max 8011.2
+tasks per client: min 1  median 60  max 181

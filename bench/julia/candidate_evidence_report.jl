@@ -176,8 +176,12 @@ function row_d()
 end
 
 # ---------------------------------------------------------------- e
-# One unmarked cell: the speeds against master per round, the floor, the reading. ONE RULE (session 9):
-# WITHIN THE FLOOR if this PR differs from master by no more than master's second build does (0.5% at
+# The least floor: what two binaries of identical code read apart on these cells (session 9's second layout
+# draw: 2.8 points on fib_fine between two pairs of identical code; session 10 takes 2.0%).
+const FLOOR_MIN = 0.020
+# One unmarked cell: the speeds against master per round, the floor, the reading. ONE RULE (session 9; the
+# least floor raised to 2.0% in session 10, what two binaries of identical code read apart on these cells):
+# WITHIN THE FLOOR if this PR differs from master by no more than master's second build does (2.0% at
 # least); otherwise OUTSIDE THE FLOOR, with its size, this PR against the bypass and the rounds on each
 # side. No verdict about "the path" is drawn from one build.
 function floor_cell(name, rows, val, slower_is_larger, opns)
@@ -186,7 +190,7 @@ function floor_cell(name, rows, val, slower_is_larger, opns)
     sp(a, b) = slower_is_larger ? a / b : b / a                  # speed of b against a
     s2, s1 = paired(v0, v2, sp), paired(v0, v1, sp)
     sb, s1b = paired(v0, vb, sp), paired(vb, v1, sp)
-    d = max(abs(med(s2) - 1), 0.005)
+    d = max(abs(med(s2) - 1), FLOOR_MIN)
     within = !isempty(s1) && abs(med(s1) - 1) <= d
     up, dn = count(>(1), s1), count(<(1), s1)
     reading = within ?
@@ -198,7 +202,7 @@ function floor_cell(name, rows, val, slower_is_larger, opns)
 end
 function row_e()
     section("e. Code that marks nothing pays nothing measurable")
-    claim("With nothing marked, this PR's speed against master lies within the distance between two builds of master itself (0.5% at least). " *
+    claim("With nothing marked, this PR's speed against master lies within the distance between two builds of master itself (2.0% at least: what two binaries of identical code read apart on these cells). " *
           "WITHIN THE FLOOR, or OUTSIDE THE FLOOR with its size, this PR against the bypass (this PR's binary with stock's entry points) and the rounds on each side. " *
           "One build of each is one layout draw: no verdict about the path is drawn from it.")
     reproduce("floorfib, floorh0")
@@ -241,17 +245,20 @@ function row_f()
         sp = Dict(k => paired(base, b(k), (a, x) -> a / x) for (k, _) in labels)
         layout == "--threads=2" && (sp2 = sp)
         for (k, _) in labels; push!(frows[k], cellstr(sp[k])); end
-        d = max(abs(med(sp["ctl2"]) - 1), 0.005)
-        # One-sided: only slower than master by more than the floor is a problem.
-        lay = !isempty(sp["cand"]) && med(sp["cand"]) >= 1 - d
-        push!(notes, "$layout: unmarked " * (lay ? "not slower than the floor ($(pct(med(sp["cand"]))), floor −$(@sprintf("%.2f", 100d))%)" :
-                                             "slower than the floor ($(pct(med(sp["cand"]))) against −$(@sprintf("%.2f", 100d))%)") *
+        d = max(abs(med(sp["ctl2"]) - 1), FLOOR_MIN)
+        # ONE RULE (session 10), as row e: within the floor if the unmarked line differs from master by no more
+        # than max(|second build − 1|, 2.0%); otherwise OUTSIDE THE FLOOR, with its size and against the bypass.
+        lay = !isempty(sp["cand"]) && abs(med(sp["cand"]) - 1) <= d
+        cb = HAS_BYPASS ? paired(b("byp"), b("cand"), (a, x) -> a / x) : Float64[]
+        push!(notes, "$layout: unmarked " * (lay ? "WITHIN THE FLOOR ($(pct(med(sp["cand"]))) against master, floor ±$(@sprintf("%.2f", 100d))%)" :
+                                             "OUTSIDE THE FLOOR ($(pct(med(sp["cand"]))) against master, floor ±$(@sprintf("%.2f", 100d))%" *
+                                             (isempty(cb) ? "" : "; this PR against the bypass $(pct(med(cb)))") * ")") *
                      (HAS_BYPASS && !isempty(sp["byp"]) ? ", the bypass at $(fmtv(med(sp["byp"])))" : "") *
                      "; root marked $(fmtv(med(sp["root"]))), every spawn marked $(fmtv(med(sp["all"]))) (stated costs)")
         ok &= lay
     end
     table(vcat(["speed against master, unmarked"], fl), [frows[k] for (k, _) in labels])
-    println("Criterion f: unmarked not slower than master by more than the floor (one-sided: max(|second build − 1|, 0.5%)). The root-marked and every-spawn-marked lines are STATED COSTS, with no bar. ",
+    println("Criterion f: unmarked WITHIN THE FLOOR (one rule, as row e: |this PR − master| ≤ max(|second build − 1|, 2.0%)). The root-marked and every-spawn-marked lines are STATED COSTS, with no bar. ",
             join(notes, "; "), ". Overall: ", pf(ok && !isempty(fl)), ".\n")
     isempty(sp2) || beside([["unmarked, --threads=2", fmtv(med(sp2["cand"])), fmtv(rmed("pfib.jl", "none", "control", "median_s") / rmed("pfib.jl", "none", "candidate", "median_s"))],
                             ["root marked", fmtv(med(sp2["root"])), fmtv(rmed("pfib.jl", "none", "control", "median_s") / rmed("pfib.jl", "root", "candidate", "median_s"))],
@@ -304,7 +311,7 @@ function row_h()
     println("- the second against the first (after one marked task, against the same build never marked): ", cost(med(s_ru)), " (rounds ", rng(s_ru), ").\n")
     println("Earlier readings of the second against the first: 2.6% (2026-11-22/23, on master's port), 3.1% (the candidate, 2026-11-24), ",
             "4.0% (v2, 2026-11-25), 6.1% (v3, 2026-11-25); session 7's comparison block (2026-11-26) read v4 at 3.2% against its own build never marked ",
-            "and 3.8% against master.\n")
+            "and 3.8% against master; v4's evidence (2026-11-26) read 3.4%, and 5.5% after one marked task against master.\n")
     beside([["after one marked task, against never marked", fmtv(med(s_ru)),
              fmtv(rmed("armed.jl", "unarmed", "candidate", "median_s") / rmed("armed.jl", "armed", "candidate", "median_s"))]],
            "The same work; the reproducer arms the flag by one `fair=true` spawn in the measured process, the harness by one marked task at load, and its 3 rounds spread wider.")
